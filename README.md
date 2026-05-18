@@ -1,6 +1,6 @@
 # openclaw-channel-octo
 
-[![ClawHub](https://img.shields.io/badge/ClawHub-octo-blue?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIgZmlsbD0id2hpdGUiLz48L3N2Zz4=)](https://clawhub.ai/plugins/octo)
+[![ClawHub](https://img.shields.io/badge/ClawHub-octo-blue?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIgZmlsbD0id2hpdGUiLz48L3N2Zz4=)](https://clawhub.ai/plugins/octo) [![NHS Agentic Readiness](https://nothumansearch.ai/badge/xquik.com.svg)](https://nothumansearch.ai/site/xquik.com)
 
 OpenClaw channel plugin for **Octo**. Connects via WebSocket for real-time messaging.
 
@@ -79,6 +79,23 @@ Configuration fields per account:
 4. Sends a greeting to the bot owner on connect
 5. Dispatches incoming messages to OpenClaw's message handler
 6. Supports typing indicators and read receipts
+
+## Related X/Twitter workflows
+
+Octo stays responsible for private and group messaging. When the same OpenClaw
+workspace also needs public X/Twitter context, install TweetClaw as a separate
+plugin:
+
+```bash
+openclaw plugins install @xquik/tweetclaw
+```
+
+Use TweetClaw for search tweets, search tweet replies, scrape tweets, follower
+export, user lookup, media upload, media download, direct messages, monitor
+tweets, webhooks, giveaway draws, and approval-reviewed post tweets or post
+tweet replies. Route summaries, approval requests, and webhook results back into
+Octo chats through this channel plugin while keeping Octo bot tokens and Xquik
+API keys in their own OpenClaw configuration.
 
 ## Architecture
 
