@@ -257,6 +257,44 @@ export async function handleOctoMessageAction(params: {
 // send
 // ---------------------------------------------------------------------------
 
+function resolveActionMediaUrls(args: Record<string, unknown>): string[] {
+  const urls: string[] = [];
+  const add = (value: unknown) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      for (const item of value) add(item);
+      return;
+    }
+    if (typeof value === "string" && value.trim()) {
+      urls.push(value.trim());
+    }
+  };
+  const attachments = args.attachments;
+  if (Array.isArray(attachments)) {
+    for (const att of attachments) {
+      if (typeof att === "string") {
+        add(att);
+      } else if (att && typeof att === "object") {
+        add(
+          (att as any).media ??
+            (att as any).mediaUrl ??
+            (att as any).path ??
+            (att as any).filePath ??
+            (att as any).fileUrl ??
+            (att as any).url,
+        );
+      }
+    }
+  }
+  add(args.mediaUrls);
+  add(args.media);
+  add(args.mediaUrl);
+  add(args.filePath);
+  add(args.fileUrl);
+  add(args.url);
+  return [...new Set(urls)];
+}
+
 async function handleSend(params: {
   args: Record<string, unknown>;
   apiUrl: string;
@@ -275,12 +313,9 @@ async function handleSend(params: {
   }
 
   const message = (args.message as string | undefined)?.trim();
-  const mediaUrl =
-    (args.media as string | undefined) ??
-    (args.mediaUrl as string | undefined) ??
-    (args.filePath as string | undefined);
+  const mediaUrls = resolveActionMediaUrls(args);
 
-  if (!message && !mediaUrl) {
+  if (!message && mediaUrls.length === 0) {
     return {
       ok: false,
       error: "At least one of message or media/mediaUrl/filePath is required",
@@ -389,18 +424,45 @@ async function handleSend(params: {
   }
 
   // Send media
-  if (mediaUrl) {
-    await uploadAndSendMedia({
-      mediaUrl,
-      apiUrl,
-      botToken,
-      channelId,
-      channelType,
-      log: log as any,
-    });
+  const sentMedia: string[] = [];
+  const failedMedia: { url: string; error: string }[] = [];
+  for (const mediaUrl of mediaUrls) {
+    try {
+      await uploadAndSendMedia({
+        mediaUrl,
+        apiUrl,
+        botToken,
+        channelId,
+        channelType,
+        log: log as any,
+      });
+      sentMedia.push(mediaUrl);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log?.error?.(`octo: uploadAndSendMedia failed for ${mediaUrl}: ${errMsg}`);
+      failedMedia.push({ url: mediaUrl, error: errMsg });
+    }
   }
 
-  return { ok: true, data: { sent: true, target, channelId, channelType } };
+  if (mediaUrls.length > 0 && sentMedia.length === 0 && !message) {
+    return {
+      ok: false,
+      error: `All ${failedMedia.length} media upload(s) failed`,
+      data: { failedMedia },
+    };
+  }
+
+  return {
+    ok: true,
+    data: {
+      sent: true,
+      target,
+      channelId,
+      channelType,
+      mediaCount: sentMedia.length,
+      ...(failedMedia.length > 0 ? { failedMedia } : {}),
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

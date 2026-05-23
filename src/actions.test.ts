@@ -731,6 +731,379 @@ describe("handleOctoMessageAction", () => {
   });
 
   // -----------------------------------------------------------------------
+  // send — multi-attachment support
+  // -----------------------------------------------------------------------
+  describe("send — multiple attachments via mediaUrls array", () => {
+    it("should call uploadAndSendMedia for each URL in mediaUrls", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          mediaUrls: [
+            "https://example.com/a.png",
+            "https://example.com/b.pdf",
+            "https://example.com/c.jpg",
+          ],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledTimes(3);
+      expect(uploadSpy.mock.calls[0][0]).toMatchObject({ mediaUrl: "https://example.com/a.png" });
+      expect(uploadSpy.mock.calls[1][0]).toMatchObject({ mediaUrl: "https://example.com/b.pdf" });
+      expect(uploadSpy.mock.calls[2][0]).toMatchObject({ mediaUrl: "https://example.com/c.jpg" });
+      expect((result as any).data.mediaCount).toBe(3);
+    });
+  });
+
+  describe("send — attachments as object array", () => {
+    it("should extract URLs from attachment objects with various key names", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          attachments: [
+            { media: "https://example.com/via-media.png" },
+            { mediaUrl: "https://example.com/via-mediaUrl.png" },
+            { path: "https://example.com/via-path.png" },
+            { filePath: "https://example.com/via-filePath.png" },
+            { fileUrl: "https://example.com/via-fileUrl.png" },
+            { url: "https://example.com/via-url.png" },
+          ],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledTimes(6);
+      expect(uploadSpy.mock.calls[0][0].mediaUrl).toBe("https://example.com/via-media.png");
+      expect(uploadSpy.mock.calls[5][0].mediaUrl).toBe("https://example.com/via-url.png");
+    });
+  });
+
+  describe("send — attachments as string array", () => {
+    it("should handle string[] attachments", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          attachments: [
+            "https://example.com/str1.png",
+            "https://example.com/str2.png",
+          ],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("send — deduplicates media URLs", () => {
+    it("should not send the same URL twice", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          mediaUrl: "https://example.com/dup.png",
+          attachments: ["https://example.com/dup.png"],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("send — single mediaUrl backward compatibility", () => {
+    it("should still work with a single mediaUrl string", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "user:uid1", mediaUrl: "https://example.com/single.png" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledOnce();
+      expect(uploadSpy.mock.calls[0][0].mediaUrl).toBe("https://example.com/single.png");
+      expect((result as any).data.mediaCount).toBe(1);
+    });
+  });
+
+  describe("send — multi-attachment with text", () => {
+    it("should send text once and upload each attachment", async () => {
+      let textSent = false;
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          const body = JSON.parse(init?.body as string);
+          if (body.payload?.content) textSent = true;
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          message: "Here are the files",
+          mediaUrls: ["https://example.com/a.png", "https://example.com/b.png"],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(textSent).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("send — partial upload failure isolation", () => {
+    it("should continue sending remaining attachments when one fails", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+      uploadSpy
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("upload timeout"))
+        .mockResolvedValueOnce(undefined);
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          mediaUrls: [
+            "https://example.com/a.png",
+            "https://example.com/b.png",
+            "https://example.com/c.png",
+          ],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledTimes(3);
+      const data = result.data as any;
+      expect(data.mediaCount).toBe(2);
+      expect(data.failedMedia).toHaveLength(1);
+      expect(data.failedMedia[0].url).toBe("https://example.com/b.png");
+    });
+
+    it("should return ok:false when all uploads fail and no text message", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+      uploadSpy.mockRejectedValue(new Error("network error"));
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          mediaUrls: ["https://example.com/a.png", "https://example.com/b.png"],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("All 2 media upload(s) failed");
+    });
+
+    it("should return ok:true when all uploads fail but text message was sent", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+      uploadSpy.mockRejectedValue(new Error("network error"));
+
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          message: "Here are files",
+          mediaUrls: ["https://example.com/a.png"],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      const data = result.data as any;
+      expect(data.mediaCount).toBe(0);
+      expect(data.failedMedia).toHaveLength(1);
+    });
+  });
+
+  describe("send — edge cases for media URL resolution", () => {
+    it("should return error when mediaUrls is empty array and no message", async () => {
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "user:uid1", mediaUrls: [] },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("message");
+    });
+
+    it("should return error when attachments have no recognizable URL keys and no message", async () => {
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          attachments: [{ unknownKey: "foo" }, { anotherKey: "bar" }],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("message");
+    });
+
+    it("should skip falsy values in attachments", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          attachments: [
+            { url: "" },
+            { url: null },
+            { url: "https://example.com/valid.png" },
+          ],
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledOnce();
+      expect(uploadSpy.mock.calls[0][0].mediaUrl).toBe("https://example.com/valid.png");
+    });
+  });
+
+  describe("send — three-source merge (attachments + mediaUrls + mediaUrl)", () => {
+    it("should send media from all three sources", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "user:uid1",
+          attachments: [{ url: "https://example.com/from-attachments.png" }],
+          mediaUrls: ["https://example.com/from-mediaUrls.png"],
+          mediaUrl: "https://example.com/from-mediaUrl.png",
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledTimes(3);
+      const sentUrls = uploadSpy.mock.calls.map(c => c[0].mediaUrl).sort();
+      expect(sentUrls).toEqual([
+        "https://example.com/from-attachments.png",
+        "https://example.com/from-mediaUrl.png",
+        "https://example.com/from-mediaUrls.png",
+      ]);
+    });
+  });
+
+  describe("send — args.url and args.fileUrl top-level collection", () => {
+    it("should collect args.url", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "user:uid1", url: "https://example.com/via-url.png" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledOnce();
+      expect(uploadSpy.mock.calls[0][0].mediaUrl).toBe("https://example.com/via-url.png");
+    });
+
+    it("should collect args.fileUrl", async () => {
+      const { uploadAndSendMedia } = await import("./inbound.js");
+      const uploadSpy = vi.mocked(uploadAndSendMedia);
+      uploadSpy.mockClear();
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "user:uid1", fileUrl: "https://example.com/via-fileUrl.png" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadSpy).toHaveBeenCalledOnce();
+      expect(uploadSpy.mock.calls[0][0].mediaUrl).toBe("https://example.com/via-fileUrl.png");
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // read action
   // -----------------------------------------------------------------------
   describe("read — same-channel group messages", () => {
