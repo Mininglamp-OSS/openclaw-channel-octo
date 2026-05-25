@@ -78,7 +78,7 @@ jobs:
       auto_bumped: ${{ steps.bump.outputs.auto_bumped }}
       use_existing_release: ${{ steps.existing.outputs.use_existing_release }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           # Need full history so we can verify the tagged commit is reachable from origin/main.
           fetch-depth: 0
@@ -228,7 +228,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           # Need full history so we can push the auto-bump commit back to main.
           fetch-depth: 0
