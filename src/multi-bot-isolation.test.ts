@@ -67,10 +67,6 @@ vi.mock("./actions.js", () => ({
   parseTarget: vi.fn(() => ({ channelId: "test", channelType: 2 })),
 }));
 
-vi.mock("./agent-tools.js", () => ({
-  createOctoManagementTools: vi.fn(() => []),
-}));
-
 vi.mock("./group-md.js", () => ({
   getOrCreateGroupMdCache: vi.fn(() => new Map()),
   registerBotGroupIds: vi.fn(),

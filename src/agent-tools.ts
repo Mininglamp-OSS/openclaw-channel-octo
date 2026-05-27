@@ -64,8 +64,10 @@ type LogSink = {
 
 export function createOctoManagementTools(params: {
   cfg?: OpenClawConfig;
+  agentAccountId?: string;
 }): any[] {
   const cfg = params.cfg;
+  const agentAccountId = params.agentAccountId;
   if (!cfg) return [];
 
   // Check if any account is configured
@@ -186,14 +188,23 @@ export function createOctoManagementTools(params: {
         | string
         | undefined;
       const content = (args.content ?? args.message) as string | undefined;
-      const rawAccountId = args.accountId as string | undefined;
+      const rawAccountId = (args.accountId as string | undefined) ?? agentAccountId ?? undefined;
 
       // Treat DEFAULT_ACCOUNT_ID ("default") as a semantic alias — not a
       // real account key — so normalise it to "unspecified".
-      const requestedAccountId =
-        rawAccountId && rawAccountId !== DEFAULT_ACCOUNT_ID
-          ? rawAccountId
-          : undefined;
+      // Determine requestedAccountId. The word "default" is both the
+      // framework's placeholder constant AND a legitimate config key when
+      // the user literally names an account "default". We only strip it
+      // when it is NOT an actual configured account.
+      const requestedAccountId: string | undefined = (() => {
+        if (!rawAccountId) return undefined;
+        if (rawAccountId === DEFAULT_ACCOUNT_ID) {
+          const ids = listOctoAccountIds(cfg);
+          if (ids.includes(DEFAULT_ACCOUNT_ID)) return rawAccountId;
+          return undefined;
+        }
+        return rawAccountId;
+      })();
 
       const knownIds = listOctoAccountIds(cfg);
 

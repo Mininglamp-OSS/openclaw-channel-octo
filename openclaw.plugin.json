@@ -8,6 +8,9 @@
   "skills": [
     "./skills"
   ],
+  "contracts": {
+    "tools": ["octo_management"]
+  },
   "activation": {
     "onStartup": true
   },

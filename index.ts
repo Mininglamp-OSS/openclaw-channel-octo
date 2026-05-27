@@ -15,6 +15,7 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -24,6 +25,7 @@ import { pendingInboundContext, sessionAccountMap, buildSessionAccountKey } from
 import { resolvePersonaHintForSession } from "./src/persona-prompt.js";
 import { setOctoRuntime } from "./src/runtime.js";
 import { octoPlugin } from "./src/channel.js";
+import { createOctoManagementTools } from "./src/agent-tools.js";
 
 // ---------------------------------------------------------------------------
 // Plugin entry — uses defineBundledChannelEntry contract (OpenClaw 2026.5.x+).
@@ -71,6 +73,18 @@ export default defineBundledChannelEntry({
   },
   configSchema: loadConfigSchema(),
   registerFull(api: OpenClawPluginApi) {
+    // Register agent tool BEFORE the 'full' mode guard — tool-discovery
+    // mode calls registerFull with registrationMode='tool-discovery' and
+    // needs to see this tool registration.
+    api.registerTool(
+      (ctx: OpenClawPluginToolContext) => {
+        const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
+        if (!cfg) return null;
+        return createOctoManagementTools({ cfg, agentAccountId: ctx.agentAccountId });
+      },
+      { names: ['octo_management'] },
+    );
+
     // CRITICAL: both setOctoRuntime AND api.registerChannel MUST be called
     // here, even though the contract's `runtime: {}` and `plugin: {}` fields
     // would auto-invoke them.

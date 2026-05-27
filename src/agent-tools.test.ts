@@ -479,6 +479,87 @@ describe("createOctoManagementTools", () => {
   });
 
   // -----------------------------------------------------------------------
+  // agentAccountId resolution
+  // -----------------------------------------------------------------------
+  describe("agentAccountId resolution", () => {
+    it("uses agentAccountId when args.accountId is not provided", async () => {
+      vi.mocked(listOctoAccountIds).mockReturnValue(["bot-A", "bot-B"]);
+      vi.mocked(resolveOctoAccount).mockImplementation(({ accountId }: any) => ({
+        accountId,
+        enabled: true,
+        configured: true,
+        config: {
+          botToken: `tok-${accountId}`,
+          apiUrl: `http://api-${accountId}.test`,
+          pollIntervalMs: 2000,
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+      vi.mocked(fetchBotGroups).mockResolvedValue([]);
+
+      const tools = createOctoManagementTools({ cfg: mockCfg, agentAccountId: "bot-A" });
+      const execute = tools[0].execute as any;
+      await execute("tc", { action: "list-groups" });
+
+      expect(fetchBotGroups).toHaveBeenCalledWith({
+        apiUrl: "http://api-bot-A.test",
+        botToken: "tok-bot-A",
+      });
+    });
+
+    it("args.accountId takes priority over agentAccountId", async () => {
+      vi.mocked(listOctoAccountIds).mockReturnValue(["bot-A", "bot-B"]);
+      vi.mocked(resolveOctoAccount).mockImplementation(({ accountId }: any) => ({
+        accountId,
+        enabled: true,
+        configured: true,
+        config: {
+          botToken: `tok-${accountId}`,
+          apiUrl: `http://api-${accountId}.test`,
+          pollIntervalMs: 2000,
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+      vi.mocked(fetchBotGroups).mockResolvedValue([]);
+
+      const tools = createOctoManagementTools({ cfg: mockCfg, agentAccountId: "bot-A" });
+      const execute = tools[0].execute as any;
+      await execute("tc", { action: "list-groups", accountId: "bot-B" });
+
+      expect(fetchBotGroups).toHaveBeenCalledWith({
+        apiUrl: "http://api-bot-B.test",
+        botToken: "tok-bot-B",
+      });
+    });
+
+    it("falls back to resolveDefault when agentAccountId is undefined", async () => {
+      vi.mocked(listOctoAccountIds).mockReturnValue(["bot-A", "bot-B"]);
+      vi.mocked(resolveDefaultOctoAccountId).mockReturnValue("bot-B");
+      vi.mocked(resolveOctoAccount).mockImplementation(({ accountId }: any) => ({
+        accountId,
+        enabled: true,
+        configured: true,
+        config: {
+          botToken: `tok-${accountId}`,
+          apiUrl: `http://api-${accountId}.test`,
+          pollIntervalMs: 2000,
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+      vi.mocked(fetchBotGroups).mockResolvedValue([]);
+
+      const tools = createOctoManagementTools({ cfg: mockCfg, agentAccountId: undefined });
+      const execute = tools[0].execute as any;
+      await execute("tc", { action: "list-groups" });
+
+      expect(fetchBotGroups).toHaveBeenCalledWith({
+        apiUrl: "http://api-bot-B.test",
+        botToken: "tok-bot-B",
+      });
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // parameter validation
   // -----------------------------------------------------------------------
   describe("parameter validation", () => {

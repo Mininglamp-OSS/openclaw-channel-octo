@@ -31,7 +31,6 @@ import { ChannelType, MessageType, type BotMessage, type MessagePayload } from "
 import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions } from "./mention-utils.js";
 import type { MentionEntity } from "./types.js";
 import { handleOctoMessageAction, parseTarget, resolveOutboundOctoTarget, normalizeOutboundChannelPrefix, extractInlineMentionUids } from "./actions.js";
-import { createOctoManagementTools } from "./agent-tools.js";
 import { getOrCreateGroupMdCache, registerBotGroupIds, getKnownGroupIds, writeGroupMdToDisk } from "./group-md.js";
 import { registerOwnerUid } from "./owner-registry.js";
 import { preloadGroupMemberCache, getGroupMembersFromCache } from "./member-cache.js";
@@ -631,7 +630,6 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       });
     },
   } as any, // TODO: remove when SDK types support this
-  agentTools: (params: { cfg?: any }) => createOctoManagementTools(params),
   agentPrompt: {
     messageToolHints: ({ cfg, accountId }: { cfg: any; accountId?: string | null }) => {
       if (!accountId) return [];
