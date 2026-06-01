@@ -59,9 +59,6 @@
           "requireMention": {
             "type": "boolean"
           },
-          "ignoreMentionAll": {
-            "type": "boolean"
-          },
           "botUid": {
             "type": "string"
           },
@@ -110,9 +107,6 @@
                   "minimum": 5000
                 },
                 "requireMention": {
-                  "type": "boolean"
-                },
-                "ignoreMentionAll": {
                   "type": "boolean"
                 },
                 "botUid": {

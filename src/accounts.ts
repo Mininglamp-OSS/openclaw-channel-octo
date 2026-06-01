@@ -16,7 +16,6 @@ export type ResolvedOctoAccount = {
     pollIntervalMs: number;
     heartbeatIntervalMs: number;
     requireMention?: boolean;
-    ignoreMentionAll?: boolean;
     historyLimit?: number;  // 群聊历史消息条数限制
     historyPromptTemplate?: string;  // Template for group history context injection
     onBehalfOf?: string;  // Persona clone: grantor uid
@@ -98,7 +97,6 @@ export function resolveOctoAccount(params: {
       pollIntervalMs,
       heartbeatIntervalMs,
       requireMention: accountConfig.requireMention ?? channel.requireMention,
-      ignoreMentionAll: accountConfig.ignoreMentionAll ?? channel.ignoreMentionAll,
       historyLimit: accountConfig.historyLimit ?? channel.historyLimit ?? 20,
       historyPromptTemplate: accountConfig.historyPromptTemplate ?? channel.historyPromptTemplate,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,

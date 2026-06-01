@@ -84,90 +84,156 @@ describe("mention.all detection", () => {
  * SHOULD respond because they act on behalf of a human who is part of @所有人.
  */
 describe("mention.humans + persona clone gating", () => {
+  const BOT_UID = "bot-123";
+
   function isMentionHumans(mention?: MentionPayload): boolean {
     const raw = mention?.humans;
     return raw === true || raw === 1;
   }
 
-  function shouldRespond(mention: MentionPayload | undefined, opts: { onBehalfOf?: string; ignoreMentionAll?: boolean }): boolean {
+  // Mirrors the production gating in src/inbound.ts (group path).
+  // `@所有人` (mention.all) no longer triggers the bot. Triggers are:
+  //   - pure `mention.ais` (suppressed when a broadcast flag all/humans is set)
+  //   - explicit bot UID mention
+  //   - `mention.humans` for a persona clone (acts on behalf of a human)
+  //   - the grantor's UID being mentioned (persona clone)
+  function shouldRespond(mention: MentionPayload | undefined, opts: { onBehalfOf?: string; botUidMentioned?: boolean } = {}): boolean {
     const mentionAllRaw = mention?.all;
     const mentionAll = mentionAllRaw === true || mentionAllRaw === 1;
     const mentionAisRaw = mention?.ais;
     const mentionAis = mentionAisRaw === true || mentionAisRaw === 1;
     const mentionHumans = isMentionHumans(mention);
     const isPersonaClone = Boolean(opts.onBehalfOf);
-    // Mirrors the production gating in src/inbound.ts (group path, PR#61 R9):
-    // when ignoreMentionAll=true and the payload carries broadcast flags
-    // (all=1 or humans=1), the whole payload is treated as broadcast and
-    // suppressed — even if `ais=1` is also set. Pure `{ais:1}` still bypasses.
+    const grantorMentioned = Boolean(
+      isPersonaClone && opts.onBehalfOf && Array.isArray(mention?.uids) && mention!.uids!.includes(opts.onBehalfOf),
+    );
+    const botUidMentioned = Boolean(
+      opts.botUidMentioned || (Array.isArray(mention?.uids) && mention!.uids!.includes(BOT_UID)),
+    );
+    // Broadcast suppression: when all/humans is set, the AI mention does not
+    // trigger on its own — `@所有人` (possibly rewritten to {all:1, ais:1}) must
+    // not re-trigger via the `ais` flag.
     const isBroadcast = mentionAll || mentionHumans;
-    const suppressedByIgnore = opts.ignoreMentionAll === true && isBroadcast;
-    return !suppressedByIgnore && (mentionAll || mentionAis || (mentionHumans && isPersonaClone));
+    return (!isBroadcast && mentionAis)
+      || botUidMentioned
+      || (mentionHumans && isPersonaClone)
+      || grantorMentioned;
   }
 
   // Helper to determine reply identity: returns "grantor" or "self"
-  function replyIdentity(mention: MentionPayload | undefined, opts: { onBehalfOf?: string; ignoreMentionAll?: boolean; botUidMentioned?: boolean }): "grantor" | "self" {
+  function replyIdentity(mention: MentionPayload | undefined, opts: { onBehalfOf?: string; botUidMentioned?: boolean }): "grantor" | "self" {
     const mentionAllRaw = mention?.all;
     const mentionAll = mentionAllRaw === true || mentionAllRaw === 1;
     const mentionHumans = isMentionHumans(mention);
     const isPersonaClone = Boolean(opts.onBehalfOf);
     const isExplicitBotMention = Boolean(opts.botUidMentioned);
-    const isHumanBroadcast = (!opts.ignoreMentionAll && mentionHumans) || (!opts.ignoreMentionAll && mentionAll);
+    const isHumanBroadcast = mentionHumans || mentionAll;
     const triggered = isHumanBroadcast && isPersonaClone && !isExplicitBotMention;
     return triggered ? "grantor" : "self";
   }
 
-  it("persona clone bot should respond to mention.humans=1", () => {
-    expect(shouldRespond({ humans: 1 }, { onBehalfOf: "admin" })).toBe(true);
+  // ── Mention trigger matrix (refactor/drop-mention-all-trigger) ──
+  // `@所有人` (mention.all) must never trigger a bot reply.
+  it("{all:1} → NOT mentioned (regular bot)", () => {
+    expect(shouldRespond({ all: 1 })).toBe(false);
   });
 
-  it("persona clone bot should respond to mention.humans=true", () => {
-    expect(shouldRespond({ humans: true }, { onBehalfOf: "admin" })).toBe(true);
+  it("{all:1} → NOT mentioned (persona clone)", () => {
+    expect(shouldRespond({ all: 1 }, { onBehalfOf: "admin" })).toBe(false);
   });
 
-  it("regular bot should NOT respond to mention.humans=1", () => {
-    expect(shouldRespond({ humans: 1 }, {})).toBe(false);
+  it("{all:true} → NOT mentioned", () => {
+    expect(shouldRespond({ all: true })).toBe(false);
+    expect(shouldRespond({ all: true }, { onBehalfOf: "admin" })).toBe(false);
   });
 
-  it("regular bot should NOT respond to mention.humans=true", () => {
-    expect(shouldRespond({ humans: true }, {})).toBe(false);
+  it("{ais:1} → mentioned (regular bot)", () => {
+    expect(shouldRespond({ ais: 1 })).toBe(true);
   });
 
-  it("persona clone bot should still respond to mention.ais=1", () => {
+  it("{ais:1} → mentioned (persona clone)", () => {
     expect(shouldRespond({ ais: 1 }, { onBehalfOf: "admin" })).toBe(true);
   });
 
-  it("regular bot should respond to mention.ais=1", () => {
-    expect(shouldRespond({ ais: 1 }, {})).toBe(true);
+  it("{ais:true} → mentioned", () => {
+    expect(shouldRespond({ ais: true })).toBe(true);
+    expect(shouldRespond({ ais: true }, { onBehalfOf: "admin" })).toBe(true);
   });
 
-  it("mention.humans=0 should NOT trigger persona clone", () => {
+  it("{ais:1, all:1} → NOT mentioned (broadcast suppresses ais)", () => {
+    expect(shouldRespond({ ais: 1, all: 1 })).toBe(false);
+    expect(shouldRespond({ ais: 1, all: 1 }, { onBehalfOf: "admin" })).toBe(false);
+  });
+
+  it("{ais:1, humans:1} regular bot → NOT mentioned (broadcast suppresses ais)", () => {
+    expect(shouldRespond({ ais: 1, humans: 1 })).toBe(false);
+  });
+
+  it("{ais:1, humans:1} persona clone → mentioned (via humans path, not ais)", () => {
+    expect(shouldRespond({ ais: 1, humans: 1 }, { onBehalfOf: "admin" })).toBe(true);
+  });
+
+  it("{humans:1} → NOT mentioned (regular bot, not persona clone)", () => {
+    expect(shouldRespond({ humans: 1 })).toBe(false);
+  });
+
+  it("{humans:true} → NOT mentioned (regular bot)", () => {
+    expect(shouldRespond({ humans: true })).toBe(false);
+  });
+
+  it("{humans:1} + persona clone → mentioned", () => {
+    expect(shouldRespond({ humans: 1 }, { onBehalfOf: "admin" })).toBe(true);
+  });
+
+  it("{humans:true} + persona clone → mentioned", () => {
+    expect(shouldRespond({ humans: true }, { onBehalfOf: "admin" })).toBe(true);
+  });
+
+  it("{uids:[botUid]} → mentioned", () => {
+    expect(shouldRespond({ uids: [BOT_UID] })).toBe(true);
+    expect(shouldRespond({ uids: [BOT_UID] }, { onBehalfOf: "admin" })).toBe(true);
+  });
+
+  it("{uids:[grantor]} + persona clone → mentioned (grantor proxy)", () => {
+    expect(shouldRespond({ uids: ["admin"] }, { onBehalfOf: "admin" })).toBe(true);
+  });
+
+  it("{} → NOT mentioned", () => {
+    expect(shouldRespond({})).toBe(false);
+    expect(shouldRespond({}, { onBehalfOf: "admin" })).toBe(false);
+  });
+
+  it("undefined → NOT mentioned", () => {
+    expect(shouldRespond(undefined)).toBe(false);
+    expect(shouldRespond(undefined, { onBehalfOf: "admin" })).toBe(false);
+  });
+
+  it("{ais:false} → NOT mentioned", () => {
+    expect(shouldRespond({ ais: false as unknown as boolean | number })).toBe(false);
+  });
+
+  it("{ais:0} → NOT mentioned", () => {
+    expect(shouldRespond({ ais: 0 })).toBe(false);
+  });
+
+  it("{ais:2} → NOT mentioned (only 1/true count)", () => {
+    expect(shouldRespond({ ais: 2 })).toBe(false);
+  });
+
+  it("{humans:0} → NOT mentioned (persona clone)", () => {
     expect(shouldRespond({ humans: 0 }, { onBehalfOf: "admin" })).toBe(false);
   });
 
-  it("mention.humans=1 + ais=1 should trigger both types", () => {
-    expect(shouldRespond({ humans: 1, ais: 1 }, { onBehalfOf: "admin" })).toBe(true);
-    expect(shouldRespond({ humans: 1, ais: 1 }, {})).toBe(true); // ais=1 triggers regular bot
-  });
-
-  it("legacy all=1 should trigger persona clone (via mentionAll path)", () => {
-    expect(shouldRespond({ all: 1 }, { onBehalfOf: "admin" })).toBe(true);
-  });
-
-  // Identity tests
+  // ── Reply identity ──
   it("@所有人 (humans=1) → persona clone replies as grantor", () => {
     expect(replyIdentity({ humans: 1 }, { onBehalfOf: "admin" })).toBe("grantor");
-  });
-
-  it("legacy @所有人 (all=1, server rewrite to {all:1,ais:1}) → persona clone replies as grantor", () => {
-    expect(replyIdentity({ all: 1, ais: 1 }, { onBehalfOf: "admin" })).toBe("grantor");
   });
 
   it("@所有AI (ais=1 only) → persona clone replies as self", () => {
     expect(replyIdentity({ ais: 1 }, { onBehalfOf: "admin" })).toBe("self");
   });
 
-  it("direct @james mention → persona clone replies as self", () => {
+  it("direct @bot mention → persona clone replies as self", () => {
     expect(replyIdentity({ humans: 1 }, { onBehalfOf: "admin", botUidMentioned: true })).toBe("self");
   });
 
@@ -175,55 +241,6 @@ describe("mention.humans + persona clone gating", () => {
     expect(replyIdentity({ humans: 1 }, {})).toBe("self");
     expect(replyIdentity({ all: 1 }, {})).toBe("self");
     expect(replyIdentity({ ais: 1 }, {})).toBe("self");
-  });
-
-  // ignoreMentionAll gating — covers mention.humans (Plan X) in addition to mention.all
-  it("persona clone + ignoreMentionAll=true + mention.humans=1 → NOT mentioned", () => {
-    expect(shouldRespond({ humans: 1 }, { onBehalfOf: "admin", ignoreMentionAll: true })).toBe(false);
-  });
-
-  it("persona clone + ignoreMentionAll=true + mention.humans=true → NOT mentioned", () => {
-    expect(shouldRespond({ humans: true }, { onBehalfOf: "admin", ignoreMentionAll: true })).toBe(false);
-  });
-
-  it("persona clone + ignoreMentionAll=true + mention.humans=1 → reply identity stays self (no human broadcast)", () => {
-    expect(replyIdentity({ humans: 1 }, { onBehalfOf: "admin", ignoreMentionAll: true })).toBe("self");
-  });
-
-  it("persona clone + ignoreMentionAll=true + mention.all=1 → reply identity stays self", () => {
-    expect(replyIdentity({ all: 1 }, { onBehalfOf: "admin", ignoreMentionAll: true })).toBe("self");
-  });
-
-  it("persona clone + ignoreMentionAll=true + mention.ais=1 → still mentioned (ais bypasses gate)", () => {
-    expect(shouldRespond({ ais: 1 }, { onBehalfOf: "admin", ignoreMentionAll: true })).toBe(true);
-  });
-
-  // PR#61 R9 / YUJ-1662: legacy @everyone payload `{all:1, ais:1}` must NOT
-  // bypass ignoreMentionAll via the `ais` flag. Mixed broadcast+AI payloads
-  // are treated as broadcast and suppressed when ignoreMentionAll=true.
-  it("R9: regular bot + ignoreMentionAll=true + {all:1, ais:1} → NOT mentioned (broadcast suppresses ais)", () => {
-    expect(shouldRespond({ all: 1, ais: 1 }, { ignoreMentionAll: true })).toBe(false);
-  });
-
-  it("R9: persona clone + ignoreMentionAll=true + {all:1, ais:1} → NOT mentioned", () => {
-    expect(shouldRespond({ all: 1, ais: 1 }, { onBehalfOf: "admin", ignoreMentionAll: true })).toBe(false);
-  });
-
-  it("R9: regular bot + ignoreMentionAll=true + {humans:1, ais:1} → NOT mentioned (broadcast suppresses ais)", () => {
-    expect(shouldRespond({ humans: 1, ais: 1 }, { ignoreMentionAll: true })).toBe(false);
-  });
-
-  it("R9: persona clone + ignoreMentionAll=true + {humans:1, ais:1} → NOT mentioned", () => {
-    expect(shouldRespond({ humans: 1, ais: 1 }, { onBehalfOf: "admin", ignoreMentionAll: true })).toBe(false);
-  });
-
-  it("R9: regular bot + ignoreMentionAll=true + pure {ais:1} → SHOULD respond (AI-only is not broadcast)", () => {
-    expect(shouldRespond({ ais: 1 }, { ignoreMentionAll: true })).toBe(true);
-  });
-
-  it("R9: ignoreMentionAll=false + {all:1, ais:1} → mentioned (no suppression when flag off)", () => {
-    expect(shouldRespond({ all: 1, ais: 1 }, {})).toBe(true);
-    expect(shouldRespond({ all: 1, ais: 1 }, { onBehalfOf: "admin" })).toBe(true);
   });
 });
 
@@ -2255,17 +2272,16 @@ describe("OBO v2 effective identity authority (PR#61 R5)", () => {
 });
 
 /**
- * Tests for OBO v2 relevance filter + ignoreMentionAll (PR#61 R8 / lml2468 R2).
+ * Tests for OBO v2 relevance filter.
  *
  * The OBO v2 path at inbound.ts:~L1653 decides whether a fan-out payload from
  * the configured grantor is "relevant" to the persona clone. Broadcast-style
- * mentions (`mention.humans=1`, `mention.all=1`) must respect the account's
- * `ignoreMentionAll` flag, mirroring the group-path semantics at
- * inbound.ts:1223 / 1230. Explicit grantor UID mentions are NOT broadcasts —
- * they target the grantor identity directly and remain relevant regardless
- * of `ignoreMentionAll`.
+ * mentions (`mention.humans=1`, `mention.all=1`) are relevant because the
+ * grantor (a human) is part of the broadcast. Explicit grantor UID mentions
+ * also remain relevant — they target the grantor identity directly. Pure
+ * `@AI` (mention.ais=1) is not relevant to a persona clone.
  */
-describe("OBO v2 relevance filter + ignoreMentionAll (PR#61 R8)", () => {
+describe("OBO v2 relevance filter", () => {
   type MentionPayload = {
     ais?: boolean | number;
     humans?: boolean | number;
@@ -2274,7 +2290,6 @@ describe("OBO v2 relevance filter + ignoreMentionAll (PR#61 R8)", () => {
   };
   type Opts = {
     grantorUid: string;
-    ignoreMentionAll?: boolean;
   };
 
   // Mirrors the OBO v2 relevance filter at inbound.ts (post-fix).
@@ -2290,159 +2305,87 @@ describe("OBO v2 relevance filter + ignoreMentionAll (PR#61 R8)", () => {
       typeof opts.grantorUid === "string" &&
       opts.grantorUid.length > 0 &&
       origUids.includes(opts.grantorUid);
-    const ignoreBroadcast = opts.ignoreMentionAll === true;
-    const broadcastRelevant = !ignoreBroadcast && (origHumans || origAll);
+    const broadcastRelevant = origHumans || origAll;
     const noMentionFallback =
       !origAis && !origHumans && !origAll && origUids.length === 0;
     return broadcastRelevant || grantorInUids || noMentionFallback;
   }
 
-  // Baseline: defaults (no ignoreMentionAll) still work as before.
-  it("mention.humans=1 + ignoreMentionAll unset → relevant (broadcast through)", () => {
+  // Broadcasts (humans/all) are relevant — the grantor is part of the broadcast.
+  it("mention.humans=1 → relevant (broadcast through)", () => {
     expect(
       isRelevantToPersona({ humans: 1 }, { grantorUid: "admin" }),
     ).toBe(true);
   });
 
-  it("mention.all=1 + ignoreMentionAll unset → relevant (legacy broadcast)", () => {
+  it("mention.humans=true → relevant", () => {
+    expect(
+      isRelevantToPersona({ humans: true }, { grantorUid: "admin" }),
+    ).toBe(true);
+  });
+
+  it("mention.all=1 → relevant (legacy broadcast)", () => {
     expect(
       isRelevantToPersona({ all: 1 }, { grantorUid: "admin" }),
     ).toBe(true);
   });
 
-  // Core fix: broadcasts are gated by ignoreMentionAll.
-  it("mention.humans=1 + ignoreMentionAll=true → NOT relevant (no typing/text/media)", () => {
+  it("mention.all=true → relevant", () => {
     expect(
-      isRelevantToPersona(
-        { humans: 1 },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
-    ).toBe(false);
-  });
-
-  it("mention.humans=true + ignoreMentionAll=true → NOT relevant", () => {
-    expect(
-      isRelevantToPersona(
-        { humans: true },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
-    ).toBe(false);
-  });
-
-  it("mention.all=1 + ignoreMentionAll=true → NOT relevant", () => {
-    expect(
-      isRelevantToPersona(
-        { all: 1 },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
-    ).toBe(false);
-  });
-
-  it("mention.all=true + ignoreMentionAll=true → NOT relevant", () => {
-    expect(
-      isRelevantToPersona(
-        { all: true },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
-    ).toBe(false);
-  });
-
-  it("both humans+all set + ignoreMentionAll=true → NOT relevant", () => {
-    expect(
-      isRelevantToPersona(
-        { humans: 1, all: 1 },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
-    ).toBe(false);
-  });
-
-  // Explicit grantor mention bypasses the broadcast gate.
-  it("explicit grantor uid mention + ignoreMentionAll=true → still relevant", () => {
-    expect(
-      isRelevantToPersona(
-        { uids: ["admin"] },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
+      isRelevantToPersona({ all: true }, { grantorUid: "admin" }),
     ).toBe(true);
   });
 
-  it("explicit grantor uid mention + humans=1 + ignoreMentionAll=true → relevant (uid wins)", () => {
+  it("both humans+all set → relevant", () => {
     expect(
-      isRelevantToPersona(
-        { humans: 1, uids: ["admin"] },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
+      isRelevantToPersona({ humans: 1, all: 1 }, { grantorUid: "admin" }),
+    ).toBe(true);
+  });
+
+  // Explicit grantor mention is relevant.
+  it("explicit grantor uid mention → relevant", () => {
+    expect(
+      isRelevantToPersona({ uids: ["admin"] }, { grantorUid: "admin" }),
+    ).toBe(true);
+  });
+
+  it("explicit grantor uid mention + humans=1 → relevant", () => {
+    expect(
+      isRelevantToPersona({ humans: 1, uids: ["admin"] }, { grantorUid: "admin" }),
     ).toBe(true);
   });
 
   // @AI-only (mention.ais=1) without humans/all/grantor mention is never
-  // relevant to the persona clone — independent of ignoreMentionAll.
-  it("mention.ais=1 only + ignoreMentionAll=true → NOT relevant (@AI not for persona)", () => {
+  // relevant to the persona clone.
+  it("mention.ais=1 only → NOT relevant (@AI not for persona)", () => {
     expect(
-      isRelevantToPersona(
-        { ais: 1 },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
+      isRelevantToPersona({ ais: 1 }, { grantorUid: "admin" }),
     ).toBe(false);
   });
 
-  it("mention.ais=1 + humans=1 + ignoreMentionAll=true → NOT relevant (broadcast gated, ais alone is not for persona)", () => {
+  it("mention.ais=1 + humans=1 → relevant (broadcast through, grantor included)", () => {
     expect(
-      isRelevantToPersona(
-        { ais: 1, humans: 1 },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
-    ).toBe(false);
-  });
-
-  it("mention.ais=1 + grantor uid + ignoreMentionAll=true → relevant (explicit grantor uid wins)", () => {
-    expect(
-      isRelevantToPersona(
-        { ais: 1, uids: ["admin"] },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
+      isRelevantToPersona({ ais: 1, humans: 1 }, { grantorUid: "admin" }),
     ).toBe(true);
   });
 
-  // No mentions at all (plain group message) — still relevant. Mirrors the
-  // existing pre-fix behavior for the no-mention fallback.
-  it("no mention payload + ignoreMentionAll=true → relevant (no-mention fallback)", () => {
+  it("mention.ais=1 + grantor uid → relevant (explicit grantor uid wins)", () => {
     expect(
-      isRelevantToPersona(
-        undefined,
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
+      isRelevantToPersona({ ais: 1, uids: ["admin"] }, { grantorUid: "admin" }),
     ).toBe(true);
   });
 
-  it("empty mention object + ignoreMentionAll=true → relevant (no-mention fallback)", () => {
+  // No mentions at all (plain group message) — still relevant.
+  it("no mention payload → relevant (no-mention fallback)", () => {
     expect(
-      isRelevantToPersona(
-        {},
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
+      isRelevantToPersona(undefined, { grantorUid: "admin" }),
     ).toBe(true);
   });
 
-  // Symmetry check with the group-path semantics tests above (~L172-185).
-  it("group-path parity: ignoreMentionAll=true suppresses humans broadcast for persona clone", () => {
-    // Group path: shouldRespond({ humans: 1 }, { onBehalfOf, ignoreMentionAll: true }) === false
-    // OBO v2 path: must reach the same conclusion.
+  it("empty mention object → relevant (no-mention fallback)", () => {
     expect(
-      isRelevantToPersona(
-        { humans: 1 },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
-    ).toBe(false);
-  });
-
-  it("group-path parity: ignoreMentionAll=true suppresses all broadcast for persona clone", () => {
-    expect(
-      isRelevantToPersona(
-        { all: 1 },
-        { grantorUid: "admin", ignoreMentionAll: true },
-      ),
-    ).toBe(false);
+      isRelevantToPersona({}, { grantorUid: "admin" }),
+    ).toBe(true);
   });
 });
 
@@ -2475,7 +2418,7 @@ describe("OBO v2 detection + filter ordering vs recordInboundSession (PR#61 R10)
       uids?: string[];
     };
   };
-  type Account = { onBehalfOf?: string; ignoreMentionAll?: boolean };
+  type Account = { onBehalfOf?: string };
   type Message = { from_uid: string; payload?: ObovPayload };
 
   type Sinks = {
@@ -2527,8 +2470,7 @@ describe("OBO v2 detection + filter ordering vs recordInboundSession (PR#61 R10)
         typeof grantorUid === "string" &&
         grantorUid.length > 0 &&
         uids.includes(grantorUid);
-      const ignoreBroadcast = account.ignoreMentionAll === true;
-      const broadcastRelevant = !ignoreBroadcast && (humans || all);
+      const broadcastRelevant = humans || all;
       const noMentionFallback =
         !ais && !humans && !all && uids.length === 0;
       const relevant = broadcastRelevant || grantorInUids || noMentionFallback;
@@ -2553,7 +2495,7 @@ describe("OBO v2 detection + filter ordering vs recordInboundSession (PR#61 R10)
 
   const grantorUid = "admin";
   const otherUid = "alice";
-  const baseAccount: Account = { onBehalfOf: grantorUid, ignoreMentionAll: true };
+  const baseAccount: Account = { onBehalfOf: grantorUid };
 
   function makeSinks(): Sinks {
     return {
@@ -2562,7 +2504,7 @@ describe("OBO v2 detection + filter ordering vs recordInboundSession (PR#61 R10)
     };
   }
 
-  it("irrelevant OBO v2 (mention.ais=1, ignoreMentionAll=true) → recordInboundSession is NOT called", () => {
+  it("irrelevant OBO v2 (mention.ais=1 only) → recordInboundSession is NOT called", () => {
     const sinks = makeSinks();
     const message: Message = {
       from_uid: grantorUid,
@@ -2582,7 +2524,7 @@ describe("OBO v2 detection + filter ordering vs recordInboundSession (PR#61 R10)
     expect(sinks.finalizeInboundContext).not.toHaveBeenCalled();
   });
 
-  it("irrelevant OBO v2 (mention.humans=1 + ignoreMentionAll=true broadcast suppressed) → recordInboundSession is NOT called", () => {
+  it("relevant OBO v2 (mention.humans=1 broadcast) → recordInboundSession IS called (grantor is part of @所有人)", () => {
     const sinks = makeSinks();
     const message: Message = {
       from_uid: grantorUid,
@@ -2595,9 +2537,10 @@ describe("OBO v2 detection + filter ordering vs recordInboundSession (PR#61 R10)
       },
     };
     const result = simulateInbound(message, baseAccount, sinks);
-    expect(result.skipped).toBe(true);
-    expect(sinks.recordInboundSession).not.toHaveBeenCalled();
-    expect(sinks.finalizeInboundContext).not.toHaveBeenCalled();
+    expect(result.skipped).toBe(false);
+    expect(result.dispatched).toBe(true);
+    expect(sinks.recordInboundSession).toHaveBeenCalledTimes(1);
+    expect(sinks.finalizeInboundContext).toHaveBeenCalledTimes(1);
   });
 
   it("relevant OBO v2 (explicit grantor uid mention) → recordInboundSession IS called and GroupSystemPrompt is persisted", () => {

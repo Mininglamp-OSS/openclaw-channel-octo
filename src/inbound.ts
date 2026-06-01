@@ -1303,19 +1303,19 @@ export async function handleInboundMessage(params: {
     // Persona clone: when the GRANTOR is @mentioned, treat it as a mention
     // for the bot too (the bot acts on the grantor's behalf).
     const grantorMentioned: boolean = !!(isPersonaClone && grantorUid && mentionUids.includes(grantorUid));
-    // Broadcast suppression (PR#61 R9 / YUJ-1662):
-    // When `ignoreMentionAll=true`, a legacy `@everyone` payload arrives as `{all:1, ais:1}`
-    // (server rewrites @所有人 to include ais=1 so AIs are also covered). Treating that as a
-    // pure AI mention would let `mentionAis` bypass `ignoreMentionAll`, which is wrong:
-    // the user's intent is "no broadcast → bot stays silent". So when broadcast flags
-    // (`all` or `humans`) are present, the whole payload is treated as broadcast and
-    // suppressed by `ignoreMentionAll`. Pure `{ais:1}` (no `all`, no `humans`) is still
-    // a deliberate AI-only mention and continues to trigger the bot.
-    // Explicit bot UID and grantor mention always work regardless of `ignoreMentionAll`.
+    // Broadcast suppression:
+    // `@所有人` (mention.all=1) must NOT trigger bot replies. The server rewrites
+    // `@所有人` to also include `ais=1` so AIs are covered, so a `{all:1, ais:1}`
+    // payload is a broadcast — treating it as a pure AI mention would let
+    // `mentionAis` re-trigger the bot, which is wrong. So when broadcast flags
+    // (`all` or `humans`) are present, the AI mention is suppressed. Pure
+    // `{ais:1}` (no `all`, no `humans`) is a deliberate AI-only mention and
+    // continues to trigger the bot. Explicit bot UID, grantor mention, and the
+    // persona-clone `humans` path always work regardless of broadcast flags.
     const isBroadcast = mentionAll || mentionHumans;
-    const suppressedByIgnore = account.config.ignoreMentionAll && isBroadcast;
-    isMentioned = (!suppressedByIgnore && (mentionAll || mentionAis || (mentionHumans && isPersonaClone)))
+    isMentioned = (!isBroadcast && mentionAis)
       || mentionUids.includes(botUid)
+      || (mentionHumans && isPersonaClone)
       || grantorMentioned;
     isExplicitBotMention = mentionUids.includes(botUid);
     // Track whether the bot was triggered as the grantor's proxy.
@@ -1323,7 +1323,7 @@ export async function handleInboundMessage(params: {
     // Covers: @admin (grantor uid mentioned), @所有人 (mention.humans=1),
     // legacy @所有人 (mention.all=1). @所有AI (ais=1 only) and direct @james
     // mentions should still respond as the bot itself.
-    const isHumanBroadcast = (!account.config.ignoreMentionAll && mentionHumans) || (!account.config.ignoreMentionAll && mentionAll);
+    const isHumanBroadcast = mentionHumans || mentionAll;
     triggeredByMentionHumans = !!(isHumanBroadcast || grantorMentioned) && isPersonaClone && !isExplicitBotMention;
 
     // Debug: log mention flags for troubleshooting persona clone routing
@@ -1699,12 +1699,11 @@ export async function handleInboundMessage(params: {
   // but no grantor mention, no @所有人), the persona clone should NOT respond.
   // @AI targets AI bots directly, not humans or their persona clones.
   //
-  // Mirrors the group-path semantics (see ~L1223/L1230): when
-  // `account.config.ignoreMentionAll=true`, broadcast-style mentions
-  // (`mention.humans=1`, `mention.all=1`) must NOT be treated as relevant for
-  // the persona clone. Explicit grantor UID mentions remain relevant
-  // regardless of `ignoreMentionAll`, because they target the grantor
-  // identity directly rather than the broadcast group.
+  // Mirrors the group-path semantics (see ~L1223/L1230): broadcast-style
+  // mentions (`mention.humans=1`, `mention.all=1`) are relevant for the persona
+  // clone because the grantor (a human) is part of the broadcast. Explicit
+  // grantor UID mentions also remain relevant, because they target the grantor
+  // identity directly.
   //
   // CRITICAL (R10): this filter MUST run before finalizeInboundContext /
   // recordInboundSession — otherwise an irrelevant OBO v2 message would
@@ -1722,17 +1721,14 @@ export async function handleInboundMessage(params: {
     // from the payload is for diagnostic logging only.
     const grantorInUids = typeof grantorUid === "string" && grantorUid.length > 0
       && origUids.includes(grantorUid);
-    const ignoreBroadcast = account.config.ignoreMentionAll === true;
-    const broadcastRelevant = (!ignoreBroadcast) && (origHumans || origAll);
+    const broadcastRelevant = origHumans || origAll;
     // No-mention fallback: when the payload carries no mention information at
     // all (no ais, no humans, no all, no uids), treat the message as relevant
-    // (plain group/DM chatter the persona should see). Tightened to exclude
-    // broadcasts so that an `ignoreMentionAll`-gated humans/all does not
-    // re-enable relevance via this fallback.
+    // (plain group/DM chatter the persona should see).
     const noMentionFallback = !origAis && !origHumans && !origAll && origUids.length === 0;
     const isRelevantToPersona = broadcastRelevant || grantorInUids || noMentionFallback;
     if (!isRelevantToPersona) {
-      log?.info?.(`octo: OBO v2 skipped — message not relevant to persona (ais=${origAis} humans=${origHumans} all=${origAll} grantorInUids=${grantorInUids} ignoreMentionAll=${ignoreBroadcast})`);
+      log?.info?.(`octo: OBO v2 skipped — message not relevant to persona (ais=${origAis} humans=${origHumans} all=${origAll} grantorInUids=${grantorInUids})`);
       // Mirror group-path early-return: do NOT call finalizeInboundContext /
       // recordInboundSession, so no DM session record (and no GroupSystemPrompt)
       // is persisted for irrelevant OBO v2 fan-out messages.
