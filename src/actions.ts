@@ -10,6 +10,7 @@ import type { MentionEntity, LogSink, RichTextBlock } from "./types.js";
 import { stripChannelPrefix } from "./constants.js";
 import {
   sendMessage,
+  sendMediaMessage,
   sendRichTextMessage,
   getChannelMessages,
   getGroupMembers,
@@ -18,7 +19,7 @@ import {
   getGroupMd,
   updateGroupMd,
 } from "./api-fetch.js";
-import { uploadAndSendMedia, uploadMedia } from "./inbound.js";
+import { uploadAndSendMedia, uploadMedia, type UploadedMedia } from "./inbound.js";
 import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions } from "./mention-utils.js";
 import { getKnownGroupIds } from "./group-md.js";
 import { checkPermission } from "./permission.js";
@@ -299,9 +300,10 @@ function resolveActionMediaUrls(args: Record<string, unknown>): string[] {
 /**
  * 组装并发送一条 RichText(=14) 图文混排消息。
  *
- * 流程：先批量上传所有 media → 拿到 url/宽高；图片进 image block，非图片（文件等）
- * 仍走旧的 uploadAndSendMedia 单发（RichText 契约 image block 只接受图片）。文本与
- * 图片按「先文本后图片」顺序组成单条 content 数组，一次 HTTP 提交（替代 N+1 次）。
+ * 流程：先批量上传所有 media → 拿到 url/宽高；带正宽高的图片进 image block，其余
+ * （非图片文件、或宽高解析失败的图片如 SVG）走 sendMediaMessage 单发复用已上传 url
+ * （RichText 契约 image block 只接受带正宽高的图片）。文本与图片按「先文本后图片」
+ * 顺序组成单条 content 数组，一次 HTTP 提交（替代 N+1 次）。
  *
  * 返回 null 表示「没有任何图片可组装」（全部是非图片文件 / 上传全失败）——调用方应
  * 回退到旧的拆条路径，保留既有的文件/失败语义。
@@ -324,26 +326,32 @@ async function sendRichTextCombined(params: {
   const { message, mediaUrls, apiUrl, botToken, channelId, channelType, resolveMentions, log } = params;
 
   // Batch-upload every media asset first.
+  // - Images WITH positive width/height → RichText image blocks (single payload).
+  // - Everything else (non-image files, or images whose dimensions couldn't be
+  //   parsed — SVG, corrupt headers) → legacy single-send. The type-14 contract
+  //   requires image blocks to carry width/height > 0, so a dimensionless image
+  //   would make the WHOLE RichText payload invalid; route it out instead.
   const imageBlocks: RichTextBlock[] = [];
-  const nonImage: Array<{ originalUrl: string }> = [];
+  const sideloads: Array<{ uploaded: UploadedMedia }> = [];
   const failedMedia: { url: string; error: string }[] = [];
 
   for (const mediaUrl of mediaUrls) {
     try {
       const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, log: log as any });
-      if (uploaded.isImage) {
+      const hasDims = !!(uploaded.width && uploaded.width > 0 && uploaded.height && uploaded.height > 0);
+      if (uploaded.isImage && hasDims) {
         imageBlocks.push({
           type: RICH_TEXT_BLOCK_IMAGE,
           url: uploaded.url,
-          ...(uploaded.width ? { width: uploaded.width } : {}),
-          ...(uploaded.height ? { height: uploaded.height } : {}),
+          width: uploaded.width!,
+          height: uploaded.height!,
           ...(uploaded.size != null ? { size: uploaded.size } : {}),
           ...(uploaded.filename ? { name: uploaded.filename } : {}),
         });
       } else {
-        // Non-image (e.g. PDF): RichText image block only accepts images, so
-        // keep the original URL and let the legacy single-send path deliver it.
-        nonImage.push({ originalUrl: mediaUrl });
+        // Non-image OR dimensionless image: deliver via the legacy single-send
+        // path using the already-uploaded URL (no re-upload needed).
+        sideloads.push({ uploaded });
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -382,17 +390,29 @@ async function sendRichTextCombined(params: {
   });
   const messageId = sendResult?.message_id ? String(sendResult.message_id).trim() : undefined;
 
-  // Deliver any non-image files via the legacy single-send path (unchanged
-  // semantics) so file attachments alongside images still work.
+  // Deliver any sideloaded assets (non-image files, or dimensionless images)
+  // via a single-send each, reusing the already-uploaded URL — no re-upload.
+  // Unchanged delivery semantics vs the legacy path.
   let extraCount = 0;
-  for (const { originalUrl } of nonImage) {
+  for (const { uploaded } of sideloads) {
     try {
-      await uploadAndSendMedia({ mediaUrl: originalUrl, apiUrl, botToken, channelId, channelType, log: log as any });
+      await sendMediaMessage({
+        apiUrl,
+        botToken,
+        channelId,
+        channelType,
+        type: uploaded.isImage ? MessageType.Image : MessageType.File,
+        url: uploaded.url,
+        name: uploaded.filename,
+        size: uploaded.size,
+        ...(uploaded.width ? { width: uploaded.width } : {}),
+        ...(uploaded.height ? { height: uploaded.height } : {}),
+      });
       extraCount += 1;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log?.error?.(`octo: uploadAndSendMedia failed for ${originalUrl}: ${errMsg}`);
-      failedMedia.push({ url: originalUrl, error: errMsg });
+      log?.error?.(`octo: sendMediaMessage failed for ${uploaded.url}: ${errMsg}`);
+      failedMedia.push({ url: uploaded.url, error: errMsg });
     }
   }
 

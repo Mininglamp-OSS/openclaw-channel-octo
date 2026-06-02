@@ -1346,15 +1346,17 @@ export async function handleInboundMessage(params: {
     inboundMediaUrl = localPath; // undefined on failure — graceful degradation
   }
   // RichText(=14): download every embedded image to a local temp file (same
-  // rationale as single-media types above). Each failure degrades gracefully:
-  // a failed download is dropped from the list rather than passing a remote URL.
+  // rationale as single-media types above). On a per-image download failure,
+  // fall back to the REMOTE url so the agent keeps a usable reference — unlike
+  // single-media types where the url survives inside rawBody, the RichText body
+  // is only plain text with [图片] placeholders, so dropping the url loses it.
   if (message.payload?.type === MessageType.RichText && resolved.mediaUrls?.length) {
-    const localPaths: string[] = [];
+    const resolvedImageUrls: string[] = [];
     for (const remoteUrl of resolved.mediaUrls) {
       const localPath = await downloadMediaToLocal(remoteUrl, guessMime(remoteUrl, "image/jpeg"), log);
-      if (localPath) localPaths.push(localPath);
+      resolvedImageUrls.push(localPath ?? remoteUrl);
     }
-    inboundMediaUrls = localPaths.length > 0 ? localPaths : undefined;
+    inboundMediaUrls = resolvedImageUrls.length > 0 ? resolvedImageUrls : undefined;
     inboundMediaUrl = inboundMediaUrls?.[0];
   }
   // Inline text file content if possible, or stream large files to temp
