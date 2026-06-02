@@ -19,7 +19,7 @@ import {
   getGroupMd,
   updateGroupMd,
 } from "./api-fetch.js";
-import { uploadAndSendMedia, uploadMedia, type UploadedMedia } from "./inbound.js";
+import { uploadAndSendMedia, uploadMedia, resolveRichTextContent, type UploadedMedia } from "./inbound.js";
 import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions } from "./mention-utils.js";
 import { getKnownGroupIds } from "./group-md.js";
 import { checkPermission } from "./permission.js";
@@ -305,8 +305,9 @@ function resolveActionMediaUrls(args: Record<string, unknown>): string[] {
  * （RichText 契约 image block 只接受带正宽高的图片）。文本与图片按「先文本后图片」
  * 顺序组成单条 content 数组，一次 HTTP 提交（替代 N+1 次）。
  *
- * 返回 null 表示「没有任何图片可组装」（全部是非图片文件 / 上传全失败）——调用方应
- * 回退到旧的拆条路径，保留既有的文件/失败语义。
+ * 当没有任何带正宽高的图片可组装（全部是非图片文件 / 宽高解析失败 / 上传全失败）时，
+ * 不返回 null（那会让调用方重新上传、孤儿化已上传的 COS 对象）：直接在此发送文本 +
+ * 复用已上传 url 的 sideload 媒体，返回 `richText:false`。
  */
 async function sendRichTextCombined(params: {
   message: string;
@@ -322,7 +323,7 @@ async function sendRichTextCombined(params: {
     hasAtAll: boolean;
   };
   log?: LogSink;
-}): Promise<{ messageId?: string; imageCount: number; failedMedia: { url: string; error: string }[] } | null> {
+}): Promise<{ messageId?: string; imageCount: number; failedMedia: { url: string; error: string }[]; richText: boolean }> {
   const { message, mediaUrls, apiUrl, botToken, channelId, channelType, resolveMentions, log } = params;
 
   // Batch-upload every media asset first.
@@ -360,13 +361,61 @@ async function sendRichTextCombined(params: {
     }
   }
 
-  // No image survived → caller should fall back to the legacy split path so the
-  // text + any non-image files keep their established behavior.
-  if (imageBlocks.length === 0) {
-    return null;
-  }
-
   const { finalMessage, mentionUids, mentionEntities, hasAtAll } = resolveMentions(message);
+
+  // Deliver any sideloaded assets (non-image files, or dimensionless images)
+  // via a single-send each, reusing the already-uploaded URL — no re-upload.
+  // Defined before the no-image early path so both branches share it (avoids
+  // returning null after uploads, which would orphan COS objects + re-upload).
+  const deliverSideloads = async (): Promise<number> => {
+    let delivered = 0;
+    for (const { uploaded } of sideloads) {
+      try {
+        await sendMediaMessage({
+          apiUrl,
+          botToken,
+          channelId,
+          channelType,
+          type: uploaded.isImage ? MessageType.Image : MessageType.File,
+          url: uploaded.url,
+          name: uploaded.filename,
+          size: uploaded.size,
+          ...(uploaded.width ? { width: uploaded.width } : {}),
+          ...(uploaded.height ? { height: uploaded.height } : {}),
+        });
+        delivered += 1;
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log?.error?.(`octo: sendMediaMessage failed for ${uploaded.url}: ${errMsg}`);
+        failedMedia.push({ url: uploaded.url, error: errMsg });
+      }
+    }
+    return delivered;
+  };
+
+  // No image block survived (all non-image files / dimensionless images / all
+  // uploads failed). We already uploaded the sideloads, so deliver them here
+  // (reusing the uploaded URLs) plus the text — do NOT return null, which would
+  // make the caller re-upload via the legacy path and orphan the COS objects.
+  if (imageBlocks.length === 0) {
+    let textMessageId: string | undefined;
+    if (finalMessage.trim() !== "") {
+      const textResult = await sendMessage({
+        apiUrl,
+        botToken,
+        channelId,
+        channelType,
+        content: finalMessage,
+        ...(mentionUids.length > 0 ? { mentionUids } : {}),
+        ...(mentionEntities.length > 0 ? { mentionEntities } : {}),
+        mentionAll: hasAtAll || undefined,
+      });
+      textMessageId = textResult?.message_id ? String(textResult.message_id).trim() : undefined;
+    }
+    const delivered = await deliverSideloads();
+    // No RichText payload was sent (no images), so this is NOT a richText result.
+    return { messageId: textMessageId, imageCount: delivered, failedMedia, richText: false };
+  }
 
   // content = [text block, ...image blocks]. Order matches the wire contract
   // (array order = 图文穿插顺序). plain is best-effort; server reauthors it.
@@ -390,33 +439,9 @@ async function sendRichTextCombined(params: {
   });
   const messageId = sendResult?.message_id ? String(sendResult.message_id).trim() : undefined;
 
-  // Deliver any sideloaded assets (non-image files, or dimensionless images)
-  // via a single-send each, reusing the already-uploaded URL — no re-upload.
-  // Unchanged delivery semantics vs the legacy path.
-  let extraCount = 0;
-  for (const { uploaded } of sideloads) {
-    try {
-      await sendMediaMessage({
-        apiUrl,
-        botToken,
-        channelId,
-        channelType,
-        type: uploaded.isImage ? MessageType.Image : MessageType.File,
-        url: uploaded.url,
-        name: uploaded.filename,
-        size: uploaded.size,
-        ...(uploaded.width ? { width: uploaded.width } : {}),
-        ...(uploaded.height ? { height: uploaded.height } : {}),
-      });
-      extraCount += 1;
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log?.error?.(`octo: sendMediaMessage failed for ${uploaded.url}: ${errMsg}`);
-      failedMedia.push({ url: uploaded.url, error: errMsg });
-    }
-  }
+  const extraCount = await deliverSideloads();
 
-  return { messageId, imageCount: imageBlocks.length + extraCount, failedMedia };
+  return { messageId, imageCount: imageBlocks.length + extraCount, failedMedia, richText: true };
 }
 
 async function handleSend(params: {
@@ -558,24 +583,21 @@ async function handleSend(params: {
       resolveMentions,
       log,
     });
-    if (richResult) {
-      return {
-        ok: true,
-        data: {
-          sent: true,
-          target,
-          channelId,
-          channelType,
-          richText: true,
-          mediaCount: richResult.imageCount,
-          ...(richResult.messageId ? { messageId: richResult.messageId } : {}),
-          ...(richResult.failedMedia.length > 0 ? { failedMedia: richResult.failedMedia } : {}),
-        },
-      };
-    }
-    // richResult === null → no images survived upload (e.g. all were non-image
-    // files or all uploads failed). Fall through to the legacy split path which
-    // sends the text and handles files/failures with the established semantics.
+    return {
+      ok: true,
+      data: {
+        sent: true,
+        target,
+        channelId,
+        channelType,
+        // richText is true only when a type-14 payload was actually sent (≥1
+        // image block); a text-only / file-only send reports richText:false.
+        ...(richResult.richText ? { richText: true } : {}),
+        mediaCount: richResult.imageCount,
+        ...(richResult.messageId ? { messageId: richResult.messageId } : {}),
+        ...(richResult.failedMedia.length > 0 ? { failedMedia: richResult.failedMedia } : {}),
+      },
+    };
   }
 
   // Send text message
@@ -751,6 +773,13 @@ async function handleRead(params: {
     else if (msgType === 5) content = "[视频]";
     else if (msgType === 9 || msgType === 8) content = `[文件: ${m.name ?? "unknown"}]`;
     else if (msgType === 11 || msgType === 12) content = "[合并转发]";
+    else if (msgType === MessageType.RichText) {
+      // RichText(=14): m.content is "" (payload.content is a block array), so
+      // expand the full payload — prefer plain, fall back to building from blocks.
+      const rt = resolveRichTextContent((m.payload ?? {}) as any);
+      const text = rt.text || "[图文消息]";
+      content = text.length > 500 ? text.slice(0, 500) + "…" : text;
+    }
     else content = rawContent.length > 500 ? rawContent.slice(0, 500) + "…" : rawContent;
 
     return {

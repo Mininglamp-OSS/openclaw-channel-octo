@@ -6,19 +6,23 @@ import { registerBotGroupIds, _testReset as _resetGroupMd } from "./group-md.js"
 
 // Mock uploadAndSendMedia / uploadMedia — the streaming COS upload uses its own
 // SDK internals that can't be tested via fetch mocks alone. Upload logic is
-// tested in inbound.test.ts.
-vi.mock("./inbound.js", () => ({
-  uploadAndSendMedia: vi.fn().mockResolvedValue(undefined),
-  uploadMedia: vi.fn().mockResolvedValue({
-    url: "https://cdn.example.com/uploaded.png",
-    filename: "uploaded.png",
-    size: 1234,
-    contentType: "image/png",
-    isImage: true,
-    width: 100,
-    height: 80,
-  }),
-}));
+// tested in inbound.test.ts. resolveRichTextContent is a pure resolver, kept real.
+vi.mock("./inbound.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./inbound.js")>();
+  return {
+    ...actual,
+    uploadAndSendMedia: vi.fn().mockResolvedValue(undefined),
+    uploadMedia: vi.fn().mockResolvedValue({
+      url: "https://cdn.example.com/uploaded.png",
+      filename: "uploaded.png",
+      size: 1234,
+      contentType: "image/png",
+      isImage: true,
+      width: 100,
+      height: 80,
+    }),
+  };
+});
 
 /**
  * Tests for message action handlers.
@@ -1032,13 +1036,13 @@ describe("handleOctoMessageAction", () => {
       expect((result.data as any).mediaCount).toBe(2);
     });
 
-    it("falls back to legacy split path when no image survives upload", async () => {
+    it("file-only richText:true delivers text + sideload without re-upload or orphaned objects", async () => {
       const { uploadMedia, uploadAndSendMedia } = await import("./inbound.js");
       const uploadMediaSpy = vi.mocked(uploadMedia);
       const uploadSendSpy = vi.mocked(uploadAndSendMedia);
       uploadMediaSpy.mockClear();
       uploadSendSpy.mockClear();
-      // Non-image (PDF) → no image block → RichText returns null → legacy path.
+      // Non-image (PDF) → no image block → text + sideload (no re-upload).
       uploadMediaSpy.mockResolvedValue({
         url: "https://cdn.example.com/doc.pdf",
         filename: "doc.pdf",
@@ -1048,10 +1052,12 @@ describe("handleOctoMessageAction", () => {
       });
 
       let textSent = false;
+      let fileSent = false;
       globalThis.fetch = mockFetch({
         "/v1/bot/sendMessage": async (_url, init) => {
           const body = JSON.parse(init?.body as string);
           if (body.payload?.type === 1 && body.payload?.content) textSent = true;
+          if (body.payload?.type === 8) fileSent = true;
           return jsonResponse({ message_id: 1, message_seq: 1 });
         },
       });
@@ -1070,10 +1076,11 @@ describe("handleOctoMessageAction", () => {
       });
 
       expect(result.ok).toBe(true);
-      // Legacy path: plain text send + uploadAndSendMedia for the file.
       expect(textSent).toBe(true);
-      expect(uploadSendSpy).toHaveBeenCalledOnce();
-      expect((result.data as any).richText).toBeUndefined();
+      expect(fileSent).toBe(true); // PDF via sendMediaMessage (reused upload)
+      expect(uploadMediaSpy).toHaveBeenCalledOnce(); // uploaded exactly once
+      expect(uploadSendSpy).not.toHaveBeenCalled(); // no re-upload via legacy path
+      expect((result.data as any).richText).toBeUndefined(); // no type-14 sent
     });
 
     it("does NOT use RichText path without opt-in (backward compatible default)", async () => {
@@ -1481,6 +1488,84 @@ describe("handleOctoMessageAction", () => {
       expect(data.hasMore).toBe(false);
       // Same-channel should NOT have prompt injection wrapper
       expect(data.header).toBeUndefined();
+    });
+  });
+
+  describe("read — RichText(=14) history expansion", () => {
+    it("expands type-14 history into plain text (not empty / [object Object])", async () => {
+      registerBotGroupIds(["grp1"]);
+      const fakeMessages = {
+        messages: [
+          {
+            from_uid: "user1",
+            message_id: "m1",
+            timestamp: 1709654400,
+            // type 14 payload: content is a block array, top-level content "" otherwise
+            payload: Buffer.from(JSON.stringify({
+              type: 14,
+              content: [
+                { type: "text", text: "看图: " },
+                { type: "image", url: "https://cdn.example.com/p.png", width: 5, height: 5 },
+              ],
+              plain: "看图: [图片]",
+            })).toString("base64"),
+          },
+        ],
+      };
+
+      globalThis.fetch = mockFetch({
+        "/v1/bot/messages/sync": async () => jsonResponse(fakeMessages),
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "read",
+        args: { target: "group:grp1" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1",
+      });
+
+      expect(result.ok).toBe(true);
+      const data = result.data as any;
+      expect(data.messages[0].content).toBe("看图: [图片]");
+    });
+
+    it("builds plain from blocks when top-level plain missing", async () => {
+      registerBotGroupIds(["grp1"]);
+      const fakeMessages = {
+        messages: [
+          {
+            from_uid: "user1",
+            message_id: "m1",
+            timestamp: 1709654400,
+            payload: Buffer.from(JSON.stringify({
+              type: 14,
+              content: [
+                { type: "text", text: "no plain " },
+                { type: "image", url: "https://cdn.example.com/p.png", width: 5, height: 5 },
+              ],
+            })).toString("base64"),
+          },
+        ],
+      };
+
+      globalThis.fetch = mockFetch({
+        "/v1/bot/messages/sync": async () => jsonResponse(fakeMessages),
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "read",
+        args: { target: "group:grp1" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1",
+      });
+
+      expect(result.ok).toBe(true);
+      const data = result.data as any;
+      expect(data.messages[0].content).toBe("no plain [图片]");
     });
   });
 

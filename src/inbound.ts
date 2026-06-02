@@ -1402,7 +1402,11 @@ export async function handleInboundMessage(params: {
   const replyData = message.payload?.reply;
   if (replyData) {
     const replyPayload = replyData.payload;
-    const replyContent = replyPayload?.content ?? (replyPayload ? resolveContentText(replyPayload, account.config.apiUrl) : "");
+    // RichText(=14) carries `content` as a block array, not a string — using the
+    // raw `content` would interpolate `[object Object]`. Only trust a string
+    // `content`; otherwise (RichText, or missing) resolve via the type-aware path.
+    const rawReplyContent = typeof replyPayload?.content === "string" ? replyPayload.content : undefined;
+    const replyContent = rawReplyContent ?? (replyPayload ? resolveContentText(replyPayload, account.config.apiUrl) : "");
     const replyFrom = replyData.from_uid ?? replyData.from_name ?? "unknown";
     if (replyContent) {
       quotePrefix = `[Quoted message from ${replyFrom}]: ${replyContent}\n---\n`;
