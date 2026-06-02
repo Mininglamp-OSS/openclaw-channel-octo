@@ -404,7 +404,9 @@ export function resolveRichTextContent(
   const blocks = normalizeRichTextBlocks(payload?.content);
   const mediaUrls: string[] = [];
   for (const blk of blocks) {
-    if (blk.type === RICH_TEXT_BLOCK_IMAGE && blk.url) {
+    // Defensive: server-originated data — only collect string urls so a
+    // malformed `{type:'image', url:{}}` never reaches buildUrl and throws.
+    if (blk.type === RICH_TEXT_BLOCK_IMAGE && typeof blk.url === "string" && blk.url) {
       const full = buildUrl ? buildUrl(blk.url) : blk.url;
       if (full) mediaUrls.push(full);
     }
@@ -445,8 +447,10 @@ function buildRichTextPlain(blocks: RichTextBlock[]): string {
     if (blk.type === RICH_TEXT_BLOCK_IMAGE) {
       out += RICH_TEXT_IMAGE_PLACEHOLDER;
     } else if (blk.type === RICH_TEXT_BLOCK_TEXT) {
-      out += blk.text ?? "";
-    } else if (blk.text) {
+      // Only string text — guards against a malformed non-string `text`
+      // rendering as "[object Object]".
+      out += typeof blk.text === "string" ? blk.text : "";
+    } else if (typeof blk.text === "string" && blk.text) {
       out += blk.text;
     }
   }

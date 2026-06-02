@@ -572,6 +572,21 @@ describe("RichText(=14) inbound resolution", () => {
     expect(resolveRichTextContent({} as any).mediaUrls).toEqual([]);
   });
 
+  it("hardens against malformed block field shapes (no throw, no [object Object])", () => {
+    const result = resolveRichTextContent({
+      content: [
+        { type: RICH_TEXT_BLOCK_IMAGE, url: {} },          // non-string url → placeholder kept, url skipped
+        { type: RICH_TEXT_BLOCK_TEXT, text: { x: 1 } },     // non-string text → skipped
+        { type: RICH_TEXT_BLOCK_TEXT, text: "ok" },
+        { type: RICH_TEXT_BLOCK_IMAGE, url: "https://cdn.example.com/good.png", width: 1, height: 1 },
+      ] as any,
+    });
+    // image blocks always contribute a placeholder; malformed text is skipped;
+    // only the string url is collected into mediaUrls.
+    expect(result.text).toBe("[图片]ok[图片]");
+    expect(result.mediaUrls).toEqual(["https://cdn.example.com/good.png"]);
+  });
+
   it("resolveInnerMessageText expands nested RichText (引用/转发预览)", () => {
     // Nested type-14 inside a quote/forward: prefer plain, fall back to blocks.
     expect(
