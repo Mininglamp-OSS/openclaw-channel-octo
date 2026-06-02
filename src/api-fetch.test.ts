@@ -1201,3 +1201,205 @@ describe("sendMessage — mentionAll serialization", () => {
     expect(sentBody.payload.mention).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// client_msg_no idempotency — outbound sends carry a dedup key
+// ---------------------------------------------------------------------------
+describe("client_msg_no idempotency", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const captureBody = () => {
+    const bodies: any[] = [];
+    global.fetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(init?.body as string));
+      return new Response(JSON.stringify({ message_id: 1, message_seq: 1 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    return bodies;
+  };
+
+  it("sendMessage auto-generates a client_msg_no", async () => {
+    const bodies = captureBody();
+    const { sendMessage } = await import("./api-fetch.js");
+    await sendMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "t",
+      channelId: "c",
+      channelType: ChannelType.Group,
+      content: "hi",
+    });
+    expect(typeof bodies[0].client_msg_no).toBe("string");
+    expect(bodies[0].client_msg_no.length).toBeGreaterThan(0);
+  });
+
+  it("sendMessage honors an explicit clientMsgNo (caller reuse on retry)", async () => {
+    const bodies = captureBody();
+    const { sendMessage } = await import("./api-fetch.js");
+    await sendMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "t",
+      channelId: "c",
+      channelType: ChannelType.Group,
+      content: "hi",
+      clientMsgNo: "fixed-uuid-123",
+    });
+    expect(bodies[0].client_msg_no).toBe("fixed-uuid-123");
+  });
+
+  it("two sendMessage calls get distinct client_msg_no values", async () => {
+    const bodies = captureBody();
+    const { sendMessage } = await import("./api-fetch.js");
+    const base = { apiUrl: "http://localhost:8090", botToken: "t", channelId: "c", channelType: ChannelType.Group };
+    await sendMessage({ ...base, content: "one" });
+    await sendMessage({ ...base, content: "two" });
+    expect(bodies[0].client_msg_no).not.toBe(bodies[1].client_msg_no);
+  });
+
+  it("sendMediaMessage auto-generates a client_msg_no", async () => {
+    const bodies = captureBody();
+    const { sendMediaMessage } = await import("./api-fetch.js");
+    await sendMediaMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "t",
+      channelId: "c",
+      channelType: ChannelType.Group,
+      type: MessageType.Image,
+      url: "https://cdn.example.com/a.png",
+      width: 10,
+      height: 10,
+    });
+    expect(typeof bodies[0].client_msg_no).toBe("string");
+    expect(bodies[0].client_msg_no.length).toBeGreaterThan(0);
+  });
+
+  it("generateClientMsgNo returns unique values", async () => {
+    const { generateClientMsgNo } = await import("./api-fetch.js");
+    const a = generateClientMsgNo();
+    const b = generateClientMsgNo();
+    expect(a).not.toBe(b);
+    expect(a.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sendRichTextMessage — single RichText(=14) payload assembly
+// ---------------------------------------------------------------------------
+describe("sendRichTextMessage — payload assembly", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const captureBody = () => {
+    const bodies: any[] = [];
+    global.fetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(init?.body as string));
+      return new Response(JSON.stringify({ message_id: 7, message_seq: 1 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    return bodies;
+  };
+
+  it("assembles a single type=14 payload with content blocks in order", async () => {
+    const bodies = captureBody();
+    const { sendRichTextMessage } = await import("./api-fetch.js");
+    await sendRichTextMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "t",
+      channelId: "c",
+      channelType: ChannelType.Group,
+      blocks: [
+        { type: "text", text: "look:" },
+        { type: "image", url: "https://cdn.example.com/a.png", width: 100, height: 80, size: 1234, name: "a.png" },
+      ],
+      plain: "look:[图片]",
+    });
+
+    expect(bodies).toHaveLength(1); // ONE HTTP send, not text + media split
+    const payload = bodies[0].payload;
+    expect(payload.type).toBe(MessageType.RichText);
+    expect(payload.content).toHaveLength(2);
+    expect(payload.content[0]).toEqual({ type: "text", text: "look:" });
+    expect(payload.content[1].type).toBe("image");
+    expect(payload.content[1].url).toBe("https://cdn.example.com/a.png");
+    expect(payload.content[1].width).toBe(100);
+    expect(payload.plain).toBe("look:[图片]");
+  });
+
+  it("carries client_msg_no for idempotency", async () => {
+    const bodies = captureBody();
+    const { sendRichTextMessage } = await import("./api-fetch.js");
+    await sendRichTextMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "t",
+      channelId: "c",
+      channelType: ChannelType.Group,
+      blocks: [{ type: "text", text: "x" }],
+    });
+    expect(typeof bodies[0].client_msg_no).toBe("string");
+    expect(bodies[0].client_msg_no.length).toBeGreaterThan(0);
+  });
+
+  it("serializes mention.all as number 1", async () => {
+    const bodies = captureBody();
+    const { sendRichTextMessage } = await import("./api-fetch.js");
+    await sendRichTextMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "t",
+      channelId: "c",
+      channelType: ChannelType.Group,
+      blocks: [{ type: "text", text: "hey @all" }],
+      mentionAll: true,
+    });
+    expect(bodies[0].payload.mention.all).toBe(1);
+  });
+
+  it("includes mention uids/entities and reply when provided", async () => {
+    const bodies = captureBody();
+    const { sendRichTextMessage } = await import("./api-fetch.js");
+    await sendRichTextMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "t",
+      channelId: "c",
+      channelType: ChannelType.Group,
+      blocks: [{ type: "text", text: "hi" }],
+      mentionUids: ["u1"],
+      mentionEntities: [{ uid: "u1", offset: 0, length: 3 }],
+      replyMsgId: "999",
+    });
+    const payload = bodies[0].payload;
+    expect(payload.mention.uids).toEqual(["u1"]);
+    expect(payload.mention.entities).toHaveLength(1);
+    expect(payload.reply).toEqual({ message_id: "999" });
+  });
+
+  it("omits plain when not provided", async () => {
+    const bodies = captureBody();
+    const { sendRichTextMessage } = await import("./api-fetch.js");
+    await sendRichTextMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "t",
+      channelId: "c",
+      channelType: ChannelType.Group,
+      blocks: [{ type: "text", text: "x" }],
+    });
+    expect("plain" in bodies[0].payload).toBe(false);
+  });
+});

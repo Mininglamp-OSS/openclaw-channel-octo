@@ -4,10 +4,20 @@ import { registerOwnerUid, _clearOwnerRegistry } from "./owner-registry.js";
 import { _clearMemberCache, _setCacheEntry } from "./member-cache.js";
 import { registerBotGroupIds, _testReset as _resetGroupMd } from "./group-md.js";
 
-// Mock uploadAndSendMedia — the streaming COS upload uses its own SDK internals
-// that can't be tested via fetch mocks alone. Upload logic is tested in inbound.test.ts.
+// Mock uploadAndSendMedia / uploadMedia — the streaming COS upload uses its own
+// SDK internals that can't be tested via fetch mocks alone. Upload logic is
+// tested in inbound.test.ts.
 vi.mock("./inbound.js", () => ({
   uploadAndSendMedia: vi.fn().mockResolvedValue(undefined),
+  uploadMedia: vi.fn().mockResolvedValue({
+    url: "https://cdn.example.com/uploaded.png",
+    filename: "uploaded.png",
+    size: 1234,
+    contentType: "image/png",
+    isImage: true,
+    width: 100,
+    height: 80,
+  }),
 }));
 
 /**
@@ -919,6 +929,227 @@ describe("handleOctoMessageAction", () => {
       expect(uploadSpy).toHaveBeenCalledOnce();
       expect(uploadSpy.mock.calls[0][0].mediaUrl).toBe("https://example.com/single.png");
       expect((result as any).data.mediaCount).toBe(1);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // RichText(=14) 图文混排 outbound — single payload assembly (opt-in)
+  // -----------------------------------------------------------------------
+  describe("send — RichText 图文混排 (richText:true)", () => {
+    it("assembles ONE RichText payload for text + image instead of split sends", async () => {
+      const { uploadMedia, uploadAndSendMedia } = await import("./inbound.js");
+      const uploadMediaSpy = vi.mocked(uploadMedia);
+      const uploadSendSpy = vi.mocked(uploadAndSendMedia);
+      uploadMediaSpy.mockClear();
+      uploadSendSpy.mockClear();
+      uploadMediaSpy.mockResolvedValue({
+        url: "https://cdn.example.com/u.png",
+        filename: "u.png",
+        size: 1234,
+        contentType: "image/png",
+        isImage: true,
+        width: 100,
+        height: 80,
+      });
+
+      let sentPayload: any = null;
+      let sendCount = 0;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sendCount += 1;
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: "rt-1", message_seq: 1 });
+        },
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          message: "look here",
+          mediaUrl: "https://example.com/pic.png",
+          richText: true,
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      // ONE HTTP send (RichText), NOT text + media split.
+      expect(sendCount).toBe(1);
+      expect(uploadSendSpy).not.toHaveBeenCalled();
+      expect(uploadMediaSpy).toHaveBeenCalledOnce();
+
+      expect(sentPayload.payload.type).toBe(14);
+      expect(sentPayload.payload.content[0]).toEqual({ type: "text", text: "look here" });
+      expect(sentPayload.payload.content[1].type).toBe("image");
+      expect(sentPayload.payload.content[1].url).toBe("https://cdn.example.com/u.png");
+      expect(sentPayload.payload.content[1].width).toBe(100);
+      expect(sentPayload.client_msg_no).toBeTruthy();
+
+      expect((result.data as any).richText).toBe(true);
+      expect((result.data as any).messageId).toBe("rt-1");
+      expect((result.data as any).mediaCount).toBe(1);
+    });
+
+    it("batch-uploads multiple images into one ordered content array", async () => {
+      const { uploadMedia } = await import("./inbound.js");
+      const uploadMediaSpy = vi.mocked(uploadMedia);
+      uploadMediaSpy.mockClear();
+      uploadMediaSpy
+        .mockResolvedValueOnce({ url: "https://cdn.example.com/1.png", filename: "1.png", size: 1, contentType: "image/png", isImage: true, width: 10, height: 10 })
+        .mockResolvedValueOnce({ url: "https://cdn.example.com/2.png", filename: "2.png", size: 2, contentType: "image/png", isImage: true, width: 20, height: 20 });
+
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: "rt-2", message_seq: 1 });
+        },
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          message: "two pics",
+          mediaUrls: ["https://example.com/a.png", "https://example.com/b.png"],
+          richText: true,
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(uploadMediaSpy).toHaveBeenCalledTimes(2);
+      const content = sentPayload.payload.content;
+      expect(content).toHaveLength(3);
+      expect(content[0]).toEqual({ type: "text", text: "two pics" });
+      expect(content[1].url).toBe("https://cdn.example.com/1.png");
+      expect(content[2].url).toBe("https://cdn.example.com/2.png");
+      expect((result.data as any).mediaCount).toBe(2);
+    });
+
+    it("falls back to legacy split path when no image survives upload", async () => {
+      const { uploadMedia, uploadAndSendMedia } = await import("./inbound.js");
+      const uploadMediaSpy = vi.mocked(uploadMedia);
+      const uploadSendSpy = vi.mocked(uploadAndSendMedia);
+      uploadMediaSpy.mockClear();
+      uploadSendSpy.mockClear();
+      // Non-image (PDF) → no image block → RichText returns null → legacy path.
+      uploadMediaSpy.mockResolvedValue({
+        url: "https://cdn.example.com/doc.pdf",
+        filename: "doc.pdf",
+        size: 10,
+        contentType: "application/pdf",
+        isImage: false,
+      });
+
+      let textSent = false;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          const body = JSON.parse(init?.body as string);
+          if (body.payload?.type === 1 && body.payload?.content) textSent = true;
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          message: "see attached",
+          mediaUrl: "https://example.com/doc.pdf",
+          richText: true,
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      // Legacy path: plain text send + uploadAndSendMedia for the file.
+      expect(textSent).toBe(true);
+      expect(uploadSendSpy).toHaveBeenCalledOnce();
+      expect((result.data as any).richText).toBeUndefined();
+    });
+
+    it("does NOT use RichText path without opt-in (backward compatible default)", async () => {
+      const { uploadMedia, uploadAndSendMedia } = await import("./inbound.js");
+      const uploadMediaSpy = vi.mocked(uploadMedia);
+      const uploadSendSpy = vi.mocked(uploadAndSendMedia);
+      uploadMediaSpy.mockClear();
+      uploadSendSpy.mockClear();
+      uploadSendSpy.mockResolvedValue(undefined);
+
+      let textSent = false;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          const body = JSON.parse(init?.body as string);
+          if (body.payload?.content) textSent = true;
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          message: "default split",
+          mediaUrl: "https://example.com/pic.png",
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      // Legacy default: separate text send + uploadAndSendMedia, no RichText.
+      expect(textSent).toBe(true);
+      expect(uploadSendSpy).toHaveBeenCalledOnce();
+      expect(uploadMediaSpy).not.toHaveBeenCalled();
+      expect((result.data as any).richText).toBeUndefined();
+    });
+
+    it("delivers non-image files alongside images via legacy single-send", async () => {
+      const { uploadMedia, uploadAndSendMedia } = await import("./inbound.js");
+      const uploadMediaSpy = vi.mocked(uploadMedia);
+      const uploadSendSpy = vi.mocked(uploadAndSendMedia);
+      uploadMediaSpy.mockClear();
+      uploadSendSpy.mockClear();
+      uploadSendSpy.mockResolvedValue(undefined);
+      uploadMediaSpy
+        .mockResolvedValueOnce({ url: "https://cdn.example.com/i.png", filename: "i.png", size: 1, contentType: "image/png", isImage: true, width: 5, height: 5 })
+        .mockResolvedValueOnce({ url: "https://cdn.example.com/d.pdf", filename: "d.pdf", size: 2, contentType: "application/pdf", isImage: false });
+
+      let richSends = 0;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          const body = JSON.parse(init?.body as string);
+          if (body.payload?.type === 14) richSends += 1;
+          return jsonResponse({ message_id: "rt-3", message_seq: 1 });
+        },
+      });
+
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          message: "mixed",
+          mediaUrls: ["https://example.com/i.png", "https://example.com/d.pdf"],
+          richText: true,
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(richSends).toBe(1); // one RichText send for text+image
+      expect(uploadSendSpy).toHaveBeenCalledOnce(); // the PDF via legacy single-send
+      expect((result.data as any).mediaCount).toBe(2);
     });
   });
 

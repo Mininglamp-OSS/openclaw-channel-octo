@@ -3,13 +3,25 @@
  * These are used by inbound/outbound where the full OctoAPI class is not available.
  */
 
-import { ChannelType, MessageType, type MentionEntity, type SendMessageResult } from "./types.js";
+import { ChannelType, MessageType, type MentionEntity, type RichTextBlock, type SendMessageResult } from "./types.js";
 import path from "path";
 import { open } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 // @ts-ignore — cos-nodejs-sdk-v5 has incomplete TypeScript definitions
 import COS from "cos-nodejs-sdk-v5";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * 生成出站消息的客户端幂等编号 client_msg_no（UUID）。
+ *
+ * WuKongIM 以 client_msg_no 做服务端去重（见 pkg/wkdb/message.go：相同
+ * client_msg_no 只落库一条）。图文混排 payload 体积大、链路长、更易触发重试，
+ * 故出站统一附带 client_msg_no，保证重试不会产生重复消息。
+ */
+export function generateClientMsgNo(): string {
+  return randomUUID();
+}
 
 const DEFAULT_HEADERS = {
   "Content-Type": "application/json",
@@ -78,6 +90,7 @@ export async function sendMediaMessage(params: {
   mentionUids?: string[];
   mentionEntities?: MentionEntity[];
   onBehalfOf?: string;
+  clientMsgNo?: string;
   signal?: AbortSignal;
 }): Promise<SendMessageResult | undefined> {
   const payload: Record<string, unknown> = {
@@ -113,6 +126,7 @@ export async function sendMediaMessage(params: {
     channel_id: params.channelId,
     channel_type: params.channelType,
     payload,
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
     ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
   }, params.signal);
 }
@@ -218,6 +232,7 @@ export async function sendMessage(params: {
   mentionAll?: boolean;
   replyMsgId?: string;
   onBehalfOf?: string;
+  clientMsgNo?: string;
   signal?: AbortSignal;
 }): Promise<SendMessageResult | undefined> {
   const payload: Record<string, unknown> = {
@@ -250,6 +265,71 @@ export async function sendMessage(params: {
     channel_id: params.channelId,
     channel_type: params.channelType,
     payload,
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+    ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
+  }, params.signal);
+}
+
+/**
+ * 发送一条 RichText(=14) 图文混排消息。
+ *
+ * 替代「sendMessage 文本 + 循环 uploadMedia」的多次 HTTP：调用方先批量上传图片
+ * 拿到 url（含 width/height），再把文本与图片按顺序组成一条 `content` block 数组
+ * 提交。一条 payload = 一次 HTTP，server 端图文不再拆条。
+ *
+ * 契约（见 octo-lib richtext.go）：
+ *   - `content` 必填且非空；text block 的 text 非空、image block 的 url 为
+ *     http/https 且 width/height >0 —— 校验由调用方/ server 负责，本函数只组装。
+ *   - `plain` 出站可附带（供老客户端/降级），server 会用 content 权威重算覆盖。
+ *   - `client_msg_no` 默认自动生成（幂等去重），调用方可显式传入复用。
+ */
+export async function sendRichTextMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  blocks: RichTextBlock[];
+  plain?: string;
+  mentionUids?: string[];
+  mentionEntities?: MentionEntity[];
+  mentionAll?: boolean;
+  replyMsgId?: string;
+  onBehalfOf?: string;
+  clientMsgNo?: string;
+  signal?: AbortSignal;
+}): Promise<SendMessageResult | undefined> {
+  const payload: Record<string, unknown> = {
+    type: MessageType.RichText,
+    content: params.blocks,
+  };
+  if (typeof params.plain === "string") {
+    payload.plain = params.plain;
+  }
+  if (
+    (params.mentionUids && params.mentionUids.length > 0) ||
+    (params.mentionEntities && params.mentionEntities.length > 0) ||
+    params.mentionAll
+  ) {
+    const mention: Record<string, unknown> = {};
+    if (params.mentionUids && params.mentionUids.length > 0) {
+      mention.uids = params.mentionUids;
+    }
+    if (params.mentionEntities && params.mentionEntities.length > 0) {
+      mention.entities = params.mentionEntities;
+    }
+    if (params.mentionAll) {
+      mention.all = 1;
+    }
+    payload.mention = mention;
+  }
+  if (params.replyMsgId) {
+    payload.reply = { message_id: params.replyMsgId };
+  }
+  return await postJson<SendMessageResult>(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload,
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
     ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
   }, params.signal);
 }

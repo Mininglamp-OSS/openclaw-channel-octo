@@ -4,7 +4,8 @@ import { DEFAULT_GROUP_HISTORY_LIMIT } from "openclaw/plugin-sdk/reply-history";
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadCredentials, uploadFileToCOS, fetchUserInfo } from "./api-fetch.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
-import { ChannelType, MessageType } from "./types.js";
+import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
+import type { RichTextBlock } from "./types.js";
 import { getOctoRuntime } from "./runtime.js";
 import { CHANNEL_ID } from "./constants.js";
 import {
@@ -116,17 +117,41 @@ export function extractFilename(url: string): string {
   }
 }
 
-/** Upload media to MinIO and send as image/file message */
-export async function uploadAndSendMedia(params: {
+/**
+ * Result of uploading a single media asset to COS (without sending).
+ */
+export interface UploadedMedia {
+  /** Public CDN/object URL of the uploaded asset. */
+  url: string;
+  /** Sanitized filename used for the upload. */
+  filename: string;
+  /** Byte size of the uploaded asset. */
+  size: number;
+  /** Resolved content type (charset normalized for text/*). */
+  contentType: string;
+  /** True when the asset is an image (contentType starts with image/). */
+  isImage: boolean;
+  /** Image width in px (images only, when parseable). */
+  width?: number;
+  /** Image height in px (images only, when parseable). */
+  height?: number;
+}
+
+/**
+ * Upload a single media asset (remote URL or local path) to COS and return its
+ * public URL plus metadata — WITHOUT sending a message.
+ *
+ * Extracted from {@link uploadAndSendMedia} so the outbound RichText(=14) path
+ * can batch-upload images first, collect their URLs/dimensions, then assemble a
+ * single RichText payload (one HTTP send) instead of one send per asset.
+ */
+export async function uploadMedia(params: {
   mediaUrl: string;
   apiUrl: string;
   botToken: string;
-  channelId: string;
-  channelType: ChannelType;
-  onBehalfOf?: string;
   log?: ChannelLogSink;
-}): Promise<SendMessageResult | undefined> {
-  const { mediaUrl, apiUrl, botToken, channelId, channelType, onBehalfOf, log } = params;
+}): Promise<UploadedMedia> {
+  const { mediaUrl, apiUrl, botToken, log } = params;
 
   const { createReadStream: fsCreateReadStream, statSync: fsStatSync, createWriteStream: fsCreateWriteStream } = await import("node:fs");
   const { basename, join: pathJoin } = await import("node:path");
@@ -203,9 +228,8 @@ export async function uploadAndSendMedia(params: {
       filename,
     });
 
-    // Determine message type from MIME
+    // Determine media kind from MIME
     const isImage = contentType.startsWith("image/");
-    const msgType = isImage ? MessageType.Image : MessageType.File;
 
     // For images, parse dimensions from file (not full buffer)
     let width: number | undefined;
@@ -219,24 +243,43 @@ export async function uploadAndSendMedia(params: {
 
     log?.info?.(`octo: uploaded media as ${isImage ? "image" : "file"}: ${filename}${width ? ` (${width}x${height})` : ""}`);
 
-    // Send via sendMessage
-    const result = await sendMediaMessage({
-      apiUrl,
-      botToken,
-      channelId,
-      channelType,
-      type: msgType,
-      url: uploadedUrl,
-      name: filename,
-      size: fileSize,
-      width,
-      height,
-      ...(onBehalfOf ? { onBehalfOf } : {}),
-    });
-    return result;
+    return { url: uploadedUrl, filename, size: fileSize, contentType, isImage, width, height };
   } finally {
     if (tempPath) await fsUnlink(tempPath).catch(() => {});
   }
+}
+
+/** Upload media to MinIO and send as image/file message */
+export async function uploadAndSendMedia(params: {
+  mediaUrl: string;
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  onBehalfOf?: string;
+  log?: ChannelLogSink;
+}): Promise<SendMessageResult | undefined> {
+  const { mediaUrl, apiUrl, botToken, channelId, channelType, onBehalfOf, log } = params;
+
+  const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, log });
+
+  const msgType = uploaded.isImage ? MessageType.Image : MessageType.File;
+
+  // Send via sendMessage
+  const result = await sendMediaMessage({
+    apiUrl,
+    botToken,
+    channelId,
+    channelType,
+    type: msgType,
+    url: uploaded.url,
+    name: uploaded.filename,
+    size: uploaded.size,
+    width: uploaded.width,
+    height: uploaded.height,
+    ...(onBehalfOf ? { onBehalfOf } : {}),
+  });
+  return result;
 }
 
 /** Guess MIME type from file extension */
@@ -262,6 +305,11 @@ export interface ResolvedContent {
   text: string;
   mediaUrl?: string;
   mediaType?: string;
+  /**
+   * RichText(=14) 图文混排展开后的全部图片 URL（有序，按 block 顺序）。
+   * 单图/纯媒体类型仍走 `mediaUrl`；此字段仅在一条消息可携带多张图时填充。
+   */
+  mediaUrls?: string[];
 }
 
 export interface ForwardUser {
@@ -329,9 +377,80 @@ export function resolveInnerMessageText(
     }
     case MessageType.MultipleForward:
       return "[合并转发]";
+    case MessageType.RichText: {
+      // 嵌套 RichText（引用/转发预览）：优先顶层 plain，缺则遍历 content blocks。
+      const rt = resolveRichTextContent(payload as any, buildUrl);
+      return rt.text || "[图文消息]";
+    }
     default:
       return payload.content ?? "[消息]";
   }
+}
+
+/**
+ * 将 RichText(=14) payload 展开成单条语义消息 `{ text, mediaUrls[] }`。
+ *
+ * 复刻 MultipleForward(=11) 的展开范式：
+ *   - 文本：优先读顶层 `plain`（server 权威生成的冗余纯文本）；
+ *     缺失时遍历 `content` block 数组现场拼接（text 取 text、image 注入占位符）。
+ *   - 图片：遍历 image block 收集 `url`（经 buildUrl 归一化为完整地址）。
+ *
+ * 向后兼容老 payload：`content` 为字符串时按单个 text block 处理。
+ */
+export function resolveRichTextContent(
+  payload: { content?: unknown; plain?: unknown; url?: string },
+  buildUrl?: (url?: string) => string | undefined,
+): { text: string; mediaUrls: string[] } {
+  const blocks = normalizeRichTextBlocks(payload?.content);
+  const mediaUrls: string[] = [];
+  for (const blk of blocks) {
+    if (blk.type === RICH_TEXT_BLOCK_IMAGE && blk.url) {
+      const full = buildUrl ? buildUrl(blk.url) : blk.url;
+      if (full) mediaUrls.push(full);
+    }
+  }
+  // 顶层 plain 优先（server 权威）。注意 plain 仅供展示，图片仍从 blocks 收集。
+  const topPlain = typeof payload?.plain === "string" ? payload.plain : "";
+  const text = topPlain.trim() !== ""
+    ? topPlain
+    : buildRichTextPlain(blocks);
+  return { text, mediaUrls };
+}
+
+/**
+ * 归一化 RichText `content`：
+ *   - 数组 → 原样（过滤非对象元素）；
+ *   - 字符串 → 视为单个 text block（向后兼容老的字符串 content）；
+ *   - 其它 → 空数组。
+ */
+function normalizeRichTextBlocks(content: unknown): RichTextBlock[] {
+  if (Array.isArray(content)) {
+    return content.filter((b): b is RichTextBlock => !!b && typeof b === "object");
+  }
+  if (typeof content === "string" && content) {
+    return [{ type: RICH_TEXT_BLOCK_TEXT, text: content }];
+  }
+  return [];
+}
+
+/**
+ * 遍历 content blocks 生成纯文本（对齐 octo-lib BuildRichTextPlain）：
+ *   - text block 取 text；
+ *   - image block 注入 RICH_TEXT_IMAGE_PLACEHOLDER；
+ *   - 未知 type 降级：有 text 写 text，否则跳过（Postel，展示端宽容）。
+ */
+function buildRichTextPlain(blocks: RichTextBlock[]): string {
+  let out = "";
+  for (const blk of blocks) {
+    if (blk.type === RICH_TEXT_BLOCK_IMAGE) {
+      out += RICH_TEXT_IMAGE_PLACEHOLDER;
+    } else if (blk.type === RICH_TEXT_BLOCK_TEXT) {
+      out += blk.text ?? "";
+    } else if (blk.text) {
+      out += blk.text;
+    }
+  }
+  return out;
 }
 
 /** Resolve MultipleForward payload into readable text */
@@ -408,6 +527,18 @@ function resolveContent(payload: BotMessage["payload"], apiUrl?: string, log?: C
     }
     case MessageType.MultipleForward: {
       return { text: resolveMultipleForwardText(payload, apiUrl, cdnUrl) };
+    }
+    case MessageType.RichText: {
+      // 图文混排：展开成单条语义 { text, mediaUrls[] }。优先顶层 plain，
+      // 缺则遍历 content blocks（复刻 MultipleForward 的展开范式）。
+      const buildUrl = (url?: string) => buildMediaUrl(url, apiUrl, cdnUrl);
+      const rt = resolveRichTextContent(payload as any, buildUrl);
+      const mediaUrls = rt.mediaUrls;
+      return {
+        text: rt.text,
+        ...(mediaUrls.length > 0 ? { mediaUrl: mediaUrls[0], mediaUrls } : {}),
+        ...(mediaUrls.length > 0 ? { mediaType: guessMime(mediaUrls[0], "image/jpeg") } : {}),
+      };
     }
     default:
       return { text: payload.content ?? payload.url ?? "" };
@@ -848,6 +979,7 @@ export function resolveApiMessagePlaceholder(type?: number, name?: string): stri
     case MessageType.Location: return "[位置信息]";
     case MessageType.Card: return "[名片]";
     case MessageType.MultipleForward: return "[合并转发]";
+    case MessageType.RichText: return "[图文消息]";
     default: return "[消息]";
   }
 }
@@ -1196,6 +1328,8 @@ export async function handleInboundMessage(params: {
   const resolved = resolveContent(message.payload, account.config.apiUrl, log, account.config.cdnUrl);
   let rawBody = resolved.text;
   let inboundMediaUrl = resolved.mediaUrl;
+  // RichText(=14) 图文混排可携带多张图：在此累积本地化后的图片路径。
+  let inboundMediaUrls: string[] | undefined;
 
   // Opportunistic uid→name cache fill from MultipleForward payloads
   if (message.payload?.type === MessageType.MultipleForward && Array.isArray(message.payload.users)) {
@@ -1210,6 +1344,18 @@ export async function handleInboundMessage(params: {
   if (inboundMediaUrl && message.payload?.type != null && mediaDownloadTypes.includes(message.payload.type)) {
     const localPath = await downloadMediaToLocal(inboundMediaUrl, resolved.mediaType, log);
     inboundMediaUrl = localPath; // undefined on failure — graceful degradation
+  }
+  // RichText(=14): download every embedded image to a local temp file (same
+  // rationale as single-media types above). Each failure degrades gracefully:
+  // a failed download is dropped from the list rather than passing a remote URL.
+  if (message.payload?.type === MessageType.RichText && resolved.mediaUrls?.length) {
+    const localPaths: string[] = [];
+    for (const remoteUrl of resolved.mediaUrls) {
+      const localPath = await downloadMediaToLocal(remoteUrl, guessMime(remoteUrl, "image/jpeg"), log);
+      if (localPath) localPaths.push(localPath);
+    }
+    inboundMediaUrls = localPaths.length > 0 ? localPaths : undefined;
+    inboundMediaUrl = inboundMediaUrls?.[0];
   }
   // Inline text file content if possible, or stream large files to temp
   const isFileMessage = message.payload?.type === MessageType.File;
@@ -1439,6 +1585,12 @@ export async function handleInboundMessage(params: {
           // For MultipleForward, expand the nested messages from full payload
           if (m.type === MessageType.MultipleForward && m.payload) {
             body = resolveMultipleForwardText(m.payload, account.config.apiUrl, account.config.cdnUrl);
+          }
+          // For RichText(=14), expand the 图文混排 payload into a single-line
+          // semantic body (plain text with [图片] placeholders), same as inbound.
+          if (m.type === MessageType.RichText && m.payload) {
+            const apiResolved = resolveContent(m.payload, account.config.apiUrl, log, account.config.cdnUrl);
+            if (apiResolved.text) body = apiResolved.text;
           }
           const entry: any = {
             sender: m.from_uid,
@@ -1795,11 +1947,19 @@ export async function handleInboundMessage(params: {
     CommandAuthorized: commandAuthorized,
     MediaUrl: isFileMessage ? undefined : inboundMediaUrl,
     MediaUrls: (() => {
-      // Only pass current message's local media path (no remote history URLs)
-      const current = isFileMessage ? undefined : inboundMediaUrl;
-      return current ? [current] : undefined;
+      if (isFileMessage) return undefined;
+      // RichText(=14): pass every locally-downloaded image (図文混排 multi-image).
+      if (inboundMediaUrls?.length) return inboundMediaUrls;
+      // Other types: only pass current message's local media path (no remote history URLs)
+      return inboundMediaUrl ? [inboundMediaUrl] : undefined;
     })(),
-    MediaTypes: resolved.mediaType ? [resolved.mediaType] : undefined,
+    MediaTypes: (() => {
+      if (isFileMessage) return undefined;
+      if (inboundMediaUrls?.length) {
+        return inboundMediaUrls.map((u) => guessMime(u, "image/jpeg"));
+      }
+      return resolved.mediaType ? [resolved.mediaType] : undefined;
+    })(),
     From: `${CHANNEL_ID}:${message.from_uid}`,
     To: `${CHANNEL_ID}:${sessionId}`,
     SessionKey: route.sessionKey,

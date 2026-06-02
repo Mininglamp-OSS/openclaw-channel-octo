@@ -1175,7 +1175,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           // Also allow event messages (e.g. group_md_updated) from any source.
           if (_knownBotUids.has(msg.from_uid) && msg.channel_type === ChannelType.DM && !isEvent) return;
           // Skip unsupported message types (Location, Card), but allow event messages through
-          const supportedTypes = [MessageType.Text, MessageType.Image, MessageType.GIF, MessageType.Voice, MessageType.Video, MessageType.File, MessageType.MultipleForward];
+          const supportedTypes = [MessageType.Text, MessageType.Image, MessageType.GIF, MessageType.Voice, MessageType.Video, MessageType.File, MessageType.MultipleForward, MessageType.RichText];
           if (!msg.payload || (!supportedTypes.includes(msg.payload.type) && !isEvent)) return;
 
           // Defense-in-depth DM filter (kept for safety, though v0.2.28+ uses independent

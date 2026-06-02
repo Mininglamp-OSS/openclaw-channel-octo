@@ -5,11 +5,12 @@
  * Each handler is stateless — maps and config are passed in via params.
  */
 
-import { ChannelType } from "./types.js";
-import type { MentionEntity, LogSink } from "./types.js";
+import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
+import type { MentionEntity, LogSink, RichTextBlock } from "./types.js";
 import { stripChannelPrefix } from "./constants.js";
 import {
   sendMessage,
+  sendRichTextMessage,
   getChannelMessages,
   getGroupMembers,
   fetchBotGroups,
@@ -17,7 +18,7 @@ import {
   getGroupMd,
   updateGroupMd,
 } from "./api-fetch.js";
-import { uploadAndSendMedia } from "./inbound.js";
+import { uploadAndSendMedia, uploadMedia } from "./inbound.js";
 import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions } from "./mention-utils.js";
 import { getKnownGroupIds } from "./group-md.js";
 import { checkPermission } from "./permission.js";
@@ -295,6 +296,109 @@ function resolveActionMediaUrls(args: Record<string, unknown>): string[] {
   return [...new Set(urls)];
 }
 
+/**
+ * 组装并发送一条 RichText(=14) 图文混排消息。
+ *
+ * 流程：先批量上传所有 media → 拿到 url/宽高；图片进 image block，非图片（文件等）
+ * 仍走旧的 uploadAndSendMedia 单发（RichText 契约 image block 只接受图片）。文本与
+ * 图片按「先文本后图片」顺序组成单条 content 数组，一次 HTTP 提交（替代 N+1 次）。
+ *
+ * 返回 null 表示「没有任何图片可组装」（全部是非图片文件 / 上传全失败）——调用方应
+ * 回退到旧的拆条路径，保留既有的文件/失败语义。
+ */
+async function sendRichTextCombined(params: {
+  message: string;
+  mediaUrls: string[];
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  resolveMentions: (raw: string) => {
+    finalMessage: string;
+    mentionUids: string[];
+    mentionEntities: MentionEntity[];
+    hasAtAll: boolean;
+  };
+  log?: LogSink;
+}): Promise<{ messageId?: string; imageCount: number; failedMedia: { url: string; error: string }[] } | null> {
+  const { message, mediaUrls, apiUrl, botToken, channelId, channelType, resolveMentions, log } = params;
+
+  // Batch-upload every media asset first.
+  const imageBlocks: RichTextBlock[] = [];
+  const nonImage: Array<{ originalUrl: string }> = [];
+  const failedMedia: { url: string; error: string }[] = [];
+
+  for (const mediaUrl of mediaUrls) {
+    try {
+      const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, log: log as any });
+      if (uploaded.isImage) {
+        imageBlocks.push({
+          type: RICH_TEXT_BLOCK_IMAGE,
+          url: uploaded.url,
+          ...(uploaded.width ? { width: uploaded.width } : {}),
+          ...(uploaded.height ? { height: uploaded.height } : {}),
+          ...(uploaded.size != null ? { size: uploaded.size } : {}),
+          ...(uploaded.filename ? { name: uploaded.filename } : {}),
+        });
+      } else {
+        // Non-image (e.g. PDF): RichText image block only accepts images, so
+        // keep the original URL and let the legacy single-send path deliver it.
+        nonImage.push({ originalUrl: mediaUrl });
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log?.error?.(`octo: uploadMedia failed for ${mediaUrl}: ${errMsg}`);
+      failedMedia.push({ url: mediaUrl, error: errMsg });
+    }
+  }
+
+  // No image survived → caller should fall back to the legacy split path so the
+  // text + any non-image files keep their established behavior.
+  if (imageBlocks.length === 0) {
+    return null;
+  }
+
+  const { finalMessage, mentionUids, mentionEntities, hasAtAll } = resolveMentions(message);
+
+  // content = [text block, ...image blocks]. Order matches the wire contract
+  // (array order = 图文穿插顺序). plain is best-effort; server reauthors it.
+  const blocks: RichTextBlock[] = [];
+  if (finalMessage.trim() !== "") {
+    blocks.push({ type: RICH_TEXT_BLOCK_TEXT, text: finalMessage });
+  }
+  blocks.push(...imageBlocks);
+  const plain = finalMessage + RICH_TEXT_IMAGE_PLACEHOLDER.repeat(imageBlocks.length);
+
+  const sendResult = await sendRichTextMessage({
+    apiUrl,
+    botToken,
+    channelId,
+    channelType,
+    blocks,
+    plain,
+    ...(mentionUids.length > 0 ? { mentionUids } : {}),
+    ...(mentionEntities.length > 0 ? { mentionEntities } : {}),
+    mentionAll: hasAtAll || undefined,
+  });
+  const messageId = sendResult?.message_id ? String(sendResult.message_id).trim() : undefined;
+
+  // Deliver any non-image files via the legacy single-send path (unchanged
+  // semantics) so file attachments alongside images still work.
+  let extraCount = 0;
+  for (const { originalUrl } of nonImage) {
+    try {
+      await uploadAndSendMedia({ mediaUrl: originalUrl, apiUrl, botToken, channelId, channelType, log: log as any });
+      extraCount += 1;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log?.error?.(`octo: uploadAndSendMedia failed for ${originalUrl}: ${errMsg}`);
+      failedMedia.push({ url: originalUrl, error: errMsg });
+    }
+  }
+
+  return { messageId, imageCount: imageBlocks.length + extraCount, failedMedia };
+}
+
 async function handleSend(params: {
   args: Record<string, unknown>;
   apiUrl: string;
@@ -367,12 +471,12 @@ async function handleSend(params: {
     }
   }
 
-  // Send text message
-  let textMessageId: string | undefined;
-  if (message) {
+  // Resolve mentions + @all once; reused by both the legacy text path and the
+  // RichText(=14) 图文混排 path so mention semantics stay identical.
+  const resolveMentions = (raw: string) => {
     let mentionUids: string[] = [];
     let mentionEntities: MentionEntity[] = [];
-    let finalMessage = message;
+    let finalMessage = raw;
 
     if (channelType === ChannelType.Group || channelType === ChannelType.CommunityTopic) {
       // v2 path: convert @[uid:name] → @name + entities
@@ -411,6 +515,53 @@ async function handleSend(params: {
 
     // Detect @all/@所有人 in final content
     const hasAtAll = /(?:^|(?<=\s))@(?:all|所有人)(?=\s|[^\w]|$)/i.test(finalMessage);
+
+    return { finalMessage, mentionUids, mentionEntities, hasAtAll };
+  };
+
+  // ── RichText(=14) 图文混排 path ──────────────────────────────────────────
+  // When the agent sends text PLUS at least one image, assemble a SINGLE
+  // RichText payload (one HTTP send) instead of "sendMessage + loop uploadMedia"
+  // (text + N media = N+1 sends). Opt-in via `richText: true` so the legacy
+  // split path (type 1/2/8/11) stays byte-for-byte the default; callers that
+  // want 图文混排 single-payload semantics ask for it explicitly. Triggers only
+  // when there IS a text message AND at least one media URL.
+  const richTextOptIn = args.richText === true;
+  if (message && mediaUrls.length > 0 && richTextOptIn) {
+    const richResult = await sendRichTextCombined({
+      message,
+      mediaUrls,
+      apiUrl,
+      botToken,
+      channelId,
+      channelType,
+      resolveMentions,
+      log,
+    });
+    if (richResult) {
+      return {
+        ok: true,
+        data: {
+          sent: true,
+          target,
+          channelId,
+          channelType,
+          richText: true,
+          mediaCount: richResult.imageCount,
+          ...(richResult.messageId ? { messageId: richResult.messageId } : {}),
+          ...(richResult.failedMedia.length > 0 ? { failedMedia: richResult.failedMedia } : {}),
+        },
+      };
+    }
+    // richResult === null → no images survived upload (e.g. all were non-image
+    // files or all uploads failed). Fall through to the legacy split path which
+    // sends the text and handles files/failures with the established semantics.
+  }
+
+  // Send text message
+  let textMessageId: string | undefined;
+  if (message) {
+    const { finalMessage, mentionUids, mentionEntities, hasAtAll } = resolveMentions(message);
 
     const sendResult = await sendMessage({
       apiUrl,

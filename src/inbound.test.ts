@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { ChannelType, MessageType, type MentionPayload } from "./types.js";
+import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, type MentionPayload } from "./types.js";
 import { DEFAULT_HISTORY_PROMPT_TEMPLATE } from "./config-schema.js";
 import {
   resolveInnerMessageText,
   resolveApiMessagePlaceholder,
   resolveMultipleForwardText,
+  resolveRichTextContent,
   buildMediaUrl,
   calcDownloadTimeout,
   formatSize,
@@ -475,6 +476,129 @@ describe("MultipleForward handling", () => {
     expect(resolveInnerMessageText({ type: MessageType.MultipleForward })).toBe("[合并转发]");
     expect(resolveInnerMessageText({ type: 99 })).toBe("[消息]");
     expect(resolveInnerMessageText({ type: 99, content: "fallback" })).toBe("fallback");
+  });
+});
+
+/**
+ * Tests for RichText(=14) 图文混排 inbound resolution.
+ *
+ * Contract (octo-lib common/richtext.go):
+ *   - content = ordered block array ([{type:'text',text}, {type:'image',url,...}]);
+ *   - plain = redundant flat text, server-authored;
+ *   - inbound maps RichText into a single semantic message { text, mediaUrls[] }.
+ */
+describe("RichText(=14) inbound resolution", () => {
+  it("prefers top-level plain when present", () => {
+    const result = resolveRichTextContent({
+      content: [
+        { type: RICH_TEXT_BLOCK_TEXT, text: "hello" },
+        { type: RICH_TEXT_BLOCK_IMAGE, url: "https://cdn.example.com/a.png", width: 10, height: 10 },
+      ],
+      plain: "server authored plain",
+    });
+    expect(result.text).toBe("server authored plain");
+    expect(result.mediaUrls).toEqual(["https://cdn.example.com/a.png"]);
+  });
+
+  it("falls back to building plain from blocks when plain missing", () => {
+    const result = resolveRichTextContent({
+      content: [
+        { type: RICH_TEXT_BLOCK_TEXT, text: "before " },
+        { type: RICH_TEXT_BLOCK_IMAGE, url: "https://cdn.example.com/a.png", width: 1, height: 1 },
+        { type: RICH_TEXT_BLOCK_TEXT, text: " after" },
+      ],
+    });
+    // text block + [图片] placeholder + text block, in array order
+    expect(result.text).toBe("before [图片] after");
+    expect(result.mediaUrls).toEqual(["https://cdn.example.com/a.png"]);
+  });
+
+  it("falls back to building plain when plain is whitespace-only", () => {
+    const result = resolveRichTextContent({
+      content: [{ type: RICH_TEXT_BLOCK_TEXT, text: "real text" }],
+      plain: "   ",
+    });
+    expect(result.text).toBe("real text");
+    expect(result.mediaUrls).toEqual([]);
+  });
+
+  it("collects every image url in array order", () => {
+    const result = resolveRichTextContent({
+      content: [
+        { type: RICH_TEXT_BLOCK_IMAGE, url: "https://cdn.example.com/1.png", width: 1, height: 1 },
+        { type: RICH_TEXT_BLOCK_TEXT, text: "mid" },
+        { type: RICH_TEXT_BLOCK_IMAGE, url: "https://cdn.example.com/2.png", width: 1, height: 1 },
+      ],
+    });
+    expect(result.mediaUrls).toEqual([
+      "https://cdn.example.com/1.png",
+      "https://cdn.example.com/2.png",
+    ]);
+    expect(result.text).toBe("[图片]mid[图片]");
+  });
+
+  it("normalizes relative image urls via buildUrl", () => {
+    const result = resolveRichTextContent(
+      {
+        content: [
+          { type: RICH_TEXT_BLOCK_IMAGE, url: "file/preview/abc.png", width: 1, height: 1 },
+        ],
+      },
+      (u) => buildMediaUrl(u, "http://api.example.com", "https://cdn.example.com"),
+    );
+    expect(result.mediaUrls).toEqual(["https://cdn.example.com/abc.png"]);
+  });
+
+  it("handles legacy string content (single text block) — backward compat", () => {
+    const result = resolveRichTextContent({ content: "legacy plain string" as any });
+    expect(result.text).toBe("legacy plain string");
+    expect(result.mediaUrls).toEqual([]);
+  });
+
+  it("degrades unknown block types: keeps text, skips noise (Postel)", () => {
+    const result = resolveRichTextContent({
+      content: [
+        { type: "future-thing", text: "kept" },
+        { type: "noise" },
+      ] as any,
+    });
+    expect(result.text).toBe("kept");
+    expect(result.mediaUrls).toEqual([]);
+  });
+
+  it("returns empty for empty/missing content", () => {
+    expect(resolveRichTextContent({ content: [] }).text).toBe("");
+    expect(resolveRichTextContent({ content: [] }).mediaUrls).toEqual([]);
+    expect(resolveRichTextContent({} as any).mediaUrls).toEqual([]);
+  });
+
+  it("resolveInnerMessageText expands nested RichText (引用/转发预览)", () => {
+    // Nested type-14 inside a quote/forward: prefer plain, fall back to blocks.
+    expect(
+      resolveInnerMessageText({
+        type: MessageType.RichText,
+        plain: "nested plain",
+        content: [{ type: RICH_TEXT_BLOCK_TEXT, text: "ignored when plain present" }],
+      } as any),
+    ).toBe("nested plain");
+
+    expect(
+      resolveInnerMessageText({
+        type: MessageType.RichText,
+        content: [
+          { type: RICH_TEXT_BLOCK_TEXT, text: "图: " },
+          { type: RICH_TEXT_BLOCK_IMAGE, url: "https://cdn.example.com/x.png", width: 1, height: 1 },
+        ],
+      } as any),
+    ).toBe("图: [图片]");
+  });
+
+  it("resolveInnerMessageText falls back to label for empty RichText", () => {
+    expect(resolveInnerMessageText({ type: MessageType.RichText, content: [] } as any)).toBe("[图文消息]");
+  });
+
+  it("resolveApiMessagePlaceholder labels RichText", () => {
+    expect(resolveApiMessagePlaceholder(MessageType.RichText)).toBe("[图文消息]");
   });
 });
 
