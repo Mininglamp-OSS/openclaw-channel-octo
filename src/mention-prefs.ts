@@ -7,10 +7,13 @@
  * to decide, per message, whether `requireMention` should be relaxed.
  *
  * Design mirrors member-cache.ts: a plain Map with per-entry TTL, lazy
- * (pull-on-miss) refresh, and an explicit invalidate hook. There is NO
- * push/event branch — the backend (octo-server#237) exposes only the
- * GET /v1/bot/groups/:group_no/mention_pref pull endpoint; there is no
- * config push bus. Edits propagate within at most one TTL window.
+ * (pull-on-miss) refresh, and an explicit invalidate hook. Freshness is driven
+ * primarily by an event: the backend (octo-server#242) pushes a
+ * `mention_pref_updated` notification when an owner toggles 免@, which inbound.ts
+ * intercepts and turns into invalidateMentionPref(accountId, groupNo) so the
+ * next message re-pulls via GET /v1/bot/groups/:group_no/mention_pref
+ * (octo-server#237). TTL is only a backstop should that event be dropped — a
+ * stale entry self-heals within one (short) TTL window.
  *
  * IMPORTANT: the cache key is the COMPOSITE `${accountId}:${parentGroupNo}`,
  * never the bare groupNo. The preference is per-bot — two bots in the same
@@ -25,13 +28,16 @@
 import { getMentionPref, fetchBotGroups, type MentionPref } from "./api-fetch.js";
 import type { LogSink } from "./types.js";
 
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes (positive: no_mention=true)
-// Negative results (no_mention=false) get a shorter TTL. getMentionPref returns
-// no_mention=false BOTH for a genuine "needs @" group AND as its failure
-// fallback, so a transient backend blip would otherwise pin no_mention=false
-// for a full 5min — delaying a freshly-enabled 免@ from taking effect. A short
-// negative TTL bounds that staleness while positive (免@) results, which are
-// the stable steady state, still cache for the full window.
+const CACHE_TTL_MS = 30 * 1000; // 30 seconds (positive: no_mention=true)
+// The cache is kept fresh primarily by the `mention_pref_updated` event (handled
+// in inbound.ts), which invalidates the affected (bot, group) entry the instant
+// an owner toggles 免@. TTL is now only a backstop: should that event ever be
+// dropped, a stale positive (免@) result self-heals within 30s instead of being
+// pinned for minutes. This is aligned with NEGATIVE_CACHE_TTL_MS below.
+// Negative results (no_mention=false) share the same short TTL. getMentionPref
+// returns no_mention=false BOTH for a genuine "needs @" group AND as its failure
+// fallback, so without a short TTL a transient backend blip would pin
+// no_mention=false and delay a freshly-enabled 免@ from taking effect.
 const NEGATIVE_CACHE_TTL_MS = 30 * 1000; // 30 seconds
 
 interface CacheEntry {
@@ -53,7 +59,7 @@ function cacheKey(accountId: string, parentGroupNo: string): string {
  * (account-level fallback). We still cache that, but with a shorter
  * NEGATIVE_CACHE_TTL_MS so a flaky backend doesn't hammer the API on every
  * inbound message yet a freshly-enabled 免@ surfaces within ~30s rather than
- * being masked for the full positive TTL.
+ * being masked for longer.
  */
 export async function getMentionPrefFromCache(params: {
   accountId: string;

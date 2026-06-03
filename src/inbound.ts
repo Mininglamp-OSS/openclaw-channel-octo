@@ -2,7 +2,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import type { ChannelLogSink } from "openclaw/plugin-sdk/channel-contract";
 import { DEFAULT_GROUP_HISTORY_LIMIT } from "openclaw/plugin-sdk/reply-history";
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadCredentials, uploadFileToCOS, fetchUserInfo } from "./api-fetch.js";
-import { getMentionPrefFromCache } from "./mention-prefs.js";
+import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
@@ -1293,6 +1293,19 @@ export async function handleInboundMessage(params: {
       log,
     }).catch((err) => log?.error?.(`octo: handleThreadMdEvent failed: ${String(err)}`));
 
+    return;
+  }
+
+  // Detect mention-pref (免@偏好) update notification — invalidate the cached
+  // (bot, group) entry so the next inbound message re-pulls the fresh value, do
+  // NOT pass to LLM. Mirrors the GROUP.md early-event pattern above. The mention
+  // gate caches no_mention per (accountId, parentGroupNo); without this an owner
+  // toggling 免@ would wait up to one TTL window for the change to take effect.
+  // TTL still backstops self-healing if this event is ever dropped.
+  if (earlyEventType === "mention_pref_updated" && message.channel_id) {
+    const groupNo = extractParentGroupNo(message.channel_id);
+    invalidateMentionPref(account.accountId, groupNo);
+    log?.info?.(`octo: mention_pref_updated for ${groupNo}, cache invalidated`);
     return;
   }
 

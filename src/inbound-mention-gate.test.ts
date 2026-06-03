@@ -3,7 +3,7 @@ import { ChannelType, MessageType } from "./types.js";
 import { handleInboundMessage } from "./inbound.js";
 import { setOctoRuntime } from "./runtime.js";
 import { registerKnownBot, _clearKnownBots } from "./bot-registry.js";
-import { _clearMentionPrefCache, _setMentionPrefEntry } from "./mention-prefs.js";
+import { _clearMentionPrefCache, _setMentionPrefEntry, _hasMentionPrefEntry } from "./mention-prefs.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 
 /**
@@ -471,5 +471,77 @@ describe("inbound mention-gate 免@ relaxation (P1: human-only)", () => {
     expect(memberRobotMap.has(UNKNOWN_UID)).toBe(false);
     expect(dispatch).not.toHaveBeenCalled();
     expect(sends.length).toBe(0);
+  });
+});
+
+describe("inbound mention_pref_updated event → cache invalidation (GH#60)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    _clearKnownBots();
+    _clearMentionPrefCache();
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    _clearKnownBots();
+    _clearMentionPrefCache();
+  });
+
+  function makeMentionPrefEvent() {
+    return {
+      message_id: "evt1",
+      message_seq: 200,
+      from_uid: "system",
+      channel_id: GROUP_ID,
+      channel_type: ChannelType.Group,
+      timestamp: Math.floor(Date.now() / 1000),
+      payload: { event: { type: "mention_pref_updated", group_no: GROUP_ID } },
+    };
+  }
+
+  it("invalidates the cached (bot, group) entry and does NOT dispatch to the LLM", async () => {
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub();
+
+    // Pre-seed a stale 免@ pref for this (bot, group).
+    _setMentionPrefEntry("acct1", GROUP_ID, { no_mention: true });
+    expect(_hasMentionPrefEntry("acct1", GROUP_ID)).toBe(true);
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeMentionPrefEvent() as any,
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+    });
+
+    // Cache entry was dropped; event was swallowed (no LLM dispatch, no reply).
+    expect(_hasMentionPrefEntry("acct1", GROUP_ID)).toBe(false);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sends.length).toBe(0);
+  });
+
+  it("only invalidates the targeted group, leaving other entries intact", async () => {
+    installRuntimeStub();
+    installFetchStub();
+
+    _setMentionPrefEntry("acct1", GROUP_ID, { no_mention: true });
+    _setMentionPrefEntry("acct1", "other_group", { no_mention: true });
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeMentionPrefEvent() as any,
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+    });
+
+    expect(_hasMentionPrefEntry("acct1", GROUP_ID)).toBe(false);
+    expect(_hasMentionPrefEntry("acct1", "other_group")).toBe(true);
   });
 });
