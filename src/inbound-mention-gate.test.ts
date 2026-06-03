@@ -25,6 +25,9 @@ const API = "http://octo.test";
 const BOT_UID = "bot_self_0000000000000000000000000000";
 const HUMAN_UID = "human_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER_BOT_UID = "bot_other_111111111111111111111111111";
+// A bot from another OpenClaw process / external integration: present in the
+// server member list with robot:true but NEVER passed to registerKnownBot().
+const EXTERNAL_BOT_UID = "bot_extern_22222222222222222222222222";
 const GROUP_ID = "g_room_1";
 
 const originalFetch = globalThis.fetch;
@@ -106,6 +109,9 @@ function installFetchStub() {
           { uid: HUMAN_UID, name: "Alice", robot: false },
           { uid: BOT_UID, name: "SelfBot", robot: true },
           { uid: OTHER_BOT_UID, name: "OtherBot", robot: true },
+          // Cross-process / external bot: server marks it robot:true, but this
+          // plugin never registered it via registerKnownBot().
+          { uid: EXTERNAL_BOT_UID, name: "ExternalBot", robot: true },
         ],
       });
     }
@@ -225,5 +231,60 @@ describe("inbound mention-gate 免@ relaxation (P1: human-only)", () => {
     const calledUrls = (globalThis.fetch as any).mock.calls.map((c: any[]) => String(c[0]));
     expect(calledUrls.some((u: string) => u.includes("/mention_pref"))).toBe(false);
     expect(sends.length).toBe(0);
+  });
+
+  it("does NOT reply to a CROSS-PROCESS bot (robot:true in member list, NOT registerKnownBot'd)", async () => {
+    // Regression for PR#57 round-2 P1: the loop guard must use the
+    // server-authoritative GroupMember.robot signal, not just the local
+    // registerKnownBot() set. EXTERNAL_BOT_UID is robot:true in the group
+    // member list but was never registered, so isKnownBot() returns false for
+    // it. Before the fix it was treated as human → 免@ relaxed → reply → loop.
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub();
+    // Force a member-cache fetch so the robot flag is loaded from the server.
+    const memberRobotMap = new Map<string, boolean>();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeTextMessage(EXTERNAL_BOT_UID, "hello from a bot in another process"),
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      memberRobotMap,
+    });
+
+    // Gate kept requireMention for the server-flagged robot sender: no dispatch,
+    // no send. The robot flag was sourced from the member list.
+    expect(memberRobotMap.get(EXTERNAL_BOT_UID)).toBe(true);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sends.length).toBe(0);
+  });
+
+  it("DOES reply to a CROSS-PROCESS bot that explicitly @mentions this bot", async () => {
+    // Explicit @mention always triggers, even from a server-flagged robot that
+    // is not locally registered — symmetric with the known-bot @mention case.
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub();
+
+    const msg = makeTextMessage(EXTERNAL_BOT_UID, "@SelfBot ping");
+    (msg.payload as any).mention = { uids: [BOT_UID] };
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: msg,
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      memberRobotMap: new Map(),
+    });
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(sends.length).toBeGreaterThan(0);
   });
 });

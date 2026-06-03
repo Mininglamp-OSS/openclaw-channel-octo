@@ -239,6 +239,20 @@ function getOrCreateGroupCacheTimestamps(accountId: string): Map<string, number>
   return m;
 }
 
+// Module-level robot flags: uid -> robot (server-authoritative GroupMember.robot)
+// Consulted by the 免@ mention gate to keep requireMention for ANY bot sender,
+// including cross-process / external bots not registered via registerKnownBot().
+// Flat uid→robot map (not keyed by groupId), like uidToNameMap.
+const _memberRobotMaps = new Map<string, Map<string, boolean>>();
+function getOrCreateMemberRobotMap(accountId: string): Map<string, boolean> {
+  let m = _memberRobotMaps.get(accountId);
+  if (!m) {
+    m = new Map<string, boolean>();
+    _memberRobotMaps.set(accountId, m);
+  }
+  return m;
+}
+
 
 // --- Group → Account mapping: tracks which accounts are active in each group ---
 // Used by handleAction to resolve the correct account when framework passes wrong accountId
@@ -1162,6 +1176,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 4d. Group cache timestamps — track when each group's members were last fetched
       const groupCacheTimestamps = getOrCreateGroupCacheTimestamps(account.accountId);
 
+      // 4e. Robot flags map — server-authoritative sender classification for the 免@ gate
+      const memberRobotMap = getOrCreateMemberRobotMap(account.accountId);
+
       // 5. Token refresh state — time-based cooldown to prevent refresh storms
       let lastTokenRefreshAt = 0;
       const TOKEN_REFRESH_COOLDOWN_MS = 60_000; // 60 seconds
@@ -1240,6 +1257,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                 memberMap,
                 uidToNameMap,
                 groupCacheTimestamps,
+                memberRobotMap,
                 groupMdCache,
                 log,
                 statusSink,
