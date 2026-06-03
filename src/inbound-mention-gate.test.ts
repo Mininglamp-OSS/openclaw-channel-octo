@@ -1,0 +1,229 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { ChannelType, MessageType } from "./types.js";
+import { handleInboundMessage } from "./inbound.js";
+import { setOctoRuntime } from "./runtime.js";
+import { registerKnownBot, _clearKnownBots } from "./bot-registry.js";
+import { _clearMentionPrefCache, _setMentionPrefEntry } from "./mention-prefs.js";
+import type { ResolvedOctoAccount } from "./accounts.js";
+
+/**
+ * Integration test for the inbound mention-gate 免@ relaxation (PR#57 review P1).
+ *
+ * The 免@ (no_mention=true) group preference relaxes requireMention so the bot
+ * replies to non-@ messages. The fix scopes that relaxation to HUMAN senders:
+ * messages from a known bot must still require an explicit @mention, otherwise
+ * two 免@ bots in the same group reply to each other forever (bot-to-bot loop).
+ *
+ * These tests drive the real handleInboundMessage with a stubbed OpenClaw
+ * runtime + stubbed network so we exercise the actual gate (not a re-impl).
+ * "Replied" is observed via the dispatcher being invoked AND a text message
+ * being POSTed to the send endpoint; "suppressed" is observed via the history-
+ * only short-circuit (no dispatch, no send).
+ */
+
+const API = "http://octo.test";
+const BOT_UID = "bot_self_0000000000000000000000000000";
+const HUMAN_UID = "human_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OTHER_BOT_UID = "bot_other_111111111111111111111111111";
+const GROUP_ID = "g_room_1";
+
+const originalFetch = globalThis.fetch;
+
+function makeAccount(): ResolvedOctoAccount {
+  return {
+    accountId: "acct1",
+    enabled: true,
+    configured: true,
+    config: {
+      botToken: "tok",
+      apiUrl: API,
+      pollIntervalMs: 1000,
+      heartbeatIntervalMs: 1000,
+      requireMention: true, // account requires @ by default; 免@ pref relaxes it
+    },
+  };
+}
+
+function makeTextMessage(fromUid: string, content: string) {
+  return {
+    message_id: "m1",
+    message_seq: 100,
+    from_uid: fromUid,
+    channel_id: GROUP_ID,
+    channel_type: ChannelType.Group,
+    timestamp: Math.floor(Date.now() / 1000),
+    payload: { type: MessageType.Text, content },
+  };
+}
+
+/**
+ * Stub OpenClaw runtime. The dispatcher immediately emits one final text block
+ * so the buffered-text path runs and POSTs a reply — letting us assert "replied"
+ * by observing the send endpoint.
+ */
+function installRuntimeStub(): { dispatch: ReturnType<typeof vi.fn> } {
+  const dispatch = vi.fn(async (args: any) => {
+    await args.dispatcherOptions.deliver({ text: "hi there" }, { kind: "final" });
+  });
+  setOctoRuntime({
+    config: { loadConfig: () => ({}) },
+    channel: {
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: dispatch,
+        resolveEnvelopeFormatOptions: () => ({}),
+        formatAgentEnvelope: ({ body }: any) => body,
+        finalizeInboundContext: (ctx: any) => ctx,
+      },
+      routing: {
+        resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/store",
+        readSessionUpdatedAt: () => undefined,
+        recordInboundSession: async () => {},
+      },
+    },
+  } as any);
+  return { dispatch };
+}
+
+/**
+ * Network stub. Members endpoint returns the human + both bots (with robot
+ * flags); the bot's own GROUP.md / mention_pref are answered benignly; the send
+ * + typing + read-receipt endpoints record calls. Returns the list of POSTed
+ * send-message bodies so we can assert a reply went out.
+ */
+function installFetchStub() {
+  const sends: any[] = [];
+  globalThis.fetch = vi.fn(async (input: any, init?: any) => {
+    const url = typeof input === "string" ? input : input.toString();
+    const json = (data: unknown, status = 200) =>
+      new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+
+    if (url.includes("/members")) {
+      return json({
+        members: [
+          { uid: HUMAN_UID, name: "Alice", robot: false },
+          { uid: BOT_UID, name: "SelfBot", robot: true },
+          { uid: OTHER_BOT_UID, name: "OtherBot", robot: true },
+        ],
+      });
+    }
+    if (url.includes("/mention_pref")) return json({ no_mention: true });
+    if (url.includes("/md")) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
+    if (url.includes("/messages/sync")) return json({ messages: [] });
+    if (url.includes("/readReceipt")) return json({});
+    if (url.includes("/typing")) return json({});
+    // sendMessage POST → record the outbound reply
+    if (url.includes("/sendMessage")) {
+      sends.push(init?.body ? JSON.parse(init.body) : {});
+      return json({ message_id: "reply1", message_seq: 0 });
+    }
+    // Default benign 200
+    return json({});
+  }) as unknown as typeof fetch;
+  return { sends };
+}
+
+describe("inbound mention-gate 免@ relaxation (P1: human-only)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    _clearKnownBots();
+    _clearMentionPrefCache();
+    // Register both this bot and the other bot as known bots.
+    registerKnownBot(BOT_UID);
+    registerKnownBot(OTHER_BOT_UID);
+    // Pre-seed the 免@ pref so no network round-trip is needed for the lookup.
+    _setMentionPrefEntry("acct1", GROUP_ID, { no_mention: true });
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    _clearKnownBots();
+    _clearMentionPrefCache();
+  });
+
+  it("replies to a HUMAN non-@ message in a 免@ group", async () => {
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeTextMessage(HUMAN_UID, "hello bot"),
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+    });
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(sends.length).toBeGreaterThan(0);
+  });
+
+  it("does NOT reply to a KNOWN-BOT non-@ message in a 免@ group (loop guard)", async () => {
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeTextMessage(OTHER_BOT_UID, "hello from other bot"),
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+    });
+
+    // History-only short-circuit: gate kept requireMention for the bot sender,
+    // the non-@ message was cached as context and the bot never dispatched.
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sends.length).toBe(0);
+  });
+
+  it("DOES reply to a KNOWN-BOT message that explicitly @mentions this bot", async () => {
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub();
+
+    const msg = makeTextMessage(OTHER_BOT_UID, "@SelfBot ping");
+    (msg.payload as any).mention = { uids: [BOT_UID] };
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: msg,
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+    });
+
+    // Explicit @mention always triggers, even from a known bot.
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(sends.length).toBeGreaterThan(0);
+  });
+
+  it("suppresses the group-pref lookup for known-bot senders (no mention_pref fetch)", async () => {
+    installRuntimeStub();
+    const { sends } = installFetchStub();
+    // Force a cache miss so a lookup WOULD hit the network if attempted.
+    _clearMentionPrefCache();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeTextMessage(OTHER_BOT_UID, "noise"),
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+    });
+
+    const calledUrls = (globalThis.fetch as any).mock.calls.map((c: any[]) => String(c[0]));
+    expect(calledUrls.some((u: string) => u.includes("/mention_pref"))).toBe(false);
+    expect(sends.length).toBe(0);
+  });
+});

@@ -1466,4 +1466,24 @@ describe("getMentionPref", () => {
       getMentionPref({ apiUrl: "http://x", botToken: "t", groupNo: "g" }),
     ).resolves.toEqual({ no_mention: false });
   });
+
+  it("uses a short (≤5s) hot-path timeout, not the 30s default", async () => {
+    // This is the per-message hot-path lookup: on a cache miss it fires on the
+    // first message of every group every TTL window and, before the backend
+    // ships, 404s. It must not stall inbound for the full 30s DEFAULT_TIMEOUT_MS.
+    let seenSignal: AbortSignal | undefined;
+    global.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seenSignal = init?.signal ?? undefined;
+      return new Response(JSON.stringify({ no_mention: false }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const { getMentionPref } = await import("./api-fetch.js");
+    await getMentionPref({ apiUrl: "http://x", botToken: "t", groupNo: "g" });
+
+    expect(seenSignal).toBeInstanceOf(AbortSignal);
+    // The short timeout aborts well before the 30s default. Wait past the
+    // expected 3s window and confirm the signal has fired.
+    await new Promise((r) => setTimeout(r, 3200));
+    expect(seenSignal!.aborted).toBe(true);
+  }, 10_000);
 });

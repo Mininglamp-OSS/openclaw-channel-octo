@@ -138,6 +138,86 @@ describe("mention-prefs", () => {
 
       expect(pref).toEqual({ no_mention: false });
     });
+
+    it("caches a negative (no_mention=false) result with a short TTL so it re-pulls soon", async () => {
+      // Negative results (genuine "needs @" OR failure fallback) must not be
+      // pinned for the full 5min positive TTL — a freshly-enabled 免@ should
+      // surface within the short negative window. We assert the entry expires
+      // well before 5min by advancing the clock past the 30s negative TTL.
+      vi.useFakeTimers();
+      try {
+        let calls = 0;
+        const fetchMock = mockFetch(async () => {
+          calls++;
+          // First pull: needs @ (negative). Second pull (after short TTL): 免@.
+          return jsonResponse({ no_mention: calls >= 2 });
+        });
+        globalThis.fetch = fetchMock;
+
+        const first = await getMentionPrefFromCache({
+          accountId: "acct1",
+          parentGroupNo: "gneg",
+          apiUrl: API,
+          botToken: TOKEN,
+        });
+        expect(first).toEqual({ no_mention: false });
+        expect(calls).toBe(1);
+
+        // Just before the negative TTL elapses → still served from cache.
+        vi.advanceTimersByTime(29 * 1000);
+        const cached = await getMentionPrefFromCache({
+          accountId: "acct1",
+          parentGroupNo: "gneg",
+          apiUrl: API,
+          botToken: TOKEN,
+        });
+        expect(cached).toEqual({ no_mention: false });
+        expect(calls).toBe(1);
+
+        // Past the 30s negative TTL → re-pulls and now sees 免@.
+        vi.advanceTimersByTime(2 * 1000);
+        const refreshed = await getMentionPrefFromCache({
+          accountId: "acct1",
+          parentGroupNo: "gneg",
+          apiUrl: API,
+          botToken: TOKEN,
+        });
+        expect(refreshed).toEqual({ no_mention: true });
+        expect(calls).toBe(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("caches a positive (no_mention=true) result for the full 5min TTL", async () => {
+      vi.useFakeTimers();
+      try {
+        const fetchMock = mockFetch(async () => jsonResponse({ no_mention: true }));
+        globalThis.fetch = fetchMock;
+
+        const first = await getMentionPrefFromCache({
+          accountId: "acct1",
+          parentGroupNo: "gpos",
+          apiUrl: API,
+          botToken: TOKEN,
+        });
+        expect(first).toEqual({ no_mention: true });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+
+        // Past the 30s negative window but within 5min → still cached (positive TTL).
+        vi.advanceTimersByTime(60 * 1000);
+        const cached = await getMentionPrefFromCache({
+          accountId: "acct1",
+          parentGroupNo: "gpos",
+          apiUrl: API,
+          botToken: TOKEN,
+        });
+        expect(cached).toEqual({ no_mention: true });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("invalidateMentionPref", () => {

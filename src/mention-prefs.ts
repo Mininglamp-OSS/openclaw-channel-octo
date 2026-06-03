@@ -25,7 +25,14 @@
 import { getMentionPref, fetchBotGroups, type MentionPref } from "./api-fetch.js";
 import type { LogSink } from "./types.js";
 
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes (positive: no_mention=true)
+// Negative results (no_mention=false) get a shorter TTL. getMentionPref returns
+// no_mention=false BOTH for a genuine "needs @" group AND as its failure
+// fallback, so a transient backend blip would otherwise pin no_mention=false
+// for a full 5min — delaying a freshly-enabled 免@ from taking effect. A short
+// negative TTL bounds that staleness while positive (免@) results, which are
+// the stable steady state, still cache for the full window.
+const NEGATIVE_CACHE_TTL_MS = 30 * 1000; // 30 seconds
 
 interface CacheEntry {
   pref: MentionPref;
@@ -43,8 +50,10 @@ function cacheKey(accountId: string, parentGroupNo: string): string {
  * Get the 免@偏好 for a (bot, group) pair, refreshing lazily on miss/expiry.
  *
  * On a fetch failure getMentionPref already returns `{ no_mention: false }`
- * (account-level fallback), which we cache like any other result so a flaky
- * backend doesn't hammer the API on every inbound message.
+ * (account-level fallback). We still cache that, but with a shorter
+ * NEGATIVE_CACHE_TTL_MS so a flaky backend doesn't hammer the API on every
+ * inbound message yet a freshly-enabled 免@ surfaces within ~30s rather than
+ * being masked for the full positive TTL.
  */
 export async function getMentionPrefFromCache(params: {
   accountId: string;
@@ -68,7 +77,8 @@ export async function getMentionPrefFromCache(params: {
         }
       : undefined,
   });
-  _prefCache.set(key, { pref, expiry: Date.now() + CACHE_TTL_MS });
+  const ttl = pref.no_mention ? CACHE_TTL_MS : NEGATIVE_CACHE_TTL_MS;
+  _prefCache.set(key, { pref, expiry: Date.now() + ttl });
   return pref;
 }
 

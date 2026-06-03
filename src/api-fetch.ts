@@ -11,6 +11,11 @@ import { randomUUID } from "node:crypto";
 import COS from "cos-nodejs-sdk-v5";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+// Short timeout for the per-message mention_pref hot-path lookup. On a cache
+// miss this fires on the first message of every group every TTL window; before
+// the backend ships it 404s, and we must not stall the inbound pipeline for the
+// full 30s. A failed/slow lookup just falls back to the account-level config.
+const MENTION_PREF_TIMEOUT_MS = 3_000;
 
 /**
  * 生成出站消息的客户端幂等编号 client_msg_no（UUID）。
@@ -529,7 +534,7 @@ export async function getMentionPref(params: {
       headers: {
         Authorization: `Bearer ${params.botToken}`,
       },
-      signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+      signal: AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
     });
     if (!resp.ok) {
       params.log?.error?.(`octo: getMentionPref(${params.groupNo}) failed: ${resp.status}`);

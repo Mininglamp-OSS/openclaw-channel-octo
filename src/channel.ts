@@ -33,6 +33,7 @@ import type { MentionEntity } from "./types.js";
 import { handleOctoMessageAction, parseTarget, resolveOutboundOctoTarget, normalizeOutboundChannelPrefix, extractInlineMentionUids } from "./actions.js";
 import { getOrCreateGroupMdCache, registerBotGroupIds, getKnownGroupIds, writeGroupMdToDisk } from "./group-md.js";
 import { registerOwnerUid } from "./owner-registry.js";
+import { registerKnownBot, isKnownBot } from "./bot-registry.js";
 import { preloadGroupMemberCache, getGroupMembersFromCache } from "./member-cache.js";
 import { preloadMentionPrefs } from "./mention-prefs.js";
 import { initPersonaPromptCache, stopPersonaPromptCache } from "./persona-prompt.js";
@@ -296,8 +297,15 @@ function cleanupStaleCaches(): void {
   }
 }
 
-// Known bot robot_ids across all accounts — for bot-to-bot loop prevention
-const _knownBotUids = new Set<string>();
+// Known bot robot_ids across all accounts — for bot-to-bot loop prevention.
+// Backed by the shared bot-registry so inbound.ts can consult the same set
+// without importing channel.ts (channel.ts → inbound.ts is one-way; importing
+// back would create a cycle). The thin wrapper keeps existing call sites
+// (_knownBotUids.add / .has) unchanged.
+const _knownBotUids = {
+  add: (uid: string) => registerKnownBot(uid),
+  has: (uid: string) => isKnownBot(uid),
+};
 
 // Singleton timer to prevent accumulation during hot reload (#54)
 let _cleanupTimer: NodeJS.Timeout | null = null;

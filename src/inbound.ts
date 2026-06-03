@@ -22,6 +22,7 @@ import {
 import type { MentionPayload, MentionEntity, SendMessageResult } from "./types.js";
 import { registerGroupAccount, ensureGroupMd, handleGroupMdEvent, broadcastGroupMdUpdate, extractParentGroupNo, extractThreadShortId, ensureThreadMd, handleThreadMdEvent } from "./group-md.js";
 import { isOwner } from "./owner-registry.js";
+import { isKnownBot } from "./bot-registry.js";
 import { getPersonaPromptForSession } from "./persona-prompt.js";
 import { createWriteStream } from "node:fs";
 import { mkdir, unlink, readdir, stat } from "node:fs/promises";
@@ -1431,19 +1432,37 @@ export async function handleInboundMessage(params: {
   // preference, so we resolve the parent group_no first. On miss/expiry the
   // cache pulls GET /v1/bot/groups/:group_no/mention_pref (TTL 5min); any
   // failure falls back to the account-level config, so the gate never crashes.
-  const parentGroupNo = isGroup ? extractParentGroupNo(message.channel_id!) : '';
-  const mentionPref = isGroup
+  //
+  // The 免@ relaxation is HUMAN-ONLY. channel.ts forwards other bots' group
+  // messages into here on purpose, relying on this mention gate to drop the
+  // non-@ ones. If we relaxed requireMention for a known-bot sender, two 免@
+  // bots in the same group would reply to each other with no @ to break the
+  // chain — an unbounded bot-to-bot loop (group spam + token burn). So known
+  // bots always keep requireMention regardless of the group 免@ preference.
+  const isFromKnownBot = isKnownBot(message.from_uid);
+  // account-level requireMention: false means the account is already 免@.
+  const accountRequiresMention = account.config.requireMention !== false;
+  // Only consult the group 免@ preference when it can actually change the
+  // outcome: the account must otherwise require @ (else the pref can only
+  // return no_mention=false, with no effect) AND the sender must be human (the
+  // relaxation never applies to known bots). This also avoids a pointless hot-
+  // path network round-trip (cache miss → up to DEFAULT_TIMEOUT_MS).
+  const shouldCheckGroupPref = isGroup && accountRequiresMention && !isFromKnownBot;
+  const mentionPref = shouldCheckGroupPref
     ? await getMentionPrefFromCache({
         accountId: account.accountId,
-        parentGroupNo,
+        parentGroupNo: extractParentGroupNo(message.channel_id!),
         apiUrl: account.config.apiUrl,
+        // botToken ?? "" can yield an empty `Bearer` header; getMentionPref
+        // treats any non-2xx (incl. the resulting 401) as no_mention=false, so
+        // the gate safely falls back to the account-level config.
         botToken: account.config.botToken ?? "",
         log,
       })
     : undefined;
   const requireMention = mentionPref?.no_mention === true
     ? false
-    : (account.config.requireMention !== false);
+    : accountRequiresMention;
   let historyPrefix = "";
 
   // Save original mention uids for reply (exclude bot itself)
