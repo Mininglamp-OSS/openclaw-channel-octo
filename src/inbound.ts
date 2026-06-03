@@ -1464,22 +1464,40 @@ export async function handleInboundMessage(params: {
   // cache pulls GET /v1/bot/groups/:group_no/mention_pref (TTL 5min); any
   // failure falls back to the account-level config, so the gate never crashes.
   //
-  // The 免@ relaxation is HUMAN-ONLY. channel.ts forwards other bots' group
-  // messages into here on purpose, relying on this mention gate to drop the
-  // non-@ ones. If we relaxed requireMention for a bot sender, two 免@ bots in
-  // the same group would reply to each other with no @ to break the chain — an
-  // unbounded bot-to-bot loop (group spam + token burn). So bots always keep
-  // requireMention regardless of the group 免@ preference.
+  // The 免@ relaxation is HUMAN-ONLY and FAIL-CLOSED (PR#57 round-4 P1).
+  // channel.ts forwards other bots' group messages into here on purpose,
+  // relying on this mention gate to drop the non-@ ones. If we relaxed
+  // requireMention for a non-human sender, two 免@ bots in the same group would
+  // reply to each other with no @ to break the chain — an unbounded bot-to-bot
+  // loop (group spam + token burn).
   //
-  // Bot classification uses TWO signals, combined so either one suffices:
-  //   1. isKnownBot(from_uid) — bots registered by THIS plugin process.
-  //   2. memberRobotMap.get(from_uid) === true — the server-authoritative
-  //      GroupMember.robot flag from the member list. This catches bots from
-  //      ANOTHER OpenClaw process, another integration, or any bot not started
-  //      by this instance — exactly the cross-process loop case (1) misses.
+  // Earlier rounds used a BLACKLIST ("relax UNLESS the sender is a proven
+  // bot"), which fails OPEN: any sender we could not positively prove was a bot
+  // defaulted to "human" and had requireMention relaxed. That left loop paths
+  // open whenever classification was uncertain — an unknown/cross-process
+  // sender absent from isKnownBot, or ANY sender when refreshGroupMemberCache
+  // failed/returned empty so memberRobotMap was never populated (robot flag →
+  // undefined → treated as human → reply → loop).
+  //
+  // We invert to a WHITELIST: relax requireMention ONLY for a sender the
+  // server-authoritative member list positively confirms as human. This closes
+  // every loop path at once, independent of where the sender came from, how its
+  // robot flag was serialized, or whether the member refresh succeeded:
+  //   memberRobotMap.get(uid) === false → confirmed human          → may relax
+  //   memberRobotMap.get(uid) === true  → confirmed bot             → keep @
+  //   memberRobotMap.get(uid) === undefined (unknown sender, OR the
+  //       member refresh failed/empty so the map is unpopulated)
+  //                                      → classification unknown   → keep @
+  //   isKnownBot(uid)                   → bot from this process     → keep @
+  //
+  // memberRobotMap is populated by the refreshGroupMemberCache() call above;
+  // a failed/empty refresh simply leaves the sender's uid absent → undefined →
+  // fail-closed. We key on this per-sender map entry rather than the refresh()
+  // boolean on purpose: that boolean is ambiguous (it also returns false on a
+  // warm-cache hit, and the maps are shared across groups), so gating on it
+  // would wrongly suppress replies to humans on every cached message.
   const isFromKnownBot = isKnownBot(message.from_uid);
-  const isFromServerRobot = memberRobotMap.get(message.from_uid) === true;
-  const isFromBot = isFromKnownBot || isFromServerRobot;
+  const isConfirmedHuman = !isFromKnownBot && memberRobotMap.get(message.from_uid) === false;
   // account-level requireMention: false means the account is already 免@.
   const accountRequiresMention = account.config.requireMention !== false;
   let historyPrefix = "";
@@ -1562,13 +1580,16 @@ export async function handleInboundMessage(params: {
   // Only consult the group pref when it can actually change the outcome:
   //   1. isGroup && accountRequiresMention — else the pref can only return
   //      no_mention=false, with no effect.
-  //   2. !isFromBot — the 免@ relaxation never applies to bot senders.
+  //   2. isConfirmedHuman — the 免@ relaxation is whitelist/fail-closed: it
+  //      applies ONLY to a sender the member list positively confirms is human.
+  //      Unknown senders, refresh failures, and any bot keep requireMention, so
+  //      there is no point paying for the pref lookup for them either.
   //   3. !isMentioned — an explicit @bot message already passes the gate, so
   //      the pref can't change anything. Short-circuiting here keeps explicit
   //      @bot replies off the (cold/slow) pref network path entirely, avoiding
   //      up to MENTION_PREF_TIMEOUT_MS of needless latency on the hot path.
   const shouldCheckGroupPref =
-    isGroup && accountRequiresMention && !isFromBot && !isMentioned;
+    isGroup && accountRequiresMention && isConfirmedHuman && !isMentioned;
   const mentionPref = shouldCheckGroupPref
     ? await getMentionPrefFromCache({
         accountId: account.accountId,

@@ -10,9 +10,13 @@ import type { ResolvedOctoAccount } from "./accounts.js";
  * Integration test for the inbound mention-gate 免@ relaxation (PR#57 review P1).
  *
  * The 免@ (no_mention=true) group preference relaxes requireMention so the bot
- * replies to non-@ messages. The fix scopes that relaxation to HUMAN senders:
- * messages from a known bot must still require an explicit @mention, otherwise
- * two 免@ bots in the same group reply to each other forever (bot-to-bot loop).
+ * replies to non-@ messages. The fix scopes that relaxation to HUMAN senders,
+ * and does so FAIL-CLOSED (round-4): the gate relaxes requireMention ONLY for a
+ * sender the server-authoritative member list positively confirms is human
+ * (memberRobotMap.get(uid) === false). Unknown senders, ANY robot, and the case
+ * where the member refresh fails/returns empty (so the robot flag is undefined)
+ * all keep requireMention — otherwise two 免@ bots in the same group, or any
+ * mis-classified sender, reply to each other forever (bot-to-bot loop).
  *
  * These tests drive the real handleInboundMessage with a stubbed OpenClaw
  * runtime + stubbed network so we exercise the actual gate (not a re-impl).
@@ -132,6 +136,38 @@ function installFetchStub() {
       return json({ message_id: "reply1", message_seq: 0 });
     }
     // Default benign 200
+    return json({});
+  }) as unknown as typeof fetch;
+  return { sends };
+}
+
+/**
+ * Network stub variant where the group-members endpoint FAILS (or returns
+ * empty), so refreshGroupMemberCache can't populate memberRobotMap. Every other
+ * endpoint behaves like installFetchStub. Used to prove the fail-closed gate:
+ * with no server robot flag, even a real human sender stays gated because the
+ * member list never confirmed them as human.
+ */
+function installFetchStubMembersDown(mode: "error" | "empty" = "error") {
+  const sends: any[] = [];
+  globalThis.fetch = vi.fn(async (input: any, init?: any) => {
+    const url = typeof input === "string" ? input : input.toString();
+    const json = (data: unknown, status = 200) =>
+      new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+
+    if (url.includes("/members")) {
+      if (mode === "error") return json({ error: "boom" }, 500);
+      return json({ members: [] });
+    }
+    if (url.includes("/mention_pref")) return json({ no_mention: true });
+    if (url.includes("/md")) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
+    if (url.includes("/messages/sync")) return json({ messages: [] });
+    if (url.includes("/readReceipt")) return json({});
+    if (url.includes("/typing")) return json({});
+    if (url.includes("/sendMessage")) {
+      sends.push(init?.body ? JSON.parse(init.body) : {});
+      return json({ message_id: "reply1", message_seq: 0 });
+    }
     return json({});
   }) as unknown as typeof fetch;
   return { sends };
@@ -350,5 +386,90 @@ describe("inbound mention-gate 免@ relaxation (P1: human-only)", () => {
 
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(sends.length).toBeGreaterThan(0);
+  });
+
+  it("does NOT reply to a HUMAN non-@ message when member refresh FAILS (fail-closed)", async () => {
+    // round-4 P1: the loop guard inverts to a whitelist. A sender is relaxed
+    // ONLY when the member list positively confirms them human. When the
+    // members endpoint errors out, refreshGroupMemberCache leaves memberRobotMap
+    // unpopulated → robot flag is undefined → classification unknown → keep
+    // requireMention. The blacklist version failed OPEN here (undefined !== true
+    // → treated as human → relax → reply → loop for ANY sender on refresh fail).
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStubMembersDown("error");
+    const memberRobotMap = new Map<string, boolean>();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeTextMessage(HUMAN_UID, "hello bot"),
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      memberRobotMap,
+    });
+
+    // Refresh failed → no robot flag recorded → fail-closed: gate kept
+    // requireMention, the non-@ message was cached only, no dispatch/send.
+    expect(memberRobotMap.has(HUMAN_UID)).toBe(false);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sends.length).toBe(0);
+  });
+
+  it("does NOT reply to a HUMAN non-@ message when member list is EMPTY (fail-closed)", async () => {
+    // Sibling of the refresh-error case: an empty member list is the other way
+    // refreshGroupMemberCache returns without populating memberRobotMap. Same
+    // fail-closed outcome — unknown classification keeps requireMention.
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStubMembersDown("empty");
+    const memberRobotMap = new Map<string, boolean>();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeTextMessage(HUMAN_UID, "hello bot"),
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      memberRobotMap,
+    });
+
+    expect(memberRobotMap.has(HUMAN_UID)).toBe(false);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sends.length).toBe(0);
+  });
+
+  it("does NOT reply to an UNKNOWN non-@ sender absent from the member list (fail-closed)", async () => {
+    // The member list loads fine but does NOT contain this sender (e.g. a uid
+    // that joined after the cache warmed, or a cross-process sender the server
+    // omits). memberRobotMap.get(uid) === undefined → not confirmed human →
+    // keep requireMention. The blacklist version relaxed here (undefined !==
+    // true), reopening the loop for any sender the member list happened to miss.
+    const UNKNOWN_UID = "user_ghost_99999999999999999999999999";
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub(); // members endpoint OK, just no UNKNOWN_UID row
+    const memberRobotMap = new Map<string, boolean>();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeTextMessage(UNKNOWN_UID, "hello bot"),
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      memberRobotMap,
+    });
+
+    // Member list loaded but had no row for UNKNOWN_UID → flag undefined →
+    // fail-closed: gate kept requireMention.
+    expect(memberRobotMap.has(UNKNOWN_UID)).toBe(false);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sends.length).toBe(0);
   });
 });

@@ -539,7 +539,17 @@ export async function getMentionPref(params: {
       signal: AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
     });
     if (!resp.ok) {
-      params.log?.error?.(`octo: getMentionPref(${params.groupNo}) failed: ${resp.status}`);
+      // 404 = the mention_pref endpoint isn't deployed yet (expected during
+      // rollout before octo-server#237 ships); 401 = empty/short-lived Bearer.
+      // Both are benign — we fall back to no_mention=false below — and recur on
+      // every inbound message, so logging them at error level (compounded by
+      // the 30s negative-cache TTL) makes a healthy rollout look broken. Log
+      // expected statuses at info and reserve error for genuinely unexpected
+      // responses (5xx, etc.).
+      const expected = resp.status === 404 || resp.status === 401;
+      const msg = `octo: getMentionPref(${params.groupNo}) failed: ${resp.status}`;
+      if (expected) params.log?.info?.(msg);
+      else params.log?.error?.(msg);
       return { no_mention: false };
     }
     const data = await resp.json();
