@@ -1083,9 +1083,13 @@ async function refreshGroupMemberCache(opts: {
         }
         // Preserve the server-authoritative robot flag for the 免@ gate. Keyed
         // by uid (not name) so sender classification survives display-name
-        // collisions. `=== true` normalizes any truthy/legacy shape to boolean.
+        // collisions. Accept BOTH boolean `true` and numeric `1`: the backend
+        // serializes GroupMember.robot as a number, so a strict `=== true`
+        // would misclassify a bot (robot:1) as human → relax requireMention →
+        // reply to non-@ bot messages → bot-to-bot loop. This matches the
+        // no_mention true/1 coercion used elsewhere in the gate.
         if (m.uid && memberRobotMap) {
-          memberRobotMap.set(m.uid, m.robot === true);
+          memberRobotMap.set(m.uid, m.robot === true || m.robot === 1);
         }
       }
       groupCacheTimestamps.set(sessionId, now);
@@ -1478,27 +1482,6 @@ export async function handleInboundMessage(params: {
   const isFromBot = isFromKnownBot || isFromServerRobot;
   // account-level requireMention: false means the account is already 免@.
   const accountRequiresMention = account.config.requireMention !== false;
-  // Only consult the group 免@ preference when it can actually change the
-  // outcome: the account must otherwise require @ (else the pref can only
-  // return no_mention=false, with no effect) AND the sender must be human (the
-  // relaxation never applies to bots). This also avoids a pointless hot-path
-  // network round-trip (cache miss → up to MENTION_PREF_TIMEOUT_MS).
-  const shouldCheckGroupPref = isGroup && accountRequiresMention && !isFromBot;
-  const mentionPref = shouldCheckGroupPref
-    ? await getMentionPrefFromCache({
-        accountId: account.accountId,
-        parentGroupNo: extractParentGroupNo(message.channel_id!),
-        apiUrl: account.config.apiUrl,
-        // botToken ?? "" can yield an empty `Bearer` header; getMentionPref
-        // treats any non-2xx (incl. the resulting 401) as no_mention=false, so
-        // the gate safely falls back to the account-level config.
-        botToken: account.config.botToken ?? "",
-        log,
-      })
-    : undefined;
-  const requireMention = mentionPref?.no_mention === true
-    ? false
-    : accountRequiresMention;
   let historyPrefix = "";
 
   // Save original mention uids for reply (exclude bot itself)
@@ -1574,6 +1557,33 @@ export async function handleInboundMessage(params: {
       }
     }
   }
+
+  // Group 免@ preference lookup — deferred until AFTER mention flags are known.
+  // Only consult the group pref when it can actually change the outcome:
+  //   1. isGroup && accountRequiresMention — else the pref can only return
+  //      no_mention=false, with no effect.
+  //   2. !isFromBot — the 免@ relaxation never applies to bot senders.
+  //   3. !isMentioned — an explicit @bot message already passes the gate, so
+  //      the pref can't change anything. Short-circuiting here keeps explicit
+  //      @bot replies off the (cold/slow) pref network path entirely, avoiding
+  //      up to MENTION_PREF_TIMEOUT_MS of needless latency on the hot path.
+  const shouldCheckGroupPref =
+    isGroup && accountRequiresMention && !isFromBot && !isMentioned;
+  const mentionPref = shouldCheckGroupPref
+    ? await getMentionPrefFromCache({
+        accountId: account.accountId,
+        parentGroupNo: extractParentGroupNo(message.channel_id!),
+        apiUrl: account.config.apiUrl,
+        // botToken ?? "" can yield an empty `Bearer` header; getMentionPref
+        // treats any non-2xx (incl. the resulting 401) as no_mention=false, so
+        // the gate safely falls back to the account-level config.
+        botToken: account.config.botToken ?? "",
+        log,
+      })
+    : undefined;
+  const requireMention = mentionPref?.no_mention === true
+    ? false
+    : accountRequiresMention;
 
   if (isGroup && requireMention) {
     // Debug: log received mention info

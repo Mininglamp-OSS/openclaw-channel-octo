@@ -443,7 +443,9 @@ export interface GroupMember {
   uid: string;
   name: string;
   role?: string;    // admin/member
-  robot?: boolean;  // 是否是机器人
+  // 是否是机器人。后端把该 flag 序列化成数字（1/0），但历史上也出现过 boolean，
+  // 故类型放宽为 boolean | number；消费端须同时认 `=== true` 和 `=== 1`。
+  robot?: boolean | number;
 }
 
 export async function getGroupMembers(params: {
@@ -527,7 +529,7 @@ export async function getMentionPref(params: {
   groupNo: string;  // 父群 group_no（thread 复合 channel_id 须先取父群）
   log?: { info?: (msg: string) => void; error?: (msg: string) => void };
 }): Promise<MentionPref> {
-  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups/${params.groupNo}/mention_pref`;
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups/${encodeURIComponent(params.groupNo)}/mention_pref`;
   try {
     const resp = await fetch(url, {
       method: "GET",

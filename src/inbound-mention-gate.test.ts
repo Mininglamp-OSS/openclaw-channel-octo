@@ -28,6 +28,10 @@ const OTHER_BOT_UID = "bot_other_111111111111111111111111111";
 // A bot from another OpenClaw process / external integration: present in the
 // server member list with robot:true but NEVER passed to registerKnownBot().
 const EXTERNAL_BOT_UID = "bot_extern_22222222222222222222222222";
+// A cross-process bot whose server robot flag is the NUMERIC shape (robot:1)
+// rather than boolean true — the backend serializes it as a number. The gate
+// must treat 1 the same as true, else this bot is misclassified as human.
+const NUMERIC_BOT_UID = "bot_numeric_3333333333333333333333333";
 const GROUP_ID = "g_room_1";
 
 const originalFetch = globalThis.fetch;
@@ -112,6 +116,8 @@ function installFetchStub() {
           // Cross-process / external bot: server marks it robot:true, but this
           // plugin never registered it via registerKnownBot().
           { uid: EXTERNAL_BOT_UID, name: "ExternalBot", robot: true },
+          // Cross-process bot whose robot flag arrives as the numeric shape (1).
+          { uid: NUMERIC_BOT_UID, name: "NumericBot", robot: 1 },
         ],
       });
     }
@@ -233,6 +239,37 @@ describe("inbound mention-gate 免@ relaxation (P1: human-only)", () => {
     expect(sends.length).toBe(0);
   });
 
+  it("suppresses the group-pref lookup for an explicit @bot message (no needless latency)", async () => {
+    // round-3 non-blocking #1: an explicit @bot message already passes the gate,
+    // so the 免@ pref can't change the outcome. The lookup must be short-
+    // circuited (computed AFTER mention flags, only when !isMentioned) so a
+    // cold/slow pref backend never adds latency to normal @bot replies.
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub();
+    // Force a cache miss so a lookup WOULD hit the network if attempted.
+    _clearMentionPrefCache();
+
+    const msg = makeTextMessage(HUMAN_UID, "@SelfBot please answer");
+    (msg.payload as any).mention = { uids: [BOT_UID] };
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: msg,
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+    });
+
+    const calledUrls = (globalThis.fetch as any).mock.calls.map((c: any[]) => String(c[0]));
+    expect(calledUrls.some((u: string) => u.includes("/mention_pref"))).toBe(false);
+    // The @bot message still triggers a normal reply.
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(sends.length).toBeGreaterThan(0);
+  });
+
   it("does NOT reply to a CROSS-PROCESS bot (robot:true in member list, NOT registerKnownBot'd)", async () => {
     // Regression for PR#57 round-2 P1: the loop guard must use the
     // server-authoritative GroupMember.robot signal, not just the local
@@ -259,6 +296,33 @@ describe("inbound mention-gate 免@ relaxation (P1: human-only)", () => {
     // Gate kept requireMention for the server-flagged robot sender: no dispatch,
     // no send. The robot flag was sourced from the member list.
     expect(memberRobotMap.get(EXTERNAL_BOT_UID)).toBe(true);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sends.length).toBe(0);
+  });
+
+  it("does NOT reply to a CROSS-PROCESS bot whose robot flag is NUMERIC (robot:1)", async () => {
+    // Regression for PR#57 round-3 P1: the backend serializes GroupMember.robot
+    // as a number, so a strict `=== true` would treat robot:1 as human → relax
+    // requireMention → reply to the non-@ bot message → bot-to-bot loop. The
+    // gate must coerce robot:1 to a bot exactly like robot:true.
+    const { dispatch } = installRuntimeStub();
+    const { sends } = installFetchStub();
+    const memberRobotMap = new Map<string, boolean>();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: makeTextMessage(NUMERIC_BOT_UID, "hello from a numeric-flagged bot"),
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      memberRobotMap,
+    });
+
+    // robot:1 coerced to true → gate kept requireMention → no dispatch, no send.
+    expect(memberRobotMap.get(NUMERIC_BOT_UID)).toBe(true);
     expect(dispatch).not.toHaveBeenCalled();
     expect(sends.length).toBe(0);
   });
