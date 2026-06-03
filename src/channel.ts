@@ -34,6 +34,7 @@ import { handleOctoMessageAction, parseTarget, resolveOutboundOctoTarget, normal
 import { getOrCreateGroupMdCache, registerBotGroupIds, getKnownGroupIds, writeGroupMdToDisk } from "./group-md.js";
 import { registerOwnerUid } from "./owner-registry.js";
 import { preloadGroupMemberCache, getGroupMembersFromCache } from "./member-cache.js";
+import { preloadMentionPrefs } from "./mention-prefs.js";
 import { initPersonaPromptCache, stopPersonaPromptCache } from "./persona-prompt.js";
 import { registerOctoThreadBindingAdapter } from "./thread-binding-adapter.js";
 import path from "node:path";
@@ -1002,6 +1003,15 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
 
       // Preload member cache for cross-session permission checks (fire-and-forget)
       preloadGroupMemberCache({
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken!,
+        log,
+      }).catch(() => {});
+
+      // Preload group-level 免@偏好 for this bot (fire-and-forget). Optional
+      // warm-up; the inbound mention gate works lazily without it.
+      preloadMentionPrefs({
+        accountId: account.accountId,
         apiUrl: account.config.apiUrl,
         botToken: account.config.botToken!,
         log,

@@ -2,6 +2,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import type { ChannelLogSink } from "openclaw/plugin-sdk/channel-contract";
 import { DEFAULT_GROUP_HISTORY_LIMIT } from "openclaw/plugin-sdk/reply-history";
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadCredentials, uploadFileToCOS, fetchUserInfo } from "./api-fetch.js";
+import { getMentionPrefFromCache } from "./mention-prefs.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
@@ -1423,7 +1424,26 @@ export async function handleInboundMessage(params: {
   }
 
   // --- Mention gating for group messages ---
-  const requireMention = account.config.requireMention !== false;
+  // Group-aware requireMention: a group admin can mark a group as 免@
+  // (no_mention=true) for this specific bot, in which case the bot replies to
+  // every message without an explicit @mention. The preference is per-(bot,
+  // group); thread (compound channel_id) messages inherit their PARENT group's
+  // preference, so we resolve the parent group_no first. On miss/expiry the
+  // cache pulls GET /v1/bot/groups/:group_no/mention_pref (TTL 5min); any
+  // failure falls back to the account-level config, so the gate never crashes.
+  const parentGroupNo = isGroup ? extractParentGroupNo(message.channel_id!) : '';
+  const mentionPref = isGroup
+    ? await getMentionPrefFromCache({
+        accountId: account.accountId,
+        parentGroupNo,
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken ?? "",
+        log,
+      })
+    : undefined;
+  const requireMention = mentionPref?.no_mention === true
+    ? false
+    : (account.config.requireMention !== false);
   let historyPrefix = "";
 
   // Save original mention uids for reply (exclude bot itself)

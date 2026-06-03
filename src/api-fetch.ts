@@ -499,6 +499,52 @@ export async function getGroupInfo(params: {
   }
 }
 
+/**
+ * 群级免@偏好（per-group mention preference）。
+ *
+ * 后端 octo-server#237 暴露 GET /v1/bot/groups/:group_no/mention_pref，
+ * 返回 `{ no_mention: boolean }`。`no_mention=true` 表示该群对当前 bot
+ * 免@即可触发回复。
+ */
+export interface MentionPref {
+  no_mention: boolean;
+}
+
+/**
+ * 获取某群对当前 bot 的免@偏好。
+ *
+ * 失败（网络错误 / 非 2xx / 解析失败）一律回退到账号级行为
+ * （`{ no_mention: false }`，即保持需@），绝不抛错，避免 gate 崩溃。
+ */
+export async function getMentionPref(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;  // 父群 group_no（thread 复合 channel_id 须先取父群）
+  log?: { info?: (msg: string) => void; error?: (msg: string) => void };
+}): Promise<MentionPref> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups/${params.groupNo}/mention_pref`;
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${params.botToken}`,
+      },
+      signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+    });
+    if (!resp.ok) {
+      params.log?.error?.(`octo: getMentionPref(${params.groupNo}) failed: ${resp.status}`);
+      return { no_mention: false };
+    }
+    const data = await resp.json();
+    // Accept boolean `true` or numeric `1` (DB/JSON may serialize either),
+    // mirroring the mention.{all,ais,humans} coercion in inbound.ts.
+    return { no_mention: data?.no_mention === true || data?.no_mention === 1 };
+  } catch (err) {
+    params.log?.error?.(`octo: getMentionPref(${params.groupNo}) error: ${err}`);
+    return { no_mention: false };
+  }
+}
+
 // Fetch GROUP.md content for a group
 export async function getGroupMd(params: {
   apiUrl: string;

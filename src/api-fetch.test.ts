@@ -1403,3 +1403,67 @@ describe("sendRichTextMessage — payload assembly", () => {
     expect("plain" in bodies[0].payload).toBe(false);
   });
 });
+
+describe("getMentionPref", () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("hits GET /v1/bot/groups/:group_no/mention_pref with Bearer token", async () => {
+    let seenUrl = "";
+    let seenAuth = "";
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      seenUrl = typeof input === "string" ? input : input.toString();
+      seenAuth = (init?.headers as Record<string, string>)?.Authorization ?? "";
+      return new Response(JSON.stringify({ no_mention: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const { getMentionPref } = await import("./api-fetch.js");
+    const pref = await getMentionPref({
+      apiUrl: "http://localhost:8090",
+      botToken: "tok",
+      groupNo: "g1",
+    });
+
+    expect(seenUrl).toBe("http://localhost:8090/v1/bot/groups/g1/mention_pref");
+    expect(seenAuth).toBe("Bearer tok");
+    expect(pref).toEqual({ no_mention: true });
+  });
+
+  it("coerces numeric no_mention=1 to true", async () => {
+    global.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ no_mention: 1 }), { status: 200 }),
+    ) as unknown as typeof fetch;
+    const { getMentionPref } = await import("./api-fetch.js");
+    const pref = await getMentionPref({ apiUrl: "http://x", botToken: "t", groupNo: "g" });
+    expect(pref).toEqual({ no_mention: true });
+  });
+
+  it("coerces missing/other no_mention to false", async () => {
+    global.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({}), { status: 200 }),
+    ) as unknown as typeof fetch;
+    const { getMentionPref } = await import("./api-fetch.js");
+    const pref = await getMentionPref({ apiUrl: "http://x", botToken: "t", groupNo: "g" });
+    expect(pref).toEqual({ no_mention: false });
+  });
+
+  it("returns {no_mention:false} on non-2xx", async () => {
+    global.fetch = vi.fn(async () => new Response("err", { status: 404 })) as unknown as typeof fetch;
+    const { getMentionPref } = await import("./api-fetch.js");
+    const pref = await getMentionPref({ apiUrl: "http://x", botToken: "t", groupNo: "g" });
+    expect(pref).toEqual({ no_mention: false });
+  });
+
+  it("returns {no_mention:false} on network error (no throw)", async () => {
+    global.fetch = vi.fn(async () => {
+      throw new Error("network down");
+    }) as unknown as typeof fetch;
+    const { getMentionPref } = await import("./api-fetch.js");
+    await expect(
+      getMentionPref({ apiUrl: "http://x", botToken: "t", groupNo: "g" }),
+    ).resolves.toEqual({ no_mention: false });
+  });
+});
