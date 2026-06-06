@@ -34,17 +34,19 @@ jobs:
           PROJECT_ID: PVT_kwDOEOckHc4BXcvH
           SPRINT_FIELD_ID: PVTIF_lADOEOckHc4BXcvHzhSphQA
         run: |
-          # shellcheck disable=SC2016
-          # Single-quoted GraphQL queries below use $var as GraphQL variable
-          # placeholders (substituted by `-f var=value`), NOT shell variables.
-          # The single quotes are intentional and correct.
           set -euo pipefail
+          # NOTE: `gh api graphql -f query='...'` calls below intentionally use
+          # single quotes so $var inside the query is a GraphQL variable
+          # placeholder (substituted via `-f var=value`), NOT a shell variable.
+          # The per-call `# shellcheck disable=SC2016` comments suppress the
+          # false-positive "expressions don't expand in single quotes" warning.
 
           # 1. Fetch current Sprint iteration. The Octo Board "Sprint" field
           # is a ProjectV2IterationField; iterations[0] is the active one
           # (already started, not yet ended). We extra-guard by date in case
           # there is a gap between iterations.
           TODAY=$(date -u +%Y-%m-%d)
+          # shellcheck disable=SC2016
           ITER_JSON=$(gh api graphql -f query='
             query($org:String!, $num:Int!) {
               organization(login:$org) {
@@ -62,6 +64,7 @@ jobs:
             --jq '.data.organization.projectV2.field.configuration.iterations')
 
           # Pick iteration that contains today.
+          # shellcheck disable=SC2016
           ITER=$(echo "$ITER_JSON" | jq -r --arg today "$TODAY" '
             map(select(
               .startDate <= $today and
@@ -82,6 +85,7 @@ jobs:
           # with us — retry up to ~30s.
           ITEM_ID=""
           for attempt in 1 2 3 4 5 6; do
+            # shellcheck disable=SC2016
             ITEM_ID=$(gh api graphql -f query='
               query($id:ID!) {
                 node(id:$id) {
@@ -105,6 +109,7 @@ jobs:
           echo "[sprint] project item: $ITEM_ID"
 
           # 3. Set Sprint field to current iteration.
+          # shellcheck disable=SC2016
           gh api graphql -f query='
             mutation($proj:ID!, $item:ID!, $field:ID!, $iter:String!) {
               updateProjectV2ItemFieldValue(input: {
