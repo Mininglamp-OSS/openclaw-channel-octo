@@ -129,7 +129,7 @@ jobs:
           if [ "$PKG_VER" != "$TAG_VER" ]; then
             echo "::error::package.json version ($PKG_VER) does not match tag ($TAG_VER)."
             echo "::error::Release flow contract: the bump must land on main BEFORE the tag (via release-please PR or a manual bump PR)."
-            echo "::error::See .github/workflows/release-please.yml and the README 发版流程 section."
+            echo "::error::See .github/workflows/release-please.yml and the CONTRIBUTING.md Release process section."
             exit 1
           fi
           echo "[verify] package.json version $PKG_VER matches tag $TAG_VER"

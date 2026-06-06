@@ -19,8 +19,18 @@ permissions: {}
 
 jobs:
   bind-sprint:
+    # Trust gate: must be a release-please-authored PR. We do NOT key on
+    # `github.actor` because release-please can be configured with a PAT,
+    # in which case the PR author is the PAT owner (a human), not
+    # `github-actions[bot]`. We use two independent invariants instead:
+    #   1. head ref starts with `release-please--` (the branch release-please
+    #      creates and pushes to, regardless of token identity)
+    #   2. PR title matches the pinned `pull-request-title-pattern` in
+    #      .release-please-config.json
+    # Both must hold. If a human happens to mimic both, the worst case is a
+    # benign re-bind to current Sprint (idempotent).
     if: >-
-      github.event.pull_request.user.login == 'github-actions[bot]' &&
+      startsWith(github.event.pull_request.head.ref, 'release-please--') &&
       startsWith(github.event.pull_request.title, 'chore(release): release v')
     runs-on: ubuntu-24.04
     steps:
