@@ -1,0 +1,118 @@
+name: Release-please PR → bind current Sprint
+
+# Sets the Sprint field on the auto-generated `chore(release): release vX.Y.Z` PR
+# (opened by release-please) so the required `check-sprint` status passes.
+#
+# Why: check-sprint's primary path expects PRs to link an issue (`Closes #N`)
+# whose Sprint is set on the Octo Board. release-please PRs don't close any
+# issue. The fallback path checks the PR's own Sprint on the project board —
+# this workflow populates that field so the fallback succeeds.
+#
+# Runs on every release-please PR open / push so that mid-cycle sprint
+# rollovers re-bind the PR to the new current sprint on the next push.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  bind-sprint:
+    if: >-
+      github.event.pull_request.user.login == 'github-actions[bot]' &&
+      startsWith(github.event.pull_request.title, 'chore(release): release v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: bind PR to current sprint iteration
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ORG_LOGIN: Mininglamp-OSS
+          PROJECT_NUMBER: '2'
+          PROJECT_ID: PVT_kwDOEOckHc4BXcvH
+          SPRINT_FIELD_ID: PVTIF_lADOEOckHc4BXcvHzhSphQA
+        run: |
+          set -euo pipefail
+
+          # 1. Fetch current Sprint iteration. The Octo Board "Sprint" field
+          # is a ProjectV2IterationField; iterations[0] is the active one
+          # (already started, not yet ended). We extra-guard by date in case
+          # there is a gap between iterations.
+          TODAY=$(date -u +%Y-%m-%d)
+          ITER_JSON=$(gh api graphql -f query='
+            query($org:String!, $num:Int!) {
+              organization(login:$org) {
+                projectV2(number:$num) {
+                  field(name:"Sprint") {
+                    ... on ProjectV2IterationField {
+                      configuration {
+                        iterations { id title startDate duration }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f org="$ORG_LOGIN" -F num="$PROJECT_NUMBER" \
+            --jq '.data.organization.projectV2.field.configuration.iterations')
+
+          # Pick iteration that contains today.
+          ITER=$(echo "$ITER_JSON" | jq -r --arg today "$TODAY" '
+            map(select(
+              .startDate <= $today and
+              ((.startDate | strptime("%Y-%m-%d") | mktime + (.duration * 86400)) > ($today | strptime("%Y-%m-%d") | mktime))
+            )) | .[0] // empty')
+
+          if [ -z "$ITER" ] || [ "$ITER" = "null" ]; then
+            echo "::warning::no active sprint iteration covers today ($TODAY) — skipping Sprint bind"
+            exit 0
+          fi
+
+          ITER_ID=$(echo "$ITER" | jq -r .id)
+          ITER_TITLE=$(echo "$ITER" | jq -r .title)
+          echo "[sprint] active iteration: $ITER_TITLE ($ITER_ID)"
+
+          # 2. Find the project item created by auto-add-to-project for this PR.
+          # That workflow runs on pull_request_target:opened too, and may race
+          # with us — retry up to ~30s.
+          ITEM_ID=""
+          for attempt in 1 2 3 4 5 6; do
+            ITEM_ID=$(gh api graphql -f query='
+              query($id:ID!) {
+                node(id:$id) {
+                  ... on PullRequest {
+                    projectItems(first:10) {
+                      nodes { id project { id } }
+                    }
+                  }
+                }
+              }' -f id="$PR_NODE_ID" \
+              --jq ".data.node.projectItems.nodes[] | select(.project.id == \"$PROJECT_ID\") | .id" | head -1)
+            if [ -n "$ITEM_ID" ]; then break; fi
+            echo "[sprint] PR #$PR_NUMBER not yet on project board, retry in 5s ($attempt/6)"
+            sleep 5
+          done
+
+          if [ -z "$ITEM_ID" ]; then
+            echo "::error::PR #$PR_NUMBER not on project board after 30s — auto-add-to-project may have failed"
+            exit 1
+          fi
+          echo "[sprint] project item: $ITEM_ID"
+
+          # 3. Set Sprint field to current iteration.
+          gh api graphql -f query='
+            mutation($proj:ID!, $item:ID!, $field:ID!, $iter:String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $proj
+                itemId: $item
+                fieldId: $field
+                value: { iterationId: $iter }
+              }) { projectV2Item { id } }
+            }' \
+            -f proj="$PROJECT_ID" \
+            -f item="$ITEM_ID" \
+            -f field="$SPRINT_FIELD_ID" \
+            -f iter="$ITER_ID" > /dev/null
+
+          echo "[sprint] release PR #$PR_NUMBER bound to Sprint $ITER_TITLE — check-sprint fallback will now pass"

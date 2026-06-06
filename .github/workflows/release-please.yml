@@ -1,0 +1,30 @@
+name: Release Please
+
+# Maintains a long-lived "chore(release): release vX.Y.Z" PR that accumulates
+# version bump + CHANGELOG entries from conventional commits merged into main.
+# Merging that PR creates the tag and a GitHub Release, which triggers
+# publish-clawhub.yml to package and publish to ClawHub.
+#
+# This replaces the previous release-drafter workflow. See README "发版流程" for
+# the developer-facing workflow.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write       # push release branch + create tag + create release
+      pull-requests: write  # open / update the release PR
+    steps:
+      - uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445 # v4.1.3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
