@@ -1,7 +1,9 @@
 name: Release-please PR → bind current Sprint
 
 # Sets the Sprint field on the auto-generated `chore(release): release vX.Y.Z` PR
-# (opened by release-please) so the required `check-sprint` status passes.
+# (opened by release-please) so the required `check-sprint` status passes,
+# then re-triggers the check-sprint workflow so its stale failed run is
+# refreshed with the newly-bound Sprint.
 #
 # Why: check-sprint's primary path expects PRs to link an issue (`Closes #N`)
 # whose Sprint is set on the Octo Board. release-please PRs don't close any
@@ -17,22 +19,32 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: release-please-sprint-bind-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   bind-sprint:
-    # Trust gate: must be a release-please-authored PR. We do NOT key on
-    # `github.actor` because release-please can be configured with a PAT,
-    # in which case the PR author is the PAT owner (a human), not
-    # `github-actions[bot]`. We use two independent invariants instead:
-    #   1. head ref starts with `release-please--` (the branch release-please
-    #      creates and pushes to, regardless of token identity)
-    #   2. PR title matches the pinned `pull-request-title-pattern` in
-    #      .release-please-config.json
-    # Both must hold. If a human happens to mimic both, the worst case is a
-    # benign re-bind to current Sprint (idempotent).
+    # Trust gate: must be a release-please-authored PR from THIS repo (not a fork).
+    # Three independent invariants:
+    #   1. Not from a fork — fork PR titles and branch names are attacker-
+    #      controllable, so a fork can mimic release-please's identity. With
+    #      pull_request_target running with secrets, we never let fork-supplied
+    #      data drive the trust gate.
+    #   2. head ref starts with `release-please--` (the branch release-please
+    #      creates and pushes to, regardless of token identity).
+    #   3. PR title matches the pinned `pull-request-title-pattern` in
+    #      .release-please-config.json.
+    # All three must hold. We do NOT key on `github.actor` because release-please
+    # can be configured with a PAT, in which case the PR author is the PAT owner
+    # (a human), not `github-actions[bot]`.
     if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'release-please--') &&
       startsWith(github.event.pull_request.title, 'chore(release): release v')
     runs-on: ubuntu-24.04
+    permissions:
+      actions: write  # to rerun the stale check-sprint workflow after we set the field
     steps:
       - name: bind PR to current sprint iteration
         env:
@@ -52,9 +64,8 @@ jobs:
           # false-positive "expressions don't expand in single quotes" warning.
 
           # 1. Fetch current Sprint iteration. The Octo Board "Sprint" field
-          # is a ProjectV2IterationField; iterations[0] is the active one
-          # (already started, not yet ended). We extra-guard by date in case
-          # there is a gap between iterations.
+          # is a ProjectV2IterationField; pick the iteration whose
+          # [startDate, startDate+duration) window covers today (UTC).
           TODAY=$(date -u +%Y-%m-%d)
           # shellcheck disable=SC2016
           ITER_JSON=$(gh api graphql -f query='
@@ -73,12 +84,21 @@ jobs:
             }' -f org="$ORG_LOGIN" -F num="$PROJECT_NUMBER" \
             --jq '.data.organization.projectV2.field.configuration.iterations')
 
-          # Pick iteration that contains today.
+          # Defensive default: if the field is missing/renamed/zero-iter, the
+          # GraphQL path resolves to literal string "null". Map over `null`
+          # crashes jq under `set -e`, bypassing the intended graceful skip.
+          # `(. // [])` substitutes an empty array so the pipeline degrades to
+          # empty ITER and the warning branch below fires.
+          #
+          # Date arithmetic precedence note: `mktime + (.duration * 86400)`
+          # would evaluate `.duration` on the mktime *output* (a number),
+          # crashing with "Cannot index number with 'duration'". The explicit
+          # outer parens keep `.duration` bound to the iteration object scope.
           # shellcheck disable=SC2016
           ITER=$(echo "$ITER_JSON" | jq -r --arg today "$TODAY" '
-            map(select(
+            (. // []) | map(select(
               .startDate <= $today and
-              ((.startDate | strptime("%Y-%m-%d") | mktime + (.duration * 86400)) > ($today | strptime("%Y-%m-%d") | mktime))
+              (((.startDate | strptime("%Y-%m-%d") | mktime) + (.duration * 86400)) > ($today | strptime("%Y-%m-%d") | mktime))
             )) | .[0] // empty')
 
           if [ -z "$ITER" ] || [ "$ITER" = "null" ]; then
@@ -92,7 +112,8 @@ jobs:
 
           # 2. Find the project item created by auto-add-to-project for this PR.
           # That workflow runs on pull_request_target:opened too, and may race
-          # with us — retry up to ~30s.
+          # with us — retry up to ~30s. `first:100` matches GitHub's hard cap
+          # on projects per PR; no pagination needed in practice.
           ITEM_ID=""
           for attempt in 1 2 3 4 5 6; do
             # shellcheck disable=SC2016
@@ -100,7 +121,7 @@ jobs:
               query($id:ID!) {
                 node(id:$id) {
                   ... on PullRequest {
-                    projectItems(first:10) {
+                    projectItems(first:100) {
                       nodes { id project { id } }
                     }
                   }
@@ -134,4 +155,30 @@ jobs:
             -f field="$SPRINT_FIELD_ID" \
             -f iter="$ITER_ID" > /dev/null
 
-          echo "[sprint] release PR #$PR_NUMBER bound to Sprint $ITER_TITLE — check-sprint fallback will now pass"
+          echo "[sprint] release PR #$PR_NUMBER bound to Sprint $ITER_TITLE"
+
+      - name: re-trigger check-sprint with the newly-bound Sprint
+        # check-sprint and this workflow both fire on pull_request_target:opened,
+        # so check-sprint frequently evaluates an unset Sprint and posts a red
+        # required status. It does not auto-re-run. We rerun it explicitly after
+        # the bind so the stale red flips to green without manual intervention.
+        # Uses GITHUB_TOKEN (not PROJECT_TOKEN) because actions:write is granted
+        # at the job level here, scoped to this run only.
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Find the most recent check-sprint run for this PR's head SHA and
+          # rerun it. If none exists yet (rare race), exit cleanly — check-sprint
+          # will fire naturally on the next pull_request_target event.
+          RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/check-sprint.yml/runs?head_sha=$PR_HEAD_SHA&event=pull_request_target" \
+            --jq '.workflow_runs[0].id // empty')
+          if [ -z "$RUN_ID" ]; then
+            echo "[sprint] no prior check-sprint run found for SHA $PR_HEAD_SHA — natural trigger will pick it up"
+            exit 0
+          fi
+          echo "[sprint] re-running check-sprint (run $RUN_ID) for PR #$PR_NUMBER"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/rerun" > /dev/null

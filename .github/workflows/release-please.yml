@@ -30,12 +30,28 @@ on:
 
 permissions: {}
 
+concurrency:
+  # Serialize runs against the release branch. release-please reconciles via
+  # force-push to `release-please--branches--main`; two concurrent runs racing
+  # to that branch can produce a corrupted/half-updated release PR (wrong
+  # version, missing CHANGELOG entries). cancel-in-progress: false lets a
+  # second push wait for the first to finish rather than be dropped.
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release-please:
     name: release-please
     runs-on: ubuntu-24.04
     permissions:
-      contents: read   # release-please uses its own RELEASE_PLEASE_TOKEN; GITHUB_TOKEN gets minimum scope
+      # release-please uses its own RELEASE_PLEASE_TOKEN PAT for all writes.
+      # GITHUB_TOKEN is intentionally restricted to `contents: read` here:
+      # if RELEASE_PLEASE_TOKEN is ever unset / expired / renamed, the action
+      # falls back to GITHUB_TOKEN and PR creation fails loudly with 403
+      # rather than silently degrading to bot-author mode (which would
+      # re-introduce the GITHUB_TOKEN trigger-suppression bug we're trying
+      # to avoid — see the comment block at the top of this file).
+      contents: read
     steps:
       - uses: googleapis/release-please-action@a02a34c4d625f9be7cb89156071d8567266a2445 # v4.2.0
         with:

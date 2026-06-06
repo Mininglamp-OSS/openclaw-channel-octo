@@ -71,6 +71,7 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       dry_run: ${{ steps.resolve.outputs.dry_run }}
       use_existing_release: ${{ steps.existing.outputs.use_existing_release }}
+      existing_is_draft: ${{ steps.existing.outputs.existing_is_draft }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -155,11 +156,19 @@ jobs:
           RC=$?
           set -e
           if [ $RC -eq 0 ]; then
-            echo "[verify] existing release found for ${{ github.ref_name }} — workflow will upload tarball to it"
+            # Successfully fetched the release. `OUTPUT` is now the literal
+            # value of `.isDraft` ("true" or "false"). Carry it forward so the
+            # publish job can flip the release to non-draft after uploading.
+            # Without this, a tag whose release happens to be a draft (left over
+            # from a prior failed run, or future release-please config drift)
+            # would silently stay draft — tarball uploaded but release invisible.
+            echo "[verify] existing release found for ${{ github.ref_name }} (isDraft=$OUTPUT) — workflow will upload tarball to it"
             echo "use_existing_release=true" >> "$GITHUB_OUTPUT"
+            echo "existing_is_draft=$OUTPUT" >> "$GITHUB_OUTPUT"
           elif echo "$OUTPUT" | grep -qiE "release not found|HTTP 404|not found"; then
             echo "[verify] no existing release for ${{ github.ref_name }} — workflow will create one (manual override path)"
             echo "use_existing_release=false" >> "$GITHUB_OUTPUT"
+            echo "existing_is_draft=false" >> "$GITHUB_OUTPUT"
           else
             echo "::error::Unexpected error from 'gh release view ${{ github.ref_name }}' (rc=$RC):"
             echo "$OUTPUT"
@@ -245,14 +254,36 @@ jobs:
         if: github.event_name == 'push' && needs.verify.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          USE_EXISTING: ${{ needs.verify.outputs.use_existing_release }}
+          EXISTING_IS_DRAFT: ${{ needs.verify.outputs.existing_is_draft }}
         run: |
-          if [ "${{ needs.verify.outputs.use_existing_release }}" = "true" ]; then
-            echo "[publish] uploading tarball to existing release ${{ github.ref_name }} (created by release-please)"
-            gh release upload "${{ github.ref_name }}" octo-*.tgz --clobber
+          set -euo pipefail
+          if [ "$USE_EXISTING" = "true" ]; then
+            echo "[publish] uploading tarball to existing release $TAG (created by release-please)"
+            gh release upload "$TAG" octo-*.tgz --clobber
+
+            # Backfill release notes if the existing release body is empty.
+            # release-please normally populates the body from generated changelog,
+            # but a configuration hiccup (all commits hidden, generator error, etc.)
+            # can leave it empty — in which case ship the CHANGELOG.md section.
+            EXISTING_BODY=$(gh release view "$TAG" --json body --jq '.body // ""')
+            if [ -z "$EXISTING_BODY" ]; then
+              echo "[publish] existing release body is empty — backfilling from CHANGELOG.md"
+              gh release edit "$TAG" --notes-file /tmp/notes.md
+            fi
+
+            # If the existing release is a draft (left over from prior failed run
+            # or future release-please config drift), flip to published. Without
+            # this, the tarball would sit on an invisible draft forever.
+            if [ "$EXISTING_IS_DRAFT" = "true" ]; then
+              echo "[publish] existing release is a draft — flipping to published"
+              gh release edit "$TAG" --draft=false
+            fi
           else
-            echo "[publish] creating new release ${{ github.ref_name }} (manual override path — no release-please PR was used)"
-            gh release create "${{ github.ref_name }}" \
-              --title "${{ github.ref_name }}" \
+            echo "[publish] creating new release $TAG (manual override path — no release-please PR was used)"
+            gh release create "$TAG" \
+              --title "$TAG" \
               --notes-file /tmp/notes.md \
               octo-*.tgz
           fi

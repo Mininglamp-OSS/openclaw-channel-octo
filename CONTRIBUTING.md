@@ -59,7 +59,11 @@ No one ever pushes a release commit directly to `main`.
 2. That PR contains, auto-generated from the merged commits:
    - `package.json` + `package-lock.json` version bumps
    - `src/version.ts` bump (via the `// x-release-please-version` marker)
-   - A new `## [X.Y.Z] - YYYY-MM-DD` section appended to `CHANGELOG.md`
+   - A new `## [X.Y.Z]` section appended to `CHANGELOG.md` (release-please's
+     node releaser emits headings like `## [X.Y.Z](compare-url) (YYYY-MM-DD)`,
+     which differs slightly from the Keep a Changelog `## [X.Y.Z] - YYYY-MM-DD`
+     headings written by hand for v1.0.x. Both forms coexist — the publish
+     workflow's `extract-changelog.sh` substring-matches either.)
    - PR body = the release notes draft
 3. When the release manager decides it's time to ship: **merge that PR** (squash, default).
 4. `release-please` then creates the `vX.Y.Z` git tag and a GitHub Release.
@@ -76,6 +80,24 @@ No one ever pushes a release commit directly to `main`.
 
 - Watch for the `chore(release): release vX.Y.Z` PR to accumulate the desired set of changes.
 - Merge it. The rest is automatic.
+
+### About `src/version.ts`
+
+`src/version.ts` is git-tracked but **has two writers**:
+
+1. The `prebuild` script in `package.json` rewrites it from `package.json`'s
+   version on every `npm run build`.
+2. release-please rewrites it inside the release PR via the
+   `// x-release-please-version` marker on line 2.
+
+Both writers produce identical content as long as `package.json` and
+`src/version.ts` are in sync (they always are, post-release-please-merge).
+If you bump `package.json` manually and run `npm run build` locally, expect
+a dirty working tree on `src/version.ts` — **include it in the same commit
+as the `package.json` bump** (the manual-override path requires both).
+
+Do not hand-edit `src/version.ts` — the comment at the top of the file says
+so, and any manual edit will be overwritten by the next build.
 
 ### Manual override (rare)
 
