@@ -35,6 +35,10 @@ jobs:
           SPRINT_FIELD_ID: PVTIF_lADOEOckHc4BXcvHzhSphQA
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2016
+          # Single-quoted GraphQL queries below use $var as GraphQL variable
+          # placeholders (substituted by `-f var=value`), NOT shell variables.
+          # The single quotes are intentional and correct.
 
           # 1. Fetch current Sprint iteration. The Octo Board "Sprint" field
           # is a ProjectV2IterationField; iterations[0] is the active one
