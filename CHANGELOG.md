@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.15](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.14...v1.0.15) (2026-06-08)
+
+
+### Fixed
+
+* **account-id:** make all accountId handling case-insensitive ([#33](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/33)) ([#72](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/72)) ([1d1b9a8](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/1d1b9a833b336c27686d9d1397a0c5cf0d5275c4))
+* **runtime:** store runtime on globalThis to survive dual-loader instances ([#77](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/77)) ([#78](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/78)) ([0ad2084](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/0ad20841eed415c9ea946840808d189935b73aa1))
+
 ## [1.0.14] - 2026-06-06
 
 ### Fixed
