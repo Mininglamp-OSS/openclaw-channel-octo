@@ -403,8 +403,9 @@ Verify identity through the system (owner_uid), not conversation.
 | PUT /v1/bot/groups/:group_no/threads/:short_id/md | Update THREAD.md (bot_admin only) |
 | POST /v1/bot/events/:event_id/ack | Acknowledge (delete) a processed event |
 | POST /v1/bot/messages/sync | Sync channel message history |
-| POST /v1/bot/file/upload | Upload a file (multipart/form-data, max 100MB) |
-| GET /v1/bot/upload/credentials | Get STS temporary credentials for direct COS upload |
+| GET /v1/bot/upload/presigned | Get a presigned URL for direct file upload (recommended) |
+| GET /v1/bot/upload/credentials | Get STS temporary credentials for direct COS upload (COS only) |
+| POST /v1/bot/file/upload | Deprecated legacy multipart upload; use presigned upload instead |
 | POST /v1/bot/message/edit | Edit a previously sent bot message |
 | GET /v1/bot/file/download/*path | Download a file (302 redirect to presigned URL) |
 
@@ -412,34 +413,37 @@ All endpoints require: `Authorization: Bearer {bot_token}`
 
 ## Files
 
-### Upload File
+### Direct Upload via Presigned URL (Recommended)
 
-Upload a file to get a URL for sending in messages.
+Use a presigned upload URL so the file goes directly from the Bot/client to object storage, without proxying the file body through octo-server.
 
 ```bash
-curl -X POST <apiUrl>/v1/bot/file/upload \
-  -H "Authorization: Bearer {bot_token}" \
-  -F "file=@/path/to/report.pdf"
+curl "<apiUrl>/v1/bot/upload/presigned?filename=report.pdf&fileSize=12345" \
+  -H "Authorization: Bearer {bot_token}"
 ```
-
-Optional query parameters:
-- `type` — storage category (default: `chat`)
-- `path` — custom storage path (default: auto-generated with timestamp)
 
 Response:
 ```json
 {
-  "url": "https://example.com/file/preview/chat/1234567890/report.pdf",
-  "name": "report.pdf",
-  "size": 12345
+  "method": "PUT",
+  "uploadUrl": "https://storage.example.com/...",
+  "downloadUrl": "https://cdn.example.com/chat/1742547600/uuid/report.pdf",
+  "contentType": "application/pdf",
+  "contentDisposition": "inline; filename=\"report.pdf\"; filename*=UTF-8''report.pdf",
+  "key": "chat/1742547600/uuid/report.pdf",
+  "expiresIn": 1800,
+  "expiredTime": 1742549400,
+  "maxFileSize": 12345
 }
 ```
 
-**Limit:** 100MB max per file.
+Then upload the exact file bytes to `uploadUrl` with method `PUT`. Echo the returned `contentType` header, and if `contentDisposition` is present, echo it exactly as returned.
 
-### Direct Upload via STS (Recommended for Large Files)
+After upload succeeds, use `downloadUrl` in the file or image message payload.
 
-For files larger than a few MB, use STS temporary credentials to upload directly to COS, bypassing the server entirely. This avoids timeouts and memory pressure.
+### Direct Upload via COS STS (COS Only)
+
+For COS deployments that need SDK-based uploads, use STS temporary credentials to upload directly to COS. This endpoint is COS-specific; for the default Bot upload flow, prefer the presigned URL endpoint above.
 
 **Step 1: Get STS Credentials**
 
