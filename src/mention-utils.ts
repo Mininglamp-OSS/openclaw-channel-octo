@@ -317,7 +317,10 @@ export interface SanitizeResult {
  *   3. 裸 `@<32hex>`         —— 命中 uidToNameMap → 重写 `@displayName` + entity；
  *      未命中 → 剥掉 `@`，不发非法 mention。
  *
- * 最终守卫：过滤 entities/uids，只保留 isValidOutboundUid 通过的项。
+ * 最终守卫：过滤 entities/uids，保留 isValidOutboundUid 通过、或来自结构化
+ * `@[uid:name]` 形式（传入的 entities，形态合法）的可信 uid。详见函数内
+ * trustedUids 注释——结构化来源是 agent 的权威意图，冷启动空 map 下也放行；
+ * 兜底分支新产生的幻觉 hex 不可信，仍被拦截。
  *
  * 重写改变字符串长度，故所有改写统一从后向前 splice，并同步调整既有
  * entity 的 offset，避免漂移。
@@ -335,6 +338,23 @@ export function sanitizeOutboundMentions(params: {
   let content = params.content;
   // 既有 entity 的工作副本（offset 会随重写调整）
   const entities: MentionEntity[] = params.entities.map((e) => ({ ...e }));
+
+  // 可信 uid 集合：传入的 entities 来自 convertStructuredMentions —— 即 agent
+  // 显式写出的 @[uid:name] 结构化形式。结构化 uid 是 agent 的权威意图，应被
+  // 信任，即便冷启动下 uidToNameMap 为空（prefetch best-effort 失败）也要放
+  // 行，否则真实成员的合法 mention 会被最终守卫误删、对方收不到通知。
+  //
+  // 关键区分：只信任**结构化来源**的 uid（此处的 params.entities），且仅当其
+  // 形态合法（裸 32-hex 或 space-prefixed 32-hex base）。sanitize 内部由
+  // bracketless/bareHex 兜底分支**新产生**的 entity 不进此集合——那些可能源自
+  // 模型瞎编的幻觉 hex，仍须经 isValidOutboundUid 校验，照旧被守卫/降级。
+  const isWellFormedUid = (uid: string): boolean =>
+    HEX32_RE.test(extractBaseUid(uid));
+  const trustedUids = new Set<string>(
+    params.entities.map((e) => e.uid).filter(isWellFormedUid),
+  );
+  const passesFinalGuard = (uid: string): boolean =>
+    isValidOutboundUid(uid, uidToNameMap) || trustedUids.has(uid);
 
   interface Edit {
     start: number;
@@ -400,7 +420,12 @@ export function sanitizeOutboundMentions(params: {
     }
 
     // ② 裸 @<32hex>
-    const bareHex = /@([0-9a-fA-F]{32})/g;
+    // 前置边界对齐 ①/MENTION_PATTERN：@ 前须为行首/空白/非字母数字。缺这个
+    // 锚点时，email 本地部分、SSH URL、mailto 里的 `@<32hex>` 会被误匹配并
+    // 损坏（user@<hex>、git@<hex>.com:org、mailto:noreply@<hex>.com）。
+    // lookbehind/^ 均为零宽，m.index 仍指向 @、m[0] 仍以 @ 开头，故下方
+    // start/end/claimed 计算与既有逻辑完全一致，无需调整。
+    const bareHex = /(?:^|(?<=\s|[^a-zA-Z0-9]))@([0-9a-fA-F]{32})/g;
     while ((m = bareHex.exec(content)) !== null) {
       const hex = m[1];
       const start = m.index;
@@ -451,9 +476,13 @@ export function sanitizeOutboundMentions(params: {
     }
   }
 
-  // 最终守卫：丢弃非法 uid 的 entity / uid
+  // 最终守卫：丢弃非法 uid 的 entity / uid。
+  // 放行条件 = isValidOutboundUid（in-map / space-prefixed 32-hex base）
+  //          OR  结构化来源的可信 uid（trustedUids，已预筛形态合法）。
+  // 这样冷启动下结构化 @[uid:name] 的真实 uid（未命中空 map）能存活，而兜底
+  // 分支新产生的幻觉 hex（不在 trustedUids）仍被拦截。
   const finalEntities = entities
-    .filter((e) => isValidOutboundUid(e.uid, uidToNameMap))
+    .filter((e) => passesFinalGuard(e.uid))
     .sort((a, b) => a.offset - b.offset);
 
   const seen = new Set<string>();
@@ -465,7 +494,7 @@ export function sanitizeOutboundMentions(params: {
     }
   }
   for (const u of params.uids) {
-    if (isValidOutboundUid(u, uidToNameMap) && !seen.has(u)) {
+    if (passesFinalGuard(u) && !seen.has(u)) {
       seen.add(u);
       finalUids.push(u);
     }

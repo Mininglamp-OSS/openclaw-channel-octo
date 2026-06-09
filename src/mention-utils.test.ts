@@ -1049,6 +1049,105 @@ describe("sanitizeOutboundMentions", () => {
     expect(r.entities[0].uid).toBe(spaceUid);
     expect(r.uids).toEqual([spaceUid]);
   });
+
+  // ── Blocking #1: bareHex left-boundary anchor — @<32hex> embedded inside an
+  // email local part / SSH URL / mailto must NOT be matched (the @ used to be
+  // swallowed, corrupting the surrounding text). ──────────────────────────────
+  describe("bareHex left boundary: email / SSH / mailto preserved", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+
+    it("email local part @<32hex> is left intact (@ not swallowed)", () => {
+      const content = `mail user@${HEX_B} now`;
+      const r = sanitizeOutboundMentions({
+        content,
+        entities: [],
+        uids: [],
+        uidToNameMap,
+      });
+      expect(r.content).toBe(content);
+      expect(r.entities).toHaveLength(0);
+      expect(r.uids).toHaveLength(0);
+    });
+
+    it("SSH-style git@<32hex>.com:org/repo is left intact", () => {
+      const content = `clone git@${HEX_B}.com:org/repo done`;
+      const r = sanitizeOutboundMentions({
+        content,
+        entities: [],
+        uids: [],
+        uidToNameMap,
+      });
+      expect(r.content).toBe(content);
+      expect(r.entities).toHaveLength(0);
+      expect(r.uids).toHaveLength(0);
+    });
+
+    it("mailto link [x](mailto:noreply@<32hex>.com) is left intact", () => {
+      const content = `[click](mailto:noreply@${HEX_B}.com)`;
+      const r = sanitizeOutboundMentions({
+        content,
+        entities: [],
+        uids: [],
+        uidToNameMap,
+      });
+      expect(r.content).toBe(content);
+      expect(r.entities).toHaveLength(0);
+      expect(r.uids).toHaveLength(0);
+    });
+
+    it("line-start bare @<32hex> not in map still downgrades (behavior unchanged)", () => {
+      // A legitimately uid-shaped bare hex at line start (left boundary = ^) is
+      // still a hallucinated, not-in-map token → @ stripped, no entity. The new
+      // anchor must not regress this established behavior.
+      const r = sanitizeOutboundMentions({
+        content: `@${HEX_B} hello`,
+        entities: [],
+        uids: [],
+        uidToNameMap,
+      });
+      expect(r.content).toBe(`${HEX_B} hello`);
+      expect(r.entities).toHaveLength(0);
+      expect(r.uids).toHaveLength(0);
+    });
+  });
+
+  // ── Blocking #2: cold-start (empty map) structured mention must survive ──────
+  it("cold start (empty uidToNameMap): structured @[uid:name] uid survives the final guard", () => {
+    // prefetch failed → uidToNameMap empty. Agent wrote a correct @[uid:Alice].
+    // The structured-source uid is trusted and must NOT be dropped by the guard,
+    // otherwise the server receives no mention and Alice gets no notification.
+    const emptyMap = new Map<string, string>();
+    const input = `Hi @[${HEX_A}:Alice]!`;
+    const mentions = parseStructuredMentions(input);
+    const converted = convertStructuredMentions(input, mentions);
+    const r = sanitizeOutboundMentions({
+      content: converted.content,
+      entities: converted.entities,
+      uids: converted.uids,
+      uidToNameMap: emptyMap,
+    });
+    expect(r.content).toBe("Hi @Alice!");
+    expect(r.entities).toHaveLength(1);
+    expect(r.entities[0].uid).toBe(HEX_A);
+    expect(r.uids).toEqual([HEX_A]);
+  });
+
+  it("cold start does NOT whitewash a hallucinated bare @<32hex> (not structured-source)", () => {
+    // Regression guard for the trustedUids relaxation: a bare hex produced by
+    // the model (NOT via @[uid:name], so not in the trusted entities) must still
+    // be stripped/downgraded even when the map is empty — it never enters
+    // trustedUids, so the final guard keeps blocking it.
+    const emptyMap = new Map<string, string>();
+    const r = sanitizeOutboundMentions({
+      content: `ping @${HEX_B} now`,
+      entities: [],
+      uids: [],
+      uidToNameMap: emptyMap,
+    });
+    expect(r.content).toBe(`ping ${HEX_B} now`);
+    expect(r.entities.some((e) => e.uid === HEX_B)).toBe(false);
+    expect(r.uids).not.toContain(HEX_B);
+  });
 });
 
 describe("MENTION_FORMAT_HINT (P1) + >10 prefix regression guard (test #13)", () => {
