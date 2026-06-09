@@ -43,7 +43,6 @@ import {
 import { broadcastGroupMdUpdate, broadcastThreadMdUpdate } from "./group-md.js";
 import { mkdir, realpath, lstat, open } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { homedir } from "node:os";
 import {
   basename,
   dirname,
@@ -55,6 +54,16 @@ import {
 } from "node:path";
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
+// 🔴 Canonical, platform-owned agent-workspace resolver. This is the SAME logic
+// the OpenClaw host uses to decide where an agent's workspace lives, so the
+// write-secret jail default stays in lock-step with the platform instead of a
+// hand-rolled re-derivation that drifts (the source of the non-default-agent
+// jail-escape + symlink-normalization bugs this rework fixes). It encodes:
+//   • default agent  → agents.defaults.workspace (or the agent's own workspace);
+//   • non-default    → agents.defaults.workspace/<normalizedAgentId> (per-agent
+//                      subdir — never the bare shared parent);
+//   • `~` home expansion via resolveUserPath.
+import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
 
 /**
@@ -141,15 +150,16 @@ async function confineSecretPath(
   }
 
   // Resolve the configured root to an absolute, symlink-free canonical form so
-  // containment checks compare apples to apples.
-  let root: string;
-  try {
-    root = await realpath(resolvePath(rootRaw));
-  } catch {
-    // Root doesn't exist yet (or isn't reachable): fall back to its lexical
-    // absolute form. We can still enforce containment lexically below.
-    root = resolvePath(rootRaw);
-  }
+  // containment checks compare apples to apples. 🔴 We canonicalize through the
+  // NEAREST EXISTING ANCESTOR rather than `realpath(root)` outright: on a
+  // workspace-default jail's first write the root directory often doesn't exist
+  // yet, and a plain realpath() would throw ENOENT and leave us with the LEXICAL
+  // (un-canonicalized) form. That lexical root later diverges from the
+  // post-mkdir `realpath(dir)` whenever any ancestor is a symlink (macOS
+  // `/tmp`→`/private/tmp`, container bind-mounts, a symlinked `$HOME`),
+  // false-rejecting a legitimate write as "escaped the allowed root after
+  // creation". Canonicalizing the existing prefix makes both sides symlink-free.
+  const root = await canonicalizeThroughExisting(rootRaw);
 
   // Resolve the requested path against the root. resolvePath collapses any
   // `..`/`.` segments; an absolute `filePath` replaces the root entirely, which
@@ -243,39 +253,30 @@ function normalizeAgentId(value: string | undefined | null): string {
 }
 
 /**
- * Expand a configured workspace string the same way the platform's canonical
- * `resolveAgentWorkspaceDir` does before it is used as a path:
- *   • leading `~` / `~/…` → the user's home directory (matches the platform's
- *     `resolveUserPath` / `expandHomePrefix`);
- *   • `$VAR` and `${VAR}` (and Windows `%VAR%`) → the matching environment
- *     variable, so an operator can parameterize the jail root.
- * A raw config string fed straight into `resolvePath` (the previous behavior)
- * would treat `~`/`$VAR` as literal path segments, jailing secrets under a
- * bogus `./~/…` directory instead of the intended workspace.
+ * Expand `$VAR` / `${VAR}` (POSIX) and `%VAR%` (Windows) against the process
+ * environment.
+ *
+ * The platform's canonical `resolveAgentWorkspaceDir` (via `resolveUserPath`)
+ * expands a leading `~` but does NOT substitute environment variables, so an
+ * operator who parameterizes a workspace as `${SECRETS_BASE}/octo` would
+ * otherwise get a literal `./${SECRETS_BASE}` directory. We pre-expand env vars
+ * on the configured workspace string BEFORE handing it to the platform resolver,
+ * which then performs the `~`-expansion and the per-agent path derivation. An
+ * undefined variable is left untouched (so the resulting non-root path still
+ * fails the existence/degeneracy checks safely rather than silently collapsing).
  */
-function expandWorkspacePath(input: string): string {
-  let out = input;
-  // $VAR / ${VAR}
-  out = out.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, a, b) => {
-    const name = a ?? b;
-    const val = process.env[name];
-    return val !== undefined ? val : m;
-  });
-  // Windows %VAR%
+function expandEnvVars(input: string): string {
+  let out = input.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (m, a, b) => {
+      const val = process.env[a ?? b];
+      return val !== undefined ? val : m;
+    },
+  );
   out = out.replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (m, name) => {
     const val = process.env[name];
     return val !== undefined ? val : m;
   });
-  // Leading ~ → home
-  if (out === "~" || out.startsWith("~/") || out.startsWith("~\\")) {
-    try {
-      const home = homedir();
-      if (home) out = out.replace(/^~(?=$|[\\/])/, home);
-    } catch {
-      // homedir() unavailable — leave the literal "~", resolvePath will treat it
-      // as a relative segment and the (non-root) result still fails safe.
-    }
-  }
   return out;
 }
 
@@ -294,35 +295,95 @@ function isFilesystemRoot(p: string): boolean {
 }
 
 /**
+ * Canonicalize an absolute path through its NEAREST EXISTING ANCESTOR.
+ *
+ * `realpath(p)` throws ENOENT the moment any component of `p` does not yet exist
+ * — which is the common case for a workspace-default jail on its very first
+ * write (the workspace dir hasn't been created). The old code fell back to the
+ * LEXICAL (un-canonicalized) form in that case. That produced a subtle but
+ * security-relevant inconsistency: the jail root was stored lexically, but the
+ * post-mkdir guard later compared it against `realpath(dir)` of the now-created
+ * directory. If ANY ancestor was a symlink (macOS `/tmp`→`/private/tmp`, a
+ * container bind-mount, a symlinked `$HOME`/workspace), the two diverged and a
+ * perfectly legitimate first write was rejected with "destination directory
+ * escaped the allowed root after creation".
+ *
+ * The fix: canonicalize the deepest ancestor that DOES exist, then re-append the
+ * still-missing tail. The result is symlink-free for every component that could
+ * possibly be a symlink (a not-yet-existing component cannot be one), so a later
+ * `realpath` of the created directory compares apples to apples. This neither
+ * loosens nor tightens containment — it only makes the root's canonical form
+ * consistent with how every downstream check canonicalizes paths.
+ */
+async function canonicalizeThroughExisting(absInput: string): Promise<string> {
+  const abs = resolvePath(absInput);
+  let dir = abs;
+  const tail: string[] = [];
+  // Walk up until we find an ancestor that exists (and can be realpath'd).
+  // Stop at the filesystem root regardless.
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      const real = await realpath(dir);
+      return tail.length ? resolvePath(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) {
+        // Reached the filesystem root and even it didn't resolve — fall back to
+        // the lexical absolute form (no symlink can hide above the root).
+        return abs;
+      }
+      tail.push(basename(dir));
+      dir = parent;
+    }
+  }
+}
+
+/**
  * Resolve the DEFAULT jail root for write-secret from the agent's workspace.
  *
  * This is the fallback used when no explicit per-account `secretsFileRoot` is
  * configured (the explicit value is handled by the caller and ALWAYS wins over
  * this default, so an operator can still lock writes to a narrower directory).
  *
- * Resolution order (matched against the OpenClaw **agent id**, the namespace
- * `cfg.agents.list[]` is keyed by — see normalizeAgentId):
- *   1. The matched `cfg.agents.list[]` entry → its `workspace`.
- *   2. `cfg.agents.defaults.workspace` (when the matched agent has no own
- *      workspace, or no agent matched).
- * The OpenClaw agent id (`agentId`) is preferred; the channel/Octo account id
- * (`agentAccountId`) is only a fallback, because account id ≠ agent id in
- * multi-agent deployments (e.g. agent `main` ↔ octo account `default`) and
- * keying on the account id would silently miss the per-agent workspace.
+ * 🔴 We delegate the actual path derivation to the platform-canonical
+ * `resolveAgentWorkspaceDir`, the SAME function the OpenClaw host uses, instead
+ * of re-deriving it here. That resolver encodes the per-agent semantics a
+ * hand-rolled version kept getting wrong:
+ *   • DEFAULT agent → `agents.defaults.workspace` (or its own `workspace`);
+ *   • NON-DEFAULT agent with no own workspace → `agents.defaults.workspace/<id>`
+ *     — a per-agent SUBDIRECTORY, never the bare shared parent. (The previous
+ *     hand-rolled code jailed every non-default agent to the WHOLE
+ *     `defaults.workspace`, letting e.g. a `worker` agent write into a sibling
+ *     `main/.env` — a cross-agent secret-write escape.)
+ * It also applies `~` expansion via `resolveUserPath`.
  *
- * 🔴 SECURITY — realpath-after-canon degenerate guard: this NEVER falls back to
- * `process.cwd()` (the source of the historical `/`-degenerate self-lock +
- * fail-open bugs). The configured workspace is home/env-expanded, then
- * **realpath-canonicalized**, and ONLY THEN checked for the filesystem-root
- * degeneracy. Doing the check after canonicalization closes the symlink-to-`/`
- * fail-open: a workspace pointed at a symlink whose real target is `/` (or a
- * drive root) now resolves to that root and is rejected here, instead of
- * slipping through a lexical `!== "/"` test and degenerating into a root-wide
- * jail downstream. If no workspace is configured, the value is empty, or it
- * canonicalizes to a filesystem root, we return `undefined` so the caller FAILS
- * CLOSED. (An operator who *explicitly* sets secretsFileRoot="/" is a separate,
- * deliberate opt-in handled by the caller and is intentionally NOT subject to
- * this default-degeneracy guard.)
+ * The OpenClaw agent id (`agentId`) is the namespace `cfg.agents.list[]` is
+ * keyed by; the channel/Octo account id (`agentAccountId`) is only a fallback
+ * for deployments where the two coincide, because account id ≠ agent id in
+ * multi-agent setups (e.g. agent `main` ↔ octo account `default`).
+ *
+ * Two things the platform resolver intentionally does NOT do, which this wrapper
+ * adds because a SECRET jail has stricter requirements than a general workspace:
+ *   1. ENV-VAR EXPANSION. The resolver expands `~` but not `$VAR`/`${VAR}`, so we
+ *      pre-expand env vars on the configured workspace strings first.
+ *   2. FAIL-CLOSED. The resolver always SYNTHESIZES a path (e.g.
+ *      `~/.openclaw/workspace`) even when nothing is configured. Silently
+ *      writing the owner's plaintext secret under a synthesized default the
+ *      operator never opted into is unsafe, so we return `undefined` (→ caller
+ *      fails closed) unless a workspace is ACTUALLY configured for this agent.
+ *
+ * 🔴 SECURITY — realpath-after-canon degenerate guard: NEVER falls back to
+ * `process.cwd()`. The resolved workspace is realpath-canonicalized and ONLY
+ * THEN checked for filesystem-root degeneracy, so a workspace pointing (directly
+ * or via symlink) at `/` or a drive root resolves to that root and is rejected
+ * here instead of degenerating into a root-wide jail downstream. We also reject
+ * when the CONFIGURED BASE is itself a filesystem root, because the platform
+ * resolver would turn `defaults.workspace="/"` into `"/<agentId>"` for a
+ * non-default agent — a per-agent subdir of `/` is still a root-adjacent jail
+ * the operator plainly did not intend. (An operator who *explicitly* sets
+ * secretsFileRoot="/" is a separate, deliberate opt-in handled by the caller and
+ * is intentionally NOT subject to this default-degeneracy guard.)
  */
 async function resolveAgentWorkspaceRoot(
   cfg: OpenClawConfig,
@@ -332,41 +393,80 @@ async function resolveAgentWorkspaceRoot(
   const agents = cfg.agents;
   if (!agents) return undefined;
 
-  // Match on the OpenClaw agent id first (the namespace list[] is keyed by),
-  // then fall back to the channel/Octo account id for deployments where the two
-  // coincide. Normalize both sides so casing/punctuation can't cause a miss.
+  // Effective agent id: prefer the OpenClaw agent id, fall back to the Octo
+  // account id only when the agent id is absent. The platform resolver
+  // normalizes this internally, so we pass it through as-is.
+  const effectiveId = (agentId ?? agentAccountId)?.trim();
+  if (!effectiveId) return undefined;
+  const normId = normalizeAgentId(effectiveId);
+
+  // Find this agent's OWN configured workspace (if any) and the shared default,
+  // matching the platform's id namespace (lower/slug-normalized).
   const list = agents.list;
-  let matched: { workspace?: string } | undefined;
-  for (const candidate of [agentId, agentAccountId]) {
-    if (!candidate) continue;
-    const norm = normalizeAgentId(candidate);
-    matched = list?.find(
-      (a) => a.id != null && normalizeAgentId(a.id) === norm,
-    );
-    if (matched) break;
+  const matched = list?.find(
+    (a) => a.id != null && normalizeAgentId(a.id) === normId,
+  );
+  const ownWorkspaceRaw = matched?.workspace?.trim();
+  const defaultWorkspaceRaw = agents.defaults?.workspace?.trim();
+
+  // 🔴 FAIL-CLOSED: only proceed when a workspace is ACTUALLY configured for
+  // this agent (its own, or a shared default it can inherit). Without this the
+  // platform resolver would synthesize `~/.openclaw/workspace` and we'd silently
+  // jail secrets under a directory the operator never opted into.
+  const configuredBaseRaw = ownWorkspaceRaw || defaultWorkspaceRaw;
+  if (!configuredBaseRaw) return undefined;
+
+  // 🔴 Reject a configured BASE that is a filesystem root up-front: for a
+  // non-default agent the platform would append `/<agentId>` and produce a
+  // root-adjacent jail (`/<agentId>`), which is just as unintended as a
+  // root-wide one. resolveUserPath('~') etc. can't yield a root from a non-root
+  // input, so this only catches an explicit `/` / drive-root base.
+  if (isFilesystemRoot(resolvePath(expandEnvVars(configuredBaseRaw)))) {
+    return undefined;
   }
 
-  const workspace = (matched?.workspace ?? agents.defaults?.workspace)?.trim();
-  if (!workspace) return undefined;
+  // Hand the platform resolver an env-EXPANDED view of this agent's config so
+  // its `~`-expansion + per-agent derivation operate on real path segments. We
+  // only override the two workspace fields it reads, preserving the rest of cfg.
+  const resolverCfg: OpenClawConfig = {
+    ...cfg,
+    agents: {
+      ...agents,
+      defaults: {
+        ...agents.defaults,
+        ...(defaultWorkspaceRaw
+          ? { workspace: expandEnvVars(defaultWorkspaceRaw) }
+          : {}),
+      },
+      ...(Array.isArray(list)
+        ? {
+            list: list.map((a) =>
+              a.id != null && normalizeAgentId(a.id) === normId && ownWorkspaceRaw
+                ? { ...a, workspace: expandEnvVars(ownWorkspaceRaw) }
+                : a,
+            ),
+          }
+        : {}),
+    },
+  } as OpenClawConfig;
 
-  // Home/env-expand to align with the platform's canonical workspace resolver,
-  // then realpath-canonicalize so the degenerate-root check below runs on the
-  // REAL target (defeats a symlink-to-`/` fail-open).
-  const expanded = resolvePath(expandWorkspacePath(workspace));
-  let canonical: string;
+  let derived: string;
   try {
-    canonical = await realpath(expanded);
+    derived = resolveAgentWorkspaceDir(resolverCfg, effectiveId);
   } catch {
-    // Workspace doesn't exist yet (or is unreachable): a non-existent path can't
-    // be a symlink, so its lexical absolute form is its effective target. We can
-    // still apply the degenerate-root guard against it.
-    canonical = expanded;
+    return undefined;
   }
+  if (!derived?.trim()) return undefined;
+
+  // Canonicalize through the nearest existing ancestor so the jail root is
+  // symlink-free and consistent with the post-mkdir `realpath(dir)` comparison
+  // (defeats the symlink-ancestor false-reject) AND so a symlink-to-`/` is
+  // caught by the degenerate-root guard below.
+  const canonical = await canonicalizeThroughExisting(derived);
 
   // 🔴 Degenerate-root guard, AFTER canonicalization: a workspace that resolves
-  // to a filesystem root (POSIX "/" or a Windows drive root) must NOT become a
-  // root-wide secret jail. Treat it as "no usable default" so the caller fails
-  // closed.
+  // to a filesystem root must NOT become a root-wide secret jail. Treat it as
+  // "no usable default" so the caller fails closed.
   if (isFilesystemRoot(canonical)) return undefined;
   return canonical;
 }

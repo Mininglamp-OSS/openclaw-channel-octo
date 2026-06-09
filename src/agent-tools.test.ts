@@ -1794,17 +1794,62 @@ describe("createOctoManagementTools", () => {
         expect(await readFile(join(root, "via-defaults.env"), "utf8")).toBe(PLAINTEXT);
       });
 
-      it("falls back to defaults.workspace when no agent matches agentAccountId", async () => {
+      // 🔴 P0 (Jerry-Xin + yujiawei) — NON-DEFAULT agent jail = per-agent
+      // SUBDIRECTORY of defaults.workspace, NEVER the bare shared parent. Here
+      // bot-A is not the default agent (someone-else is), so the platform's
+      // canonical resolveAgentWorkspaceDir derives <defaults.workspace>/<agentId>.
+      // The previous hand-rolled resolver wrongly jailed every non-default agent
+      // to the WHOLE defaults.workspace, letting one agent write into another's
+      // tree. Assert the secret lands under the per-agent subdir, not the parent.
+      it("jails a non-default agent to defaults.workspace/<agentId> (per-agent subdir)", async () => {
         setupMocks();
         vi.mocked(resolveSecret).mockResolvedValue({ status: "resolved", value: PLAINTEXT });
         const exec = executeWithAgents(
           { defaults: { workspace: root }, list: [{ id: "someone-else", workspace: "/x" }] },
-          "bot-A",
+          undefined,
+          "bot-A", // non-default agent (default is someone-else)
         );
 
         const result = await exec({ alias: "k", filePath: "no-match.env" });
         expect(parseText(result).written).toBe(true);
-        expect(await readFile(join(root, "no-match.env"), "utf8")).toBe(PLAINTEXT);
+        // Under the per-agent subdir…
+        expect(await readFile(join(root, "bot-a", "no-match.env"), "utf8")).toBe(PLAINTEXT);
+        // …NOT the bare shared parent.
+        await expect(
+          readFile(join(root, "no-match.env"), "utf8"),
+        ).rejects.toThrow();
+      });
+
+      // 🔴 P0 (Jerry-Xin + yujiawei) — a non-default agent must NOT be able to
+      // climb out of its per-agent subdir into a SIBLING agent's directory and
+      // write the owner's plaintext there. This is the concrete cross-agent
+      // secret-write escape the bare-defaults jail allowed: a `worker` writing
+      // `main/.env`. With the per-agent subdir jail, `../main/.env` resolves
+      // outside the jail and is refused before any plaintext is fetched.
+      it("rejects a non-default agent writing into a sibling agent's dir (worker→main/.env)", async () => {
+        setupMocks();
+        vi.mocked(resolveSecret).mockResolvedValue({ status: "resolved", value: PLAINTEXT });
+        // Pre-create a sibling "main" dir so a successful escape would actually
+        // land a file there — making the assertion that nothing escaped real.
+        await mkdir(join(root, "main"), { recursive: true });
+        const exec = executeWithAgents(
+          {
+            defaults: { workspace: root },
+            list: [
+              { id: "main", default: true },
+              { id: "worker" },
+            ],
+          },
+          undefined,
+          "worker", // non-default agent → jailed to <root>/worker
+        );
+
+        const result = await exec({ alias: "k", filePath: "../main/.env" });
+        expect(parseText(result).error).toMatch(/outside the allowed|permitted root/i);
+        // Plaintext never fetched on a confinement reject; nothing written to main/.
+        expect(resolveSecret).not.toHaveBeenCalled();
+        await expect(readFile(join(root, "main", ".env"), "utf8")).rejects.toThrow();
+        expect(JSON.stringify(result)).not.toContain(PLAINTEXT);
       });
 
       it("explicit secretsFileRoot still wins over the agent-workspace default", async () => {
@@ -2047,6 +2092,43 @@ describe("createOctoManagementTools", () => {
         } finally {
           if (prev === undefined) delete process.env.OCTO_TEST_WS;
           else process.env.OCTO_TEST_WS = prev;
+        }
+      });
+
+      // 🔴 必修2 (lml2468) — symlink-ANCESTOR first-write must NOT be
+      // false-rejected. When the jail root sits under a symlinked ancestor
+      // (macOS /tmp→/private/tmp, container bind-mounts, a symlinked $HOME) AND
+      // the workspace dir does not exist yet (the common first-write case), the
+      // old code stored the root in its LEXICAL form but compared it post-mkdir
+      // against realpath(dir). The two diverged through the symlink and the write
+      // was wrongly refused as "escaped the allowed root after creation". The fix
+      // canonicalizes the root through its nearest existing ancestor, so both
+      // sides are symlink-free. Build a real symlinked-ancestor root and assert
+      // the first write succeeds and the file lands at the real target.
+      it("does not false-reject a first write when the jail root has a symlinked ancestor", async () => {
+        setupMocks();
+        vi.mocked(resolveSecret).mockResolvedValue({ status: "resolved", value: PLAINTEXT });
+        // realDir is the genuine directory; linkDir is a symlink pointing at it.
+        // The workspace is configured UNDER the symlink, and its leaf subdir does
+        // NOT exist yet, so confineSecretPath falls into the not-yet-created path.
+        const realDir = await mkdtemp(join(tmpdir(), "octo-realtarget-"));
+        const linkDir = join(tmpdir(), `octo-symlink-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        await symlink(realDir, linkDir, "dir");
+        try {
+          const workspace = join(linkDir, "ws"); // under the symlink, not yet created
+          const exec = executeWithAgents(
+            { list: [{ id: "bot-A", workspace }] },
+            "bot-A",
+          );
+
+          const result = await exec({ alias: "k", filePath: "first.env" });
+          expect(parseText(result).written).toBe(true);
+          // The file lands at the REAL target the symlink points to.
+          expect(await readFile(join(realDir, "ws", "first.env"), "utf8")).toBe(PLAINTEXT);
+          expect(JSON.stringify(result)).not.toContain(PLAINTEXT);
+        } finally {
+          await rm(linkDir, { force: true });
+          await rm(realDir, { recursive: true, force: true });
         }
       });
     });
