@@ -20,8 +20,8 @@ import {
   updateGroupMd,
 } from "./api-fetch.js";
 import { uploadAndSendMedia, uploadMedia, resolveRichTextContent, type UploadedMedia } from "./inbound.js";
-import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions } from "./mention-utils.js";
-import { getKnownGroupIds } from "./group-md.js";
+import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions, sanitizeOutboundMentions } from "./mention-utils.js";
+import { getKnownGroupIds, extractParentGroupNo } from "./group-md.js";
 import { checkPermission } from "./permission.js";
 import { emitAuditLog } from "./audit.js";
 import { getGroupMembersFromCache, findSharedGroupsFromCache } from "./member-cache.js";
@@ -488,6 +488,33 @@ async function handleSend(params: {
 
   const { channelId, channelType } = resolveOutboundOctoTarget(target, effectiveThreadId);
 
+  // P0-1: ensure member maps are populated before @ conversion. The message-tool
+  // send path (agent-initiated @, new sub-topic) has no inbound refresh, so the
+  // passed-in maps can be empty/stale. Only when the message contains an `@`,
+  // pull the target group's members from the shared 5-min-TTL cache (cache hit =
+  // zero cost) and fill both maps. Threads only carry the parent group_no for
+  // the member API, so strip the `____` suffix. Best-effort, silent on failure.
+  if (
+    (channelType === ChannelType.Group || channelType === ChannelType.CommunityTopic) &&
+    typeof message === "string" &&
+    message.includes("@")
+  ) {
+    try {
+      const groupNo = extractParentGroupNo(channelId);
+      if (groupNo) {
+        const members = await getGroupMembersFromCache({ apiUrl, botToken, groupNo, log });
+        for (const mb of members) {
+          if (mb.name && mb.uid) {
+            memberMap?.set(mb.name, mb.uid);
+            uidToNameMap?.set(mb.uid, mb.name);
+          }
+        }
+      }
+    } catch (err) {
+      log?.error?.(`octo: handleSend member prefetch failed: ${err}`);
+    }
+  }
+
   // UX warning for a specific foot-gun on the message-tool path (#232 review):
   // the agent is replying inside a sub-topic (session's currentChannelId carries
   // `____`) but explicitly passed a bare parent-group target matching the
@@ -555,6 +582,21 @@ async function handleSend(params: {
       if (mentionEntities.length > 0) {
         mentionEntities.sort((a, b) => a.offset - b.offset);
         mentionUids = mentionEntities.map(e => e.uid);
+      }
+
+      // P0-3: last-line guard — rewrite/downgrade/strip malformed @ that the
+      // conversion+fallback couldn't resolve, and drop illegal uids so a bad
+      // mention is never leaked to the server.
+      if (uidToNameMap) {
+        const sanitized = sanitizeOutboundMentions({
+          content: finalMessage,
+          entities: mentionEntities,
+          uids: mentionUids,
+          uidToNameMap,
+        });
+        finalMessage = sanitized.content;
+        mentionEntities = sanitized.entities;
+        mentionUids = sanitized.uids;
       }
     }
 

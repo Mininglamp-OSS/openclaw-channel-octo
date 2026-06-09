@@ -19,6 +19,7 @@ import {
   parseStructuredMentions,
   convertStructuredMentions,
   buildEntitiesFromFallback,
+  MENTION_FORMAT_HINT,
 } from "./mention-utils.js";
 import type { MentionPayload, MentionEntity, SendMessageResult } from "./types.js";
 import { registerGroupAccount, ensureGroupMd, handleGroupMdEvent, broadcastGroupMdUpdate, extractParentGroupNo, extractThreadShortId, ensureThreadMd, handleThreadMdEvent } from "./group-md.js";
@@ -1229,10 +1230,20 @@ export function buildMemberListPrefix(uidToNameMap: Map<string, string>): string
     const memberLines = members
       .map(([uid, name]) => `  ${name} (${uid})`)
       .join("\n");
-    return `[Group Members]\n${memberLines}\n\nWhen mentioning a group member, use the format @[uid:displayName] (e.g. @[${members[0][0]}:${members[0][1]}]). I will convert it to the correct format before sending.\n\n`;
+    // 真实形态示例锚点用真名 + 真 uid（来自内联名单）；格式说明/anti-pattern
+    // 取自共享常量，三处同源不 drift。占位槽用尖括号，避免示例本身被
+    // STRUCTURED_MENTION_PATTERN 解析成非法 {uid:"uid"}。
+    return `[Group Members]\n${memberLines}\n\n${MENTION_FORMAT_HINT}\n(e.g. @[${members[0][0]}:${members[0][1]}]).\n\n`;
   }
 
-  return `[Group Info] This group has ${uidToNameMap.size} members. Use the group management tool to look up member info when needed. When mentioning a group member, use the format @[uid:displayName].\n\n`;
+  return (
+    `[Group Info] This group has ${uidToNameMap.size} members — too many to list here.\n` +
+    `To @mention someone, FIRST look up their real uid and display name with the ` +
+    `group management tool (octo_management action="group-members", ` +
+    `target="group:<groupId>"); it returns each member's { uid, name }.\n` +
+    `THEN write the mention. ${MENTION_FORMAT_HINT}\n` +
+    `Real example: @[a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6:Alice].\n\n`
+  );
 }
 
 /**

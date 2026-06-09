@@ -27,7 +27,7 @@ import {
   isRemoteMediaUrl,
   type ResolveFileResult,
 } from "./inbound.js";
-import { extractMentionUids } from "./mention-utils.js";
+import { extractMentionUids, parseStructuredMentions } from "./mention-utils.js";
 import { normalizeMediaAttachments } from "openclaw/plugin-sdk/media-runtime";
 import { existsSync, unlinkSync, readFileSync } from "node:fs";
 
@@ -1417,7 +1417,10 @@ describe("buildMemberListPrefix", () => {
     expect(result).toContain("Alice (uid_alice)");
     expect(result).toContain("Bob (uid_bob)");
     expect(result).toContain("陈皮皮 (uid_chen)");
-    expect(result).toContain("@[uid:displayName]");
+    // Format hint uses angle-bracket placeholder slots (never the literal
+    // @[uid:displayName] trap that parses into {uid:"uid"}).
+    expect(result).toContain("@[<uid>:<displayName>]");
+    expect(result).not.toContain("@[uid:displayName]");
   });
 
   it("should inject full member list when exactly 10 members", () => {
@@ -1452,6 +1455,50 @@ describe("buildMemberListPrefix", () => {
     const result = buildMemberListPrefix(map);
     expect(result).toContain("[Group Info]");
     expect(result).toContain("50 members");
+  });
+
+  it(">10 branch names the real group-members action + a real-form hex anchor", () => {
+    const map = new Map<string, string>();
+    for (let i = 1; i <= 13; i++) map.set(`uid_${i}`, `User${i}`);
+    const result = buildMemberListPrefix(map);
+    // points at the real octo_management action, not a vague "tool"
+    expect(result).toContain("group-members");
+    // real-form hex example anchor (32-hex), never the literal word "uid"
+    expect(result).toContain("@[a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6:Alice]");
+  });
+
+  it(">10 branch carries the convert promise, single-colon, brackets and anti-patterns", () => {
+    const map = new Map<string, string>();
+    for (let i = 1; i <= 13; i++) map.set(`uid_${i}`, `User${i}`);
+    const result = buildMemberListPrefix(map);
+    expect(result).toContain("I will convert");
+    expect(result).toContain("ONE colon");
+    expect(result).toContain("REQUIRED");
+    expect(result).toContain("username/bot_id");
+    expect(result).toContain('"uid"');
+    expect(result).toContain("bare uid");
+    expect(result).toMatch(/\n\n$/); // still terminated with a blank line
+  });
+
+  it("regression guard (test #13): >10 text parses to exactly ONE legal structured mention", () => {
+    const map = new Map<string, string>();
+    for (let i = 1; i <= 13; i++) map.set(`uid_${i}`, `User${i}`);
+    const result = buildMemberListPrefix(map);
+    const parsed = parseStructuredMentions(result);
+    expect(parsed.every((mtn) => mtn.uid !== "uid")).toBe(true);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].uid).toBe("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6");
+  });
+
+  it("≤10 and >10 branches share the MENTION_FORMAT_HINT core (no drift)", () => {
+    const small = new Map<string, string>([["uid_a", "Alice"], ["uid_b", "Bob"]]);
+    const large = new Map<string, string>();
+    for (let i = 1; i <= 13; i++) large.set(`uid_${i}`, `User${i}`);
+    const core = "@[<uid>:<displayName>]";
+    expect(buildMemberListPrefix(small)).toContain(core);
+    expect(buildMemberListPrefix(large)).toContain(core);
+    expect(buildMemberListPrefix(small)).toContain("ONE colon");
+    expect(buildMemberListPrefix(large)).toContain("ONE colon");
   });
 });
 

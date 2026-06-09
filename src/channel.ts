@@ -28,10 +28,10 @@ function getAgentVersion(): string {
 import { WKSocket } from "./socket.js";
 import { handleInboundMessage, type OctoStatusSink, sanitizeFilename } from "./inbound.js";
 import { ChannelType, MessageType, type BotMessage, type MessagePayload, type SendMessageResult } from "./types.js";
-import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions } from "./mention-utils.js";
+import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions, sanitizeOutboundMentions, MENTION_FORMAT_HINT } from "./mention-utils.js";
 import type { MentionEntity } from "./types.js";
 import { handleOctoMessageAction, parseTarget, resolveOutboundOctoTarget, normalizeOutboundChannelPrefix, extractInlineMentionUids } from "./actions.js";
-import { getOrCreateGroupMdCache, registerBotGroupIds, getKnownGroupIds, writeGroupMdToDisk } from "./group-md.js";
+import { getOrCreateGroupMdCache, registerBotGroupIds, getKnownGroupIds, writeGroupMdToDisk, extractParentGroupNo } from "./group-md.js";
 import { registerOwnerUid } from "./owner-registry.js";
 import { registerKnownBot, isKnownBot } from "./bot-registry.js";
 import { preloadGroupMemberCache, getGroupMembersFromCache } from "./member-cache.js";
@@ -247,6 +247,49 @@ function getOrCreateGroupCacheTimestamps(accountId: string): Map<string, number>
     _groupCacheTimestamps.set(id, m);
   }
   return m;
+}
+
+/**
+ * Outbound @mention prefetch (P0-1).
+ *
+ * Proactive sends (cron, new sub-topic, agent-initiated @) never go through the
+ * inbound member-cache refresh, so the per-account memberMap/uidToNameMap can be
+ * empty or stale at send time. Before converting, if the text contains an `@`,
+ * pull the target group's members from the shared 5-min-TTL cache and fill both
+ * maps. Cache hit = zero cost; on a cold start (cache miss) this performs one
+ * synchronous member-list API round-trip on the send path. Threads only know the
+ * parent group_no for the member API, so strip the `____` sub-topic suffix.
+ * Best-effort: any failure degrades silently (the outbound sanitizer is the real
+ * safety net).
+ */
+async function prefetchOutboundMembers(opts: {
+  content: string;
+  channelId: string;
+  apiUrl: string;
+  botToken: string;
+  memberMap: Map<string, string>;
+  uidToNameMap: Map<string, string>;
+  log?: { info?: (msg: string) => void; error?: (msg: string) => void };
+}): Promise<void> {
+  if (!opts.content.includes("@")) return;
+  try {
+    const groupNo = extractParentGroupNo(opts.channelId);
+    if (!groupNo) return;
+    const members = await getGroupMembersFromCache({
+      apiUrl: opts.apiUrl,
+      botToken: opts.botToken,
+      groupNo,
+      log: opts.log,
+    });
+    for (const m of members) {
+      if (m.name && m.uid) {
+        opts.memberMap.set(m.name, m.uid);
+        opts.uidToNameMap.set(m.uid, m.name);
+      }
+    }
+  } catch (err) {
+    opts.log?.error?.(`octo: prefetchOutboundMembers failed: ${err}`);
+  }
 }
 
 // Module-level robot flags: uid -> robot (server-authoritative GroupMember.robot)
@@ -702,6 +745,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         `For threads/sub-topics: if you are explicitly targeting a thread, the target MUST be the full "group:<group_no>____<short_id>" (four underscores) — do not send just the parent "group:<group_no>" or the reply will land in the parent group instead of the thread. The same rule applies to file uploads.`,
         `For reading message history: use action="read" with target="user:<uid>" to read DM history, or target="group:<groupId>" to read group message history. Cross-channel queries require the requester to be a participant of the target channel.`,
         `For searching: use action="search" with query="shared-groups" to find groups that the bot and the current user both belong to.`,
+        `For @mentions in a group: FIRST look up the target member's real uid + display name with octo_management action="group-members" (target="group:<groupId>"). ${MENTION_FORMAT_HINT}`,
       ];
     },
   },
@@ -769,6 +813,17 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         const accountMemberMap = getOrCreateMemberMap(accountId);
         const uidToNameMap = getOrCreateUidToNameMap(accountId);
 
+        // P0-1: ensure member maps are populated for proactive sends (cron / new
+        // sub-topic / agent-initiated @) where the inbound refresh never ran.
+        await prefetchOutboundMembers({
+          content: finalContent,
+          channelId,
+          apiUrl: account.config.apiUrl,
+          botToken: account.config.botToken,
+          memberMap: accountMemberMap,
+          uidToNameMap,
+        });
+
         // v2 path: convert @[uid:name] → @name + entities
         const structuredMentions = parseStructuredMentions(finalContent);
         if (structuredMentions.length > 0) {
@@ -795,6 +850,20 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             mentionUids.push(uid);
           }
         }
+
+        // P0-3: last-line guard — rewrite/downgrade/strip any malformed @ the
+        // conversion+fallback couldn't resolve, and drop illegal uids so a bad
+        // mention is never leaked to the server.
+        const sanitized = sanitizeOutboundMentions({
+          content: finalContent,
+          entities: mentionEntities,
+          uids: mentionUids,
+          uidToNameMap,
+        });
+        finalContent = sanitized.content;
+        mentionEntities = sanitized.entities;
+        mentionUids.length = 0;
+        mentionUids.push(...sanitized.uids);
       }
 
       // Detect @all/@所有人 in content

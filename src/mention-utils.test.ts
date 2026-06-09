@@ -11,6 +11,9 @@ import {
   convertContentForLLM,
   buildSenderPrefix,
   tryLongestMemberMatch,
+  sanitizeOutboundMentions,
+  isValidOutboundUid,
+  MENTION_FORMAT_HINT,
 } from "./mention-utils.js";
 import type { MentionPayload } from "./types.js";
 
@@ -747,5 +750,326 @@ describe("inbound text fallback regex", () => {
 
   it("does NOT match CJK bot name followed by CJK", () => {
     expect(buildFallbackRegex("小助手").test("@小助手好")).toBe(false);
+  });
+});
+
+// ── Outbound mention sanitizer (P0-3) + shared format hint (P1) ──────────────
+
+const HEX_A = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"; // Alice
+const HEX_B = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"; // Bob
+
+describe("isValidOutboundUid", () => {
+  const map = new Map<string, string>([[HEX_A, "Alice"]]);
+
+  it("accepts a uid present in uidToNameMap", () => {
+    expect(isValidOutboundUid(HEX_A, map)).toBe(true);
+  });
+  it("rejects the literal word 'uid'", () => {
+    expect(isValidOutboundUid("uid", map)).toBe(false);
+  });
+  it("rejects a guessed username/bot_id", () => {
+    expect(isValidOutboundUid("somebody_bot", map)).toBe(false);
+  });
+  it("rejects a 32-hex uid that is not in the map (hallucinated)", () => {
+    expect(isValidOutboundUid(HEX_B, map)).toBe(false);
+  });
+  it("rejects a fake space-prefix whose base is not 32-hex", () => {
+    expect(isValidOutboundUid("s1_haha", map)).toBe(false);
+  });
+  it("accepts a space-prefixed uid whose base IS 32-hex", () => {
+    expect(isValidOutboundUid("s14_" + HEX_B, map)).toBe(true);
+  });
+});
+
+describe("sanitizeOutboundMentions", () => {
+  it("bracketless @uid:name with valid (in-map) uid → @displayName + entity, no raw uid:name", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: `Hi @${HEX_A}:Alice!`,
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.content).toBe("Hi @Alice!");
+    expect(r.content).not.toContain(`${HEX_A}:`);
+    expect(r.entities).toHaveLength(1);
+    expect(r.entities[0]).toMatchObject({ uid: HEX_A, offset: 3, length: 6 });
+    expect(r.uids).toEqual([HEX_A]);
+  });
+
+  it("bracketless @uid:name where token is not uid-shaped → left untouched, no entity", () => {
+    // The literal word "uid" doesn't look like a uid (not 32-hex, not in map,
+    // not a real space-prefix), so the sanitizer must NOT rewrite it — leaving
+    // ambiguous text intact is safer than mangling it. The only hard guarantee
+    // is that no illegal mention entity leaks.
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: "Hi @uid:Alice!",
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.content).toBe("Hi @uid:Alice!");
+    expect(r.entities).toHaveLength(0);
+    expect(r.uids).not.toContain("uid");
+  });
+
+  it("@username with no usernameMap → left as plain text, never sent as uid", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: "Ping @somebody_bot please",
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.content).toBe("Ping @somebody_bot please");
+    expect(r.entities).toHaveLength(0);
+    expect(r.uids).not.toContain("somebody_bot");
+  });
+
+  it("@username with usernameMap hit → reverse-looked-up entity (P2)", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const usernameMap = new Map([["somebody_bot", HEX_A]]);
+    const r = sanitizeOutboundMentions({
+      content: "Ping @somebody_bot please",
+      entities: [],
+      uids: [],
+      uidToNameMap,
+      usernameMap,
+    });
+    expect(r.content).toBe("Ping @Alice please");
+    expect(r.entities).toHaveLength(1);
+    expect(r.entities[0].uid).toBe(HEX_A);
+    expect(r.uids).toEqual([HEX_A]);
+  });
+
+  it("bare @<32hex> hit in uidToNameMap → @displayName + entity", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: `Hey @${HEX_A} hi`,
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.content).toBe("Hey @Alice hi");
+    expect(r.entities).toHaveLength(1);
+    expect(r.entities[0].uid).toBe(HEX_A);
+  });
+
+  it("bare @<32hex> not in map → @ stripped, no entity", () => {
+    const uidToNameMap = new Map<string, string>();
+    const r = sanitizeOutboundMentions({
+      content: `Hey @${HEX_B} hi`,
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.content).toBe(`Hey ${HEX_B} hi`);
+    expect(r.entities).toHaveLength(0);
+    expect(r.uids).toHaveLength(0);
+  });
+
+  it("offset drift: pre-existing entity offsets stay aligned after rewrites", () => {
+    // Leading converted v2 mention @Bob (entity) + a bracketless @uid:name later.
+    const uidToNameMap = new Map([
+      [HEX_B, "Bob"],
+      [HEX_A, "Alice"],
+    ]);
+    const content = `@Bob ping @${HEX_A}:Alice end`;
+    const r = sanitizeOutboundMentions({
+      content,
+      entities: [{ uid: HEX_B, offset: 0, length: 4 }],
+      uids: [HEX_B],
+      uidToNameMap,
+    });
+    expect(r.content).toBe("@Bob ping @Alice end");
+    // Every entity offset must point at its @name in the rewritten content.
+    for (const e of r.entities) {
+      const slice = r.content.slice(e.offset, e.offset + e.length);
+      expect(slice.startsWith("@")).toBe(true);
+    }
+    const bob = r.entities.find((e) => e.uid === HEX_B)!;
+    expect(r.content.slice(bob.offset, bob.offset + bob.length)).toBe("@Bob");
+    const alice = r.entities.find((e) => e.uid === HEX_A)!;
+    expect(r.content.slice(alice.offset, alice.offset + alice.length)).toBe("@Alice");
+  });
+
+  it("does not damage a space-prefixed uid mention", () => {
+    const spaceUid = "s14_" + HEX_A;
+    const uidToNameMap = new Map([[spaceUid, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: `Hi @${spaceUid}:Alice!`,
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.content).toBe("Hi @Alice!");
+    expect(r.entities).toHaveLength(1);
+    expect(r.entities[0].uid).toBe(spaceUid);
+    expect(r.uids).toEqual([spaceUid]);
+  });
+
+  it("space-nickname + bracketless uid", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice Smith"]]);
+    const r = sanitizeOutboundMentions({
+      content: `Hi @${HEX_A}:Alice Smith!`,
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.content).toBe("Hi @Alice Smith!");
+    expect(r.entities).toHaveLength(1);
+    expect(r.entities[0].uid).toBe(HEX_A);
+    expect(r.content.slice(r.entities[0].offset, r.entities[0].offset + r.entities[0].length)).toBe(
+      "@Alice Smith",
+    );
+  });
+
+  it("final guard filters illegal uids out of the supplied uids list", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: "plain text no mentions",
+      entities: [],
+      uids: [HEX_A, "uid", "somebody_bot"],
+      uidToNameMap,
+    });
+    expect(r.uids).toEqual([HEX_A]);
+  });
+
+  // ── Negative cases: normal colon-bearing text must NOT be mangled (#1) ──────
+  describe("does not damage normal colon-bearing text", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+
+    it("leaves a time like @12:30 untouched", () => {
+      const r = sanitizeOutboundMentions({
+        content: "lets meet @12:30 today",
+        entities: [],
+        uids: [],
+        uidToNameMap,
+      });
+      expect(r.content).toBe("lets meet @12:30 today");
+      expect(r.entities).toHaveLength(0);
+      expect(r.uids).toHaveLength(0);
+    });
+
+    it("leaves an SSH-style git@github.com:org/repo untouched", () => {
+      const r = sanitizeOutboundMentions({
+        content: "deploy git@github.com:org/repo now",
+        entities: [],
+        uids: [],
+        uidToNameMap,
+      });
+      expect(r.content).toBe("deploy git@github.com:org/repo now");
+      expect(r.entities).toHaveLength(0);
+      expect(r.uids).toHaveLength(0);
+    });
+
+    it("leaves a ratio like @3:1 untouched", () => {
+      const r = sanitizeOutboundMentions({
+        content: "ratio @3:1 split",
+        entities: [],
+        uids: [],
+        uidToNameMap,
+      });
+      expect(r.content).toBe("ratio @3:1 split");
+      expect(r.entities).toHaveLength(0);
+      expect(r.uids).toHaveLength(0);
+    });
+
+    it("leaves a URL with userinfo+port untouched", () => {
+      const r = sanitizeOutboundMentions({
+        content: "see http://a@host:8080/p here",
+        entities: [],
+        uids: [],
+        uidToNameMap,
+      });
+      expect(r.content).toBe("see http://a@host:8080/p here");
+      expect(r.entities).toHaveLength(0);
+      expect(r.uids).toHaveLength(0);
+    });
+  });
+
+  // ── Hole B: fake space-prefix must not produce a junk uid entity (#2) ───────
+  it("fake space-prefix @s1_haha:Bob → no entity with uid 's1_haha'", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: "hi @s1_haha:Bob",
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.entities.some((e) => e.uid === "s1_haha")).toBe(false);
+    expect(r.uids).not.toContain("s1_haha");
+  });
+
+  // ── Hole A: hallucinated 32-hex not in map must not be sent as entity (#2) ──
+  it("hallucinated @<32hex>:Ghost not in map → downgraded, no entity", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: `hi @${HEX_B}:Ghost`,
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    // hex is uid-shaped but not in map → downgrade to @Ghost, drop the uid.
+    expect(r.content).toBe("hi @Ghost");
+    expect(r.entities.some((e) => e.uid === HEX_B)).toBe(false);
+    expect(r.uids).not.toContain(HEX_B);
+  });
+
+  // ── Main path must not regress: real member @[uid:Alice] (#2) ───────────────
+  it("real in-map member uid is converted + kept as entity (main path)", () => {
+    const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+    const mentions = parseStructuredMentions(`ping @[${HEX_A}:Alice] ok`);
+    const converted = convertStructuredMentions(`ping @[${HEX_A}:Alice] ok`, mentions);
+    const r = sanitizeOutboundMentions({
+      content: converted.content,
+      entities: converted.entities,
+      uids: converted.uids,
+      uidToNameMap,
+    });
+    expect(r.content).toBe("ping @Alice ok");
+    expect(r.entities).toHaveLength(1);
+    expect(r.entities[0].uid).toBe(HEX_A);
+    expect(r.uids).toEqual([HEX_A]);
+  });
+
+  // ── space-prefix real member with 32-hex base stays valid (#2) ─────────────
+  it("real space-prefixed member @s14_<32hex> stays valid", () => {
+    const spaceUid = "s14_" + HEX_A;
+    const uidToNameMap = new Map([[spaceUid, "Alice"]]);
+    const r = sanitizeOutboundMentions({
+      content: `hi @${spaceUid}:Alice!`,
+      entities: [],
+      uids: [],
+      uidToNameMap,
+    });
+    expect(r.content).toBe("hi @Alice!");
+    expect(r.entities).toHaveLength(1);
+    expect(r.entities[0].uid).toBe(spaceUid);
+    expect(r.uids).toEqual([spaceUid]);
+  });
+});
+
+describe("MENTION_FORMAT_HINT (P1) + >10 prefix regression guard (test #13)", () => {
+  it("never itself parses into an illegal {uid:'uid'} mention", () => {
+    const parsed = parseStructuredMentions(MENTION_FORMAT_HINT);
+    expect(parsed.every((m) => m.uid !== "uid")).toBe(true);
+    // angle-bracket placeholder slots are not parseable structured mentions
+    expect(parsed).toHaveLength(0);
+  });
+
+  it("uses angle-bracket placeholder slots, not the literal @[uid:displayName] trap", () => {
+    expect(MENTION_FORMAT_HINT).toContain("@[<uid>:<displayName>]");
+    expect(MENTION_FORMAT_HINT).not.toContain("@[uid:displayName]");
+  });
+
+  it("contains single-colon, brackets, convert promise, and three anti-patterns", () => {
+    expect(MENTION_FORMAT_HINT).toContain("ONE colon");
+    expect(MENTION_FORMAT_HINT).toContain("REQUIRED");
+    expect(MENTION_FORMAT_HINT).toContain("I will convert");
+    expect(MENTION_FORMAT_HINT).toContain("username/bot_id");
+    expect(MENTION_FORMAT_HINT).toContain('"uid"');
+    expect(MENTION_FORMAT_HINT).toContain("bare uid");
   });
 });

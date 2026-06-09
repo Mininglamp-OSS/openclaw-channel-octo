@@ -35,6 +35,26 @@ export const MENTION_PATTERN =
 export const STRUCTURED_MENTION_PATTERN = /@\[([\w.\-]+):([^\]\n]+)\]/g;
 
 /**
+ * Shared @mention format instruction.
+ *
+ * Single source of truth reused by the inbound member-list prefix (both the
+ * ≤10 and >10 branches) and the outbound message-tool hints, so the format
+ * rules and anti-patterns can never drift between the three injection points.
+ *
+ * The placeholder slots are written as `@[<uid>:<displayName>]` (angle
+ * brackets), NOT `@[uid:displayName]`. The angle brackets keep the literal
+ * placeholder out of STRUCTURED_MENTION_PATTERN's uid char class ([\w.\-]),
+ * so this hint text itself never parses into an illegal `{uid:"uid"}` mention
+ * that a model could copy verbatim into a payload.
+ */
+export const MENTION_FORMAT_HINT =
+  `To @mention a member, use @[<uid>:<displayName>] where <uid> is the member's REAL ` +
+  `32-char hex id, with exactly ONE colon and the square brackets are REQUIRED. ` +
+  `Never use a username/bot_id (e.g. @somebody_bot), never copy the literal word ` +
+  `"uid", never write a bare uid without brackets, never omit the brackets. ` +
+  `I will convert the @[<uid>:<displayName>] form to the correct mention before sending.`;
+
+/**
  * Parse @mentions from message content.
  * Returns an array of mentioned names (without the @ prefix).
  *
@@ -235,7 +255,224 @@ export function buildEntitiesFromFallback(
   return { entities, uids };
 }
 
-// ── Extract UIDs from MentionPayload (entities-first with fallback) ──────────
+// ── Outbound mention sanitizer (last-line guard before send) ─────────────────
+
+/** Octo uids are random 32-char hex hashes. */
+const HEX32_RE = /^[0-9a-fA-F]{32}$/;
+
+/**
+ * 判定一个 uid 是否可作为出站 mention 发出。
+ *
+ * 白名单（保守策略，与 bareHex 兜底分支口径一致）：
+ *   1. 在 uidToNameMap 中命中（v2 主路径的真实成员 uid 走这里放行）。
+ *   2. space-prefixed（s{digits}_<base>）且剥离后的 base 为标准 32-hex。
+ *
+ * 故意 **不** 放行"未命中 map 的裸 32-hex"：模型幻觉出的随机 32-hex 不在本
+ * 群成员表里，若放行会被当 entity 发给服务端（幻觉提醒）。bareHex 兜底分支
+ * 对未命中 hex 已采取"剥掉 @、不发 mention"的保守处理，这里与之统一。
+ *
+ * 其余（字面词 "uid"、猜测的 username/bot_id、伪 space-prefix 如 s1_haha）
+ * 一律视为非法。
+ */
+export function isValidOutboundUid(
+  uid: string,
+  uidToNameMap: Map<string, string>,
+): boolean {
+  if (uidToNameMap.has(uid)) return true;
+  // space-prefixed uid（s14_<32hex>）：base 必须是标准 32-hex 才算合法，
+  // 避免伪造的 s1_haha 这类"能剥就放行"导致垃圾 uid entity 泄露。
+  const base = extractBaseUid(uid);
+  if (base !== uid && HEX32_RE.test(base)) return true;
+  return false;
+}
+
+/**
+ * 形态预筛：判断 token 是否"长得像一个 uid"，决定出站兜底是否要触碰这段文本。
+ *
+ * 比 isValidOutboundUid 略宽——额外把"裸 32-hex"也算 uid 形态，使得
+ * `@<32hex>:Name`（即便 hex 未命中 map）能进入重写路径并降级为 `@Name`，
+ * 而 `@12:30`/`@3:1`/`git@github.com:org` 这类普通含冒号文本（token 形态完全
+ * 不像 uid）被直接跳过、原样保留，不做任何改写。
+ */
+function isUidShaped(uid: string, uidToNameMap: Map<string, string>): boolean {
+  if (isValidOutboundUid(uid, uidToNameMap)) return true;
+  if (HEX32_RE.test(uid)) return true; // 裸 32-hex（可能未命中 map）
+  return false;
+}
+
+export interface SanitizeResult {
+  content: string;
+  entities: MentionEntity[];
+  uids: string[];
+}
+
+/**
+ * 出站宽松兜底 + 守卫：在 v2/v1 转换之后、send 之前调用。
+ *
+ * 修复三类模型常写错、转换/兜底都救不回的坏 @：
+ *   1. 缺方括号 `@uid:name`  —— uid 合法 → 重写 `@displayName` + entity；
+ *      非法 → 降级 `@name`（剥掉 uid），绝不发 `uid:name` 整段。
+ *   2. `@username`/猜测句柄  —— 有 usernameMap 命中 → 反查补 entity；
+ *      否则保持纯文本（无 entity），绝不把非法 token 当 uid。
+ *   3. 裸 `@<32hex>`         —— 命中 uidToNameMap → 重写 `@displayName` + entity；
+ *      未命中 → 剥掉 `@`，不发非法 mention。
+ *
+ * 最终守卫：过滤 entities/uids，只保留 isValidOutboundUid 通过的项。
+ *
+ * 重写改变字符串长度，故所有改写统一从后向前 splice，并同步调整既有
+ * entity 的 offset，避免漂移。
+ */
+export function sanitizeOutboundMentions(params: {
+  content: string;
+  entities: MentionEntity[];
+  uids: string[];
+  uidToNameMap: Map<string, string>;
+  // 预留：@username → uid 反查表（P2 能力）。当前生产路径尚未接线（仅测试
+  // 传入），故 ③ 分支线上不可达；接入后即可对 @handle 自动补 entity。
+  usernameMap?: Map<string, string>;
+}): SanitizeResult {
+  const { uidToNameMap, usernameMap } = params;
+  let content = params.content;
+  // 既有 entity 的工作副本（offset 会随重写调整）
+  const entities: MentionEntity[] = params.entities.map((e) => ({ ...e }));
+
+  interface Edit {
+    start: number;
+    end: number;
+    replacement: string;
+    uid?: string;
+  }
+  const edits: Edit[] = [];
+
+  // 已被既有 entity / 已决定的 edit 占用的区间，避免重复处理同一段文本
+  const claimed: Array<[number, number]> = entities.map((e) => [
+    e.offset,
+    e.offset + e.length,
+  ]);
+  const overlaps = (s: number, e: number): boolean =>
+    claimed.some(([cs, ce]) => s < ce && e > cs);
+
+  // 前置短路：正文不含 @ 时无需扫描任何 mention 形态（出站群消息正文绝大多数
+  // 没有 @）。最终 uid/entity 守卫仍会执行（见末尾），故传入的 uids 仍被过滤。
+  if (content.includes("@")) {
+    // ① 缺方括号 @uid:name（name 字符集复用 MENTION_PATTERN 的内部集合）
+    // 前置边界对齐 MENTION_PATTERN：@ 前须为行首/空白/非字母数字，排除
+    // git@github.com:org、http://x@host:8080 这类中缀 @ 误匹配。
+    const bracketless =
+      /(?:^|(?<=\s|[^a-zA-Z0-9]))@([\w.\-]+):([\wÀ-ɏ一-鿿぀-ヿ가-힯.\-]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = bracketless.exec(content)) !== null) {
+      const uidTok = m[1];
+      if (uidTok.toLowerCase() === "all") continue;
+      // 形态预筛：只有"确实像一个 uid"的 token 才进入重写/降级。普通含冒号
+      // 文本（@12:30 时间、@3:1 比例、github.com 等）形态不像 uid → 原样保留。
+      if (!isUidShaped(uidTok, uidToNameMap)) continue;
+      const start = m.index;
+      let end = m.index + m[0].length;
+      if (overlaps(start, end)) continue;
+
+      const canonical =
+        uidToNameMap.get(uidTok) ??
+        (extractBaseUid(uidTok) !== uidTok
+          ? uidToNameMap.get(extractBaseUid(uidTok))
+          : undefined);
+
+      let replacement: string;
+      let uid: string | undefined;
+      if (isValidOutboundUid(uidTok, uidToNameMap)) {
+        // 合法 uid → 重写为真名（优先用映射的规范名）+ entity
+        const dispName = canonical ?? m[2];
+        // 含空格昵称：若冒号后紧跟规范名，扩展消费范围把整段名字吃掉
+        const colonEnd = start + 1 + uidTok.length + 1; // @ + uid + ':'
+        if (canonical && content.startsWith(canonical, colonEnd)) {
+          end = colonEnd + canonical.length;
+        }
+        replacement = `@${dispName}`;
+        uid = uidTok;
+      } else {
+        // 形态像 uid 但不合法（如未命中 map 的幻觉 32-hex）→ 降级为 @name
+        //（剥掉 uid 段），不发非法 mention。
+        replacement = `@${m[2]}`;
+        uid = undefined;
+      }
+      edits.push({ start, end, replacement, uid });
+      claimed.push([start, end]);
+    }
+
+    // ② 裸 @<32hex>
+    const bareHex = /@([0-9a-fA-F]{32})/g;
+    while ((m = bareHex.exec(content)) !== null) {
+      const hex = m[1];
+      const start = m.index;
+      const end = m.index + m[0].length;
+      if (overlaps(start, end)) continue;
+      const name = uidToNameMap.get(hex);
+      if (name) {
+        edits.push({ start, end, replacement: `@${name}`, uid: hex });
+      } else {
+        // 未命中 → 剥掉 @，不当作 mention 发出
+        edits.push({ start, end, replacement: hex, uid: undefined });
+      }
+      claimed.push([start, end]);
+    }
+
+    // ③ @username（仅当 usernameMap 命中时反查补回；否则保持纯文本）
+    if (usernameMap && usernameMap.size > 0) {
+      const userPat = /@([a-zA-Z0-9_]+)/g;
+      while ((m = userPat.exec(content)) !== null) {
+        const username = m[1];
+        if (username.toLowerCase() === "all") continue;
+        const start = m.index;
+        const end = m.index + m[0].length;
+        if (overlaps(start, end)) continue;
+        const uid = usernameMap.get(username);
+        if (!uid) continue;
+        const name = uidToNameMap.get(uid) ?? username;
+        edits.push({ start, end, replacement: `@${name}`, uid });
+        claimed.push([start, end]);
+      }
+    }
+  }
+
+  // 从后向前应用所有 edit，同步调整既有/新增 entity 的 offset
+  edits.sort((a, b) => b.start - a.start);
+  for (const ed of edits) {
+    const delta = ed.replacement.length - (ed.end - ed.start);
+    content = content.slice(0, ed.start) + ed.replacement + content.slice(ed.end);
+    for (const e of entities) {
+      if (e.offset >= ed.end) e.offset += delta;
+    }
+    if (ed.uid) {
+      entities.push({
+        uid: ed.uid,
+        offset: ed.start,
+        length: ed.replacement.length,
+      });
+    }
+  }
+
+  // 最终守卫：丢弃非法 uid 的 entity / uid
+  const finalEntities = entities
+    .filter((e) => isValidOutboundUid(e.uid, uidToNameMap))
+    .sort((a, b) => a.offset - b.offset);
+
+  const seen = new Set<string>();
+  const finalUids: string[] = [];
+  for (const e of finalEntities) {
+    if (!seen.has(e.uid)) {
+      seen.add(e.uid);
+      finalUids.push(e.uid);
+    }
+  }
+  for (const u of params.uids) {
+    if (isValidOutboundUid(u, uidToNameMap) && !seen.has(u)) {
+      seen.add(u);
+      finalUids.push(u);
+    }
+  }
+
+  return { content, entities: finalEntities, uids: finalUids };
+}
 
 /**
  * 兼容提取 mention 中的 uid 列表。

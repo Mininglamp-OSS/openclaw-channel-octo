@@ -32,6 +32,7 @@ vi.mock("./api-fetch.js", async () => {
     registerBot: vi.fn(),
     sendHeartbeat: vi.fn(),
     fetchBotGroups: vi.fn().mockResolvedValue([]),
+    getGroupMembers: vi.fn().mockResolvedValue([]),
     getGroupMd: vi.fn(),
   };
 });
@@ -829,5 +830,135 @@ describe("outbound sendText/sendMedia — messageId propagation (#51)", () => {
     } as any);
 
     expect(result.messageId).toBe("media-xyz");
+  });
+});
+
+// ─── P0-2: messageToolHints @mention format hint ─────────────────────────────
+
+describe("agentPrompt.messageToolHints — @mention format hint", () => {
+  it("appends the shared MENTION_FORMAT_HINT with group-members + anti-patterns", async () => {
+    const { octoPlugin } = await import("./channel.js");
+    const { MENTION_FORMAT_HINT } = await import("./mention-utils.js");
+    const hints: string[] = (octoPlugin as any).agentPrompt.messageToolHints({
+      cfg: {},
+      accountId: "default",
+    });
+    const joined = hints.join("\n");
+    expect(joined).toContain("group-members");
+    expect(joined).toContain(MENTION_FORMAT_HINT);
+    // anti-patterns + single-colon + brackets reachable through the shared hint
+    expect(joined).toContain("ONE colon");
+    expect(joined).toContain("username/bot_id");
+    expect(joined).toContain('"uid"');
+  });
+
+  it("hint text never parses into an illegal {uid:'uid'} structured mention", async () => {
+    const { octoPlugin } = await import("./channel.js");
+    const { parseStructuredMentions } = await import("./mention-utils.js");
+    const hints: string[] = (octoPlugin as any).agentPrompt.messageToolHints({
+      cfg: {},
+      accountId: "default",
+    });
+    const parsed = parseStructuredMentions(hints.join("\n"));
+    expect(parsed.every((m) => m.uid !== "uid")).toBe(true);
+  });
+});
+
+// ─── P0-1: outbound member prefetch (cold start) ─────────────────────────────
+
+describe("outbound.sendText — P0-1 member prefetch", () => {
+  const cfg = {
+    channels: {
+      octo: {
+        apiUrl: "https://api.example",
+        accounts: {
+          default: { botToken: "bf_test", apiUrl: "https://api.example" },
+        },
+      },
+    },
+  };
+
+  beforeEach(async () => {
+    const apiFetch = await import("./api-fetch.js");
+    (apiFetch.sendMessage as any).mockClear();
+    (apiFetch.getGroupMembers as any).mockClear();
+    (apiFetch.getGroupMembers as any).mockResolvedValue([]);
+    const memberCache = await import("./member-cache.js");
+    memberCache._clearMemberCache();
+  });
+
+  it("cold map: fetches members for the target group and resolves @displayName to an entity", async () => {
+    const apiFetch = await import("./api-fetch.js");
+    (apiFetch.getGroupMembers as any).mockResolvedValue([
+      { uid: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", name: "Alice" },
+    ]);
+    const { octoPlugin } = await import("./channel.js");
+
+    await octoPlugin.outbound!.sendText!({
+      cfg,
+      to: "group:grpcold",
+      text: "hello @Alice",
+      accountId: "default",
+    } as any);
+
+    const memberCall = (apiFetch.getGroupMembers as any).mock.calls[0][0];
+    expect(memberCall.groupNo).toBe("grpcold");
+
+    const call = (apiFetch.sendMessage as any).mock.calls[0][0];
+    expect(call.content).toBe("hello @Alice");
+    expect(call.mentionEntities).toEqual([
+      { uid: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", offset: 6, length: 6 },
+    ]);
+  });
+
+  it("sub-topic target: prefetch uses the PARENT group_no (strips ____ suffix)", async () => {
+    const apiFetch = await import("./api-fetch.js");
+    (apiFetch.getGroupMembers as any).mockResolvedValue([
+      { uid: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", name: "Alice" },
+    ]);
+    const { octoPlugin } = await import("./channel.js");
+
+    await octoPlugin.outbound!.sendText!({
+      cfg,
+      to: "group:parentG____topic1",
+      text: "ping @Alice",
+      accountId: "default",
+    } as any);
+
+    const memberCall = (apiFetch.getGroupMembers as any).mock.calls[0][0];
+    expect(memberCall.groupNo).toBe("parentG");
+  });
+
+  it("no @ in text: skips the member fetch entirely", async () => {
+    const apiFetch = await import("./api-fetch.js");
+    const { octoPlugin } = await import("./channel.js");
+
+    await octoPlugin.outbound!.sendText!({
+      cfg,
+      to: "group:grpcold",
+      text: "no mentions here",
+      accountId: "default",
+    } as any);
+
+    expect((apiFetch.getGroupMembers as any).mock.calls.length).toBe(0);
+  });
+
+  it("member fetch failure degrades silently (still sends)", async () => {
+    const apiFetch = await import("./api-fetch.js");
+    (apiFetch.getGroupMembers as any).mockRejectedValue(new Error("boom"));
+    const { octoPlugin } = await import("./channel.js");
+
+    const result = await octoPlugin.outbound!.sendText!({
+      cfg,
+      to: "group:grpcold",
+      text: "hi @Ghost",
+      accountId: "default",
+    } as any);
+
+    expect(result.messageId).toBe("test-msg-id");
+    const call = (apiFetch.sendMessage as any).mock.calls[0][0];
+    // unresolved @Ghost left as plain text, no illegal mention leaked
+    expect(call.content).toBe("hi @Ghost");
+    expect(call.mentionEntities).toBeUndefined();
   });
 });

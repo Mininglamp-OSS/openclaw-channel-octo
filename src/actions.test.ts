@@ -380,7 +380,7 @@ describe("handleOctoMessageAction", () => {
   });
 
   describe("send — invalid uid in v2 (uid not in uidToNameMap)", () => {
-    it("should create entities for all structured mentions including unknown uids", async () => {
+    it("drops non-hex unknown uids via the outbound guard, keeps known ones", async () => {
       let sentPayload: any = null;
       globalThis.fetch = mockFetch({
         "/v1/bot/sendMessage": async (_url, init) => {
@@ -392,7 +392,9 @@ describe("handleOctoMessageAction", () => {
       const uidToNameMap = new Map([
         ["uid_bob", "bob"],
       ]);
-      // uid_unknown is NOT in uidToNameMap
+      // uid_unknown is NOT in uidToNameMap and is not a 32-hex / space-prefixed
+      // uid, so the P0-3 outbound guard strips it (server would reject it
+      // anyway). uid_bob is in the map → kept.
 
       const { handleOctoMessageAction } = await import("./actions.js");
       const result = await handleOctoMessageAction({
@@ -404,13 +406,12 @@ describe("handleOctoMessageAction", () => {
       });
 
       expect(result.ok).toBe(true);
-      // Format is still converted for both
+      // Format is still converted for both (text is human-readable @name)
       expect(sentPayload.payload.content).toBe("Hello @Ghost and @bob!");
-      // All structured mentions get entities (uid trusted from LLM)
+      // Only the valid (in-map) uid survives the outbound guard.
       const entities = sentPayload.payload.mention.entities;
-      expect(entities).toHaveLength(2);
-      expect(entities[0]).toMatchObject({ uid: "uid_unknown" });
-      expect(entities[1]).toMatchObject({ uid: "uid_bob" });
+      expect(entities).toHaveLength(1);
+      expect(entities[0]).toMatchObject({ uid: "uid_bob" });
     });
   });
 
@@ -438,6 +439,103 @@ describe("handleOctoMessageAction", () => {
       expect(result.ok).toBe(true);
       // No mention field when UIDs can't be resolved
       expect(sentPayload.payload.mention).toBeUndefined();
+    });
+  });
+
+  describe("send — P0-3 outbound sanitizer", () => {
+    const HEX_A = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+
+    it("bracketless @uid:name (valid uid) → @displayName + entity, no raw uid:name leaked", async () => {
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+
+      const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: `Hi @${HEX_A}:Alice!` },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        uidToNameMap,
+      });
+
+      expect(result.ok).toBe(true);
+      expect(sentPayload.payload.content).toBe("Hi @Alice!");
+      expect(sentPayload.payload.content).not.toContain(`${HEX_A}:`);
+      expect(sentPayload.payload.mention.entities).toEqual([
+        { uid: HEX_A, offset: 3, length: 6 },
+      ]);
+    });
+
+    it("bracketless @uid:name (token not uid-shaped) → left untouched, no mention", async () => {
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+
+      const uidToNameMap = new Map([[HEX_A, "Alice"]]);
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "Hi @uid:Alice!" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        uidToNameMap,
+      });
+
+      expect(result.ok).toBe(true);
+      // "uid" is not uid-shaped (not 32-hex, not in map, not a real
+      // space-prefix), so the sanitizer leaves the ambiguous text intact —
+      // the hard guarantee is only that no illegal mention is emitted.
+      expect(sentPayload.payload.content).toBe("Hi @uid:Alice!");
+      expect(sentPayload.payload.mention).toBeUndefined();
+    });
+  });
+
+  describe("send — P0-1 sub-topic parent group prefetch", () => {
+    const HEX_A = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+
+    it("fetches members from the PARENT group_no for a sub-topic target", async () => {
+      let memberGroupNo: string | null = null;
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/members": async (url) => {
+          // /v1/bot/groups/<groupNo>/members
+          const m = url.match(/\/groups\/([^/]+)\/members/);
+          memberGroupNo = m ? m[1] : null;
+          return jsonResponse([{ uid: HEX_A, name: "Alice" }]);
+        },
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+
+      const memberMap = new Map<string, string>();
+      const uidToNameMap = new Map<string, string>();
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:parentG____topic1", message: "ping @Alice" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        memberMap,
+        uidToNameMap,
+      });
+
+      expect(result.ok).toBe(true);
+      expect(memberGroupNo).toBe("parentG");
+      // prefetched member resolved @Alice into an entity
+      expect(sentPayload.payload.content).toBe("ping @Alice");
+      expect(sentPayload.payload.mention.entities[0]).toMatchObject({ uid: HEX_A });
     });
   });
 
