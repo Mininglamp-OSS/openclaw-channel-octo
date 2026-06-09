@@ -254,30 +254,46 @@ function normalizeAgentId(value: string | undefined | null): string {
 
 /**
  * Expand `$VAR` / `${VAR}` (POSIX) and `%VAR%` (Windows) against the process
- * environment.
+ * environment, returning `undefined` if ANY referenced variable is undefined.
  *
  * The platform's canonical `resolveAgentWorkspaceDir` (via `resolveUserPath`)
  * expands a leading `~` but does NOT substitute environment variables, so an
  * operator who parameterizes a workspace as `${SECRETS_BASE}/octo` would
  * otherwise get a literal `./${SECRETS_BASE}` directory. We pre-expand env vars
- * on the configured workspace string BEFORE handing it to the platform resolver,
- * which then performs the `~`-expansion and the per-agent path derivation. An
- * undefined variable is left untouched (so the resulting non-root path still
- * fails the existence/degeneracy checks safely rather than silently collapsing).
+ * on the configured workspace string BEFORE handing it to the platform resolver.
+ *
+ * 🔴 FAIL-CLOSED on an UNDEFINED variable. Leaving an unresolved `${UNDEF}` as a
+ * literal segment is NOT safe: `path.resolve("${UNDEF}/octo")` silently anchors
+ * the relative remainder to `process.cwd()`, which would sail past the
+ * filesystem-root degeneracy guards and rebuild exactly the cwd-anchored jail
+ * this PR's fail-closed guarantee exists to prevent. So a reference to a variable
+ * the operator never set collapses the whole resolution to `undefined`, and the
+ * caller fails closed (refuses the write) rather than guessing a jail root from
+ * the process working directory. A string with no variable references at all is
+ * returned unchanged.
  */
-function expandEnvVars(input: string): string {
+function expandEnvVars(input: string): string | undefined {
+  let missing = false;
   let out = input.replace(
     /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
     (m, a, b) => {
       const val = process.env[a ?? b];
-      return val !== undefined ? val : m;
+      if (val === undefined) {
+        missing = true;
+        return m;
+      }
+      return val;
     },
   );
   out = out.replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (m, name) => {
     const val = process.env[name];
-    return val !== undefined ? val : m;
+    if (val === undefined) {
+      missing = true;
+      return m;
+    }
+    return val;
   });
-  return out;
+  return missing ? undefined : out;
 }
 
 /**
@@ -409,44 +425,61 @@ async function resolveAgentWorkspaceRoot(
   const ownWorkspaceRaw = matched?.workspace?.trim();
   const defaultWorkspaceRaw = agents.defaults?.workspace?.trim();
 
+  // Determine the EFFECTIVE base the platform resolver will use for this agent,
+  // mirroring its precedence: an agent's own workspace wins; otherwise the shared
+  // default (which the resolver uses verbatim for the default agent, or appends
+  // `/<agentId>` to for a non-default agent).
+  const usingOwnWorkspace = Boolean(ownWorkspaceRaw);
+  const configuredBaseRaw = ownWorkspaceRaw || defaultWorkspaceRaw;
+
   // 🔴 FAIL-CLOSED: only proceed when a workspace is ACTUALLY configured for
   // this agent (its own, or a shared default it can inherit). Without this the
   // platform resolver would synthesize `~/.openclaw/workspace` and we'd silently
   // jail secrets under a directory the operator never opted into.
-  const configuredBaseRaw = ownWorkspaceRaw || defaultWorkspaceRaw;
   if (!configuredBaseRaw) return undefined;
+
+  // Env-expand the EFFECTIVE base BEFORE handing it to the platform resolver.
+  // 🔴 expandEnvVars FAILS CLOSED on an undefined variable (returns undefined)
+  // rather than leaving a literal `${UNDEF}` that `path.resolve` would anchor to
+  // process.cwd() and slip past the filesystem-root guards below — so an operator
+  // typo / unset var refuses the write instead of silently rebuilding a
+  // cwd-anchored jail.
+  const configuredBaseExpanded = expandEnvVars(configuredBaseRaw);
+  if (configuredBaseExpanded === undefined) return undefined;
 
   // 🔴 Reject a configured BASE that is a filesystem root up-front: for a
   // non-default agent the platform would append `/<agentId>` and produce a
   // root-adjacent jail (`/<agentId>`), which is just as unintended as a
   // root-wide one. resolveUserPath('~') etc. can't yield a root from a non-root
   // input, so this only catches an explicit `/` / drive-root base.
-  if (isFilesystemRoot(resolvePath(expandEnvVars(configuredBaseRaw)))) {
+  if (isFilesystemRoot(resolvePath(configuredBaseExpanded))) {
     return undefined;
   }
 
   // Hand the platform resolver an env-EXPANDED view of this agent's config so
   // its `~`-expansion + per-agent derivation operate on real path segments. We
-  // only override the two workspace fields it reads, preserving the rest of cfg.
+  // override ONLY the single workspace field the resolver will actually read for
+  // this agent (its own entry, or the shared default), preserving the rest of cfg.
   const resolverCfg: OpenClawConfig = {
     ...cfg,
     agents: {
       ...agents,
-      defaults: {
-        ...agents.defaults,
-        ...(defaultWorkspaceRaw
-          ? { workspace: expandEnvVars(defaultWorkspaceRaw) }
-          : {}),
-      },
-      ...(Array.isArray(list)
+      ...(usingOwnWorkspace
         ? {
-            list: list.map((a) =>
-              a.id != null && normalizeAgentId(a.id) === normId && ownWorkspaceRaw
-                ? { ...a, workspace: expandEnvVars(ownWorkspaceRaw) }
-                : a,
-            ),
+            list: Array.isArray(list)
+              ? list.map((a) =>
+                  a.id != null && normalizeAgentId(a.id) === normId
+                    ? { ...a, workspace: configuredBaseExpanded }
+                    : a,
+                )
+              : list,
           }
-        : {}),
+        : {
+            defaults: {
+              ...agents.defaults,
+              workspace: configuredBaseExpanded,
+            },
+          }),
     },
   } as OpenClawConfig;
 

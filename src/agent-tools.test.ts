@@ -2095,41 +2095,135 @@ describe("createOctoManagementTools", () => {
         }
       });
 
-      // 🔴 必修2 (lml2468) — symlink-ANCESTOR first-write must NOT be
-      // false-rejected. When the jail root sits under a symlinked ancestor
-      // (macOS /tmp→/private/tmp, container bind-mounts, a symlinked $HOME) AND
+      // 🔴 必修2 / P1-A (lml2468) — symlink-ANCESTOR first-write must NOT be
+      // false-rejected. When the jail root sits under a symlinked ancestor AND
       // the workspace dir does not exist yet (the common first-write case), the
       // old code stored the root in its LEXICAL form but compared it post-mkdir
       // against realpath(dir). The two diverged through the symlink and the write
       // was wrongly refused as "escaped the allowed root after creation". The fix
-      // canonicalizes the root through its nearest existing ancestor, so both
-      // sides are symlink-free. Build a real symlinked-ancestor root and assert
-      // the first write succeeds and the file lands at the real target.
-      it("does not false-reject a first write when the jail root has a symlinked ancestor", async () => {
+      // canonicalizes BOTH the resolved workspace (resolveAgentWorkspaceRoot) and
+      // the jail root (confineSecretPath) through their nearest existing ancestor,
+      // so every comparison is symlink-free.
+      //
+      // lml2468 asked for coverage of three real-world ancestor-symlink shapes,
+      // not just one. Each case builds a genuine symlinked-ancestor root whose
+      // workspace leaf does not exist yet, then asserts the FIRST write succeeds
+      // and the file materializes at the REAL (symlink-resolved) target.
+      const symlinkAncestorCases: {
+        label: string;
+        build: () => Promise<{ workspace: string; realTarget: string; cleanup: () => Promise<void> }>;
+      }[] = [
+        {
+          // macOS-style: an intermediate path component is a symlink to its real
+          // dir (e.g. /tmp → /private/tmp). Workspace = <link>/ws.
+          label: "intermediate symlink (macOS /tmp→/private/tmp shape)",
+          build: async () => {
+            const realDir = await mkdtemp(join(tmpdir(), "octo-real-tmp-"));
+            const linkDir = join(tmpdir(), `octo-link-tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+            await symlink(realDir, linkDir, "dir");
+            return {
+              workspace: join(linkDir, "ws"),
+              realTarget: join(realDir, "ws"),
+              cleanup: async () => {
+                await rm(linkDir, { force: true });
+                await rm(realDir, { recursive: true, force: true });
+              },
+            };
+          },
+        },
+        {
+          // Symlinked HOME shape: the home-like ancestor itself is a symlink and
+          // the workspace is nested several levels below it.
+          label: "symlinked HOME ancestor",
+          build: async () => {
+            const realHome = await mkdtemp(join(tmpdir(), "octo-real-home-"));
+            await mkdir(join(realHome, "agents"), { recursive: true });
+            const linkHome = join(tmpdir(), `octo-link-home-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+            await symlink(realHome, linkHome, "dir");
+            return {
+              workspace: join(linkHome, "agents", "ws", "secrets"),
+              realTarget: join(realHome, "agents", "ws", "secrets"),
+              cleanup: async () => {
+                await rm(linkHome, { force: true });
+                await rm(realHome, { recursive: true, force: true });
+              },
+            };
+          },
+        },
+        {
+          // Container bind-mount shape: a chain of symlinks (link→link→realdir),
+          // as a bind-mounted path indirected through more than one link can
+          // present. Workspace = <top-link>/data/ws.
+          label: "bind-mount-style symlink chain",
+          build: async () => {
+            const realDir = await mkdtemp(join(tmpdir(), "octo-real-bm-"));
+            const midLink = join(tmpdir(), `octo-bm-mid-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+            await symlink(realDir, midLink, "dir");
+            const topLink = join(tmpdir(), `octo-bm-top-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+            await symlink(midLink, topLink, "dir");
+            return {
+              workspace: join(topLink, "data", "ws"),
+              realTarget: join(realDir, "data", "ws"),
+              cleanup: async () => {
+                await rm(topLink, { force: true });
+                await rm(midLink, { force: true });
+                await rm(realDir, { recursive: true, force: true });
+              },
+            };
+          },
+        },
+      ];
+
+      for (const tc of symlinkAncestorCases) {
+        it(`does not false-reject a first write through a ${tc.label}`, async () => {
+          setupMocks();
+          vi.mocked(resolveSecret).mockResolvedValue({ status: "resolved", value: PLAINTEXT });
+          const { workspace, realTarget, cleanup } = await tc.build();
+          try {
+            const exec = executeWithAgents(
+              { list: [{ id: "bot-A", workspace }] },
+              "bot-A",
+            );
+
+            const result = await exec({ alias: "k", filePath: "first.env" });
+            expect(parseText(result).written).toBe(true);
+            // File lands at the REAL (symlink-resolved) target, first write.
+            expect(await readFile(join(realTarget, "first.env"), "utf8")).toBe(PLAINTEXT);
+            expect(JSON.stringify(result)).not.toContain(PLAINTEXT);
+          } finally {
+            await cleanup();
+          }
+        });
+      }
+
+      // 🔴 P1-B (Yu CR) — an UNDEFINED env var in the workspace path must FAIL
+      // CLOSED, not anchor the jail to process.cwd(). A literal, unexpanded
+      // `${UNDEF}` fed to path.resolve() silently roots the relative remainder at
+      // the current working directory, which would sail past both filesystem-root
+      // degeneracy guards and rebuild exactly the cwd-anchored jail this PR's
+      // fail-closed guarantee exists to prevent. Assert: refusal + no resolve()
+      // call + nothing written under cwd.
+      it("fails closed when the workspace references an UNDEFINED env var (no cwd anchor)", async () => {
         setupMocks();
         vi.mocked(resolveSecret).mockResolvedValue({ status: "resolved", value: PLAINTEXT });
-        // realDir is the genuine directory; linkDir is a symlink pointing at it.
-        // The workspace is configured UNDER the symlink, and its leaf subdir does
-        // NOT exist yet, so confineSecretPath falls into the not-yet-created path.
-        const realDir = await mkdtemp(join(tmpdir(), "octo-realtarget-"));
-        const linkDir = join(tmpdir(), `octo-symlink-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-        await symlink(realDir, linkDir, "dir");
-        try {
-          const workspace = join(linkDir, "ws"); // under the symlink, not yet created
-          const exec = executeWithAgents(
-            { list: [{ id: "bot-A", workspace }] },
-            "bot-A",
-          );
+        const varName = `OCTO_UNSET_${Date.now()}`;
+        // Ensure the var is genuinely undefined.
+        delete process.env[varName];
+        const exec = executeWithAgents(
+          { list: [{ id: "bot-A", workspace: `\${${varName}}/octo-secrets` }] },
+          "bot-A",
+        );
 
-          const result = await exec({ alias: "k", filePath: "first.env" });
-          expect(parseText(result).written).toBe(true);
-          // The file lands at the REAL target the symlink points to.
-          expect(await readFile(join(realDir, "ws", "first.env"), "utf8")).toBe(PLAINTEXT);
-          expect(JSON.stringify(result)).not.toContain(PLAINTEXT);
-        } finally {
-          await rm(linkDir, { force: true });
-          await rm(realDir, { recursive: true, force: true });
-        }
+        const result = await exec({ alias: "k", filePath: "leak.env" });
+        expect(parseText(result).error).toMatch(/not configured/i);
+        // Never fetched the plaintext on the fail-closed path…
+        expect(resolveSecret).not.toHaveBeenCalled();
+        expect(JSON.stringify(result)).not.toContain(PLAINTEXT);
+        // …and crucially nothing was written under the literal "${UNDEF}" dir
+        // that a cwd-anchored resolve would have created.
+        await expect(
+          readFile(join(process.cwd(), `\${${varName}}`, "octo-secrets", "leak.env"), "utf8"),
+        ).rejects.toThrow();
       });
     });
   });
