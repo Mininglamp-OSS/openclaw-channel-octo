@@ -126,7 +126,7 @@
                 },
                 "secretsFileRoot": {
                   "type": "string",
-                  "description": "Jail root for write-secret: secret files may only be written under this path (defaults to the plugin process working directory)"
+                  "description": "Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace). If neither resolves to a usable directory, write-secret is unavailable (fail-closed); there is no process working-directory fallback."
                 }
               }
             }
@@ -137,7 +137,7 @@
           },
           "secretsFileRoot": {
             "type": "string",
-            "description": "Jail root for write-secret: secret files may only be written under this path (defaults to the plugin process working directory)"
+            "description": "Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace). If neither resolves to a usable directory, write-secret is unavailable (fail-closed); there is no process working-directory fallback."
           }
         }
       }

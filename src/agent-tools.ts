@@ -43,7 +43,16 @@ import {
 import { broadcastGroupMdUpdate, broadcastThreadMdUpdate } from "./group-md.js";
 import { mkdir, realpath, lstat, open } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { basename, dirname, relative, resolve as resolvePath, sep } from "node:path";
+import { homedir } from "node:os";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  parse as parsePath,
+  relative,
+  resolve as resolvePath,
+  sep,
+} from "node:path";
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
@@ -64,18 +73,54 @@ const SECRET_PLACEHOLDER = "{{secret}}";
 const SECRET_FILE_MODE = 0o600;
 
 /**
+ * Containment test: is `candidate` the jail `root` itself or a path strictly
+ * beneath it?
+ *
+ * We use `path.relative(root, candidate)` rather than string-prefix matching on
+ * `root + sep`. The prefix form has two failure modes that BOTH bit us in
+ * production:
+ *   • `root === "/"` makes `root + sep === "//"`, so `candidate.startsWith("//")`
+ *     is false for every real path → the jail rejects everything (self-lock).
+ *   • Patching that special-case the other way (treating `/` as "always inside")
+ *     turns the jail into a no-op fail-open.
+ * `path.relative` has neither pathology: the candidate is inside the root iff
+ * the relative path is empty (candidate === root), does not start with `..`
+ * (would climb out), and is not itself absolute (different root / drive on
+ * Windows). The same predicate is reused at every containment site (lexical
+ * check, symlink walk, post-mkdir re-check) so they cannot drift apart.
+ */
+function isInsideRoot(root: string, candidate: string): boolean {
+  if (candidate === root) return true;
+  const rel = relative(root, candidate);
+  return rel !== "" && !rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel);
+}
+
+/**
  * Confine a caller-supplied write target to an operator-approved jail root.
  *
  * 🔴 SECURITY (P0): `filePath` comes from the LLM tool call, which is reachable
  * via inbound group-chat messages — an untrusted, prompt-injectable surface.
  * Without confinement, `write-secret` is an arbitrary-file-write of the owner's
  * plaintext secret (e.g. "append my key to ~/.bashrc" / ".ssh/authorized_keys"
- * / a web root). We therefore resolve the requested path against a fixed root
- * (`secretsFileRoot` from config, else the plugin process CWD) and reject
- * anything that escapes it — including `..` traversal, absolute paths pointing
- * elsewhere, and symlink escapes (resolved, dangling, or otherwise
- * unverifiable). The actual write additionally uses O_NOFOLLOW to defeat a
- * TOCTOU swap between this check and the write.
+ * / a web root). The OWNER may have triggered the conversation, but the caller
+ * that actually picks `filePath`/`template` is a prompt-injectable LLM driven by
+ * arbitrary group-chat members, so OS-level "owner can write anyway" reasoning
+ * does NOT make the jail redundant — it is the only boundary between an injected
+ * instruction and an arbitrary owner-writable file.
+ *
+ * 🔴 FAIL-CLOSED: the jail root is resolved by the caller — an explicit
+ * `secretsFileRoot` if configured, otherwise the agent's workspace (see
+ * resolveAgentWorkspaceRoot). There is deliberately NO fallback to
+ * `process.cwd()`: a CWD of `/` is exactly what produced the historical
+ * self-lock and fail-open bugs, and silently writing owner secrets under
+ * whatever directory the process happens to run in is itself unsafe. If neither
+ * an explicit root nor a workspace resolves to a usable (non-root) directory,
+ * we refuse the write outright rather than guess one.
+ *
+ * When a root IS configured, we reject anything that escapes it — `..`
+ * traversal, absolute paths pointing elsewhere, and symlink escapes (resolved,
+ * dangling, or otherwise unverifiable). The actual write additionally uses
+ * O_NOFOLLOW to defeat a TOCTOU swap between this check and the write.
  *
  * Returns the safe absolute path, or an error string describing the rejection
  * (never echoing secret material — only the caller-typed path).
@@ -84,10 +129,19 @@ async function confineSecretPath(
   filePath: string,
   rootInput: string | undefined,
 ): Promise<{ ok: true; abs: string; root: string } | { ok: false; error: string }> {
-  // The jail root: operator config wins; otherwise the plugin's working dir.
-  // Resolve it to an absolute, symlink-free canonical form so containment
-  // checks compare apples to apples.
-  const rootRaw = rootInput && rootInput.trim() ? rootInput.trim() : process.cwd();
+  // 🔴 FAIL-CLOSED: no operator-configured root → refuse. Never fall back to
+  // process.cwd() (the source of the `/`-degenerate self-lock + fail-open bugs).
+  const rootRaw = rootInput?.trim();
+  if (!rootRaw) {
+    return {
+      ok: false,
+      error:
+        "write-secret is not configured: no jail root could be resolved. Set an explicit secretsFileRoot (the directory secrets may be written under), or configure the agent's workspace via agents.list[].workspace or agents.defaults.workspace, before this action can be used.",
+    };
+  }
+
+  // Resolve the configured root to an absolute, symlink-free canonical form so
+  // containment checks compare apples to apples.
   let root: string;
   try {
     root = await realpath(resolvePath(rootRaw));
@@ -102,9 +156,10 @@ async function confineSecretPath(
   // the containment check below then rejects unless it still lands inside root.
   const candidate = resolvePath(root, filePath);
 
-  // Lexical containment: candidate must be the root itself or sit strictly
-  // beneath it. This already defeats `..` traversal and absolute-elsewhere.
-  if (candidate !== root && !candidate.startsWith(root + sep)) {
+  // Lexical containment (path.relative form): candidate must be the root itself
+  // or sit strictly beneath it. This defeats `..` traversal and
+  // absolute-elsewhere without the `root + sep` self-lock/fail-open pitfalls.
+  if (!isInsideRoot(root, candidate)) {
     return {
       ok: false,
       error: `Refusing to write the secret outside the allowed directory. "${filePath}" resolves outside the permitted root. Use a path inside the workspace.`,
@@ -125,7 +180,7 @@ async function confineSecretPath(
   //   • a component that simply does not exist (ENOENT on lstat itself, not a
   //     symlink) → it and everything below it will be freshly created as plain
   //     entries inside the already-validated jail, so we can stop walking.
-  const rel = candidate === root ? "" : candidate.slice(root.length + sep.length);
+  const rel = candidate === root ? "" : relative(root, candidate);
   const segments = rel ? rel.split(sep) : [];
   let current = root;
   for (const seg of segments) {
@@ -149,7 +204,7 @@ async function confineSecretPath(
           error: `Refusing to write the secret: "${filePath}" passes through a symlink that cannot be verified to stay inside the allowed directory.`,
         };
       }
-      if (real !== root && !real.startsWith(root + sep)) {
+      if (!isInsideRoot(root, real)) {
         return {
           ok: false,
           error: `Refusing to write the secret: "${filePath}" resolves through a symlink that escapes the allowed directory.`,
@@ -162,6 +217,158 @@ async function confineSecretPath(
   }
 
   return { ok: true, abs: candidate, root };
+}
+
+/**
+ * Canonical agent-id matcher, aligned with the platform's `normalizeAgentId`
+ * (openclaw/plugin-sdk/routing). Agent entries in `cfg.agents.list[]` are keyed
+ * by OpenClaw agent id, which is lower-cased and slug-normalized; comparing raw
+ * strings (the previous `a.id === agentAccountId`) misses legitimate matches
+ * whenever casing or punctuation differs. We normalize BOTH sides before
+ * comparison so the match key lives in the same namespace as the platform.
+ */
+const VALID_AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+function normalizeAgentId(value: string | undefined | null): string {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return "main";
+  const lower = trimmed.toLowerCase();
+  if (VALID_AGENT_ID_RE.test(trimmed)) return lower;
+  return (
+    lower
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+/, "")
+      .replace(/-+$/, "")
+      .slice(0, 64) || "main"
+  );
+}
+
+/**
+ * Expand a configured workspace string the same way the platform's canonical
+ * `resolveAgentWorkspaceDir` does before it is used as a path:
+ *   • leading `~` / `~/…` → the user's home directory (matches the platform's
+ *     `resolveUserPath` / `expandHomePrefix`);
+ *   • `$VAR` and `${VAR}` (and Windows `%VAR%`) → the matching environment
+ *     variable, so an operator can parameterize the jail root.
+ * A raw config string fed straight into `resolvePath` (the previous behavior)
+ * would treat `~`/`$VAR` as literal path segments, jailing secrets under a
+ * bogus `./~/…` directory instead of the intended workspace.
+ */
+function expandWorkspacePath(input: string): string {
+  let out = input;
+  // $VAR / ${VAR}
+  out = out.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, a, b) => {
+    const name = a ?? b;
+    const val = process.env[name];
+    return val !== undefined ? val : m;
+  });
+  // Windows %VAR%
+  out = out.replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (m, name) => {
+    const val = process.env[name];
+    return val !== undefined ? val : m;
+  });
+  // Leading ~ → home
+  if (out === "~" || out.startsWith("~/") || out.startsWith("~\\")) {
+    try {
+      const home = homedir();
+      if (home) out = out.replace(/^~(?=$|[\\/])/, home);
+    } catch {
+      // homedir() unavailable — leave the literal "~", resolvePath will treat it
+      // as a relative segment and the (non-root) result still fails safe.
+    }
+  }
+  return out;
+}
+
+/**
+ * Is `p` a filesystem root — POSIX `/` or a Windows drive root like `C:\`?
+ *
+ * `path.parse(p).root === p` is true exactly for those roots and nothing else,
+ * which is why we use it instead of a bare `=== sep` compare: the old check
+ * missed Windows drive roots (`resolvePath("C:\\") !== "/"`), and — crucially —
+ * it ran on the LEXICAL form, so a workspace configured as a symlink TO `/`
+ * (e.g. `/tmp/ws-link` → `/`) sailed past it and only degenerated into a
+ * root-wide jail later, inside confineSecretPath's realpath().
+ */
+function isFilesystemRoot(p: string): boolean {
+  return parsePath(p).root === p;
+}
+
+/**
+ * Resolve the DEFAULT jail root for write-secret from the agent's workspace.
+ *
+ * This is the fallback used when no explicit per-account `secretsFileRoot` is
+ * configured (the explicit value is handled by the caller and ALWAYS wins over
+ * this default, so an operator can still lock writes to a narrower directory).
+ *
+ * Resolution order (matched against the OpenClaw **agent id**, the namespace
+ * `cfg.agents.list[]` is keyed by — see normalizeAgentId):
+ *   1. The matched `cfg.agents.list[]` entry → its `workspace`.
+ *   2. `cfg.agents.defaults.workspace` (when the matched agent has no own
+ *      workspace, or no agent matched).
+ * The OpenClaw agent id (`agentId`) is preferred; the channel/Octo account id
+ * (`agentAccountId`) is only a fallback, because account id ≠ agent id in
+ * multi-agent deployments (e.g. agent `main` ↔ octo account `default`) and
+ * keying on the account id would silently miss the per-agent workspace.
+ *
+ * 🔴 SECURITY — realpath-after-canon degenerate guard: this NEVER falls back to
+ * `process.cwd()` (the source of the historical `/`-degenerate self-lock +
+ * fail-open bugs). The configured workspace is home/env-expanded, then
+ * **realpath-canonicalized**, and ONLY THEN checked for the filesystem-root
+ * degeneracy. Doing the check after canonicalization closes the symlink-to-`/`
+ * fail-open: a workspace pointed at a symlink whose real target is `/` (or a
+ * drive root) now resolves to that root and is rejected here, instead of
+ * slipping through a lexical `!== "/"` test and degenerating into a root-wide
+ * jail downstream. If no workspace is configured, the value is empty, or it
+ * canonicalizes to a filesystem root, we return `undefined` so the caller FAILS
+ * CLOSED. (An operator who *explicitly* sets secretsFileRoot="/" is a separate,
+ * deliberate opt-in handled by the caller and is intentionally NOT subject to
+ * this default-degeneracy guard.)
+ */
+async function resolveAgentWorkspaceRoot(
+  cfg: OpenClawConfig,
+  agentId: string | undefined,
+  agentAccountId: string | undefined,
+): Promise<string | undefined> {
+  const agents = cfg.agents;
+  if (!agents) return undefined;
+
+  // Match on the OpenClaw agent id first (the namespace list[] is keyed by),
+  // then fall back to the channel/Octo account id for deployments where the two
+  // coincide. Normalize both sides so casing/punctuation can't cause a miss.
+  const list = agents.list;
+  let matched: { workspace?: string } | undefined;
+  for (const candidate of [agentId, agentAccountId]) {
+    if (!candidate) continue;
+    const norm = normalizeAgentId(candidate);
+    matched = list?.find(
+      (a) => a.id != null && normalizeAgentId(a.id) === norm,
+    );
+    if (matched) break;
+  }
+
+  const workspace = (matched?.workspace ?? agents.defaults?.workspace)?.trim();
+  if (!workspace) return undefined;
+
+  // Home/env-expand to align with the platform's canonical workspace resolver,
+  // then realpath-canonicalize so the degenerate-root check below runs on the
+  // REAL target (defeats a symlink-to-`/` fail-open).
+  const expanded = resolvePath(expandWorkspacePath(workspace));
+  let canonical: string;
+  try {
+    canonical = await realpath(expanded);
+  } catch {
+    // Workspace doesn't exist yet (or is unreachable): a non-existent path can't
+    // be a symlink, so its lexical absolute form is its effective target. We can
+    // still apply the degenerate-root guard against it.
+    canonical = expanded;
+  }
+
+  // 🔴 Degenerate-root guard, AFTER canonicalization: a workspace that resolves
+  // to a filesystem root (POSIX "/" or a Windows drive root) must NOT become a
+  // root-wide secret jail. Treat it as "no usable default" so the caller fails
+  // closed.
+  if (isFilesystemRoot(canonical)) return undefined;
+  return canonical;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,9 +392,11 @@ type LogSink = {
 export function createOctoManagementTools(params: {
   cfg?: OpenClawConfig;
   agentAccountId?: string;
+  agentId?: string;
 }): any[] {
   const cfg = params.cfg;
   const agentAccountId = params.agentAccountId;
+  const agentId = params.agentId;
   if (!cfg) return [];
 
   // Check if any account is configured
@@ -675,6 +884,17 @@ export function createOctoManagementTools(params: {
                 `Invalid mode "${rawMode}" for write-secret; use "overwrite" or "append"`,
               );
             }
+            // Jail root resolution (highest priority first):
+            //   1. explicit per-account/channel secretsFileRoot (operator can
+            //      lock writes to a narrower directory — this always wins).
+            //   2. DEFAULT: the agent's workspace, matched by OpenClaw agent id
+            //      (cfg.agents.list[].workspace, else cfg.agents.defaults.workspace),
+            //      home/env-expanded + realpath-canonicalized.
+            // If neither yields a usable non-root directory, confineSecretPath
+            // fails closed — there is NO process.cwd() fallback.
+            const effectiveSecretsRoot =
+              account.config.secretsFileRoot?.trim() ||
+              (await resolveAgentWorkspaceRoot(cfg, agentId, agentAccountId));
             return await handleWriteSecret({
               apiUrl,
               botToken,
@@ -682,7 +902,7 @@ export function createOctoManagementTools(params: {
               filePath,
               template,
               mode: rawMode === "append" ? "append" : "overwrite",
-              secretsFileRoot: account.config.secretsFileRoot,
+              secretsFileRoot: effectiveSecretsRoot,
             });
           }
 
@@ -977,6 +1197,15 @@ async function handleWriteSecret(params: {
     );
   }
 
+  // rate_limited → the resolve endpoint's per-IP limiter rejected the call.
+  // Surface a transient, actionable hint. 🔴 No body is read on a 429, so this
+  // message carries no server-controlled string — only a fixed back-off prompt.
+  if (resolved.status === "rate_limited") {
+    return makeError(
+      `The key service is busy right now (rate limited). Wait a moment and retry write-secret for "${params.alias}".`,
+    );
+  }
+
   // ambiguous → hand back ONLY the labels so the LLM can ask the user which one.
   // 🔴 candidates carry display_name (+ secret_id) only, never the value.
   if (resolved.status === "ambiguous") {
@@ -1011,7 +1240,7 @@ async function handleWriteSecret(params: {
       // containment, then open via the canonical parent + basename so every
       // component is proven to stay inside the root.
       const realDir = await realpath(dir);
-      if (realDir !== root && !realDir.startsWith(root + sep)) {
+      if (!isInsideRoot(root, realDir)) {
         return makeError(
           "Refusing to write the secret: the destination directory escaped the allowed root after creation.",
         );

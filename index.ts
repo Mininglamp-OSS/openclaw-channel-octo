@@ -80,7 +80,11 @@ export default defineBundledChannelEntry({
       (ctx: OpenClawPluginToolContext) => {
         const cfg = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
         if (!cfg) return null;
-        return createOctoManagementTools({ cfg, agentAccountId: ctx.agentAccountId });
+        return createOctoManagementTools({
+          cfg,
+          agentAccountId: ctx.agentAccountId,
+          agentId: ctx.agentId,
+        });
       },
       { names: ['octo_management'] },
     );

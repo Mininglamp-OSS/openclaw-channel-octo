@@ -900,10 +900,15 @@ export interface SecretCandidate {
  * Result of resolving a secret alias for the bot's owner.
  *
  * Discriminated on `status`:
- *  - `resolved`   → exactly one match; `value` holds the plaintext secret.
- *  - `not_found`  → no secret matches the alias; the owner must add it first.
- *  - `ambiguous`  → multiple matches; `candidates` lists labels for the caller
- *                   to re-resolve against (no plaintext).
+ *  - `resolved`     → exactly one EXACT match; `value` holds the plaintext secret.
+ *  - `not_found`    → no secret matches the alias; the owner must add it first.
+ *  - `ambiguous`    → server needs confirmation; `candidates` lists labels for the
+ *                     caller to re-resolve against (no plaintext). Per octo-server
+ *                     PR#301 this covers BOTH "exact name hit >1" AND "any
+ *                     pinyin/fuzzy hit, even exactly one candidate" — a single
+ *                     fuzzy candidate must still be confirmed, never auto-used.
+ *  - `rate_limited` → the per-IP resolve limiter rejected this call (HTTP 429);
+ *                     the caller should back off and retry.
  *
  * 🔴 RED LINE: the `value` field on the `resolved` variant is the ONLY place
  * plaintext appears. Callers must consume it internally (e.g. write it to a
@@ -913,7 +918,8 @@ export interface SecretCandidate {
 export type ResolveSecretResult =
   | { status: "resolved"; value: string; secret_id?: string; display_name?: string }
   | { status: "not_found" }
-  | { status: "ambiguous"; candidates: SecretCandidate[] };
+  | { status: "ambiguous"; candidates: SecretCandidate[] }
+  | { status: "rate_limited" };
 
 /**
  * Resolve a user-managed external-key alias to its current plaintext value.
@@ -929,14 +935,22 @@ export type ResolveSecretResult =
  * is always fetched. If the owner rotates the key, the next call picks it up
  * with zero restart and zero cache invalidation.
  *
- * Contract:
- *  - 200 `{ status: "resolved", value, secret_id?, display_name? }`
- *  - 200 `{ status: "ambiguous", candidates: [{ secret_id?, display_name }] }`
- *  - 200 `{ status: "not_found" }` OR 404 → normalized to `{ status: "not_found" }`
+ * Contract (octo-server PR#301, docs/user-secret-alias-api.md):
+ *  - 200 `{ secret_id?, value }` → exact unique hit; `value` is the plaintext.
+ *  - 422 → ambiguous: the i18n error envelope carries the (masked) candidates at
+ *    `error.details.candidates`. Triggered by an exact name hit on >1 row OR ANY
+ *    pinyin/fuzzy hit (even a single candidate). Normalized to
+ *    `{ status: "ambiguous", candidates }`.
+ *  - 404 → not_found (also covers "endpoint not deployed yet during rollout").
+ *  - 429 → the per-IP resolve limiter rejected this call. Normalized to
+ *    `{ status: "rate_limited" }` so the caller can surface a back-off hint.
  *  - any other non-2xx → throws (caller surfaces a non-plaintext "resolve
- *    failed, please re-set" message)
+ *    failed, please re-set" message).
  *
- * 🔴 SECURITY: on a non-2xx the thrown Error message contains ONLY the HTTP
+ * For backward compatibility a 200 body still carrying `status:"ambiguous"` /
+ * `status:"not_found"` is honored, but the HTTP status is authoritative.
+ *
+ * 🔴 SECURITY: on a thrown non-2xx the Error message contains ONLY the HTTP
  * status — never the response body and never a resolved value. The body is
  * deliberately dropped because this error reaches an LLM-visible tool result
  * and a resolve-endpoint error body could carry secret-bearing diagnostics.
@@ -955,7 +969,11 @@ export async function resolveSecret(params: {
       ...DEFAULT_HEADERS,
       Authorization: `Bearer ${params.botToken}`,
     },
-    body: JSON.stringify({ alias: params.alias }),
+    // 🔴 The server binds the request field `query` (BindJSON → req.Query) and
+    // 400s when it is empty. The function input is still named `alias` for
+    // callers, but the wire field MUST be `query` — `query` accepts either a
+    // secret_id or a display_name, matching the `alias` semantics.
+    body: JSON.stringify({ query: params.alias }),
     signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
   });
 
@@ -965,6 +983,31 @@ export async function resolveSecret(params: {
   if (resp.status === 404) {
     return { status: "not_found" };
   }
+
+  // 422 = ambiguous. The server returns the i18n error envelope; the masked
+  // candidate list lives at `error.details.candidates`. This is NOT an HTTP
+  // failure to surface — it is a normal "needs confirmation" outcome, so we
+  // parse it here instead of letting it fall into the throw branch below.
+  // 🔴 SECURITY: candidates carry ONLY masked identifiers (display_name,
+  // secret_id, kind, masked) — never the plaintext value — so reading this
+  // specific body is safe. We still read NOTHING from any other error body.
+  if (resp.status === 422) {
+    const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+    const error = (raw?.error ?? {}) as Record<string, unknown>;
+    const details = (error.details ?? {}) as Record<string, unknown>;
+    const rawCandidates = Array.isArray(details.candidates) ? details.candidates : [];
+    return { status: "ambiguous", candidates: parseCandidates(rawCandidates) };
+  }
+
+  // 429 = the per-IP resolve limiter (StrictIPRateLimitMiddleware,
+  // tag=usersecret_resolve) rejected this call. Surface a recognizable
+  // back-off outcome rather than a generic error.
+  // 🔴 SECURITY: do NOT read the body — a rate-limit response is not expected to
+  // carry a value, and the no-body-in-error invariant for this endpoint stands.
+  if (resp.status === 429) {
+    return { status: "rate_limited" };
+  }
+
   if (!resp.ok) {
     // 🔴 SECURITY: never fold the response body into the error. A resolve
     // endpoint handles plaintext secrets; a 5xx/diagnostic body could echo a
@@ -980,25 +1023,23 @@ export async function resolveSecret(params: {
 
   const status = raw.status;
 
+  // Backward-compat: honor a legacy 200 body that still carries an explicit
+  // status discriminator. The current server (PR#301) instead signals these via
+  // HTTP status (404/422), handled above; a 200 body simply carries the value.
   if (status === "not_found") {
     return { status: "not_found" };
   }
 
   if (status === "ambiguous") {
     const rawCandidates = Array.isArray(raw.candidates) ? raw.candidates : [];
-    const candidates: SecretCandidate[] = rawCandidates
-      .map((c) => {
-        const obj = (c ?? {}) as Record<string, unknown>;
-        const displayName = typeof obj.display_name === "string" ? obj.display_name : "";
-        const secretId = typeof obj.secret_id === "string" ? obj.secret_id : undefined;
-        return { display_name: displayName, secret_id: secretId };
-      })
-      // Drop entries with no label — a candidate the caller can't show is useless.
-      .filter((c) => c.display_name.length > 0);
-    return { status: "ambiguous", candidates };
+    return { status: "ambiguous", candidates: parseCandidates(rawCandidates) };
   }
 
-  if (status === "resolved") {
+  // Resolved: the current server returns 200 `{ secret_id?, value }` WITHOUT a
+  // status field, so a 200 carrying a non-empty `value` is the resolved case.
+  // A legacy `status:"resolved"` body is also accepted. Anything else is treated
+  // as a malformed resolved response (missing value) and rejected.
+  if (status === "resolved" || (status === undefined && "value" in raw)) {
     if (typeof raw.value !== "string" || raw.value.length === 0) {
       throw new Error("resolveSecret resolved a secret with no value");
     }
@@ -1015,6 +1056,26 @@ export async function resolveSecret(params: {
   // server-controlled value back into the transcript is an injection vector.
   // Use a fixed message — the unexpected status is unusable to the caller anyway.
   throw new Error("resolveSecret returned an unknown status");
+}
+
+/**
+ * Map a raw candidate array (from a 422 `error.details.candidates` envelope or a
+ * legacy 200 ambiguous body) into label-only SecretCandidate entries.
+ *
+ * 🔴 SECURITY: deliberately copies ONLY `display_name` + `secret_id` — never any
+ * `value`/`masked`/other server field — so nothing sensitive leaks into the
+ * disambiguation surface the LLM eventually sees. Entries with no label are
+ * dropped: a candidate the caller can't show the user is useless.
+ */
+function parseCandidates(rawCandidates: unknown[]): SecretCandidate[] {
+  return rawCandidates
+    .map((c) => {
+      const obj = (c ?? {}) as Record<string, unknown>;
+      const displayName = typeof obj.display_name === "string" ? obj.display_name : "";
+      const secretId = typeof obj.secret_id === "string" ? obj.secret_id : undefined;
+      return { display_name: displayName, secret_id: secretId };
+    })
+    .filter((c) => c.display_name.length > 0);
 }
 
 /** Decoded payload from base64 message content */

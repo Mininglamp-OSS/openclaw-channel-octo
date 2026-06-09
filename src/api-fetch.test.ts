@@ -1545,7 +1545,33 @@ describe("resolveSecret", () => {
     }
   });
 
-  it("POSTs the alias with a bearer bot token", async () => {
+  it("resolves a 200 body with no status field ({ secret_id, value }) per PR#301", async () => {
+    // The current server returns the resolved value via HTTP 200 with NO status
+    // discriminator: `{ "secret_id": "...", "value": "..." }`.
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        secret_id: "a1b2c3d4",
+        value: "sk-live-PLAINTEXT",
+      }),
+    }) as unknown as typeof fetch;
+
+    const { resolveSecret } = await import("./api-fetch.js");
+    const result = await resolveSecret({
+      apiUrl: "http://api.test",
+      botToken: "bf_token",
+      alias: "openai key",
+    });
+
+    expect(result.status).toBe("resolved");
+    if (result.status === "resolved") {
+      expect(result.value).toBe("sk-live-PLAINTEXT");
+      expect(result.secret_id).toBe("a1b2c3d4");
+    }
+  });
+
+  it("POSTs the alias as the `query` field with a bearer bot token", async () => {
     const spy = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -1560,7 +1586,11 @@ describe("resolveSecret", () => {
     expect(url).toBe("http://api.test/v1/bot/secrets/resolve");
     expect(init.method).toBe("POST");
     expect(init.headers.Authorization).toBe("Bearer bf_token");
-    expect(JSON.parse(init.body)).toEqual({ alias: "k" });
+    // 🔴 The server binds `query` (req.Query); sending `alias` leaves Query empty
+    // → 400 request_invalid. The wire field MUST be `query`, never `alias`.
+    const body = JSON.parse(init.body);
+    expect(body).toEqual({ query: "k" });
+    expect(body).not.toHaveProperty("alias");
   });
 
   it("normalizes status:not_found", async () => {
@@ -1610,6 +1640,98 @@ describe("resolveSecret", () => {
       // No plaintext leaks into candidates.
       expect(JSON.stringify(result.candidates)).not.toContain("value");
     }
+  });
+
+  it("parses 422 ambiguous candidates from error.details.candidates (PR#301 envelope)", async () => {
+    // The current server signals ambiguity with HTTP 422 and the i18n error
+    // envelope: error.details.candidates carries the masked candidate views.
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 422,
+      json: vi.fn().mockResolvedValue({
+        status: 422,
+        error: {
+          code: "err.server.usersecret.ambiguous",
+          message: "名称匹配到多个密钥，请进一步区分。",
+          http_status: 422,
+          details: {
+            candidates: [
+              {
+                secret_id: "a",
+                display_name: "我的密钥",
+                kind: "external",
+                masked: "****1111",
+              },
+              {
+                secret_id: "b",
+                display_name: "我的米要",
+                kind: "external",
+                masked: "****2222",
+              },
+            ],
+          },
+        },
+      }),
+    }) as unknown as typeof fetch;
+
+    const { resolveSecret } = await import("./api-fetch.js");
+    const result = await resolveSecret({ apiUrl: "http://api.test", botToken: "t", alias: "我的密钥" });
+    expect(result.status).toBe("ambiguous");
+    if (result.status === "ambiguous") {
+      expect(result.candidates).toHaveLength(2);
+      // Only label-only fields survive — masked/kind are dropped.
+      expect(result.candidates[0]).toEqual({ secret_id: "a", display_name: "我的密钥" });
+      expect(JSON.stringify(result.candidates)).not.toContain("value");
+      expect(JSON.stringify(result.candidates)).not.toContain("masked");
+    }
+  });
+
+  it("treats a 422 with exactly one candidate as ambiguous (fuzzy hit needs confirmation)", async () => {
+    // Per PR#301 a single fuzzy/pinyin candidate STILL returns 422 — it must be
+    // confirmed, never auto-used. The plugin must surface it as ambiguous.
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 422,
+      json: vi.fn().mockResolvedValue({
+        status: 422,
+        error: {
+          code: "err.server.usersecret.ambiguous",
+          http_status: 422,
+          details: {
+            candidates: [
+              { secret_id: "only", display_name: "我的密钥", kind: "external", masked: "****1111" },
+            ],
+          },
+        },
+      }),
+    }) as unknown as typeof fetch;
+
+    const { resolveSecret } = await import("./api-fetch.js");
+    const result = await resolveSecret({ apiUrl: "http://api.test", botToken: "t", alias: "我的米要" });
+    expect(result.status).toBe("ambiguous");
+    if (result.status === "ambiguous") {
+      expect(result.candidates).toHaveLength(1);
+      expect(result.candidates[0]).toEqual({ secret_id: "only", display_name: "我的密钥" });
+    }
+  });
+
+  it("normalizes 429 to rate_limited without reading the body", async () => {
+    // The per-IP resolve limiter returns 429. Surface a recognizable back-off
+    // outcome — and 🔴 never read the body (no-body-in-error invariant).
+    const jsonSpy = vi.fn();
+    const textSpy = vi.fn();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 429,
+      json: jsonSpy,
+      text: textSpy,
+    }) as unknown as typeof fetch;
+
+    const { resolveSecret } = await import("./api-fetch.js");
+    const result = await resolveSecret({ apiUrl: "http://api.test", botToken: "t", alias: "x" });
+    expect(result.status).toBe("rate_limited");
+    expect(jsonSpy).not.toHaveBeenCalled();
+    expect(textSpy).not.toHaveBeenCalled();
   });
 
   it("throws on a 5xx (resolve failure) without leaking the response body", async () => {
