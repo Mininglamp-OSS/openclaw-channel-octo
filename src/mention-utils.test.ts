@@ -757,6 +757,7 @@ describe("inbound text fallback regex", () => {
 
 const HEX_A = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"; // Alice
 const HEX_B = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"; // Bob
+const HEX_C = "1234567890abcdef1234567890abcdef"; // hallucinated bare hex
 
 describe("isValidOutboundUid", () => {
   const map = new Map<string, string>([[HEX_A, "Alice"]]);
@@ -782,6 +783,47 @@ describe("isValidOutboundUid", () => {
 });
 
 describe("sanitizeOutboundMentions", () => {
+  it("cold-start inline uids survive empty map (target-suffix mention path)", () => {
+    // target=`group:<gid>@uid1,uid2` 抽出的 inline uid 经 params.uids 传入。
+    // 正文无 @、prefetch 短路 → uidToNameMap 为空；caller 没给 entity。
+    // inline uid 是框架权威意图，必须存活、被 @ 的人才能收到通知。
+    const r = sanitizeOutboundMentions({
+      content: "Reminder for the project team",
+      entities: [],
+      uids: [HEX_A, HEX_B],
+      uidToNameMap: new Map(),
+    });
+    expect(r.uids).toEqual([HEX_A, HEX_B]);
+    // caller 没给 entity 就不凭空造 entity。
+    expect(r.entities).toEqual([]);
+  });
+
+  it("hallucinated bare @<hex> in body (no caller uids) is still dropped", () => {
+    // HEX_C 是模型在正文里瞎编的裸 hex；caller 既没传 entity 也没传 uids。
+    // 放宽 trustedUids 纳入 params.uids 后，这条防幻觉链路必须照旧拦截。
+    const r = sanitizeOutboundMentions({
+      content: `ping @${HEX_C} now`,
+      entities: [],
+      uids: [],
+      uidToNameMap: new Map(),
+    });
+    expect(r.uids).not.toContain(HEX_C);
+    expect(r.entities.some((e) => e.uid === HEX_C)).toBe(false);
+  });
+
+  it("fake space-prefix inline uid (non-hex base) is rejected, not revived", () => {
+    // "s1_haha" 的 base 非 32-hex，isWellFormedUid 不认 → 不进 trustedUids。
+    // 确认放宽 trustedUids 没让伪 space-prefix 复活。
+    const r = sanitizeOutboundMentions({
+      content: "Reminder for the project team",
+      entities: [],
+      uids: ["s1_haha", HEX_A],
+      uidToNameMap: new Map(),
+    });
+    expect(r.uids).not.toContain("s1_haha");
+    expect(r.uids).toContain(HEX_A);
+  });
+
   it("bracketless @uid:name with valid (in-map) uid → @displayName + entity, no raw uid:name", () => {
     const uidToNameMap = new Map([[HEX_A, "Alice"]]);
     const r = sanitizeOutboundMentions({

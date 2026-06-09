@@ -339,19 +339,26 @@ export function sanitizeOutboundMentions(params: {
   // 既有 entity 的工作副本（offset 会随重写调整）
   const entities: MentionEntity[] = params.entities.map((e) => ({ ...e }));
 
-  // 可信 uid 集合：传入的 entities 来自 convertStructuredMentions —— 即 agent
-  // 显式写出的 @[uid:name] 结构化形式。结构化 uid 是 agent 的权威意图，应被
-  // 信任，即便冷启动下 uidToNameMap 为空（prefetch best-effort 失败）也要放
-  // 行，否则真实成员的合法 mention 会被最终守卫误删、对方收不到通知。
+  // 可信 uid 集合：两个来源都来自 caller 入参，都是框架/agent 的权威意图：
+  //   1. params.entities —— 来自 convertStructuredMentions，即 agent 显式写出的
+  //      @[uid:name] 结构化形式；
+  //   2. params.uids —— 由框架从 target 后缀（group:<gid>@uid1,uid2）等渠道抽出
+  //      的 inline mention uid（正文里没有 @，但调用方明确要 @ 这些人）。
+  // 两者都应被信任，即便冷启动下 uidToNameMap 为空（prefetch best-effort 失败、
+  // 正文无 @ 而短路）也要放行，否则真实成员的合法 mention 会被最终守卫误删、对
+  // 方收不到通知。
   //
-  // 关键区分：只信任**结构化来源**的 uid（此处的 params.entities），且仅当其
-  // 形态合法（裸 32-hex 或 space-prefixed 32-hex base）。sanitize 内部由
-  // bracketless/bareHex 兜底分支**新产生**的 entity 不进此集合——那些可能源自
-  // 模型瞎编的幻觉 hex，仍须经 isValidOutboundUid 校验，照旧被守卫/降级。
+  // 关键区分：只信任**来自 caller 入参**的 uid（params.entities + params.uids），
+  // 且仅当其形态合法（裸 32-hex 或 space-prefixed 32-hex base）。sanitize 内部由
+  // bracketless/bareHex 兜底分支**新产生**、push 进局部 entities 的 uid 不进此集
+  // 合——那些可能源自模型瞎编的幻觉 hex，仍须经 isValidOutboundUid 校验，照旧被
+  // 守卫/降级。
   const isWellFormedUid = (uid: string): boolean =>
     HEX32_RE.test(extractBaseUid(uid));
   const trustedUids = new Set<string>(
-    params.entities.map((e) => e.uid).filter(isWellFormedUid),
+    [...params.entities.map((e) => e.uid), ...params.uids].filter(
+      isWellFormedUid,
+    ),
   );
   const passesFinalGuard = (uid: string): boolean =>
     isValidOutboundUid(uid, uidToNameMap) || trustedUids.has(uid);
