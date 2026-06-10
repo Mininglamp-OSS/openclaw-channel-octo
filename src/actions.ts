@@ -92,16 +92,40 @@ function stripGroupPrefix(raw: string): string {
 }
 
 /**
- * Normalise outbound target prefix. OpenClaw's delivery pipeline sometimes
- * emits `channel:<id>` as an alternative group-channel reference (parallel to
- * `group:<id>`). `parseTarget` now recognises `channel:` natively as well,
- * but keep this normaliser for the older outbound entry points that wrap
- * parseTarget with extra logic (mention-UID strip, thread merge) — having a
- * single documented place to look up prefix aliases is worth the small
- * redundancy.
+ * Canonicalise an outbound delivery target prefix.
+ *
+ * OpenClaw's delivery pipeline can emit several equivalent shapes for the same
+ * channel-group target (`group:<id>`, `channel:<id>`, `octo:<id>`), and the
+ * agent-tool / multi-bot routing layer occasionally produces stacked forms
+ * such as `"group:octo:grp1"` or `"channel:octo:grp1"`. Without canonical
+ * collapse, the downstream parseTarget would only strip one leading prefix and
+ * mis-parse the stacked inner segment as part of the group id (PR #103
+ * Jerry-Xin: `"group:octo:grp1"` → channelId `"octo:grp1"` → message routed to
+ * the wrong group). The recursive collapse below makes the guard at handleSend
+ * (which uses stripAllChannelPrefixes) and this delivery path agree on the
+ * canonical bare groupId.
+ *
+ * Rules:
+ *   - No leading channel-namespace prefix at all → pass through (bare IDs,
+ *     thread channel IDs like `grp1____x`, and other shapes parseTarget
+ *     handles natively).
+ *   - Stacked channel-namespace prefix wrapping a `user:` DM (e.g.
+ *     `"octo:user:uid123"`) → unwrap to clean `user:uid123` so the DM path
+ *     fires correctly.
+ *   - Any other leading channel-namespace prefix(es) → strip recursively and
+ *     re-prefix canonically as `group:` so parseTarget sees ONE known shape.
  */
 export function normalizeOutboundChannelPrefix(ctxTo: string): string {
-  return ctxTo.startsWith("channel:") ? "group:" + ctxTo.slice(8) : ctxTo;
+  const bare = stripAllChannelPrefixes(ctxTo);
+  // No channel-namespace prefix to strip — let parseTarget handle it natively
+  // (covers bare groupNo, `grp1____x` thread refs, `user:<uid>` DMs).
+  if (bare === ctxTo) return ctxTo;
+  // Stacked channel-namespace prefix wrapping a user: DM — return the clean
+  // user: form so parseTarget routes it as DM, not as a group with `user:` in
+  // the channelId.
+  if (bare.startsWith("user:")) return bare;
+  // Channel-group target — canonicalise to a single leading `group:`.
+  return "group:" + bare;
 }
 
 /**

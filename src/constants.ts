@@ -41,15 +41,17 @@ export const THREAD_ID_SEPARATOR = "____";
  * site at src/actions.ts ran `replace(/^octo:/)` then `replace(/^group:/)`
  * then `replace(/^channel:/)`, which collapsed some stacked forms (e.g.
  * `"octo:group:topicA"` → `"topicA"`) but NOT all (e.g.
- * `"channel:octo:grp1"` → `"octo:grp1"`, because the chain stripped
- * `group:` only once and never re-ran `octo:`). The recursive helper is
+ * `"channel:octo:grp1"` → `"octo:grp1"`, because only the final
+ * `channel:` replace stripped the outer layer and the chain never re-ran
+ * `octo:` against the now-exposed inner prefix). The recursive helper is
  * **intentionally broader** than the old chain: it canonicalizes any order
  * of stacked runtime prefixes. Net effect is strictly safer for downstream
  * comparisons and matches the helper's "all channel prefixes" name.
  *
  * Note: this is a prefix-strip, not a prefix-rewrite. `normalizeOutboundChannelPrefix`
- * in src/actions.ts is a different operation that maps `channel:<id>` → `group:<id>`
- * for outbound delivery semantics.
+ * in src/actions.ts is a different operation that canonicalises outbound
+ * channel-group targets to a single leading `group:` (and shares this
+ * recursive collapse internally to handle stacked outbound forms safely).
  */
 export function stripAllChannelPrefixes(s: string): string {
   let out = s;

@@ -1094,6 +1094,39 @@ describe("handleOctoMessageAction", () => {
       expect(sentPayload.channel_type).toBe(2);
     });
 
+    it("9h — stacked-prefix target (group:octo:<id>) — guard AND delivery use same normalization (PR#103 Jerry-Xin)", async () => {
+      // 🔴 Regression guard for the bug Jerry-Xin caught on PR #103:
+      // handleSend's effectiveThreadId guard collapsed stacked prefixes
+      // recursively (stripAllChannelPrefixes), but resolveOutboundOctoTarget
+      // only stripped a SINGLE leading prefix. So target="group:octo:grp1"
+      // made the guard match the current parent (preserving threadId) while
+      // delivery parsed the inner "octo:grp1" as the group → routed to the
+      // wrong channel "octo:grp1____topicB" instead of "grp1____topicB".
+      // The fix unified the normalization source inside
+      // normalizeOutboundChannelPrefix; this test locks both arms in.
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:octo:grp1", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        threadId: "topicB",
+      });
+      // Both sides see "grp1" → threadId "topicB" merged onto parent grp1
+      // (NOT onto bogus group "octo:grp1").
+      expect(sentPayload.channel_id).toBe("grp1____topicB");
+      expect(sentPayload.channel_type).toBe(5);
+    });
+
     it("11 — DM target inside a thread session is NEVER rerouted (safety boundary)", async () => {
       // Regression guard for the reroute scope: the auto-reroute only
       // fires when effectiveChannelType === Group. A user:<uid> target
@@ -3203,6 +3236,39 @@ describe("resolveOutboundOctoTarget", () => {
     // channel:octo:topicA (order the old chain could NOT fully strip) → topicA
     expect(resolveOutboundOctoTarget("group:grp1", "channel:octo:topicA").channelId)
       .toBe("grp1____topicA");
+  });
+
+  it("collapses stacked prefixes on the TARGET itself, not just threadId (PR#103 Jerry-Xin)", async () => {
+    // 🔴 PR #103 Jerry-Xin blocking finding: the threadId path strips stacked
+    // prefixes recursively, but the target path used to only strip one. A
+    // stacked target like "group:octo:grp1" parsed to channelId="octo:grp1"
+    // (wrong group), so threadId merge produced "octo:grp1____<short>". The
+    // fix collapses the target stack inside normalizeOutboundChannelPrefix so
+    // both target and threadId paths agree on the canonical bare groupId.
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    registerBotGroupIds(["grp1"]);
+    // group:octo:<id> → group:<id>
+    expect(resolveOutboundOctoTarget("group:octo:grp1").channelId).toBe("grp1");
+    expect(resolveOutboundOctoTarget("group:octo:grp1").channelType).toBe(ChannelType.Group);
+    // channel:octo:<id> → group:<id>
+    expect(resolveOutboundOctoTarget("channel:octo:grp1").channelId).toBe("grp1");
+    expect(resolveOutboundOctoTarget("channel:octo:grp1").channelType).toBe(ChannelType.Group);
+    // Stacked target + threadId — merged onto the canonical bare parent
+    expect(resolveOutboundOctoTarget("group:octo:grp1", "topicA").channelId)
+      .toBe("grp1____topicA");
+    // Stacked target + @uid suffix still strips correctly
+    expect(resolveOutboundOctoTarget("group:octo:grp1@uid1,uid2", "topicA").channelId)
+      .toBe("grp1____topicA");
+  });
+
+  it("leaves user: targets untouched even when wrapped in channel-namespace prefixes", async () => {
+    // user: targets are DMs and never go through the channel-group canonicalization;
+    // a stacked octo:user:<uid> form unwraps to a clean user:<uid> (no group: re-prefix).
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    expect(resolveOutboundOctoTarget("user:uid123").channelType).toBe(ChannelType.DM);
+    expect(resolveOutboundOctoTarget("user:uid123").channelId).toBe("uid123");
+    expect(resolveOutboundOctoTarget("octo:user:uid123").channelType).toBe(ChannelType.DM);
+    expect(resolveOutboundOctoTarget("octo:user:uid123").channelId).toBe("uid123");
   });
 
   // The OpenClaw delivery pipeline can emit `channel:<id>` as an alternative

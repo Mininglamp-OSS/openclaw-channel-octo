@@ -37,11 +37,12 @@ describe("stripAllChannelPrefixes", () => {
     // The previous threadId-parsing site at src/actions.ts did:
     //   stripChannelPrefix(...).replace(/^group:/, "").replace(/^channel:/, "")
     // That chain collapsed SOME stacked forms (e.g. "octo:group:topicA" → "topicA")
-    // but NOT all (e.g. "channel:octo:grp1" → "octo:grp1" — the chain stripped
-    // group: once and never re-ran octo:). The recursive helper is intentionally
-    // broader: it canonicalizes any order of stacked runtime prefixes. Safer
-    // for downstream comparisons, and matches the helper's "all channel
-    // prefixes" name.
+    // but NOT all (e.g. "channel:octo:grp1" → "octo:grp1" — only the final
+    // channel: replace stripped the outer layer and the chain never re-ran
+    // octo: against the now-exposed inner prefix). The recursive helper is
+    // intentionally broader: it canonicalizes any order of stacked runtime
+    // prefixes. Safer for downstream comparisons, and matches the helper's
+    // "all channel prefixes" name.
     expect(stripAllChannelPrefixes("octo:group:grp1")).toBe("grp1");
     expect(stripAllChannelPrefixes("channel:octo:grp1")).toBe("grp1");
     expect(stripAllChannelPrefixes("octo:channel:group:grp1____topicA")).toBe("grp1____topicA");
