@@ -187,6 +187,97 @@ export function resolveOutboundOctoTarget(
   return parsed;
 }
 
+/** Resolution outcome of {@link applyThreadScope}. */
+export type ThreadScopeResolution = {
+  channelId: string;
+  channelType: ChannelType;
+  rewritten: boolean;
+  resolutionReason: "thread-context-rewrite" | "explicit-parent-scope" | "explicit-target" | "passthrough";
+};
+
+/**
+ * Decide the final delivery target for a `send` once the raw target has been
+ * resolved (via resolveOutboundOctoTarget) into a concrete {channelId, channelType}.
+ *
+ * Background (#104, reverses the warn-only decision from #232): when the agent
+ * is replying inside a sub-topic (session's currentChannelId carries `____`)
+ * but passes a bare parent-group target matching the current thread's parent,
+ * it's almost always a phrasing slip ("send to this group" really means the
+ * current thread). Rather than silently delivering to the parent group and only
+ * logging, rewrite the target to the current thread so the reply lands where the
+ * conversation is happening.
+ *
+ * Priority (highest first):
+ *  - scope === "parent"  → explicit escape hatch, never rewrite (caller already
+ *    cleared effectiveThreadId before resolveOutboundOctoTarget so the target
+ *    stays the parent group). resolutionReason="explicit-parent-scope".
+ *  - target carries `____` → caller named a thread explicitly, respect it.
+ *    resolutionReason="explicit-target".
+ *  - bare parent-group target inside a thread context → rewrite to the current
+ *    thread. resolutionReason="thread-context-rewrite", rewritten=true. This only
+ *    fires when the resolved type is still Group, i.e. threadId was absent and
+ *    nothing got synthesised onto a sub-topic.
+ *  - otherwise → passthrough.
+ *
+ * Pure function: takes only the already-resolved target plus context, returns
+ * the (possibly rewritten) target. The `scope==="parent"` effectiveThreadId reset
+ * MUST happen at the call site before resolveOutboundOctoTarget — it cannot be
+ * expressed here because by the time we run, the target is already resolved.
+ */
+export function applyThreadScope(input: {
+  resolvedChannelId: string;
+  resolvedChannelType: ChannelType;
+  target: string;
+  currentChannelId?: string;
+  scope?: "parent" | "thread";
+}): ThreadScopeResolution {
+  const THREAD_SEP = "____";
+  const { resolvedChannelId, resolvedChannelType, target, currentChannelId, scope } = input;
+
+  // Explicit parent-group escape hatch always wins — never rewrite.
+  if (scope === "parent") {
+    return {
+      channelId: resolvedChannelId,
+      channelType: resolvedChannelType,
+      rewritten: false,
+      resolutionReason: "explicit-parent-scope",
+    };
+  }
+
+  // Target already names a sub-topic explicitly (carries `____`) → respect it.
+  if (target.includes(THREAD_SEP)) {
+    return {
+      channelId: resolvedChannelId,
+      channelType: resolvedChannelType,
+      rewritten: false,
+      resolutionReason: "explicit-target",
+    };
+  }
+
+  // Context-aware rewrite: bare parent-group target while the session is inside
+  // a sub-topic of that same parent, and no threadId was synthesised (resolved
+  // type is still Group). Redirect to the current thread.
+  if (
+    resolvedChannelType === ChannelType.Group &&
+    currentChannelId?.includes(THREAD_SEP) &&
+    resolvedChannelId === currentChannelId.slice(0, currentChannelId.indexOf(THREAD_SEP))
+  ) {
+    return {
+      channelId: currentChannelId,
+      channelType: ChannelType.CommunityTopic,
+      rewritten: true,
+      resolutionReason: "thread-context-rewrite",
+    };
+  }
+
+  return {
+    channelId: resolvedChannelId,
+    channelType: resolvedChannelType,
+    rewritten: false,
+    resolutionReason: "passthrough",
+  };
+}
+
 /**
  * Resolve the group ID from args, falling back to currentChannelId.
  * Accepts: args.groupId, args.target (with group: prefix), or bare currentChannelId.
@@ -471,8 +562,18 @@ async function handleSend(params: {
     };
   }
 
+  // Explicit parent-group escape hatch (#104): `scope:"parent"` means "I really
+  // do want the parent group, even from a thread context". It must take effect
+  // BEFORE resolveOutboundOctoTarget so an ambient threadId can't be synthesised
+  // onto a sub-topic — once that synthesis happens the target is already a
+  // CommunityTopic and the parent-group intent is lost. So clear effectiveThreadId
+  // up front when scope is "parent".
+  const scope = args.scope === "parent" || args.scope === "thread" ? args.scope : undefined;
+
   let effectiveThreadId: typeof threadId = threadId;
-  if (effectiveThreadId != null && currentChannelId) {
+  if (scope === "parent") {
+    effectiveThreadId = undefined;
+  } else if (effectiveThreadId != null && currentChannelId) {
     const SEP = "____";
     const currentParent = currentChannelId.includes(SEP)
       ? currentChannelId.slice(0, currentChannelId.indexOf(SEP))
@@ -486,35 +587,42 @@ async function handleSend(params: {
     }
   }
 
-  const { channelId, channelType } = resolveOutboundOctoTarget(target, effectiveThreadId);
+  const resolved = resolveOutboundOctoTarget(target, effectiveThreadId);
 
-  // UX warning for a specific foot-gun on the message-tool path (#232 review):
-  // the agent is replying inside a sub-topic (session's currentChannelId carries
-  // `____`) but explicitly passed a bare parent-group target matching the
-  // current thread's parent group. That's semantically valid (parent-group
-  // reply from a thread context) but almost always a model mistake — the
-  // reply will land in the parent group where other members see it rather
-  // than in the thread where the conversation is happening. Don't silently
-  // reroute to the thread and don't hard-reject (breaks the legitimate case),
-  // just log so operators have a paper trail. Scoped to same-group cross-room
-  // to avoid false positives on legitimate cross-channel sends (e.g. the
-  // agent explicitly shipping results to a different group entirely).
-  const THREAD_SEP = "____";
-  if (
-    channelType === ChannelType.Group &&
-    currentChannelId?.includes(THREAD_SEP) &&
-    !target.includes(THREAD_SEP)
-  ) {
-    const currentThreadParent = currentChannelId.slice(0, currentChannelId.indexOf(THREAD_SEP));
-    if (channelId === currentThreadParent) {
-      const warn = log?.warn ?? log?.info;
-      warn?.(
-        `octo: send action: target="${target}" is the parent group of the current thread session ` +
-        `(${currentChannelId}). Reply will land in the parent group, not the thread. If the agent ` +
-        `meant to reply to the thread, pass the full target "group:${currentChannelId}".`,
-      );
-    }
+  // Context-aware routing (#104, reverses #232's warn-only decision): inside a
+  // sub-topic, a bare parent-group target matching the current thread's parent
+  // is almost always a phrasing slip ("send to this group" → the current
+  // thread). Rewrite it to the current thread instead of silently delivering to
+  // the parent group. `scope:"parent"` is the explicit escape hatch (handled
+  // above + here), and an explicit `____` target is respected as-is.
+  const { channelId, channelType, rewritten, resolutionReason } = applyThreadScope({
+    resolvedChannelId: resolved.channelId,
+    resolvedChannelType: resolved.channelType,
+    target,
+    currentChannelId,
+    scope,
+  });
+
+  // Keep a paper trail when we rewrite (operators still need to notice the
+  // ambiguity) and when the explicit parent-group escape hatch is taken.
+  if (rewritten) {
+    const warn = log?.warn ?? log?.info;
+    warn?.(
+      `octo: send action: target="${target}" is the parent group of the current thread session ` +
+      `(${currentChannelId}). Rewriting delivery to the current thread "group:${channelId}". ` +
+      `Pass scope:"parent" to deliver to the parent group instead.`,
+    );
+  } else if (resolutionReason === "explicit-parent-scope" && currentChannelId?.includes("____")) {
+    log?.info?.(
+      `octo: send action: scope:"parent" → delivering target="${target}" to the parent group ` +
+      `from thread context (${currentChannelId}).`,
+    );
   }
+
+  // Receipt prefix for the actually-delivered address, so the agent can see
+  // exactly where the message landed (e.g. "group:grp1____topicA" vs "group:grp1").
+  const kindPrefix = channelType === ChannelType.DM ? "user:" : "group:";
+  const resolvedTarget = `${kindPrefix}${channelId}`;
 
   // Resolve mentions + @all once; reused by both the legacy text path and the
   // RichText(=14) 图文混排 path so mention semantics stay identical.
@@ -590,6 +698,9 @@ async function handleSend(params: {
         target,
         channelId,
         channelType,
+        resolvedTarget,
+        resolutionReason,
+        rewritten,
         // richText is true only when a type-14 payload was actually sent (≥1
         // image block); a text-only / file-only send reports richText:false.
         ...(richResult.richText ? { richText: true } : {}),
@@ -663,6 +774,9 @@ async function handleSend(params: {
       target,
       channelId,
       channelType,
+      resolvedTarget,
+      resolutionReason,
+      rewritten,
       mediaCount: sentMedia.length,
       // messageId fields added for issue #51 — let the LLM reference the
       // sent message(s) for downstream edit/pin/delete operations.

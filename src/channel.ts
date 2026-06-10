@@ -699,7 +699,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       return [
         `IMPORTANT: Your Octo accountId is "${accountId}". You MUST always pass accountId: "${accountId}" when using the octo_management tool. Do NOT use any other accountId.`,
         `For sending messages: if the target is a group, use target="group:<groupId>". If the target is a specific user (1v1 direct message), use target="user:<userId>". If sending to the current conversation, no prefix is needed.`,
-        `For threads/sub-topics: if you are explicitly targeting a thread, the target MUST be the full "group:<group_no>____<short_id>" (four underscores) — do not send just the parent "group:<group_no>" or the reply will land in the parent group instead of the thread. The same rule applies to file uploads.`,
+        `Terminology: "group" (群) means the parent group, visible to all members; "thread"/sub-topic (子区) means the current conversation thread. When you are inside a thread session and the user says "send to this group/the current chat", that defaults to the CURRENT THREAD — do NOT send to the parent group. To deliberately post to the parent group from a thread, pass scope:"parent". To explicitly target a specific thread, the target MUST be the full "group:<group_no>____<short_id>" (four underscores). The same rules apply to file uploads.`,
         `For reading message history: use action="read" with target="user:<uid>" to read DM history, or target="group:<groupId>" to read group message history. Cross-channel queries require the requester to be a participant of the target channel.`,
         `For searching: use action="search" with query="shared-groups" to find groups that the bot and the current user both belong to.`,
       ];

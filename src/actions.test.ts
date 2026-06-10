@@ -528,37 +528,173 @@ describe("handleOctoMessageAction", () => {
     });
   });
 
-  // Foot-gun UX guard (#232 review): when the agent explicitly passes a bare
-  // parent-group target while the session's currentChannelId is inside a
-  // thread, log a warning. This doesn't reroute and doesn't reject (the
-  // parent-group reply may be intentional), it just surfaces the ambiguity
-  // so operators can notice model misuse.
+  // Context-aware rewrite (#104, reverses #232's warn-only decision): when the
+  // agent passes a bare parent-group target while the session's currentChannelId
+  // is inside a thread, the send is rewritten to the current thread (the most
+  // likely intent). `scope:"parent"` is the explicit escape hatch to reach the
+  // parent group. A paper-trail warning is still logged on rewrite.
 
-  describe("send — thread-context foot-gun warning", () => {
-    it("warns (via log.warn) when target is the thread's parent group", async () => {
+  describe("send — thread-context rewrite", () => {
+    it("rewrites a bare parent-group target to the current thread (no scope)", async () => {
       registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
       globalThis.fetch = mockFetch({
-        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
       });
       const logWarn = vi.fn();
-      const logInfo = vi.fn();
       const { handleOctoMessageAction } = await import("./actions.js");
-      await handleOctoMessageAction({
+      const result = await handleOctoMessageAction({
         action: "send",
         args: { target: "group:grp1", message: "hi" },
         apiUrl: "http://localhost:8090",
         botToken: "test-token",
         currentChannelId: "grp1____topicA",
-        log: { warn: logWarn, info: logInfo } as any,
+        log: { warn: logWarn } as any,
       });
+      expect(result.ok).toBe(true);
+      expect(sentPayload.channel_id).toBe("grp1____topicA");
+      expect(sentPayload.channel_type).toBe(ChannelType.CommunityTopic);
+      expect((result.data as any).rewritten).toBe(true);
+      expect((result.data as any).resolutionReason).toBe("thread-context-rewrite");
+      expect((result.data as any).resolvedTarget).toBe("group:grp1____topicA");
+      // Paper trail preserved on rewrite.
       expect(logWarn).toHaveBeenCalledTimes(1);
-      expect(logInfo).not.toHaveBeenCalled();
-      const msg = logWarn.mock.calls[0][0] as string;
-      expect(msg).toContain("target=\"group:grp1\"");
-      expect(msg).toContain("grp1____topicA");
     });
 
-    it("falls back to log.info when log.warn is not provided", async () => {
+    it("scope:\"parent\" delivers to the parent group and never rewrites", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "hi", scope: "parent" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+      });
+      expect(result.ok).toBe(true);
+      expect(sentPayload.channel_id).toBe("grp1");
+      expect(sentPayload.channel_type).toBe(ChannelType.Group);
+      expect((result.data as any).rewritten).toBe(false);
+      expect((result.data as any).resolutionReason).toBe("explicit-parent-scope");
+    });
+
+    it("scope:\"parent\" clears an ambient threadId (no thread synthesis)", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "hi", scope: "parent" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        threadId: "topicA",
+      });
+      expect(result.ok).toBe(true);
+      // Even with threadId present, scope:"parent" prevents synthesis to the thread.
+      expect(sentPayload.channel_id).toBe("grp1");
+      expect(sentPayload.channel_type).toBe(ChannelType.Group);
+      expect((result.data as any).rewritten).toBe(false);
+      expect((result.data as any).resolutionReason).toBe("explicit-parent-scope");
+    });
+
+    it("does NOT rewrite when target is a DIFFERENT group (legitimate cross-channel send)", async () => {
+      registerBotGroupIds(["grp1", "otherGroup"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const logWarn = vi.fn();
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:otherGroup", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA", // in thread of grp1, but sending to otherGroup
+        log: { warn: logWarn } as any,
+      });
+      expect(result.ok).toBe(true);
+      expect(sentPayload.channel_id).toBe("otherGroup");
+      expect(sentPayload.channel_type).toBe(ChannelType.Group);
+      expect((result.data as any).rewritten).toBe(false);
+      expect((result.data as any).resolutionReason).toBe("passthrough");
+      expect(logWarn).not.toHaveBeenCalled();
+    });
+
+    it("does NOT rewrite when target already carries the thread short id", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const logWarn = vi.fn();
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1____topicA", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { warn: logWarn } as any,
+      });
+      expect(result.ok).toBe(true);
+      expect(sentPayload.channel_id).toBe("grp1____topicA");
+      expect((result.data as any).rewritten).toBe(false);
+      expect((result.data as any).resolutionReason).toBe("explicit-target");
+      expect(logWarn).not.toHaveBeenCalled();
+    });
+
+    it("does NOT rewrite when session is NOT in a thread (plain group chat)", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const logWarn = vi.fn();
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1",
+        log: { warn: logWarn } as any,
+      });
+      expect(result.ok).toBe(true);
+      expect(sentPayload.channel_id).toBe("grp1");
+      expect(sentPayload.channel_type).toBe(ChannelType.Group);
+      expect((result.data as any).rewritten).toBe(false);
+      expect((result.data as any).resolutionReason).toBe("passthrough");
+      expect(logWarn).not.toHaveBeenCalled();
+    });
+
+    it("falls back to log.info for the paper trail when log.warn is absent", async () => {
       registerBotGroupIds(["grp1"]);
       globalThis.fetch = mockFetch({
         "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
@@ -576,82 +712,30 @@ describe("handleOctoMessageAction", () => {
       expect(logInfo).toHaveBeenCalledTimes(1);
     });
 
-    it("does NOT warn when target is a DIFFERENT group (legitimate cross-channel send)", async () => {
-      registerBotGroupIds(["grp1", "otherGroup"]);
-      globalThis.fetch = mockFetch({
-        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
-      });
-      const logWarn = vi.fn();
-      const logInfo = vi.fn();
-      const { handleOctoMessageAction } = await import("./actions.js");
-      await handleOctoMessageAction({
-        action: "send",
-        args: { target: "group:otherGroup", message: "hi" },
-        apiUrl: "http://localhost:8090",
-        botToken: "test-token",
-        currentChannelId: "grp1____topicA", // in thread of grp1, but sending to otherGroup
-        log: { warn: logWarn, info: logInfo } as any,
-      });
-      expect(logWarn).not.toHaveBeenCalled();
-      expect(logInfo).not.toHaveBeenCalled();
-    });
-
-    it("does NOT warn when target already carries the thread short id", async () => {
+    it("exposes receipt fields on the RichText success path", async () => {
       registerBotGroupIds(["grp1"]);
       globalThis.fetch = mockFetch({
         "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
-      });
-      const logWarn = vi.fn();
-      const { handleOctoMessageAction } = await import("./actions.js");
-      await handleOctoMessageAction({
-        action: "send",
-        args: { target: "group:grp1____topicA", message: "hi" },
-        apiUrl: "http://localhost:8090",
-        botToken: "test-token",
-        currentChannelId: "grp1____topicA",
-        log: { warn: logWarn } as any,
-      });
-      expect(logWarn).not.toHaveBeenCalled();
-    });
-
-    it("does NOT warn when session is NOT in a thread (plain group chat)", async () => {
-      registerBotGroupIds(["grp1"]);
-      globalThis.fetch = mockFetch({
-        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
-      });
-      const logWarn = vi.fn();
-      const { handleOctoMessageAction } = await import("./actions.js");
-      await handleOctoMessageAction({
-        action: "send",
-        args: { target: "group:grp1", message: "hi" },
-        apiUrl: "http://localhost:8090",
-        botToken: "test-token",
-        currentChannelId: "grp1",
-        log: { warn: logWarn } as any,
-      });
-      expect(logWarn).not.toHaveBeenCalled();
-    });
-
-    it("still sends the message when the warning fires (warn, not reject)", async () => {
-      registerBotGroupIds(["grp1"]);
-      let sent = false;
-      globalThis.fetch = mockFetch({
-        "/v1/bot/sendMessage": async () => {
-          sent = true;
-          return jsonResponse({ message_id: 1, message_seq: 1 });
-        },
+        "/v1/bot/sendRichText": async () => jsonResponse({ message_id: 2, message_seq: 2 }),
+        "/v1/bot/sendMedia": async () => jsonResponse({ message_id: 3, message_seq: 3 }),
       });
       const { handleOctoMessageAction } = await import("./actions.js");
       const result = await handleOctoMessageAction({
         action: "send",
-        args: { target: "group:grp1", message: "hi" },
+        args: {
+          target: "group:grp1",
+          message: "look",
+          mediaUrl: "https://example.com/image.png",
+          richText: true,
+        },
         apiUrl: "http://localhost:8090",
         botToken: "test-token",
         currentChannelId: "grp1____topicA",
-        log: { warn: vi.fn() } as any,
       });
-      expect(sent).toBe(true);
       expect(result.ok).toBe(true);
+      expect((result.data as any).resolvedTarget).toBe("group:grp1____topicA");
+      expect((result.data as any).resolutionReason).toBe("thread-context-rewrite");
+      expect((result.data as any).rewritten).toBe(true);
     });
   });
 
