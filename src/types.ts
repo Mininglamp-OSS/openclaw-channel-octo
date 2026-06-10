@@ -190,6 +190,28 @@ export interface RichTextPayload {
   plain?: string;
 }
 
+/**
+ * A single candidate returned by the name → target resolver
+ * (GET /v1/bot/resolve/targets, octo-server PR #337).
+ *
+ * Group candidates carry only the group identity; thread candidates additionally
+ * carry `shortId` + `parentName`. There is no `parentGroupNo` — `groupNo` already
+ * holds the parent group for a thread.
+ */
+export interface TargetCandidate {
+  kind: "group" | "thread";
+  /** group: group_no ; thread: group_no____short_id (four underscores). */
+  channelId: string;
+  /** 2 = group, 5 = thread (CommunityTopic). */
+  channelType: ChannelType;
+  name: string;
+  groupNo: string;
+  /** Thread only. */
+  shortId?: string;
+  /** Thread only. */
+  parentName?: string;
+}
+
 /** Minimal logger interface used across modules. */
 export type LogSink = {
   info?: (msg: string) => void;

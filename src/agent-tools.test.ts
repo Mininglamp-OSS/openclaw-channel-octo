@@ -18,11 +18,13 @@ vi.mock("./api-fetch.js", () => ({
   getThreadMd: vi.fn(),
   updateThreadMd: vi.fn(),
   resolveSecret: vi.fn(),
+  resolveTargetsByName: vi.fn(),
 }));
 
 vi.mock("./group-md.js", () => ({
   broadcastGroupMdUpdate: vi.fn(),
   broadcastThreadMdUpdate: vi.fn(),
+  getKnownGroupIds: vi.fn(() => new Set()),
 }));
 
 // NOTE: only mkdir from node:fs/promises is wrapped (see the vi.mock below); all
@@ -42,7 +44,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   return { ...actual, mkdir: vi.fn(actual.mkdir) };
 });
 
-import { createOctoManagementTools } from "./agent-tools.js";
+import { createOctoManagementTools, _clearResolveCache } from "./agent-tools.js";
 import {
   listOctoAccountIds,
   resolveOctoAccount,
@@ -60,8 +62,9 @@ import {
   getThreadMd,
   updateThreadMd,
   resolveSecret,
+  resolveTargetsByName,
 } from "./api-fetch.js";
-import { broadcastGroupMdUpdate, broadcastThreadMdUpdate } from "./group-md.js";
+import { broadcastGroupMdUpdate, broadcastThreadMdUpdate, getKnownGroupIds } from "./group-md.js";
 import {
   mkdir,
   mkdtemp,
@@ -2225,6 +2228,321 @@ describe("createOctoManagementTools", () => {
           readFile(join(process.cwd(), `\${${varName}}`, "octo-secrets", "leak.env"), "utf8"),
         ).rejects.toThrow();
       });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // resolve action (name → target candidates)
+  // -----------------------------------------------------------------------
+  describe("resolve action", () => {
+    beforeEach(() => {
+      _clearResolveCache();
+      vi.mocked(getKnownGroupIds).mockReturnValue(new Set());
+    });
+
+    it("enum contains 'resolve'", () => {
+      const tools = createOctoManagementTools({ cfg: mockCfg });
+      expect(tools[0].parameters.properties.action.enum).toContain("resolve");
+      // resolve-only params are present
+      expect(tools[0].parameters.properties.kind).toBeDefined();
+      expect(tools[0].parameters.properties.limit).toBeDefined();
+    });
+
+    it("requires a non-empty name", async () => {
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve" });
+      const data = res.details as any;
+      expect(data.error).toContain("name is required");
+      expect(resolveTargetsByName).not.toHaveBeenCalled();
+    });
+
+    it("rejects an invalid kind", async () => {
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "X", kind: "bogus" });
+      const data = res.details as any;
+      expect(data.error).toContain("Invalid kind");
+      expect(resolveTargetsByName).not.toHaveBeenCalled();
+    });
+
+    it("0 candidates → not-found result with fuzzy suggestions", async () => {
+      vi.mocked(getKnownGroupIds).mockReturnValue(new Set(["Sales Team", "Random"]));
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [],
+        total: 0,
+        truncated: false,
+      });
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "sales" });
+      const data = res.details as any;
+      expect(data.resolved).toBeNull();
+      expect(data.candidates).toEqual([]);
+      expect(data.total).toBe(0);
+      expect(data.error).toContain('No target named "sales" found');
+      expect(data.suggestions).toContain("Sales Team");
+      expect(data.suggestions).not.toContain("Random");
+    });
+
+    it("0 candidates with no matching known names → empty suggestions", async () => {
+      vi.mocked(getKnownGroupIds).mockReturnValue(new Set(["grp123"]));
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [],
+        total: 0,
+        truncated: false,
+      });
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "nonexistent" });
+      const data = res.details as any;
+      expect(data.suggestions).toEqual([]);
+    });
+
+    it("exactly 1 candidate → resolved echoes kind, does not send", async () => {
+      const candidate: any = {
+        kind: "group",
+        channelId: "grp1",
+        channelType: 2,
+        name: "Sales",
+        groupNo: "grp1",
+      };
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [candidate],
+        total: 1,
+        truncated: false,
+      });
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "Sales" });
+      const data = res.details as any;
+      expect(data.resolved).toEqual(candidate);
+      expect(data.resolved.kind).toBe("group");
+      // No candidates list on the single-resolve shape; nothing auto-sent.
+      expect(data.candidates).toBeUndefined();
+    });
+
+    // 🔴 BLOCKER: a single RETURNED candidate that is NOT the whole match set
+    // (total>1 and/or truncated) must NOT auto-resolve — otherwise a limit:1
+    // request over 5 matches would silently treat a partial result as a
+    // confident pick. It must fall through to the candidates branch so the agent
+    // asks the user.
+    it("1 returned but total>1 → returns candidates, NOT resolved (no silent send)", async () => {
+      const candidate: any = {
+        kind: "group",
+        channelId: "grp1",
+        channelType: 2,
+        name: "Sales",
+        groupNo: "grp1",
+      };
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [candidate],
+        total: 5,
+        truncated: false,
+      });
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "Sales", limit: 1 });
+      const data = res.details as any;
+      // Must NOT auto-resolve a truncated/partial result.
+      expect(data.resolved).toBeUndefined();
+      expect(data.candidates).toHaveLength(1);
+      expect(data.total).toBe(5);
+    });
+
+    it("1 returned but truncated:true → returns candidates, NOT resolved", async () => {
+      const candidate: any = {
+        kind: "group",
+        channelId: "grp1",
+        channelType: 2,
+        name: "Sales",
+        groupNo: "grp1",
+      };
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [candidate],
+        total: 1,
+        truncated: true,
+      });
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "Sales" });
+      const data = res.details as any;
+      expect(data.resolved).toBeUndefined();
+      expect(data.candidates).toHaveLength(1);
+      expect(data.truncated).toBe(true);
+    });
+
+    it("multiple candidates (same-name group + thread) → returns candidates, no send", async () => {
+      const candidates: any[] = [
+        { kind: "group", channelId: "grp1", channelType: 2, name: "Ops", groupNo: "grp1" },
+        {
+          kind: "thread",
+          channelId: "grp1____tp01",
+          channelType: 5,
+          name: "Ops",
+          groupNo: "grp1",
+          shortId: "tp01",
+          parentName: "Parent",
+        },
+      ];
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates,
+        total: 2,
+        truncated: false,
+      });
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "Ops" });
+      const data = res.details as any;
+      expect(data.candidates).toHaveLength(2);
+      expect(data.total).toBe(2);
+      expect(data.resolved).toBeUndefined();
+    });
+
+    it("multiple same-name threads → returns candidates", async () => {
+      const candidates: any[] = [
+        { kind: "thread", channelId: "grp1____a", channelType: 5, name: "Bugs", groupNo: "grp1", shortId: "a", parentName: "P1" },
+        { kind: "thread", channelId: "grp2____b", channelType: 5, name: "Bugs", groupNo: "grp2", shortId: "b", parentName: "P2" },
+      ];
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates,
+        total: 2,
+        truncated: false,
+      });
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "Bugs" });
+      const data = res.details as any;
+      expect(data.candidates).toHaveLength(2);
+    });
+
+    it("truncated:true is passed through", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [
+          { kind: "group", channelId: "g1", channelType: 2, name: "A", groupNo: "g1" } as any,
+          { kind: "group", channelId: "g2", channelType: 2, name: "A", groupNo: "g2" } as any,
+        ],
+        total: 2,
+        truncated: true,
+      });
+      const execute = getExecute();
+      const res = await execute("id", { action: "resolve", name: "A" });
+      const data = res.details as any;
+      expect(data.truncated).toBe(true);
+    });
+
+    it("forwards kind and limit into the request", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [],
+        total: 0,
+        truncated: false,
+      });
+      const execute = getExecute();
+      await execute("id", { action: "resolve", name: "X", kind: "thread", limit: 5 });
+      expect(resolveTargetsByName).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "X", kind: "thread", limit: 5 }),
+      );
+    });
+
+    // MINOR: an invalid limit (<=0, NaN, non-integer) must be dropped so the
+    // backend default applies — never forwarded as 0 / negative into the query.
+    it("does not forward an invalid limit (<=0 / NaN / non-integer)", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [],
+        total: 0,
+        truncated: false,
+      });
+      const execute = getExecute();
+
+      for (const bad of [0, -3, Number.NaN]) {
+        vi.mocked(resolveTargetsByName).mockClear();
+        _clearResolveCache();
+        await execute("id", { action: "resolve", name: "X", limit: bad });
+        const call = vi.mocked(resolveTargetsByName).mock.calls[0][0] as any;
+        expect(call.limit).toBeUndefined();
+      }
+
+      // A non-integer is floored only when it stays positive; <1 fractional drops.
+      vi.mocked(resolveTargetsByName).mockClear();
+      _clearResolveCache();
+      await execute("id", { action: "resolve", name: "X", limit: 0.5 });
+      expect((vi.mocked(resolveTargetsByName).mock.calls[0][0] as any).limit).toBeUndefined();
+    });
+
+    it("floors a positive non-integer limit and forwards it", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [],
+        total: 0,
+        truncated: false,
+      });
+      const execute = getExecute();
+      await execute("id", { action: "resolve", name: "X", limit: 7.9 });
+      expect(resolveTargetsByName).toHaveBeenCalledWith(
+        expect.objectContaining({ limit: 7 }),
+      );
+    });
+
+    // MAJOR: a 0-candidate (not-found) result must NOT be cached, so a target
+    // freshly created/renamed seconds later is not masked by a stale miss. A
+    // second resolve after an initial 0-result must hit fetch again.
+    it("does not cache a 0-candidate result — second resolve refetches", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [],
+        total: 0,
+        truncated: false,
+      });
+      const execute = getExecute();
+      await execute("id", { action: "resolve", name: "Fresh" });
+      await execute("id", { action: "resolve", name: "Fresh" });
+      expect(resolveTargetsByName).toHaveBeenCalledTimes(2);
+    });
+
+    it("caches a POSITIVE result — second identical resolve refetches only once", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [
+          { kind: "group", channelId: "g1", channelType: 2, name: "Hit", groupNo: "g1" } as any,
+        ],
+        total: 1,
+        truncated: false,
+      });
+      const execute = getExecute();
+      await execute("id", { action: "resolve", name: "Hit" });
+      await execute("id", { action: "resolve", name: "Hit" });
+      expect(resolveTargetsByName).toHaveBeenCalledTimes(1);
+    });
+
+    it("caches within TTL — second identical resolve does not refetch", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [
+          { kind: "group", channelId: "g1", channelType: 2, name: "Dup", groupNo: "g1" } as any,
+        ],
+        total: 1,
+        truncated: false,
+      });
+      const execute = getExecute();
+      await execute("id", { action: "resolve", name: "Dup" });
+      await execute("id", { action: "resolve", name: "Dup" });
+      expect(resolveTargetsByName).toHaveBeenCalledTimes(1);
+    });
+
+    it("different kind is a distinct cache key", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [
+          { kind: "group", channelId: "g1", channelType: 2, name: "Dup", groupNo: "g1" } as any,
+        ],
+        total: 1,
+        truncated: false,
+      });
+      const execute = getExecute();
+      await execute("id", { action: "resolve", name: "Dup", kind: "group" });
+      await execute("id", { action: "resolve", name: "Dup", kind: "thread" });
+      expect(resolveTargetsByName).toHaveBeenCalledTimes(2);
+    });
+
+    it("cache clear hook resets the cache", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [
+          { kind: "group", channelId: "g1", channelType: 2, name: "Dup", groupNo: "g1" } as any,
+        ],
+        total: 1,
+        truncated: false,
+      });
+      const execute = getExecute();
+      await execute("id", { action: "resolve", name: "Dup" });
+      _clearResolveCache();
+      await execute("id", { action: "resolve", name: "Dup" });
+      expect(resolveTargetsByName).toHaveBeenCalledTimes(2);
     });
   });
 });

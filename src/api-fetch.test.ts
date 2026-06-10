@@ -1891,3 +1891,154 @@ describe("resolveSecret", () => {
     ).rejects.toThrow(/unknown status/);
   });
 });
+
+describe("resolveTargetsByName", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  it("maps snake_case → camelCase for group and thread candidates", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        candidates: [
+          { kind: "group", channel_id: "grp1", channel_type: 2, name: "G", group_no: "grp1" },
+          {
+            kind: "thread",
+            channel_id: "grp1____tp01",
+            channel_type: 5,
+            name: "T",
+            group_no: "grp1",
+            short_id: "tp01",
+            parent_name: "G",
+          },
+        ],
+        total: 2,
+        truncated: false,
+      }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const { resolveTargetsByName } = await import("./api-fetch.js");
+    const result = await resolveTargetsByName({
+      apiUrl: "http://api.test",
+      botToken: "t",
+      name: "X",
+    });
+
+    expect(result.total).toBe(2);
+    expect(result.truncated).toBe(false);
+
+    const [group, thread] = result.candidates;
+    expect(group).toEqual({
+      kind: "group",
+      channelId: "grp1",
+      channelType: 2,
+      name: "G",
+      groupNo: "grp1",
+    });
+    // group candidate must NOT carry thread-only fields
+    expect(group.shortId).toBeUndefined();
+    expect(group.parentName).toBeUndefined();
+
+    expect(thread).toEqual({
+      kind: "thread",
+      channelId: "grp1____tp01",
+      channelType: 5,
+      name: "T",
+      groupNo: "grp1",
+      shortId: "tp01",
+      parentName: "G",
+    });
+  });
+
+  it("always sets name; sets kind/limit only when provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ candidates: [], total: 0, truncated: false }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const { resolveTargetsByName } = await import("./api-fetch.js");
+    await resolveTargetsByName({
+      apiUrl: "http://api.test",
+      botToken: "t",
+      name: "Hello World",
+      kind: "thread",
+      limit: 7,
+    });
+
+    const calledUrl = fetchMock.mock.calls[0][0] as string;
+    const qs = new URL(calledUrl).searchParams;
+    expect(qs.get("name")).toBe("Hello World");
+    expect(qs.get("kind")).toBe("thread");
+    expect(qs.get("limit")).toBe("7");
+  });
+
+  it("omits kind/limit from the query when not provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ candidates: [], total: 0, truncated: false }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const { resolveTargetsByName } = await import("./api-fetch.js");
+    await resolveTargetsByName({ apiUrl: "http://api.test", botToken: "t", name: "X" });
+
+    const qs = new URL(fetchMock.mock.calls[0][0] as string).searchParams;
+    expect(qs.has("kind")).toBe(false);
+    expect(qs.has("limit")).toBe(false);
+  });
+
+  it("passes through truncated:true", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        candidates: [{ kind: "group", channel_id: "g", channel_type: 2, name: "n", group_no: "g" }],
+        total: 1,
+        truncated: true,
+      }),
+    }) as unknown as typeof fetch;
+
+    const { resolveTargetsByName } = await import("./api-fetch.js");
+    const result = await resolveTargetsByName({ apiUrl: "http://api.test", botToken: "t", name: "X" });
+    expect(result.truncated).toBe(true);
+  });
+
+  it("empty result (App Bot / no match) → empty candidates, total 0", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ candidates: [], total: 0, truncated: false }),
+    }) as unknown as typeof fetch;
+
+    const { resolveTargetsByName } = await import("./api-fetch.js");
+    const result = await resolveTargetsByName({ apiUrl: "http://api.test", botToken: "t", name: "X" });
+    expect(result.candidates).toEqual([]);
+    expect(result.total).toBe(0);
+  });
+
+  it("throws on non-2xx with status and body", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      text: vi.fn().mockResolvedValue("boom"),
+    }) as unknown as typeof fetch;
+
+    const { resolveTargetsByName } = await import("./api-fetch.js");
+    await expect(
+      resolveTargetsByName({ apiUrl: "http://api.test", botToken: "t", name: "X" }),
+    ).rejects.toThrow(/resolveTargetsByName failed \(500\): boom/);
+  });
+});

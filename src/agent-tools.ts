@@ -39,8 +39,10 @@ import {
   getThreadMd,
   updateThreadMd,
   resolveSecret,
+  resolveTargetsByName,
 } from "./api-fetch.js";
-import { broadcastGroupMdUpdate, broadcastThreadMdUpdate } from "./group-md.js";
+import { broadcastGroupMdUpdate, broadcastThreadMdUpdate, getKnownGroupIds } from "./group-md.js";
+import type { TargetCandidate } from "./types.js";
 import { mkdir, realpath, lstat, open } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import {
@@ -519,6 +521,31 @@ type LogSink = {
 };
 
 // ---------------------------------------------------------------------------
+// Resolve-targets short-TTL cache
+// ---------------------------------------------------------------------------
+
+/**
+ * Short-TTL in-process cache for resolveTargetsByName results. The agent often
+ * resolves the same name several times within one conversation turn (read it,
+ * ask the user, resolve again); a 30s TTL collapses those into a single backend
+ * fetch without risking a stale view across turns. Mirrors the reset-hook style
+ * of member-cache (`_clearMemberCache`) / owner-registry (`_clearOwnerRegistry`).
+ */
+const RESOLVE_CACHE_TTL_MS = 30_000;
+
+interface ResolveCacheEntry {
+  result: { candidates: TargetCandidate[]; total: number; truncated: boolean };
+  expiry: number;
+}
+
+const _resolveCache = new Map<string, ResolveCacheEntry>();
+
+/** Visible for testing — clears the resolve-targets cache. */
+export function _clearResolveCache(): void {
+  _resolveCache.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Tool factory
 // ---------------------------------------------------------------------------
 
@@ -567,6 +594,7 @@ export function createOctoManagementTools(params: {
             "group-md-read",
             "group-md-update",
             "search-members",
+            "resolve",
             "create-group",
             "update-group",
             "add-members",
@@ -616,7 +644,17 @@ export function createOctoManagementTools(params: {
         name: {
           type: "string",
           description:
-            "Group name. Optional for create-group, update-group.",
+            "Group name. Optional for create-group, update-group; for action=resolve it is the target name to search for.",
+        },
+        kind: {
+          type: "string",
+          enum: ["group", "thread", "all"],
+          description: "For resolve only. Filter candidate kind. Default all.",
+        },
+        limit: {
+          type: "number",
+          description:
+            "For resolve only. Max candidates (default 20, capped 50 by the server).",
         },
         notice: {
           type: "string",
@@ -802,6 +840,41 @@ export function createOctoManagementTools(params: {
               keyword: keyword || undefined,
             });
             return makeSuccess({ members: results });
+          }
+
+          case "resolve": {
+            const name = (args.name as string | undefined)?.trim();
+            if (!name) {
+              return makeError("name is required for resolve");
+            }
+            const rawKind = args.kind as string | undefined;
+            if (
+              rawKind !== undefined &&
+              rawKind !== "group" &&
+              rawKind !== "thread" &&
+              rawKind !== "all"
+            ) {
+              return makeError(
+                `Invalid kind "${rawKind}" for resolve; use "group", "thread", or "all"`,
+              );
+            }
+            const kind = rawKind as "group" | "thread" | "all" | undefined;
+            // Validate limit: accept only a positive integer. Anything else
+            // (<=0, NaN, non-integer) is dropped so the backend default applies
+            // — never forward a 0 / negative limit into the query.
+            let limit: number | undefined;
+            if (typeof args.limit === "number" && Number.isFinite(args.limit)) {
+              const floored = Math.floor(args.limit);
+              if (floored > 0) limit = floored;
+            }
+            return await handleResolveTargets({
+              apiUrl,
+              botToken,
+              accountId,
+              name,
+              kind,
+              limit,
+            });
           }
 
           case "create-group": {
@@ -1068,6 +1141,108 @@ async function handleListGroups(params: {
     botToken: params.botToken,
   });
   return makeSuccess({ groups });
+}
+
+/**
+ * Resolve a NAMED target into concrete channel candidates.
+ *
+ * Disambiguation is mandatory — this NEVER auto-sends and NEVER silently picks
+ * when more than one candidate matches:
+ *   • 0 candidates  → not-found result carrying fuzzy name suggestions (so the
+ *                     agent can offer "did you mean …?"), nothing sent.
+ *   • genuinely unique (1 candidate AND total === 1 AND not truncated)
+ *                   → { resolved } echoing kind; the agent must then call send
+ *                     with candidate.channelId. Still not sent here.
+ *   • anything else (>1 candidates, OR 1 returned but total>1 / truncated)
+ *                   → { candidates, total, truncated }; the agent must ask the
+ *                     user which one. Not sent here. A single returned candidate
+ *                     over a larger match set is NOT treated as unambiguous, so
+ *                     a truncated/partial result can never silently auto-resolve.
+ *
+ * Results are cached for RESOLVE_CACHE_TTL_MS keyed by accountId|name|kind to
+ * avoid repeat fetches within one conversation turn.
+ */
+async function handleResolveTargets(params: {
+  apiUrl: string;
+  botToken: string;
+  accountId: string;
+  name: string;
+  kind?: "group" | "thread" | "all";
+  limit?: number;
+}): Promise<ToolResult> {
+  const cacheKey = `${params.accountId}|${params.name}|${params.kind ?? "all"}`;
+  const cached = _resolveCache.get(cacheKey);
+  let result: { candidates: TargetCandidate[]; total: number; truncated: boolean };
+  if (cached && cached.expiry > Date.now()) {
+    result = cached.result;
+  } else {
+    result = await resolveTargetsByName({
+      apiUrl: params.apiUrl,
+      botToken: params.botToken,
+      name: params.name,
+      kind: params.kind,
+      limit: params.limit,
+    });
+    // Only cache POSITIVE (>=1 candidate) results. A 0-candidate miss must NOT
+    // be cached: a target freshly created/renamed seconds ago would otherwise be
+    // masked by the stale not-found entry for the rest of the 30s TTL.
+    if (result.candidates.length > 0) {
+      _resolveCache.set(cacheKey, {
+        result,
+        expiry: Date.now() + RESOLVE_CACHE_TTL_MS,
+      });
+    }
+  }
+
+  const { candidates, total, truncated } = result;
+
+  // 0 candidates → not found. Offer fuzzy suggestions from known group NAMES so
+  // the agent can ask "did you mean …?" instead of guessing a group: address.
+  if (candidates.length === 0) {
+    const suggestions = fuzzyGroupNameSuggestions(params.name);
+    return makeSuccess({
+      resolved: null,
+      candidates: [],
+      total: 0,
+      error: `No target named "${params.name}" found`,
+      suggestions,
+    });
+  }
+
+  // Genuinely unique → resolved. Require candidates.length === 1 AND total === 1
+  // AND not truncated: a single RETURNED candidate over a larger match set (e.g.
+  // the agent passed limit:1, or the server truncated) is NOT unambiguous, and
+  // auto-resolving it would silently treat a partial result as a confident pick.
+  // Echo kind so the agent knows group vs thread. Do NOT auto-send; the agent
+  // must call send with candidate.channelId next.
+  if (candidates.length === 1 && total === 1 && truncated !== true) {
+    return makeSuccess({ resolved: candidates[0] });
+  }
+
+  // Otherwise (>1 candidates, OR 1 returned but total>1 / truncated) → return the
+  // list; the agent must ask the user which one. Pass truncated through so the
+  // agent can suggest refining the name.
+  return makeSuccess({ candidates, total, truncated });
+}
+
+/**
+ * Fuzzy-match a name against the known group NAMES for "did you mean …?"
+ * suggestions on a not-found resolve. Intentionally simple: case-insensitive
+ * substring match in either direction. getKnownGroupIds() exposes group IDs;
+ * when those happen to be human names they match here, otherwise suggestions are
+ * empty — which is an acceptable degrade (the agent just gets no hints).
+ */
+function fuzzyGroupNameSuggestions(name: string): string[] {
+  const needle = name.trim().toLowerCase();
+  if (!needle) return [];
+  const out: string[] = [];
+  for (const known of getKnownGroupIds()) {
+    const hay = known.toLowerCase();
+    if (hay.includes(needle) || needle.includes(hay)) {
+      out.push(known);
+    }
+  }
+  return out;
 }
 
 async function handleGroupInfo(params: {

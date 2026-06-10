@@ -3,7 +3,7 @@
  * These are used by inbound/outbound where the full OctoAPI class is not available.
  */
 
-import { ChannelType, MessageType, type MentionEntity, type RichTextBlock, type SendMessageResult } from "./types.js";
+import { ChannelType, MessageType, type MentionEntity, type RichTextBlock, type SendMessageResult, type TargetCandidate } from "./types.js";
 import path from "path";
 import { open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -1560,4 +1560,64 @@ export async function leaveThread(params: {
     const text = await resp.text().catch(() => "");
     throw new Error(`leaveThread failed (${resp.status}): ${text || resp.statusText}`);
   }
+}
+
+// ========== Target Resolve API ==========
+
+/**
+ * Resolve a NAMED target ("forward to 'XXX'") into concrete channel candidates.
+ *
+ * GET /v1/bot/resolve/targets?name=...&kind=...&limit=... (octo-server PR #337).
+ *
+ * Returns candidates the agent can disambiguate against — it must NEVER
+ * hand-build a `group:` address from a name. An empty result (App Bot, or no
+ * match) comes back as candidates:[] / total:0 with HTTP 200, not an error.
+ *
+ * The server response is snake_case; this does EXPLICIT field mapping into the
+ * camelCase TargetCandidate shape rather than casting the raw JSON, so a backend
+ * field rename surfaces as a typed gap here instead of silently propagating.
+ */
+export async function resolveTargetsByName(params: {
+  apiUrl: string;
+  botToken: string;
+  name: string;
+  kind?: "group" | "thread" | "all";
+  limit?: number;
+}): Promise<{ candidates: TargetCandidate[]; total: number; truncated: boolean }> {
+  const query = new URLSearchParams();
+  query.set("name", params.name);
+  if (params.kind) query.set("kind", params.kind);
+  if (params.limit != null) query.set("limit", String(params.limit));
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/resolve/targets?${query}`;
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${params.botToken}` },
+    signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`resolveTargetsByName failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  const data = (await resp.json()) as {
+    candidates?: Array<Record<string, unknown>>;
+    total?: number;
+    truncated?: boolean;
+  };
+  const rawCandidates = Array.isArray(data?.candidates) ? data.candidates : [];
+  const candidates: TargetCandidate[] = rawCandidates.map((c) => {
+    const mapped: TargetCandidate = {
+      kind: c.kind as "group" | "thread",
+      channelId: c.channel_id as string,
+      channelType: c.channel_type as ChannelType,
+      name: c.name as string,
+      groupNo: c.group_no as string,
+    };
+    if (c.short_id != null) mapped.shortId = c.short_id as string;
+    if (c.parent_name != null) mapped.parentName = c.parent_name as string;
+    return mapped;
+  });
+  return {
+    candidates,
+    total: typeof data?.total === "number" ? data.total : candidates.length,
+    truncated: data?.truncated === true,
+  };
 }

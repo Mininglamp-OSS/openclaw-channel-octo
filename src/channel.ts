@@ -743,6 +743,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         `For reading message history: use action="read" with target="user:<uid>" to read DM history, or target="group:<groupId>" to read group message history. Cross-channel queries require the requester to be a participant of the target channel.`,
         `For searching: use action="search" with query="shared-groups" to find groups that the bot and the current user both belong to.`,
         `For @mentions in a group: FIRST look up the target member's real uid + display name with octo_management action="group-members" (target="group:<groupId>"). ${MENTION_FORMAT_HINT}`,
+        `When the user names a target by NAME (not id), e.g. "forward to 'XXX' group/chat", FIRST call octo_management action="resolve" with name:"XXX" to resolve it. If multiple candidates are returned, ask the user which group/thread; if exactly one, use its channelId to send. Never hand-build a "group:" address from a name.`,
       ];
     },
   },
