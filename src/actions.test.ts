@@ -1066,6 +1066,63 @@ describe("handleOctoMessageAction", () => {
       expect(sentPayload.channel_type).toBe(5);
     });
 
+    it("9g — prefixed currentChannelId + cross-group target: upstream guard DISCARDS threadId (symmetric to 9d-f)", async () => {
+      // 9d-f cover the "same parent → threadId survives" direction. 9g
+      // locks in the opposite arm of the same bilateral normalization:
+      // when the parents really differ AND both sides carry prefixes,
+      // threadId must be discarded so the message goes to the bare target
+      // group, not silently routed through a stale thread.
+      registerBotGroupIds(["grp1", "otherGroup"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      await handleOctoMessageAction({
+        action: "send",
+        args: { target: "octo:otherGroup", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "octo:grp1____topicA", // current thread is grp1's
+        threadId: "topicA",                       // would route to grp1's thread if not discarded
+      });
+      // Different group → threadId discarded → goes to bare otherGroup (Group, not CommunityTopic)
+      expect(sentPayload.channel_id).toBe("otherGroup");
+      expect(sentPayload.channel_type).toBe(2);
+    });
+
+    it("11 — DM target inside a thread session is NEVER rerouted (safety boundary)", async () => {
+      // Regression guard for the reroute scope: the auto-reroute only
+      // fires when effectiveChannelType === Group. A user:<uid> target
+      // resolves to ChannelType.DM (=1), which must never be rerouted
+      // into the thread even though currentChannelId is a thread. This
+      // test prevents a future refactor of the scope conditions from
+      // accidentally widening the guard to DM/User targets.
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const logInfo = vi.fn();
+      const { handleOctoMessageAction } = await import("./actions.js");
+      await handleOctoMessageAction({
+        action: "send",
+        args: { target: "user:someUid", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA", // bot is in a thread, but sending DM
+        log: { info: logInfo } as any,
+      });
+      expect(sentPayload.channel_id).toBe("someUid");
+      expect(sentPayload.channel_type).toBe(1); // ChannelType.DM
+      expect(logInfo).not.toHaveBeenCalled(); // no reroute log
+    });
+
     it("10 — tool result reports the rerouted destination (acts as destination echo)", async () => {
       registerBotGroupIds(["grp1"]);
       globalThis.fetch = mockFetch({

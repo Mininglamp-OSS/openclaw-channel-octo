@@ -504,10 +504,12 @@ async function handleSend(params: {
   // agent is operating inside a thread session AND the resolved target is the
   // SAME group's parent. Overwhelmingly an LLM mistake ("send to the group"
   // when the user means "send here"); silent misrouting causes visibility/
-  // privacy damage. The runtime layer enforces what the prompt at
-  // channel.ts:702 asks the model to do, so the guardrail is
-  // model-independent (defense in depth, mirrors PR #86's
-  // MENTION_FORMAT_HINT + sanitizeOutboundMentions pattern).
+  // privacy damage. The runtime layer enforces what the thread-routing
+  // hint in octoPlugin.agentPrompt.messageToolHints (the "For threads/
+  // sub-topics" sentence next to MENTION_FORMAT_HINT, src/channel.ts) asks
+  // the model to do, so the guardrail is model-independent (defense in
+  // depth, mirrors PR #86's MENTION_FORMAT_HINT + sanitizeOutboundMentions
+  // pattern).
   //
   // Scope (all three must hold):
   //   (a) effectiveChannelType === ChannelType.Group — resolved target is not
