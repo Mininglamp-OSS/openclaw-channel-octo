@@ -7,7 +7,7 @@
 
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
 import type { MentionEntity, LogSink, RichTextBlock } from "./types.js";
-import { stripChannelPrefix } from "./constants.js";
+import { stripAllChannelPrefixes } from "./constants.js";
 import {
   sendMessage,
   sendMediaMessage,
@@ -159,9 +159,7 @@ export function resolveOutboundOctoTarget(
   // caller already encoded the thread via "____" in ctx.to, parsed.channelType
   // is already CommunityTopic and we pass through.
   if (threadId != null && parsed.channelType === ChannelType.Group) {
-    const shortId = stripChannelPrefix(String(threadId))
-      .replace(/^group:/, "")
-      .replace(/^channel:/, "");
+    const shortId = stripAllChannelPrefixes(String(threadId));
     if (!shortId) return parsed;
 
     // Defensive: if threadId already contains `____`, validate its parent
@@ -471,13 +469,13 @@ async function handleSend(params: {
     };
   }
 
-  // Canonicalize currentChannelId once. Strips all three known runtime
-  // prefixes ("octo:", "channel:", "group:") via a single regex so the
-  // normalization rule is in one place. Used by BOTH the effectiveThreadId
-  // guard (immediately below) and the issue #98 auto-reroute (after
-  // resolveOutboundOctoTarget).
+  // Canonicalize currentChannelId once via the shared helper so the same
+  // normalization rule is in one place (src/constants.ts) and shared with
+  // handleRead, channel.ts account correction, and the threadId path above.
+  // Used by BOTH the effectiveThreadId guard (immediately below) and the
+  // issue #98 auto-reroute (after resolveOutboundOctoTarget).
   const bareCurrentChannelId = currentChannelId
-    ? currentChannelId.replace(/^(octo:|channel:|group:)/, "")
+    ? stripAllChannelPrefixes(currentChannelId)
     : undefined;
 
   // effectiveThreadId guard: drop an explicit threadId when it points at a
@@ -489,9 +487,7 @@ async function handleSend(params: {
   let effectiveThreadId: typeof threadId = threadId;
   if (effectiveThreadId != null && bareCurrentChannelId) {
     const currentParent = extractParentGroupNo(bareCurrentChannelId);
-    const bareTarget = target
-      .replace(/^(octo:|channel:|group:)/, "")
-      .replace(/^([^@]+)@.*$/, "$1");
+    const bareTarget = stripAllChannelPrefixes(target).replace(/^([^@]+)@.*$/, "$1");
     const targetParent = extractParentGroupNo(bareTarget);
     if (targetParent !== currentParent) {
       effectiveThreadId = undefined;
@@ -768,8 +764,13 @@ async function handleRead(params: {
   const { channelId, channelType } = parseTarget(target, currentChannelId, getKnownGroupIds());
 
   // ====== Permission check ======
-  // Strip channel-namespace prefix from currentChannelId for comparison
-  const bareCurrentChannelId = currentChannelId ? stripChannelPrefix(currentChannelId) : currentChannelId;
+  // Strip channel-namespace prefix from currentChannelId for comparison.
+  // Uses the shared helper so all three runtime prefixes (octo:/channel:/group:)
+  // are handled — see src/constants.ts. Pre-fix this only stripped "octo:",
+  // so prefixed forms (channel:grp1____x, group:grp1____x) mis-compared
+  // against the prefix-stripped parsed channelId and treated legitimate
+  // same-channel reads as cross-channel queries. Fix tracked in #102.
+  const bareCurrentChannelId = currentChannelId ? stripAllChannelPrefixes(currentChannelId) : currentChannelId;
   // Infer the current channel type
   const knownGroups = getKnownGroupIds();
   const currentChannelType = bareCurrentChannelId?.includes("____")

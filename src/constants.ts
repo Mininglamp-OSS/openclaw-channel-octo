@@ -23,9 +23,44 @@ export const CHANNEL_ID = "octo";
  */
 export const THREAD_ID_SEPARATOR = "____";
 
-/** Strip channel namespace prefix from a sessionKey or target string. */
-export function stripChannelPrefix(s: string): string {
-  return s.replace(/^octo:/, "");
+/**
+ * Strip any of the known channel namespace prefixes (`octo:`, `channel:`,
+ * `group:`) from a channelId / sessionKey / target string. Strips
+ * **recursively** — stacked prefixes such as `"octo:group:grp1"` or
+ * `"channel:octo:grp1"` are stripped down to `"grp1"` in one call.
+ * Fully idempotent for any input.
+ *
+ * Why three prefixes: the OpenClaw runtime passes channel ids through several
+ * layers (gateway, plugin SDK, agent tool context) and different layers
+ * historically attach different namespace prefixes. Comparisons between
+ * channel ids therefore need a single normalization step that strips
+ * whichever prefix is present, so two callers do not silently miscompare
+ * `"octo:grp1"` against `"grp1"` or `"channel:grp1"` against `"group:grp1"`.
+ *
+ * Recursive vs. the old chained-replace site: the previous threadId-parsing
+ * site at src/actions.ts ran `replace(/^octo:/)` then `replace(/^group:/)`
+ * then `replace(/^channel:/)`, which collapsed some stacked forms (e.g.
+ * `"octo:group:topicA"` → `"topicA"`) but NOT all (e.g.
+ * `"channel:octo:grp1"` → `"octo:grp1"`, because the chain stripped
+ * `group:` only once and never re-ran `octo:`). The recursive helper is
+ * **intentionally broader** than the old chain: it canonicalizes any order
+ * of stacked runtime prefixes. Net effect is strictly safer for downstream
+ * comparisons and matches the helper's "all channel prefixes" name.
+ *
+ * Note: this is a prefix-strip, not a prefix-rewrite. `normalizeOutboundChannelPrefix`
+ * in src/actions.ts is a different operation that maps `channel:<id>` → `group:<id>`
+ * for outbound delivery semantics.
+ */
+export function stripAllChannelPrefixes(s: string): string {
+  let out = s;
+  // Loop bounded by the number of leading runtime prefixes (at most a
+  // handful in any realistic input). Each iteration strictly shortens
+  // `out`, so termination is guaranteed regardless of order.
+  while (true) {
+    const next = out.replace(/^(octo:|channel:|group:)/, "");
+    if (next === out) return out;
+    out = next;
+  }
 }
 
 /** Return the per-channel sub-config for the current channel id (runtime read). */

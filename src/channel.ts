@@ -6,7 +6,7 @@ import type {
 import type { ChannelOutboundContext } from "openclaw/plugin-sdk/channel-contract";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
 import { OctoConfigJsonSchema } from "./config-schema.js";
-import { CHANNEL_ID, stripChannelPrefix } from "./constants.js";
+import { CHANNEL_ID, stripAllChannelPrefixes } from "./constants.js";
 import {
   listOctoAccountIds,
   resolveDefaultOctoAccountId,
@@ -696,7 +696,13 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       let accountId = ctx.accountId ?? DEFAULT_ACCOUNT_ID;
       const currentChannelId = ctx.toolContext?.currentChannelId;
       if (currentChannelId) {
-        const rawId = stripChannelPrefix(currentChannelId);
+        // Use the shared helper so all three runtime prefixes
+        // (octo:/channel:/group:) are handled — see src/constants.ts.
+        // Pre-fix this only stripped "octo:", so a prefixed currentChannelId
+        // like "channel:grp1____x" yielded rawGroupNo="channel:grp1" and
+        // the isAccountRegisteredForGroup check below would miss the account
+        // entirely. Fix tracked in #102.
+        const rawId = stripAllChannelPrefixes(currentChannelId);
         // 子区 channelID (groupNo____shortId) → 提取父群 groupNo
         const rawGroupNo = rawId.includes("____") ? rawId.split("____")[0] : rawId;
         // Only correct if current accountId is NOT registered for this group

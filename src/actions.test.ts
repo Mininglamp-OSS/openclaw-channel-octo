@@ -1979,6 +1979,84 @@ describe("handleOctoMessageAction", () => {
     });
   });
 
+  // Regression guard for issue #102: handleRead's bareCurrentChannelId
+  // previously used the old octo:-only strip helper, so a prefixed
+  // currentChannelId like "channel:grp1" / "group:grp1" /
+  // "channel:grp1____topicA" stayed prefixed after the strip, mis-compared
+  // against the prefix-stripped parsed channelId from parseTarget, and the
+  // isSameChannel check returned false — turning a legitimate same-channel
+  // read into a cross-channel query that may be denied by permission checks
+  // (or silently change the response shape with the prompt-injection wrapper).
+  // Now both sides go through stripAllChannelPrefixes; these tests lock that
+  // in.
+  describe("read — issue #102: prefixed currentChannelId is normalized", () => {
+    const fakeMessages = {
+      messages: [
+        {
+          from_uid: "u1",
+          message_id: "m1",
+          timestamp: 1709654400,
+          payload: Buffer.from(JSON.stringify({ type: 1, content: "x" })).toString("base64"),
+        },
+      ],
+    };
+
+    it("treats currentChannelId='channel:grp1' + target='group:grp1' as same channel (was: cross-channel)", async () => {
+      registerBotGroupIds(["grp1"]);
+      globalThis.fetch = mockFetch({
+        "/v1/bot/messages/sync": async () => jsonResponse(fakeMessages),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "read",
+        args: { target: "group:grp1" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "channel:grp1",
+      });
+      expect(result.ok).toBe(true);
+      const data = result.data as any;
+      // Same-channel → no prompt-injection wrapper (cross-channel would add one)
+      expect(data.header).toBeUndefined();
+    });
+
+    it("treats currentChannelId='group:grp1' + target='group:grp1' as same channel", async () => {
+      registerBotGroupIds(["grp1"]);
+      globalThis.fetch = mockFetch({
+        "/v1/bot/messages/sync": async () => jsonResponse(fakeMessages),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "read",
+        args: { target: "group:grp1" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "group:grp1",
+      });
+      expect(result.ok).toBe(true);
+      const data = result.data as any;
+      expect(data.header).toBeUndefined();
+    });
+
+    it("treats currentChannelId='channel:grp1____topicA' + target='group:grp1____topicA' as same thread", async () => {
+      registerBotGroupIds(["grp1"]);
+      globalThis.fetch = mockFetch({
+        "/v1/bot/messages/sync": async () => jsonResponse(fakeMessages),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "read",
+        args: { target: "group:grp1____topicA" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "channel:grp1____topicA",
+      });
+      expect(result.ok).toBe(true);
+      const data = result.data as any;
+      expect(data.header).toBeUndefined();
+    });
+  });
+
   describe("read — RichText(=14) history expansion", () => {
     it("expands type-14 history into plain text (not empty / [object Object])", async () => {
       registerBotGroupIds(["grp1"]);
@@ -3108,6 +3186,22 @@ describe("resolveOutboundOctoTarget", () => {
     expect(resolveOutboundOctoTarget("group:grp1", "group:topicA").channelId)
       .toBe("grp1____topicA");
     expect(resolveOutboundOctoTarget("group:grp1", "channel:topicA").channelId)
+      .toBe("grp1____topicA");
+  });
+
+  it("strips stacked prefixes from threadId via stripAllChannelPrefixes (#102)", async () => {
+    // End-to-end guard for issue #102: the threadId-parsing path now uses
+    // stripAllChannelPrefixes (recursive), which is intentionally broader
+    // than the old fixed-order chained replace. Demonstrate the broader
+    // semantic at the public API level so future refactors of the helper
+    // cannot silently regress.
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    registerBotGroupIds(["grp1"]);
+    // octo:channel:group:topicA (3 stacked prefixes) → topicA → grp1____topicA
+    expect(resolveOutboundOctoTarget("group:grp1", "octo:channel:group:topicA").channelId)
+      .toBe("grp1____topicA");
+    // channel:octo:topicA (order the old chain could NOT fully strip) → topicA
+    expect(resolveOutboundOctoTarget("group:grp1", "channel:octo:topicA").channelId)
       .toBe("grp1____topicA");
   });
 
