@@ -7,7 +7,7 @@
 
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
 import type { MentionEntity, LogSink, RichTextBlock } from "./types.js";
-import { stripChannelPrefix } from "./constants.js";
+import { stripChannelPrefix, THREAD_ID_SEPARATOR } from "./constants.js";
 import {
   sendMessage,
   sendMediaMessage,
@@ -471,22 +471,82 @@ async function handleSend(params: {
     };
   }
 
+  // Canonicalize currentChannelId once. stripChannelPrefix removes "octo:";
+  // the runtime context can also carry "channel:" or "group:" prefixes, so we
+  // strip all three. Used by BOTH the effectiveThreadId guard (immediately
+  // below) and the issue #98 auto-reroute (after resolveOutboundOctoTarget).
+  const bareCurrentChannelId = currentChannelId
+    ? stripChannelPrefix(currentChannelId).replace(/^(channel:|group:)/, "")
+    : undefined;
+
+  // effectiveThreadId guard: drop an explicit threadId when it points at a
+  // different group than the current session. Normalization on BOTH sides
+  // (currentChannelId via bareCurrentChannelId; target via bareTarget) so
+  // prefixed forms ("octo:grp1", "group:grp1____x", "group:grp1@uid1,uid2")
+  // do not mis-compare and silently drop a legitimate threadId. Fixes a
+  // latent bug exposed by issue #98 review (codex round 3 MAJOR #1).
   let effectiveThreadId: typeof threadId = threadId;
-  if (effectiveThreadId != null && currentChannelId) {
-    const SEP = "____";
-    const currentParent = currentChannelId.includes(SEP)
-      ? currentChannelId.slice(0, currentChannelId.indexOf(SEP))
-      : currentChannelId;
-    const targetRaw = target.replace(/^(group:|channel:)/, "");
-    const targetParent = targetRaw.includes(SEP)
-      ? targetRaw.slice(0, targetRaw.indexOf(SEP))
-      : targetRaw;
+  if (effectiveThreadId != null && bareCurrentChannelId) {
+    const currentParent = bareCurrentChannelId.includes(THREAD_ID_SEPARATOR)
+      ? bareCurrentChannelId.slice(0, bareCurrentChannelId.indexOf(THREAD_ID_SEPARATOR))
+      : bareCurrentChannelId;
+    const bareTarget = target
+      .replace(/^(octo:|channel:|group:)/, "")
+      .replace(/^([^@]+)@.*$/, "$1");
+    const targetParent = bareTarget.includes(THREAD_ID_SEPARATOR)
+      ? bareTarget.slice(0, bareTarget.indexOf(THREAD_ID_SEPARATOR))
+      : bareTarget;
     if (targetParent !== currentParent) {
       effectiveThreadId = undefined;
     }
   }
 
   const { channelId, channelType } = resolveOutboundOctoTarget(target, effectiveThreadId);
+
+  // P0 #98: auto-reroute bare-parent target back to current thread when the
+  // agent is operating inside a thread session AND the resolved target is the
+  // SAME group's parent. Overwhelmingly an LLM mistake ("send to the group"
+  // when the user means "send here"); silent misrouting causes visibility/
+  // privacy damage. The runtime layer enforces what the prompt at
+  // channel.ts:702 asks the model to do, so the guardrail is
+  // model-independent (defense in depth, mirrors PR #86's
+  // MENTION_FORMAT_HINT + sanitizeOutboundMentions pattern).
+  //
+  // Scope (all three must hold):
+  //   (a) effectiveChannelType === ChannelType.Group — resolved target is not
+  //       already a thread. Implicitly excludes the explicit threadId path
+  //       (which would yield CommunityTopic via resolveOutboundOctoTarget),
+  //       so an effective threadId always wins over this guardrail.
+  //   (b) bareCurrentChannelId carries `____` — bot is in a thread session.
+  //   (c) effectiveChannelId === currentThreadParent — bare-parent target is
+  //       the SAME group as the current thread (cross-group sends untouched).
+  //
+  // `effectiveChannelId` from resolveOutboundOctoTarget is already
+  // canonicalized (no prefix), so comparison with the canonical
+  // currentThreadParent is prefix-safe.
+  let effectiveChannelId = channelId;
+  let effectiveChannelType = channelType;
+
+  if (
+    effectiveChannelType === ChannelType.Group &&
+    bareCurrentChannelId?.includes(THREAD_ID_SEPARATOR)
+  ) {
+    const currentThreadParent = bareCurrentChannelId.slice(
+      0,
+      bareCurrentChannelId.indexOf(THREAD_ID_SEPARATOR),
+    );
+    if (effectiveChannelId === currentThreadParent) {
+      log?.info?.(
+        `octo: send action: auto-rerouted target="${target}" to current thread ` +
+        `"${bareCurrentChannelId}" (issue #98). Bare-parent target inside a ` +
+        `thread session is treated as an in-thread send. To target the parent ` +
+        `group or a different group, operate outside the thread session or pass ` +
+        `that group's full target.`,
+      );
+      effectiveChannelId = bareCurrentChannelId;
+      effectiveChannelType = ChannelType.CommunityTopic;
+    }
+  }
 
   // P0-1: ensure member maps are populated before @ conversion. The message-tool
   // send path (agent-initiated @, new sub-topic) has no inbound refresh, so the
@@ -495,12 +555,12 @@ async function handleSend(params: {
   // zero cost) and fill both maps. Threads only carry the parent group_no for
   // the member API, so strip the `____` suffix. Best-effort, silent on failure.
   if (
-    (channelType === ChannelType.Group || channelType === ChannelType.CommunityTopic) &&
+    (effectiveChannelType === ChannelType.Group || effectiveChannelType === ChannelType.CommunityTopic) &&
     typeof message === "string" &&
     message.includes("@")
   ) {
     try {
-      const groupNo = extractParentGroupNo(channelId);
+      const groupNo = extractParentGroupNo(effectiveChannelId);
       if (groupNo) {
         const members = await getGroupMembersFromCache({ apiUrl, botToken, groupNo, log });
         for (const mb of members) {
@@ -515,34 +575,6 @@ async function handleSend(params: {
     }
   }
 
-  // UX warning for a specific foot-gun on the message-tool path (#232 review):
-  // the agent is replying inside a sub-topic (session's currentChannelId carries
-  // `____`) but explicitly passed a bare parent-group target matching the
-  // current thread's parent group. That's semantically valid (parent-group
-  // reply from a thread context) but almost always a model mistake — the
-  // reply will land in the parent group where other members see it rather
-  // than in the thread where the conversation is happening. Don't silently
-  // reroute to the thread and don't hard-reject (breaks the legitimate case),
-  // just log so operators have a paper trail. Scoped to same-group cross-room
-  // to avoid false positives on legitimate cross-channel sends (e.g. the
-  // agent explicitly shipping results to a different group entirely).
-  const THREAD_SEP = "____";
-  if (
-    channelType === ChannelType.Group &&
-    currentChannelId?.includes(THREAD_SEP) &&
-    !target.includes(THREAD_SEP)
-  ) {
-    const currentThreadParent = currentChannelId.slice(0, currentChannelId.indexOf(THREAD_SEP));
-    if (channelId === currentThreadParent) {
-      const warn = log?.warn ?? log?.info;
-      warn?.(
-        `octo: send action: target="${target}" is the parent group of the current thread session ` +
-        `(${currentChannelId}). Reply will land in the parent group, not the thread. If the agent ` +
-        `meant to reply to the thread, pass the full target "group:${currentChannelId}".`,
-      );
-    }
-  }
-
   // Resolve mentions + @all once; reused by both the legacy text path and the
   // RichText(=14) 图文混排 path so mention semantics stay identical.
   const resolveMentions = (raw: string) => {
@@ -550,7 +582,7 @@ async function handleSend(params: {
     let mentionEntities: MentionEntity[] = [];
     let finalMessage = raw;
 
-    if (channelType === ChannelType.Group || channelType === ChannelType.CommunityTopic) {
+    if (effectiveChannelType === ChannelType.Group || effectiveChannelType === ChannelType.CommunityTopic) {
       // v2 path: convert @[uid:name] → @name + entities
       if (uidToNameMap) {
         const structuredMentions = parseStructuredMentions(finalMessage);
@@ -620,8 +652,8 @@ async function handleSend(params: {
       mediaUrls,
       apiUrl,
       botToken,
-      channelId,
-      channelType,
+      channelId: effectiveChannelId,
+      channelType: effectiveChannelType,
       resolveMentions,
       log,
     });
@@ -630,8 +662,8 @@ async function handleSend(params: {
       data: {
         sent: true,
         target,
-        channelId,
-        channelType,
+        channelId: effectiveChannelId,
+        channelType: effectiveChannelType,
         // richText is true only when a type-14 payload was actually sent (≥1
         // image block); a text-only / file-only send reports richText:false.
         ...(richResult.richText ? { richText: true } : {}),
@@ -650,8 +682,8 @@ async function handleSend(params: {
     const sendResult = await sendMessage({
       apiUrl,
       botToken,
-      channelId,
-      channelType,
+      channelId: effectiveChannelId,
+      channelType: effectiveChannelType,
       content: finalMessage,
       ...(mentionUids.length > 0 ? { mentionUids } : {}),
       ...(mentionEntities.length > 0 ? { mentionEntities } : {}),
@@ -673,8 +705,8 @@ async function handleSend(params: {
         mediaUrl,
         apiUrl,
         botToken,
-        channelId,
-        channelType,
+        channelId: effectiveChannelId,
+        channelType: effectiveChannelType,
         log: log as any,
       });
       const mediaMessageId = mediaResult?.message_id ? String(mediaResult.message_id).trim() : undefined;
@@ -703,8 +735,8 @@ async function handleSend(params: {
     data: {
       sent: true,
       target,
-      channelId,
-      channelType,
+      channelId: effectiveChannelId,
+      channelType: effectiveChannelType,
       mediaCount: sentMedia.length,
       // messageId fields added for issue #51 — let the LLM reference the
       // sent message(s) for downstream edit/pin/delete operations.
