@@ -7,7 +7,7 @@
 
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
 import type { MentionEntity, LogSink, RichTextBlock } from "./types.js";
-import { stripChannelPrefix, THREAD_ID_SEPARATOR } from "./constants.js";
+import { stripChannelPrefix } from "./constants.js";
 import {
   sendMessage,
   sendMediaMessage,
@@ -21,7 +21,7 @@ import {
 } from "./api-fetch.js";
 import { uploadAndSendMedia, uploadMedia, resolveRichTextContent, type UploadedMedia } from "./inbound.js";
 import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions, sanitizeOutboundMentions } from "./mention-utils.js";
-import { getKnownGroupIds, extractParentGroupNo } from "./group-md.js";
+import { getKnownGroupIds, extractParentGroupNo, isThreadChannelId } from "./group-md.js";
 import { checkPermission } from "./permission.js";
 import { emitAuditLog } from "./audit.js";
 import { getGroupMembersFromCache, findSharedGroupsFromCache } from "./member-cache.js";
@@ -471,12 +471,13 @@ async function handleSend(params: {
     };
   }
 
-  // Canonicalize currentChannelId once. stripChannelPrefix removes "octo:";
-  // the runtime context can also carry "channel:" or "group:" prefixes, so we
-  // strip all three. Used by BOTH the effectiveThreadId guard (immediately
-  // below) and the issue #98 auto-reroute (after resolveOutboundOctoTarget).
+  // Canonicalize currentChannelId once. Strips all three known runtime
+  // prefixes ("octo:", "channel:", "group:") via a single regex so the
+  // normalization rule is in one place. Used by BOTH the effectiveThreadId
+  // guard (immediately below) and the issue #98 auto-reroute (after
+  // resolveOutboundOctoTarget).
   const bareCurrentChannelId = currentChannelId
-    ? stripChannelPrefix(currentChannelId).replace(/^(channel:|group:)/, "")
+    ? currentChannelId.replace(/^(octo:|channel:|group:)/, "")
     : undefined;
 
   // effectiveThreadId guard: drop an explicit threadId when it points at a
@@ -487,15 +488,11 @@ async function handleSend(params: {
   // latent bug exposed by issue #98 review (codex round 3 MAJOR #1).
   let effectiveThreadId: typeof threadId = threadId;
   if (effectiveThreadId != null && bareCurrentChannelId) {
-    const currentParent = bareCurrentChannelId.includes(THREAD_ID_SEPARATOR)
-      ? bareCurrentChannelId.slice(0, bareCurrentChannelId.indexOf(THREAD_ID_SEPARATOR))
-      : bareCurrentChannelId;
+    const currentParent = extractParentGroupNo(bareCurrentChannelId);
     const bareTarget = target
       .replace(/^(octo:|channel:|group:)/, "")
       .replace(/^([^@]+)@.*$/, "$1");
-    const targetParent = bareTarget.includes(THREAD_ID_SEPARATOR)
-      ? bareTarget.slice(0, bareTarget.indexOf(THREAD_ID_SEPARATOR))
-      : bareTarget;
+    const targetParent = extractParentGroupNo(bareTarget);
     if (targetParent !== currentParent) {
       effectiveThreadId = undefined;
     }
@@ -517,7 +514,7 @@ async function handleSend(params: {
   //       already a thread. Implicitly excludes the explicit threadId path
   //       (which would yield CommunityTopic via resolveOutboundOctoTarget),
   //       so an effective threadId always wins over this guardrail.
-  //   (b) bareCurrentChannelId carries `____` — bot is in a thread session.
+  //   (b) bareCurrentChannelId is a thread channelId — bot is in a thread session.
   //   (c) effectiveChannelId === currentThreadParent — bare-parent target is
   //       the SAME group as the current thread (cross-group sends untouched).
   //
@@ -529,12 +526,10 @@ async function handleSend(params: {
 
   if (
     effectiveChannelType === ChannelType.Group &&
-    bareCurrentChannelId?.includes(THREAD_ID_SEPARATOR)
+    bareCurrentChannelId &&
+    isThreadChannelId(bareCurrentChannelId)
   ) {
-    const currentThreadParent = bareCurrentChannelId.slice(
-      0,
-      bareCurrentChannelId.indexOf(THREAD_ID_SEPARATOR),
-    );
+    const currentThreadParent = extractParentGroupNo(bareCurrentChannelId);
     if (effectiveChannelId === currentThreadParent) {
       log?.info?.(
         `octo: send action: auto-rerouted target="${target}" to current thread ` +

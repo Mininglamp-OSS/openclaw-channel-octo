@@ -836,13 +836,10 @@ describe("handleOctoMessageAction", () => {
       registerBotGroupIds(["grp1"]);
       let richTextPayload: any = null;
       globalThis.fetch = mockFetch({
-        // RichText path may go through sendMessage with a type-14 payload,
-        // or through dedicated /v1/bot/sendRichTextMessage. Capture both.
+        // RichText path internally POSTs to /v1/bot/sendMessage with a
+        // type-14 (RichText) payload — there is no dedicated
+        // /v1/bot/sendRichTextMessage endpoint. Capture from sendMessage.
         "/v1/bot/sendMessage": async (_url, init) => {
-          richTextPayload = JSON.parse(init?.body as string);
-          return jsonResponse({ message_id: 1, message_seq: 1 });
-        },
-        "/v1/bot/sendRichTextMessage": async (_url, init) => {
           richTextPayload = JSON.parse(init?.body as string);
           return jsonResponse({ message_id: 1, message_seq: 1 });
         },
