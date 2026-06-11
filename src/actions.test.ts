@@ -1176,6 +1176,303 @@ describe("handleOctoMessageAction", () => {
     });
   });
 
+  // issue #98 follow-up (deferred by #100): scope:"parent" escape hatch +
+  // send receipt observability fields. The escape hatch lets the agent
+  // deliberately reach the PARENT group from inside a thread session,
+  // opting out of the auto-reroute above. The receipt fields (resolvedTarget,
+  // resolutionReason, rewritten) make the routing decision auditable.
+  describe("send — issue #98 scope:\"parent\" escape hatch + receipt fields", () => {
+    const HEX_98 = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+
+    it("scope:'parent' inside a thread → sends to parent group, NOT rerouted", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const logInfo = vi.fn();
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "hi", scope: "parent" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { info: logInfo } as any,
+      });
+      // Parent group send — auto-reroute short-circuited by scope:"parent"
+      expect(sentPayload.channel_id).toBe("grp1");
+      expect(sentPayload.channel_type).toBe(2);
+      expect(logInfo).not.toHaveBeenCalled(); // no reroute log
+      expect((result as any).data.resolvedTarget).toBe("grp1");
+      expect((result as any).data.resolutionReason).toBe("explicit-parent-scope");
+      expect((result as any).data.rewritten).toBe(false);
+    });
+
+    it("scope:'parent' clears ambient threadId (no thread synthesised even with threadId)", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "hi", scope: "parent" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        threadId: "topicA", // would normally route to grp1____topicA
+      });
+      // scope:"parent" outranks the ambient threadId → bare parent group
+      expect(sentPayload.channel_id).toBe("grp1");
+      expect(sentPayload.channel_type).toBe(2);
+      expect((result as any).data.resolutionReason).toBe("explicit-parent-scope");
+      expect((result as any).data.rewritten).toBe(false);
+    });
+
+    it("non-'parent' scope value is ignored (auto-reroute still fires)", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "hi", scope: "bogus" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { info: vi.fn() } as any,
+      });
+      // Garbage scope ignored → behaves exactly like no scope → auto-reroute
+      expect(sentPayload.channel_id).toBe("grp1____topicA");
+      expect(sentPayload.channel_type).toBe(5);
+      expect((result as any).data.resolutionReason).toBe("thread-context-rewrite");
+      expect((result as any).data.rewritten).toBe(true);
+    });
+
+    it("auto-reroute receipt: resolutionReason='thread-context-rewrite', rewritten=true", async () => {
+      registerBotGroupIds(["grp1"]);
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { info: vi.fn() } as any,
+      });
+      expect((result as any).data.resolvedTarget).toBe("grp1____topicA");
+      expect((result as any).data.resolutionReason).toBe("thread-context-rewrite");
+      expect((result as any).data.rewritten).toBe(true);
+    });
+
+    it("cross-group send receipt: resolutionReason='passthrough', rewritten=false", async () => {
+      registerBotGroupIds(["grp1", "otherGroup"]);
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:otherGroup", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { info: vi.fn() } as any,
+      });
+      expect((result as any).data.resolvedTarget).toBe("otherGroup");
+      expect((result as any).data.resolutionReason).toBe("passthrough");
+      expect((result as any).data.rewritten).toBe(false);
+    });
+
+    it("explicit threadId receipt: resolutionReason='explicit-target', rewritten=false", async () => {
+      registerBotGroupIds(["grp1"]);
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "group:grp1", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1",
+        threadId: "topicB",
+      });
+      expect((result as any).data.resolvedTarget).toBe("grp1____topicB");
+      expect((result as any).data.resolutionReason).toBe("explicit-target");
+      expect((result as any).data.rewritten).toBe(false);
+    });
+
+    it("RichText path also carries receipt fields (auto-reroute)", async () => {
+      registerBotGroupIds(["grp1"]);
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: 1, message_seq: 1 }),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          message: "see attached",
+          mediaUrl: "https://example.com/img.png",
+          richText: true,
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { info: vi.fn() } as any,
+      });
+      expect(result.ok).toBe(true);
+      expect((result as any).data.resolvedTarget).toBe("grp1____topicA");
+      expect((result as any).data.resolutionReason).toBe("thread-context-rewrite");
+      expect((result as any).data.rewritten).toBe(true);
+    });
+
+    it("RichText path carries receipt fields under scope:'parent'", async () => {
+      registerBotGroupIds(["grp1"]);
+      let richTextPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          richTextPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: {
+          target: "group:grp1",
+          message: "see attached",
+          mediaUrl: "https://example.com/img.png",
+          richText: true,
+          scope: "parent",
+        },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { info: vi.fn() } as any,
+      });
+      expect(result.ok).toBe(true);
+      // Sent to parent group, not the thread
+      expect(richTextPayload.channel_id).toBe("grp1");
+      expect(richTextPayload.channel_type).toBe(2);
+      expect((result as any).data.resolvedTarget).toBe("grp1");
+      expect((result as any).data.resolutionReason).toBe("explicit-parent-scope");
+      expect((result as any).data.rewritten).toBe(false);
+    });
+
+    it("scope:'parent' with a thread-suffixed target → strips suffix, sends to parent group", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const logInfo = vi.fn();
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        // Target itself encodes the thread — without the suffix strip this would
+        // resolve to a CommunityTopic and land in the thread despite scope:"parent".
+        args: { target: "group:grp1____topicA", message: "hi", scope: "parent" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { info: logInfo } as any,
+      });
+      // Parent group send — thread suffix stripped, not rerouted
+      expect(sentPayload.channel_id).toBe("grp1");
+      expect(sentPayload.channel_type).toBe(2);
+      expect(logInfo).not.toHaveBeenCalled(); // no reroute log
+      // Receipt is consistent with the actual destination (parent group)
+      expect((result as any).data.resolvedTarget).toBe("grp1");
+      expect((result as any).data.resolutionReason).toBe("explicit-parent-scope");
+      expect((result as any).data.rewritten).toBe(false);
+    });
+
+    it("scope:'parent' on a DM target → sent as DM, NOT rewritten to a group", async () => {
+      // Boundary bug (issue #98 review round 4): scope:"parent" used to
+      // unconditionally strip the suffix and rewrite the target to
+      // "group:<bare>". For a DM (`user:<uid>`) target that produced
+      // "group:user:uid", which resolved to a Group and sent the message to a
+      // bogus group, destroying the `user:` prefix semantics. scope is
+      // meaningless on a DM, so the target must pass through untouched and the
+      // receipt must read passthrough (there is no parent group to send to).
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const logInfo = vi.fn();
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        args: { target: "user:uid1", message: "hi", scope: "parent" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA", // bot is in a thread, sending a DM
+        log: { info: logInfo } as any,
+      });
+      // Delivered as a normal DM — channel_id keeps the bare uid, channel_type DM
+      expect(sentPayload.channel_id).toBe("uid1");
+      expect(sentPayload.channel_type).toBe(1); // ChannelType.DM
+      expect(logInfo).not.toHaveBeenCalled(); // no reroute log
+      // Receipt: scope:"parent" did not apply to a DM → passthrough, not
+      // explicit-parent-scope (no real "send to parent group" semantics).
+      expect((result as any).data.resolvedTarget).toBe("uid1");
+      expect((result as any).data.resolutionReason).toBe("passthrough");
+      expect((result as any).data.rewritten).toBe(false);
+    });
+
+    it("explicit thread-suffixed target (no scope) → resolutionReason='explicit-target'", async () => {
+      registerBotGroupIds(["grp1"]);
+      let sentPayload: any = null;
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          sentPayload = JSON.parse(init?.body as string);
+          return jsonResponse({ message_id: 1, message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send",
+        // Caller explicitly points target at a thread of the current session's
+        // group. Final dest is a thread NOT synthesised by the auto-reroute.
+        args: { target: "group:grp1____topicA", message: "hi" },
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        currentChannelId: "grp1____topicA",
+        log: { info: vi.fn() } as any,
+      });
+      expect(sentPayload.channel_id).toBe("grp1____topicA");
+      expect(sentPayload.channel_type).toBe(5);
+      expect((result as any).data.resolvedTarget).toBe("grp1____topicA");
+      expect((result as any).data.resolutionReason).toBe("explicit-target");
+      expect((result as any).data.rewritten).toBe(false);
+    });
+  });
+
   // -----------------------------------------------------------------------
   // send — threadId routing via resolveOutboundOctoTarget
   // -----------------------------------------------------------------------

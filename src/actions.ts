@@ -483,6 +483,13 @@ async function handleSend(params: {
     return { ok: false, error: "Missing required parameter: target" };
   }
 
+  // issue #98 scope:"parent" escape hatch (the follow-up #100 explicitly
+  // deferred). Lets the agent deliberately send to the PARENT group from
+  // inside a thread session, opting out of the auto-reroute below. Only the
+  // literal string "parent" is honoured; any other value is ignored so a
+  // malformed scope never silently changes routing.
+  const scope: "parent" | undefined = args.scope === "parent" ? "parent" : undefined;
+
   const message = (args.message as string | undefined)?.trim();
   const mediaUrls = resolveActionMediaUrls(args);
 
@@ -518,7 +525,50 @@ async function handleSend(params: {
     }
   }
 
-  const { channelId, channelType } = resolveOutboundOctoTarget(target, effectiveThreadId);
+  // scope:"parent" has the highest precedence — it forces a parent-group send
+  // even from inside a thread session. Clear any ambient threadId here (BEFORE
+  // resolveOutboundOctoTarget) so no thread is synthesised, and the auto-reroute
+  // below is short-circuited. This is the deliberate opt-out the LLM uses when
+  // it really does mean "post to the parent group", not "post here".
+  //
+  // Clearing effectiveThreadId alone is not enough: when the target ITSELF
+  // encodes a thread ("group:grp1____topicA", or a bare "grp1____topicA"
+  // OpenClaw core may synthesise from the current thread session),
+  // resolveOutboundOctoTarget would still parse it as a CommunityTopic and the
+  // Group-only auto-reroute below could not undo it — the send would land in the
+  // thread while the receipt claimed "explicit-parent-scope". So also strip the
+  // "____<short_id>" thread suffix from the target down to the bare parent
+  // group_no, reusing extractParentGroupNo (same split rule as everywhere else)
+  // and re-applying the canonical "group:" prefix so it resolves back to a Group.
+  //
+  // BUT only for group-like targets: a DM (`user:<uid>`) / bare-user target has
+  // no parent group, so the "strip suffix + rewrite group:" logic must NOT run
+  // on it — otherwise "user:uid" would become "group:user:uid", resolve to a
+  // Group, and the message would be sent to a bogus group instead of the DM,
+  // destroying the `user:` prefix semantics (issue #98 review round 4). scope is
+  // meaningless on a DM, so leave the target untouched and let it pass through
+  // as a normal DM. Reuse the same parse path as resolveOutboundOctoTarget
+  // (normalizeOutboundChannelPrefix + parseTarget + getKnownGroupIds) so the
+  // group-like vs DM verdict matches the actual outbound routing exactly.
+  let targetForResolve = target;
+  let parentScopeApplied = false;
+  if (scope === "parent") {
+    effectiveThreadId = undefined;
+    const { channelType: scopeTargetType } = parseTarget(
+      normalizeOutboundChannelPrefix(target),
+      undefined,
+      getKnownGroupIds(),
+    );
+    if (scopeTargetType !== ChannelType.DM) {
+      const bareParent = extractParentGroupNo(
+        stripAllChannelPrefixes(target).replace(/^([^@]+)@.*$/, "$1"),
+      );
+      targetForResolve = `group:${bareParent}`;
+      parentScopeApplied = true;
+    }
+  }
+
+  const { channelId, channelType } = resolveOutboundOctoTarget(targetForResolve, effectiveThreadId);
 
   // P0 #98: auto-reroute bare-parent target back to current thread when the
   // agent is operating inside a thread session AND the resolved target is the
@@ -546,7 +596,16 @@ async function handleSend(params: {
   let effectiveChannelId = channelId;
   let effectiveChannelType = channelType;
 
+  // Observability fields surfaced in the send receipt (issue #98 follow-up):
+  //   - rewritten: did the auto-reroute fire and change the destination?
+  //   - resolutionReason: which routing branch decided the destination.
+  // `rewritten` is set by the auto-reroute block below; `resolutionReason` is
+  // derived AFTER it (see the four-value enum), because the "explicit-target"
+  // verdict depends on the FINAL effectiveChannelType.
+  let rewritten = false;
+
   if (
+    scope !== "parent" &&
     effectiveChannelType === ChannelType.Group &&
     bareCurrentChannelId &&
     isThreadChannelId(bareCurrentChannelId)
@@ -557,12 +616,38 @@ async function handleSend(params: {
         `octo: send action: auto-rerouted target="${target}" to current thread ` +
         `"${bareCurrentChannelId}" (issue #98). Bare-parent target inside a ` +
         `thread session is treated as an in-thread send. To target the parent ` +
-        `group or a different group, operate outside the thread session or pass ` +
-        `that group's full target.`,
+        `group or a different group, operate outside the thread session, pass ` +
+        `that group's full target, or set scope:"parent" to send to the parent ` +
+        `group explicitly.`,
       );
       effectiveChannelId = bareCurrentChannelId;
       effectiveChannelType = ChannelType.CommunityTopic;
+      rewritten = true;
     }
+  }
+
+  // Four-value resolutionReason verdict, decided AFTER the auto-reroute block so
+  // it can read the FINAL effectiveChannelType. Precedence order matters:
+  //   1. scope:"parent" on a group-like target → explicit-parent-scope (highest
+  //      precedence, handled above as parentScopeApplied; never auto-rerouted).
+  //      scope:"parent" on a DM target is a no-op (parentScopeApplied stays
+  //      false) and falls through to passthrough — there is no parent group to
+  //      send to, so the DM is delivered as-is.
+  //   2. auto-reroute fired        → thread-context-rewrite (rewritten === true).
+  //   3. final dest is a thread    → explicit-target. Covers BOTH an explicit
+  //      threadId that survived the guard AND a caller-supplied thread target
+  //      ("group:grp1____topicA" / bare "grp1____topicA"); the common thread is
+  //      "destination is a thread that the auto-reroute did NOT synthesise".
+  //   4. otherwise (Group / DM)    → passthrough.
+  let resolutionReason: "thread-context-rewrite" | "explicit-parent-scope" | "explicit-target" | "passthrough";
+  if (parentScopeApplied) {
+    resolutionReason = "explicit-parent-scope";
+  } else if (rewritten) {
+    resolutionReason = "thread-context-rewrite";
+  } else if (effectiveChannelType === ChannelType.CommunityTopic) {
+    resolutionReason = "explicit-target";
+  } else {
+    resolutionReason = "passthrough";
   }
 
   // P0-1: ensure member maps are populated before @ conversion. The message-tool
@@ -681,6 +766,11 @@ async function handleSend(params: {
         target,
         channelId: effectiveChannelId,
         channelType: effectiveChannelType,
+        // issue #98 receipt fields: surface the resolved/rewritten destination
+        // and how it was decided so callers can audit routing.
+        resolvedTarget: effectiveChannelId,
+        resolutionReason,
+        rewritten,
         // richText is true only when a type-14 payload was actually sent (≥1
         // image block); a text-only / file-only send reports richText:false.
         ...(richResult.richText ? { richText: true } : {}),
@@ -754,6 +844,11 @@ async function handleSend(params: {
       target,
       channelId: effectiveChannelId,
       channelType: effectiveChannelType,
+      // issue #98 receipt fields: surface the resolved/rewritten destination
+      // and how it was decided so callers can audit routing.
+      resolvedTarget: effectiveChannelId,
+      resolutionReason,
+      rewritten,
       mediaCount: sentMedia.length,
       // messageId fields added for issue #51 — let the LLM reference the
       // sent message(s) for downstream edit/pin/delete operations.
