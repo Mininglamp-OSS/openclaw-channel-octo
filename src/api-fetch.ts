@@ -1615,9 +1615,19 @@ export async function resolveTargetsByName(params: {
     if (c.parent_name != null) mapped.parentName = c.parent_name as string;
     return mapped;
   });
+  // When the server omits `total`, fall back to candidates.length — but that
+  // fallback is unsafe if we asked for a bounded page (limit) and got a full
+  // page back: total would collapse to the page size and a truncated result
+  // could masquerade as genuinely unique. Fail closed: if total is missing AND
+  // we hit the limit, force truncated=true so the caller never auto-resolves.
+  const hasTotal = typeof data?.total === "number";
+  const total = hasTotal ? (data.total as number) : candidates.length;
+  const limitReached =
+    typeof params.limit === "number" && params.limit > 0 && candidates.length >= params.limit;
+  const truncated = data?.truncated === true || (!hasTotal && limitReached);
   return {
     candidates,
-    total: typeof data?.total === "number" ? data.total : candidates.length,
-    truncated: data?.truncated === true,
+    total,
+    truncated,
   };
 }

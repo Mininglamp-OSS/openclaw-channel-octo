@@ -2544,5 +2544,49 @@ describe("createOctoManagementTools", () => {
       await execute("id", { action: "resolve", name: "Dup" });
       expect(resolveTargetsByName).toHaveBeenCalledTimes(2);
     });
+
+    // A limit:1 lookup returns a bounded page; a later wider (no-limit) lookup
+    // for the same name must NOT be served from that narrow cache entry — the
+    // limit is part of the cache key.
+    it("limit is part of the cache key — limit:1 then no-limit refetches", async () => {
+      vi.mocked(resolveTargetsByName).mockResolvedValue({
+        candidates: [
+          { kind: "group", channelId: "g1", channelType: 2, name: "Dup", groupNo: "g1" } as any,
+        ],
+        total: 1,
+        truncated: false,
+      });
+      const execute = getExecute();
+      await execute("id", { action: "resolve", name: "Dup", limit: 1 });
+      await execute("id", { action: "resolve", name: "Dup" });
+      expect(resolveTargetsByName).toHaveBeenCalledTimes(2);
+    });
+
+    // The positive-result cache only holds for RESOLVE_CACHE_TTL_MS (30s); once
+    // it expires the next identical resolve must hit fetch again.
+    it("cache expires after TTL — identical resolve refetches", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.mocked(resolveTargetsByName).mockResolvedValue({
+          candidates: [
+            { kind: "group", channelId: "g1", channelType: 2, name: "Dup", groupNo: "g1" } as any,
+          ],
+          total: 1,
+          truncated: false,
+        });
+        const execute = getExecute();
+        await execute("id", { action: "resolve", name: "Dup" });
+        // Within TTL → served from cache, no refetch.
+        vi.advanceTimersByTime(29_999);
+        await execute("id", { action: "resolve", name: "Dup" });
+        expect(resolveTargetsByName).toHaveBeenCalledTimes(1);
+        // Past TTL → entry expired, refetch.
+        vi.advanceTimersByTime(2);
+        await execute("id", { action: "resolve", name: "Dup" });
+        expect(resolveTargetsByName).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });

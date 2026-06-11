@@ -2041,4 +2041,46 @@ describe("resolveTargetsByName", () => {
       resolveTargetsByName({ apiUrl: "http://api.test", botToken: "t", name: "X" }),
     ).rejects.toThrow(/resolveTargetsByName failed \(500\): boom/);
   });
+
+  it("falls back total to candidates.length when total is omitted (no limit)", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        candidates: [
+          { kind: "group", channel_id: "g1", channel_type: 2, name: "n1", group_no: "g1" },
+          { kind: "group", channel_id: "g2", channel_type: 2, name: "n2", group_no: "g2" },
+        ],
+        // total + truncated omitted by the server
+      }),
+    }) as unknown as typeof fetch;
+
+    const { resolveTargetsByName } = await import("./api-fetch.js");
+    const result = await resolveTargetsByName({ apiUrl: "http://api.test", botToken: "t", name: "X" });
+    expect(result.total).toBe(2);
+    // No limit requested → cannot have hit a bound → not forced truncated.
+    expect(result.truncated).toBe(false);
+  });
+
+  it("fail-closed: total omitted AND candidates fill the limit → truncated:true", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        candidates: [{ kind: "group", channel_id: "g1", channel_type: 2, name: "n1", group_no: "g1" }],
+        // total + truncated omitted: a limit:1 page that fills the bound must
+        // be treated as possibly-partial, never as a confident total of 1.
+      }),
+    }) as unknown as typeof fetch;
+
+    const { resolveTargetsByName } = await import("./api-fetch.js");
+    const result = await resolveTargetsByName({
+      apiUrl: "http://api.test",
+      botToken: "t",
+      name: "X",
+      limit: 1,
+    });
+    expect(result.total).toBe(1);
+    expect(result.truncated).toBe(true);
+  });
 });

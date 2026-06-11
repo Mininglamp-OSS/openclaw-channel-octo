@@ -1159,8 +1159,8 @@ async function handleListGroups(params: {
  *                     over a larger match set is NOT treated as unambiguous, so
  *                     a truncated/partial result can never silently auto-resolve.
  *
- * Results are cached for RESOLVE_CACHE_TTL_MS keyed by accountId|name|kind to
- * avoid repeat fetches within one conversation turn.
+ * Results are cached for RESOLVE_CACHE_TTL_MS keyed by accountId|name|kind|limit
+ * to avoid repeat fetches within one conversation turn.
  */
 async function handleResolveTargets(params: {
   apiUrl: string;
@@ -1170,7 +1170,12 @@ async function handleResolveTargets(params: {
   kind?: "group" | "thread" | "all";
   limit?: number;
 }): Promise<ToolResult> {
-  const cacheKey = `${params.accountId}|${params.name}|${params.kind ?? "all"}`;
+  // Include the normalized limit in the cache key: a limit:1 lookup returns a
+  // bounded page, which must NOT satisfy a later wider (no-limit) lookup for the
+  // same name — otherwise the narrow, possibly-truncated result would poison the
+  // broader request.
+  const limitKey = params.limit == null ? "default" : String(params.limit);
+  const cacheKey = `${params.accountId}|${params.name}|${params.kind ?? "all"}|${limitKey}`;
   const cached = _resolveCache.get(cacheKey);
   let result: { candidates: TargetCandidate[]; total: number; truncated: boolean };
   if (cached && cached.expiry > Date.now()) {
