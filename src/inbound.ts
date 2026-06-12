@@ -2519,7 +2519,29 @@ export async function handleInboundMessage(params: {
   // Idle window resolution mirrors account.config.historyLimit: account value
   // wins, else channel top-level (already merged into account.config by
   // resolveOctoAccount), else the (test-overridable) default.
-  const idleTimeoutMs = account.config.dispatchIdleTimeoutMs ?? DISPATCH_IDLE_TIMEOUT_MS;
+  //
+  // Runtime finite-positive guard: the schema's minimum:1000 is host metadata
+  // and is NOT enforced at runtime. A dirty config that bypasses the schema can
+  // smuggle in NaN/0/negative/Infinity. Any of those would make setTimeout clamp
+  // the delay to 1ms, and because the idle timer is armed ONCE before the race
+  // (before the first deliver), a 1ms window fires almost certainly before the
+  // first deliver event — so EVERY message would be judged instantly timed out
+  // and the whole account/channel would become unusable. We therefore accept
+  // only a finite positive number and otherwise fall back to the default.
+  //
+  // The fallback is the default (DISPATCH_IDLE_TIMEOUT_MS), deliberately NOT the
+  // schema's 1000 floor — clamping to 1000 would silently break legitimate
+  // small per-account overrides (e.g. dispatchIdleTimeoutMs: 80).
+  const configured = account.config.dispatchIdleTimeoutMs;
+  const idleTimeoutMs =
+    typeof configured === "number" && Number.isFinite(configured) && configured > 0
+      ? configured
+      : DISPATCH_IDLE_TIMEOUT_MS;
+  if (configured !== undefined && idleTimeoutMs !== configured) {
+    log?.warn?.(
+      `octo: ignoring invalid dispatchIdleTimeoutMs=${configured}, falling back to default ${DISPATCH_IDLE_TIMEOUT_MS}ms`,
+    );
+  }
   let dispatchTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
   // True once the race has settled (timeout OR normal completion) and the
   // finally block has run its clearTimeout. A still-running upstream dispatch

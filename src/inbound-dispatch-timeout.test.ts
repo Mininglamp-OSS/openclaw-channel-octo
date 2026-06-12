@@ -498,6 +498,52 @@ describe("dispatch idle timeout (issue #113)", () => {
     expect(elapsed, "must time out at the small account window, not the 10s default").toBeLessThan(2000);
   });
 
+  // Suggestion #1 — runtime finite-positive guard for dispatchIdleTimeoutMs.
+  // The schema's minimum:1000 is host metadata and is not enforced at runtime;
+  // a dirty config can smuggle NaN/0/negative/Infinity past it. setTimeout
+  // clamps any of those to a 1ms delay, and since the idle timer arms ONCE
+  // before the first deliver, a 1ms window would fire before any delivery and
+  // mark every message timed out — bricking the whole account/channel. The
+  // guard must fall back to the DEFAULT (not the 1000 floor, which would break
+  // the legitimate 80ms override above).
+  //
+  // Each case sets the default to a controllable small window (IDLE_WINDOW_MS)
+  // and runs the streaming runtime: 12 chunks 20ms apart (240ms total) survive
+  // the 200ms window only via idle resets. If the invalid value were honored,
+  // setTimeout's 1ms clamp would fire before the first chunk → 处理超时. So a
+  // clean stream + a warn log proves the fallback, distinguishing it from an
+  // instant timeout.
+  for (const { label, value } of [
+    { label: "NaN", value: NaN },
+    { label: "0", value: 0 },
+    { label: "negative", value: -5 },
+    { label: "Infinity", value: Infinity },
+  ]) {
+    it(`config: invalid dispatchIdleTimeoutMs=${label} falls back to default (no instant timeout)`, async () => {
+      _setDispatchTimeoutForTests(IDLE_WINDOW_MS);
+      installStreamingRuntime({
+        deliveries: Array.from({ length: DELIVER_COUNT }, (_, i) => ({ text: `chunk ${i}` })),
+        intervalMs: DELIVER_INTERVAL_MS,
+        finalText: "fallback answer",
+      });
+      const { sends } = installFetchStub();
+      const warnSpy = vi.fn();
+
+      const account = makeAccount({ dispatchIdleTimeoutMs: value as number });
+      await runInbound({ account, log: { debug: () => {}, info: () => {}, warn: warnSpy, error: () => {} } });
+
+      // Fell back to the default window: the long-but-active stream was NOT
+      // killed (no 处理超时), and the real buffered reply was flushed.
+      expect(pickTimeoutSends(sends)).toHaveLength(0);
+      expect(sends.find((s) => s?.payload?.content === "fallback answer")).toBeDefined();
+      // And the invalid value was reported.
+      expect(
+        warnSpy.mock.calls.some((c) => String(c[0]).includes("ignoring invalid dispatchIdleTimeoutMs")),
+        "an invalid dispatchIdleTimeoutMs must be logged",
+      ).toBe(true);
+    });
+  }
+
   it("config: resolveOctoAccount picks account > channel-top-level > undefined", () => {
     // account value wins over channel top-level
     const both = resolveOctoAccount({
