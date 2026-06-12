@@ -8,6 +8,7 @@ import {
 import { setOctoRuntime } from "./runtime.js";
 import { _clearKnownBots } from "./bot-registry.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
+import { resolveOctoAccount } from "./accounts.js";
 
 /**
  * Regression tests for issue #75 — upstream
@@ -50,7 +51,7 @@ const originalClearTimeout = globalThis.clearTimeout;
 const TIMEOUT_MS_FOR_TESTS = 100;
 const APOLOGY_TIMEOUT_MS_FOR_TESTS = 150;
 
-function makeAccount(): ResolvedOctoAccount {
+function makeAccount(configOverrides?: Partial<ResolvedOctoAccount["config"]>): ResolvedOctoAccount {
   return {
     accountId: "acct1",
     enabled: true,
@@ -61,9 +62,14 @@ function makeAccount(): ResolvedOctoAccount {
       pollIntervalMs: 1000,
       heartbeatIntervalMs: 1000,
       requireMention: false,
+      ...configOverrides,
     },
   };
 }
+
+// Real-timer sleep that bypasses any setTimeout spy installed in a test, so
+// streaming-delivery pacing never pollutes the spy's call records.
+const sleep = (ms: number) => new Promise<void>((resolve) => originalSetTimeout(resolve, ms));
 
 function makeAtBotMessage() {
   return {
@@ -227,9 +233,56 @@ function pickTimeoutSends(sends: any[]) {
   );
 }
 
-function runInbound(opts: { log?: any } = {}) {
+/**
+ * Runtime that streams a series of deliver() calls spaced `intervalMs` apart,
+ * optionally finishing with a non-reasoning "final" block. Used to exercise the
+ * idle-reset path: each delivery resets the idle timer, so a total stream
+ * longer than the idle window must NOT time out as long as every gap is shorter
+ * than the window.
+ */
+function installStreamingRuntime(opts: {
+  deliveries: Array<{ text?: string; isReasoning?: boolean; kind?: string }>;
+  intervalMs: number;
+  finalText?: string;
+}) {
+  const dispatch = vi.fn(async (args: any) => {
+    for (const d of opts.deliveries) {
+      await sleep(opts.intervalMs);
+      await args.dispatcherOptions.deliver(
+        { text: d.text, isReasoning: d.isReasoning },
+        { kind: d.kind ?? "block" },
+      );
+    }
+    if (opts.finalText !== undefined) {
+      await sleep(opts.intervalMs);
+      await args.dispatcherOptions.deliver({ text: opts.finalText }, { kind: "block" });
+    }
+  });
+  setOctoRuntime({
+    config: { loadConfig: () => ({}) },
+    channel: {
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: dispatch,
+        resolveEnvelopeFormatOptions: () => ({}),
+        formatAgentEnvelope: ({ body }: any) => body,
+        finalizeInboundContext: (ctx: any) => ctx,
+      },
+      routing: {
+        resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/store",
+        readSessionUpdatedAt: () => undefined,
+        recordInboundSession: async () => {},
+      },
+    },
+  } as any);
+  return { dispatch };
+}
+
+function runInbound(opts: { log?: any; account?: ResolvedOctoAccount } = {}) {
   return handleInboundMessage({
-    account: makeAccount(),
+    account: opts.account ?? makeAccount(),
     message: makeAtBotMessage() as any,
     botUid: BOT_UID,
     groupHistories: new Map(),
@@ -267,7 +320,7 @@ describe("dispatch timeout guard (issue #75)", () => {
 
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(pickTimeoutSends(sends)).toHaveLength(1);
-    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("dispatch hung"))).toBe(true);
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("dispatch idle"))).toBe(true);
   });
 
   it("happy path: dispatchTimeoutHandle is cleared (no leaked timer)", async () => {
@@ -354,5 +407,228 @@ describe("dispatch timeout guard (issue #75)", () => {
     const finalFlush = sends.find((s) => s.content === "buffered-final");
     expect(finalFlush, "final flush sendMessage must reach fetch").toBeDefined();
     expect(finalFlush!.abortedBeforeResolve, "final flush must be aborted by its own AbortSignal.timeout").toBe(true);
+  });
+});
+
+/**
+ * Regression tests for issue #113 — the dispatch timeout used to be a single
+ * non-resetting setTimeout measuring TOTAL turn wall-clock, which killed long
+ * but actively-streaming turns. It is now an IDLE timer: every deliver event
+ * resets it, so only a genuinely silent dispatch (zero events for a full
+ * window) is treated as hung.
+ */
+describe("dispatch idle timeout (issue #113)", () => {
+  // Window comfortably larger than each delivery gap, but smaller than the
+  // total stream duration — so a correct idle reset survives while a stale
+  // "total wall-clock" timer would fire mid-stream.
+  const IDLE_WINDOW_MS = 200;
+  const DELIVER_INTERVAL_MS = 20;
+  const DELIVER_COUNT = 12; // 12 * 20ms = 240ms total > 200ms window
+
+  it("idle reset: repeated deliver within the window outlasts it without timing out", async () => {
+    _setDispatchTimeoutForTests(IDLE_WINDOW_MS);
+    installStreamingRuntime({
+      deliveries: Array.from({ length: DELIVER_COUNT }, (_, i) => ({ text: `chunk ${i}` })),
+      intervalMs: DELIVER_INTERVAL_MS,
+      finalText: "the real answer",
+    });
+    const { sends } = installFetchStub();
+
+    await runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } });
+
+    // No timeout apology, and the real buffered reply was flushed.
+    expect(pickTimeoutSends(sends)).toHaveLength(0);
+    const realReply = sends.find((s) => s?.payload?.content === "the real answer");
+    expect(realReply, "real reply must be sent after a long but active stream").toBeDefined();
+  });
+
+  it("reasoning-only stream resets the idle timer (reset runs before isReasoning return)", async () => {
+    // This locks the ordering constraint: resetIdleTimer() MUST be called
+    // before `if (payload.isReasoning) return;`. A turn that streams only
+    // reasoning blocks for longer than the window must NOT be killed. Moving
+    // the reset after the early return makes this test fail (idle timer fires
+    // mid-reasoning → 处理超时).
+    _setDispatchTimeoutForTests(IDLE_WINDOW_MS);
+    installStreamingRuntime({
+      deliveries: Array.from({ length: DELIVER_COUNT }, () => ({ isReasoning: true })),
+      intervalMs: DELIVER_INTERVAL_MS,
+      finalText: "answer after thinking",
+    });
+    const { sends } = installFetchStub();
+
+    await runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } });
+
+    expect(pickTimeoutSends(sends)).toHaveLength(0);
+    const realReply = sends.find((s) => s?.payload?.content === "answer after thinking");
+    expect(realReply, "reply must follow a long reasoning-only phase without timing out").toBeDefined();
+  });
+
+  it("true idle: a dispatch that never delivers rejects, posts 处理超时, advances the queue", async () => {
+    // Same semantics as the issue #75 hang test — zero deliver events ever, so
+    // the idle timer (armed once before the race) fires.
+    const { dispatch } = installHangingRuntime();
+    const { sends } = installFetchStub();
+    const warnSpy = vi.fn();
+
+    await expect(runInbound({ log: { debug: () => {}, info: () => {}, warn: warnSpy, error: () => {} } }))
+      .rejects.toThrow();
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(pickTimeoutSends(sends)).toHaveLength(1);
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("dispatch idle"))).toBe(true);
+  });
+
+  it("config: account.config.dispatchIdleTimeoutMs overrides the default window", async () => {
+    // Default window is set deliberately large; the per-account override is
+    // small. The hanging runtime never delivers, so it must time out at the
+    // SMALL account value — proving the account override is honored, not the
+    // large default.
+    _setDispatchTimeoutForTests(10_000);
+    installHangingRuntime();
+    const { sends } = installFetchStub();
+
+    const account = makeAccount({ dispatchIdleTimeoutMs: 80 });
+    const start = Date.now();
+    await expect(
+      runInbound({ account, log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } }),
+    ).rejects.toThrow();
+    const elapsed = Date.now() - start;
+
+    expect(pickTimeoutSends(sends)).toHaveLength(1);
+    expect(elapsed, "must time out at the small account window, not the 10s default").toBeLessThan(2000);
+  });
+
+  it("config: resolveOctoAccount picks account > channel-top-level > undefined", () => {
+    // account value wins over channel top-level
+    const both = resolveOctoAccount({
+      cfg: {
+        channels: {
+          octo: {
+            dispatchIdleTimeoutMs: 5000,
+            accounts: { acctA: { dispatchIdleTimeoutMs: 1234 } },
+          },
+        },
+      } as any,
+      accountId: "acctA",
+    });
+    expect(both.config.dispatchIdleTimeoutMs).toBe(1234);
+
+    // only channel top-level set → channel value used
+    const channelOnly = resolveOctoAccount({
+      cfg: {
+        channels: {
+          octo: {
+            dispatchIdleTimeoutMs: 5000,
+            accounts: { acctA: {} },
+          },
+        },
+      } as any,
+      accountId: "acctA",
+    });
+    expect(channelOnly.config.dispatchIdleTimeoutMs).toBe(5000);
+
+    // neither set → undefined (inbound.ts then falls back to the default)
+    const neither = resolveOctoAccount({
+      cfg: { channels: { octo: { accounts: { acctA: {} } } } } as any,
+      accountId: "acctA",
+    });
+    expect(neither.config.dispatchIdleTimeoutMs).toBeUndefined();
+  });
+
+  it("timer cleanup: every idle-timer setTimeout handle is eventually cleared (reset + finally)", async () => {
+    // resetIdleTimer arms a fresh setTimeout on each delivery and clears the
+    // prior one; the finally block clears the last. Net: zero leaked timers.
+    // Filter by delay === IDLE_WINDOW_MS, which is unique vs the apology timers
+    // (APOLOGY_TIMEOUT_MS_FOR_TESTS) and the streaming sleeps (which bypass the
+    // spy via originalSetTimeout).
+    _setDispatchTimeoutForTests(IDLE_WINDOW_MS);
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout") as any;
+    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout") as any;
+
+    installStreamingRuntime({
+      deliveries: Array.from({ length: 4 }, (_, i) => ({ text: `chunk ${i}` })),
+      intervalMs: DELIVER_INTERVAL_MS,
+      finalText: "done",
+    });
+    installFetchStub();
+
+    await runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } });
+
+    const idleTimerCalls = setTimeoutSpy.mock.calls
+      .map((call: any[], idx: number) => ({ delay: call[1], idx }))
+      .filter((x: any) => x.delay === IDLE_WINDOW_MS);
+    // arm-once + one reset per delivery (4 chunks + 1 final) = several timers
+    expect(idleTimerCalls.length).toBeGreaterThan(1);
+
+    for (const c of idleTimerCalls) {
+      const handle = setTimeoutSpy.mock.results[c.idx]?.value;
+      expect(handle).toBeDefined();
+      const cleared = clearTimeoutSpy.mock.calls.some((call: any[]) => call[0] === handle);
+      expect(cleared, `idle-timer handle from setTimeout call ${c.idx} was not cleared`).toBe(true);
+    }
+  });
+
+  it("late deliver after idle timeout does not arm a new (uncleared) idle timer", async () => {
+    // The Promise.race settles on idle timeout, but the upstream dispatch may
+    // keep running and call deliver() afterwards. resetIdleTimer() must NOT arm
+    // a fresh setTimeout once the race has settled — the finally block already
+    // ran its clearTimeout and would never clear a newly-armed handle, leaking
+    // one timer ref for up to a full idle window. The `settled` guard gates
+    // ONLY the timer re-arm; the late reply content is still delivered.
+    _setDispatchTimeoutForTests(IDLE_WINDOW_MS);
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout") as any;
+    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout") as any;
+
+    // Dispatch captures the deliver callback then never resolves, forcing the
+    // idle timeout to fire while the dispatch is still "running".
+    let capturedDeliver: ((payload: any, info?: any) => Promise<void>) | undefined;
+    const dispatch = vi.fn(async (args: any) => {
+      capturedDeliver = args.dispatcherOptions.deliver;
+      await new Promise<void>(() => {}); // never resolves, never rejects
+    });
+    setOctoRuntime({
+      config: { loadConfig: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: {
+          resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }),
+        },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    installFetchStub();
+
+    await expect(runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } }))
+      .rejects.toThrow();
+
+    const idleCallsBefore = setTimeoutSpy.mock.calls.filter((c: any[]) => c[1] === IDLE_WINDOW_MS).length;
+
+    // Simulate the still-running upstream dispatch delivering a late reply.
+    expect(capturedDeliver).toBeDefined();
+    await capturedDeliver!({ text: "late reply" }, { kind: "final" });
+
+    // No new idle timer was armed by the late deliver...
+    const idleCallsAfter = setTimeoutSpy.mock.calls.filter((c: any[]) => c[1] === IDLE_WINDOW_MS).length;
+    expect(idleCallsAfter, "late deliver must not arm a new idle timer").toBe(idleCallsBefore);
+
+    // ...and every idle-timer handle ever armed has a matching clearTimeout.
+    const idleTimerCalls = setTimeoutSpy.mock.calls
+      .map((call: any[], idx: number) => ({ delay: call[1], idx }))
+      .filter((x: any) => x.delay === IDLE_WINDOW_MS);
+    for (const c of idleTimerCalls) {
+      const handle = setTimeoutSpy.mock.results[c.idx]?.value;
+      expect(handle).toBeDefined();
+      const cleared = clearTimeoutSpy.mock.calls.some((call: any[]) => call[0] === handle);
+      expect(cleared, `idle-timer handle from setTimeout call ${c.idx} leaked (not cleared)`).toBe(true);
+    }
   });
 });

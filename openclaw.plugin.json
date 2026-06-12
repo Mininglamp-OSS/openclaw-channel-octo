@@ -127,6 +127,10 @@
                 "secretsFileRoot": {
                   "type": "string",
                   "description": "Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace). If neither resolves to a usable directory, write-secret is unavailable (fail-closed); there is no process working-directory fallback."
+                },
+                "dispatchIdleTimeoutMs": {
+                  "type": "number",
+                  "minimum": 1000
                 }
               }
             }
@@ -138,6 +142,10 @@
           "secretsFileRoot": {
             "type": "string",
             "description": "Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace). If neither resolves to a usable directory, write-secret is unavailable (fail-closed); there is no process working-directory fallback."
+          },
+          "dispatchIdleTimeoutMs": {
+            "type": "number",
+            "minimum": 1000
           }
         }
       }

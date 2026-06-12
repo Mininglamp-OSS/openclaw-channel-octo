@@ -15,6 +15,7 @@ export interface OctoAccountConfig {
   historyPromptTemplate?: string;  // Template for group history context injection
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace); if neither resolves, write-secret fails closed (no process.cwd() fallback).
+  dispatchIdleTimeoutMs?: number;  // Idle window (ms) of zero deliver events before a silent dispatch is treated as hung (issue #113)
 }
 
 export interface OctoConfig {
@@ -32,6 +33,7 @@ export interface OctoConfig {
   historyPromptTemplate?: string;  // Template for group history context injection
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret (see OctoAccountConfig)
+  dispatchIdleTimeoutMs?: number;  // Idle window (ms) of zero deliver events before a silent dispatch is treated as hung (issue #113)
   accounts?: Record<string, OctoAccountConfig | undefined>;
 }
 
@@ -64,6 +66,7 @@ export const OctoConfigJsonSchema = {
       historyPromptTemplate: { type: "string" },
       onBehalfOf: { type: "string" },
       secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
+      dispatchIdleTimeoutMs: { type: "number", minimum: 1000 },
       accounts: {
         type: "object",
         additionalProperties: {
@@ -83,6 +86,7 @@ export const OctoConfigJsonSchema = {
             historyPromptTemplate: { type: "string" },
             onBehalfOf: { type: "string" },
             secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
+            dispatchIdleTimeoutMs: { type: "number", minimum: 1000 },
           },
         },
       },

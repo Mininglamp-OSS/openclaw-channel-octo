@@ -20,6 +20,7 @@ export type ResolvedOctoAccount = {
     historyPromptTemplate?: string;  // Template for group history context injection
     onBehalfOf?: string;  // Persona clone: grantor uid
     secretsFileRoot?: string;  // Jail root for write-secret file writes
+    dispatchIdleTimeoutMs?: number;  // Idle window (ms) before a silent dispatch is treated as hung (issue #113)
   };
 };
 
@@ -102,6 +103,7 @@ export function resolveOctoAccount(params: {
       historyPromptTemplate: accountConfig.historyPromptTemplate ?? channel.historyPromptTemplate,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,
       secretsFileRoot: accountConfig.secretsFileRoot ?? channel.secretsFileRoot,
+      dispatchIdleTimeoutMs: accountConfig.dispatchIdleTimeoutMs ?? channel.dispatchIdleTimeoutMs,
     },
   };
 }

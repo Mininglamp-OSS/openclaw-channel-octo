@@ -32,20 +32,31 @@ import { mkdir, unlink, readdir, stat } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { randomUUID } from "node:crypto";
 
-// Per-inbound dispatch timeout (issue #75). The upstream OpenClaw runtime call
-// `core.channel.reply.dispatchReplyWithBufferedBlockDispatcher` is observed to
-// occasionally hang indefinitely (no resolve, no reject, no onError) — likely
-// in agent/runtime layers, not in this plugin. Combined with the per-group
-// serial inbound queue (`enqueueInbound` in channel.ts), a single hang locks
-// the entire group: no further messages get processed until the gateway
-// restarts. This wrapper turns "silent permanent block" into "single-message
-// timeout with a warn log + user-facing apology + queue advances".
+// Per-inbound dispatcher idle timeout (issues #75, #113). The upstream
+// OpenClaw runtime call `core.channel.reply.dispatchReplyWithBufferedBlockDispatcher`
+// is observed to occasionally hang indefinitely (no resolve, no reject, no
+// onError) — likely in agent/runtime layers, not in this plugin. Combined with
+// the per-group serial inbound queue (`enqueueInbound` in channel.ts), a single
+// hang locks the entire group: no further messages get processed until the
+// gateway restarts. This wrapper turns "silent permanent block" into "single-
+// message timeout with a warn log + user-facing apology + queue advances".
 //
-// 5 minutes is intentionally generous — longer than any normal LLM round-trip,
-// short enough that a stuck group recovers within one user attention span.
-// Tests override via `_setDispatchTimeoutForTests` to keep the suite fast.
-const DISPATCH_TIMEOUT_DEFAULT_MS = 5 * 60 * 1000;
-let DISPATCH_TIMEOUT_MS = DISPATCH_TIMEOUT_DEFAULT_MS;
+// The timeout is measured as IDLE time, not total wall-clock turn time: each
+// `deliver` event from the dispatcher resets the timer, so we only give up
+// after N consecutive seconds with ZERO deliver activity (issue #113 — a long
+// but actively-streaming turn must never be killed mid-flight). A genuinely
+// stuck dispatch produces no events at all, so the idle timer still fires.
+//
+// Default idle window = LLM_REQUEST_TIMEOUT_MS + IDLE_GRACE_MS: long enough to
+// outlast one stalled LLM/HTTP round-trip plus slack, short enough that a truly
+// stuck group recovers within one user attention span. Both are tunable
+// constants; the window is also configurable per account / per channel via
+// `dispatchIdleTimeoutMs`. Tests override the default via
+// `_setDispatchTimeoutForTests` to keep the suite fast.
+const LLM_REQUEST_TIMEOUT_MS = 300_000; // single LLM/HTTP request timeout, matches AbortSignal.timeout(300_000) elsewhere
+const IDLE_GRACE_MS = 120_000; // idle grace on top of one stalled request
+const DISPATCH_IDLE_TIMEOUT_DEFAULT_MS = LLM_REQUEST_TIMEOUT_MS + IDLE_GRACE_MS; // 420_000ms
+let DISPATCH_IDLE_TIMEOUT_MS = DISPATCH_IDLE_TIMEOUT_DEFAULT_MS;
 // How long we wait for the user-facing "处理超时" apology to post, AND for the
 // happy-path buffered-text final flush, before giving up. The whole point of
 // issue #75 is that an Octo API call can hang; these recovery/flush calls hit
@@ -57,7 +68,7 @@ const DISPATCH_TIMEOUT_APOLOGY_DEFAULT_MS = 10_000;
 let DISPATCH_TIMEOUT_APOLOGY_MS = DISPATCH_TIMEOUT_APOLOGY_DEFAULT_MS;
 
 export function _setDispatchTimeoutForTests(ms: number | null): void {
-  DISPATCH_TIMEOUT_MS = ms === null ? DISPATCH_TIMEOUT_DEFAULT_MS : ms;
+  DISPATCH_IDLE_TIMEOUT_MS = ms === null ? DISPATCH_IDLE_TIMEOUT_DEFAULT_MS : ms;
 }
 
 export function _setDispatchApologyTimeoutForTests(ms: number | null): void {
@@ -2487,9 +2498,11 @@ export async function handleInboundMessage(params: {
 
   let replySucceeded = false;
 
-  // Timeout guard: see DISPATCH_TIMEOUT_MS at top of file. Without this, an
-  // upstream dispatch hang would leave the per-group queue's Promise chain
-  // unresolved forever — see issue #75.
+  // Idle-timeout guard: see DISPATCH_IDLE_TIMEOUT_MS at top of file. Without
+  // this, an upstream dispatch hang would leave the per-group queue's Promise
+  // chain unresolved forever — see issue #75. We measure idle (inter-event)
+  // time, not total turn time, so a long but actively-streaming turn is never
+  // killed mid-flight — see issue #113.
   //
   // Scope note: we intentionally do NOT try to cancel an already-in-flight
   // dispatch or gate late deliver/onError callbacks from a "woken up" old
@@ -2502,15 +2515,40 @@ export async function handleInboundMessage(params: {
   // timeoutError: a per-invocation Error so the outer catch identifies "this
   // is OUR timeout" by reference equality, never by string comparison —
   // protects against a same-text upstream error being misclassified.
+  //
+  // Idle window resolution mirrors account.config.historyLimit: account value
+  // wins, else channel top-level (already merged into account.config by
+  // resolveOctoAccount), else the (test-overridable) default.
+  const idleTimeoutMs = account.config.dispatchIdleTimeoutMs ?? DISPATCH_IDLE_TIMEOUT_MS;
   let dispatchTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  // True once the race has settled (timeout OR normal completion) and the
+  // finally block has run its clearTimeout. A still-running upstream dispatch
+  // can call deliver() AFTER we've settled — without this guard, resetIdleTimer
+  // would arm a fresh handle that the (already-executed) finally never clears,
+  // leaking one timer ref for up to a full idle window (issue #113 review).
+  // Note: this gates ONLY timer re-arming. Late deliver content is still sent
+  // as before — we do not adopt the timedOut-style "drop late replies" guard.
+  let settled = false;
   const timeoutError = new Error(
-    `octo: dispatch timed out after ${DISPATCH_TIMEOUT_MS}ms`,
+    `octo: dispatch idle for ${idleTimeoutMs}ms with no deliver activity`,
   );
-  const dispatchTimeoutPromise = new Promise<never>((_, reject) => {
+  // Resettable idle timer: each call clears the prior handle and arms a fresh
+  // one. Every deliver event calls this, so the timer only fires after a full
+  // idle window with no dispatcher activity at all.
+  let rejectTimeout: (err: unknown) => void = () => {};
+  const resetIdleTimer = () => {
+    if (settled) return;
+    if (dispatchTimeoutHandle) clearTimeout(dispatchTimeoutHandle);
     dispatchTimeoutHandle = setTimeout(() => {
-      reject(timeoutError);
-    }, DISPATCH_TIMEOUT_MS);
+      rejectTimeout(timeoutError);
+    }, idleTimeoutMs);
+  };
+  const dispatchTimeoutPromise = new Promise<never>((_, reject) => {
+    rejectTimeout = reject;
   });
+  // Arm once before the race so the original "zero events ever" hang is still
+  // covered even if deliver is never called.
+  resetIdleTimer();
 
   try {
     await Promise.race([
@@ -2526,6 +2564,13 @@ export async function handleInboundMessage(params: {
           replyToId?: string | null;
           isReasoning?: boolean;
         }, info?: { kind?: string }) => {
+          // Any deliver event — including reasoning-only blocks — proves the
+          // dispatcher is alive, so reset the idle timer FIRST. This MUST run
+          // before the `if (payload.isReasoning) return;` below: a turn that
+          // streams only reasoning blocks for a while would otherwise look
+          // idle and get killed mid-thought (issue #113).
+          resetIdleTimer();
+
           // Skip reasoning blocks
           if (payload.isReasoning) return;
 
@@ -2601,9 +2646,9 @@ export async function handleInboundMessage(params: {
       dispatchTimeoutPromise,
     ]);
   } catch (err) {
-    // Timeout: dispatch never returned within DISPATCH_TIMEOUT_MS. Tell the
-    // user, suppress any stale buffered text (so the finally-flush branch
-    // does not double-send), then rethrow so the per-group queue's outer
+    // Timeout: dispatch produced no deliver activity for a full idle window.
+    // Tell the user, suppress any stale buffered text (so the finally-flush
+    // branch does not double-send), then rethrow so the per-group queue's outer
     // .catch() (channel.ts#enqueueInbound) can advance to the next message
     // — otherwise this group stays stuck forever, see issue #75.
     //
@@ -2613,7 +2658,7 @@ export async function handleInboundMessage(params: {
     if (err === timeoutError) {
       clearInterval(typingInterval);
       log?.warn?.(
-        `octo: dispatch hung past ${DISPATCH_TIMEOUT_MS}ms, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
+        `octo: dispatch idle past ${idleTimeoutMs}ms with no deliver activity, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
       );
       deliverBuffer.lastText = null;
       deliverBuffer.textSent = true;
@@ -2636,6 +2681,11 @@ export async function handleInboundMessage(params: {
     }
     throw err;
   } finally {
+    // Mark settled BEFORE clearing the handle so any late deliver() from a
+    // still-running upstream dispatch can't re-arm a new idle timer that this
+    // finally would never clear (issue #113 review). Late reply CONTENT is
+    // unaffected — settled gates only resetIdleTimer, not the send path.
+    settled = true;
     if (dispatchTimeoutHandle) clearTimeout(dispatchTimeoutHandle);
     // --- Debug: log dispatch outcome ---
     log?.debug?.(`octo: [dispatch-result] replySucceeded=${replySucceeded} bufferedText=${deliverBuffer.lastText?.length ?? 0} textSent=${deliverBuffer.textSent} effectiveOBO=${effectiveOnBehalfOf ?? 'none'}`);
