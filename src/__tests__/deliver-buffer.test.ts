@@ -18,6 +18,11 @@ import { describe, it, expect, vi } from "vitest";
 
 // ---- helpers that mirror the production logic in inbound.ts ----
 
+// Bounded signal used by the production sends (DISPATCH_TIMEOUT_APOLOGY_MS).
+// Mirror sends pass AbortSignal.timeout(...) so a sick Octo API can't strand
+// the per-group queue; tests assert the signal is forwarded.
+const DISPATCH_TIMEOUT_APOLOGY_MS = 10_000;
+
 function createDeliverBuffer() {
   return {
     lastText: null as string | null,
@@ -46,7 +51,7 @@ function makeDeliver(
   state: DeliverState,
   sentMediaUrls: Set<string>,
   sendMediaFn: (url: string) => Promise<void>,
-  sendTextFn: (text: string) => Promise<void>,
+  sendTextFn: (text: string, signal?: AbortSignal) => Promise<void>,
   isToolWarningFn: (payload: any) => boolean,
 ) {
   return async (
@@ -57,12 +62,12 @@ function makeDeliver(
       isReasoning?: boolean;
       isError?: boolean;
     },
-    info?: { kind?: string },
+    info: { kind: string },
   ) => {
     // Skip reasoning blocks
     if (payload.isReasoning) return;
 
-    const kind = info?.kind ?? "final";
+    const kind = info.kind;
 
     // Media: send immediately with dedup
     const outboundMediaUrls = [
@@ -82,7 +87,7 @@ function makeDeliver(
 
     // Text handling based on kind
     const content = payload.text?.trim() ?? "";
-    if (!content && outboundMediaUrls.length > 0) {
+    if (!content && sentMediaUrls.size > 0) {
       state.replySucceeded = true;
       return;
     }
@@ -90,7 +95,7 @@ function makeDeliver(
 
     if (kind === "tool") {
       // Verbose tool call output: send immediately
-      await sendTextFn(content);
+      await sendTextFn(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
       state.replySucceeded = true;
       return;
     }
@@ -103,7 +108,7 @@ function makeDeliver(
         return;
       }
 
-      await sendTextFn(content);
+      await sendTextFn(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
       state.replySucceeded = true;
       state.userFacingFinalDelivered = true;
       state.pendingToolWarningFinal = undefined;
@@ -131,17 +136,24 @@ function makeOnError(
 }
 
 function makeOnFreshSettledDelivery(
+  deliverBuffer: ReturnType<typeof createDeliverBuffer>,
   state: DeliverState,
-  sendTextFn: (text: string) => Promise<void>,
+  sendTextFn: (text: string, signal?: AbortSignal) => Promise<void>,
 ) {
   return async () => {
     if (!state.pendingToolWarningFinal || state.userFacingFinalDelivered || state.deliveryErrorOccurred) {
       return undefined;
     }
+    // Buffered block text is the real user-facing reply; let the finally
+    // flush deliver it and drop the warning fallback (single message).
+    if (deliverBuffer.lastText && !deliverBuffer.textSent) {
+      state.pendingToolWarningFinal = undefined;
+      return undefined;
+    }
     const pending = state.pendingToolWarningFinal;
     state.pendingToolWarningFinal = undefined;
     try {
-      await sendTextFn(pending.text);
+      await sendTextFn(pending.text, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
       state.replySucceeded = true;
       return { visibleReplySent: true };
     } catch {
@@ -152,12 +164,12 @@ function makeOnFreshSettledDelivery(
 
 async function runFinally(
   deliverBuffer: ReturnType<typeof createDeliverBuffer>,
-  sendTextFn: (text: string) => Promise<void>,
+  sendTextFn: (text: string, signal?: AbortSignal) => Promise<void>,
   state?: DeliverState,
 ) {
   if (deliverBuffer.lastText && !deliverBuffer.textSent) {
     deliverBuffer.textSent = true;
-    await sendTextFn(deliverBuffer.lastText);
+    await sendTextFn(deliverBuffer.lastText, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
     if (state) state.replySucceeded = true;
   }
 }
@@ -199,7 +211,7 @@ describe("deliver buffer pattern", () => {
     // finally block sends the buffered text
     await runFinally(deliverBuffer, sendText, state);
     expect(sendText).toHaveBeenCalledTimes(1);
-    expect(sendText).toHaveBeenCalledWith("Hello, how are you? I'm here to help.");
+    expect(sendText).toHaveBeenCalledWith("Hello, how are you? I'm here to help.", expect.any(AbortSignal));
     expect(deliverBuffer.textSent).toBe(true);
   });
 
@@ -215,7 +227,7 @@ describe("deliver buffer pattern", () => {
 
     // final is sent immediately
     expect(sendText).toHaveBeenCalledTimes(1);
-    expect(sendText).toHaveBeenCalledWith("Final answer");
+    expect(sendText).toHaveBeenCalledWith("Final answer", expect.any(AbortSignal));
     expect(state.userFacingFinalDelivered).toBe(true);
     // Buffer is cleared to prevent finally from re-sending
     expect(deliverBuffer.textSent).toBe(true);
@@ -237,7 +249,7 @@ describe("deliver buffer pattern", () => {
     await deliver({ text: "Tool output: file listing..." }, { kind: "tool" });
 
     expect(sendText).toHaveBeenCalledTimes(1);
-    expect(sendText).toHaveBeenCalledWith("Tool output: file listing...");
+    expect(sendText).toHaveBeenCalledWith("Tool output: file listing...", expect.any(AbortSignal));
     // tool does NOT set textSent — final text should still be sent via finally
     expect(deliverBuffer.textSent).toBe(false);
     expect(deliverBuffer.lastText).toBeNull();
@@ -262,27 +274,11 @@ describe("deliver buffer pattern", () => {
     // Final sent immediately
     await deliver(textPayload("Here are your files: ..."), { kind: "final" });
     expect(sendText).toHaveBeenCalledTimes(2);
-    expect(sendText).toHaveBeenLastCalledWith("Here are your files: ...");
+    expect(sendText).toHaveBeenLastCalledWith("Here are your files: ...", expect.any(AbortSignal));
 
     // finally should not send again
     await runFinally(deliverBuffer, sendText, state);
     expect(sendText).toHaveBeenCalledTimes(2);
-  });
-
-  it("undefined kind defaults to final: sends text immediately", async () => {
-    const deliverBuffer = createDeliverBuffer();
-    const state = createDeliverState();
-    const sentMediaUrls = new Set<string>();
-    const sendMedia = vi.fn().mockResolvedValue(undefined);
-    const sendText = vi.fn().mockResolvedValue(undefined);
-    const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
-
-    // No info parameter at all
-    await deliver({ text: "Fallback text" });
-
-    // undefined kind defaults to "final" → sent immediately (not a tool warning)
-    expect(sendText).toHaveBeenCalledTimes(1);
-    expect(sendText).toHaveBeenCalledWith("Fallback text");
   });
 
   it("isReasoning: skips entirely", async () => {
@@ -320,7 +316,7 @@ describe("deliver buffer pattern", () => {
     // Final arrives — sent immediately, clears buffer
     await deliver(textPayload("Complete response"), { kind: "final" });
     expect(sendText).toHaveBeenCalledTimes(1);
-    expect(sendText).toHaveBeenCalledWith("Complete response");
+    expect(sendText).toHaveBeenCalledWith("Complete response", expect.any(AbortSignal));
     expect(deliverBuffer.lastText).toBeNull();
 
     // finally block should not send again
@@ -410,12 +406,12 @@ describe("tool warning deferral", () => {
     const sendMedia = vi.fn().mockResolvedValue(undefined);
     const sendText = vi.fn().mockResolvedValue(undefined);
     const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
-    const onSettled = makeOnFreshSettledDelivery(state, sendText);
+    const onSettled = makeOnFreshSettledDelivery(deliverBuffer, state, sendText);
 
     // Normal final sent immediately
     await deliver(textPayload("Here is your answer with 173 chars of content..."), { kind: "final" });
     expect(sendText).toHaveBeenCalledTimes(1);
-    expect(sendText).toHaveBeenCalledWith("Here is your answer with 173 chars of content...");
+    expect(sendText).toHaveBeenCalledWith("Here is your answer with 173 chars of content...", expect.any(AbortSignal));
     expect(state.userFacingFinalDelivered).toBe(true);
 
     // Tool warning final arrives — discarded (userFacingFinalDelivered=true, not stored)
@@ -436,7 +432,7 @@ describe("tool warning deferral", () => {
     const sendMedia = vi.fn().mockResolvedValue(undefined);
     const sendText = vi.fn().mockResolvedValue(undefined);
     const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
-    const onSettled = makeOnFreshSettledDelivery(state, sendText);
+    const onSettled = makeOnFreshSettledDelivery(deliverBuffer, state, sendText);
 
     // Tool warning arrives first — deferred
     await deliver(toolWarningPayload("write_file failed"), { kind: "final" });
@@ -446,7 +442,7 @@ describe("tool warning deferral", () => {
     // Normal final arrives — sent immediately, clears pending warning
     await deliver(textPayload("Here is your answer"), { kind: "final" });
     expect(sendText).toHaveBeenCalledTimes(1);
-    expect(sendText).toHaveBeenCalledWith("Here is your answer");
+    expect(sendText).toHaveBeenCalledWith("Here is your answer", expect.any(AbortSignal));
     expect(state.userFacingFinalDelivered).toBe(true);
     expect(state.pendingToolWarningFinal).toBeUndefined();
 
@@ -463,7 +459,7 @@ describe("tool warning deferral", () => {
     const sendMedia = vi.fn().mockResolvedValue(undefined);
     const sendText = vi.fn().mockResolvedValue(undefined);
     const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
-    const onSettled = makeOnFreshSettledDelivery(state, sendText);
+    const onSettled = makeOnFreshSettledDelivery(deliverBuffer, state, sendText);
 
     // Only tool warning final — deferred
     await deliver(toolWarningPayload("write_file failed"), { kind: "final" });
@@ -475,7 +471,7 @@ describe("tool warning deferral", () => {
     const result = await onSettled();
     expect(result).toEqual({ visibleReplySent: true });
     expect(sendText).toHaveBeenCalledTimes(1);
-    expect(sendText).toHaveBeenCalledWith("write_file failed");
+    expect(sendText).toHaveBeenCalledWith("write_file failed", expect.any(AbortSignal));
     expect(state.pendingToolWarningFinal).toBeUndefined();
   });
 
@@ -486,7 +482,7 @@ describe("tool warning deferral", () => {
     const sendMedia = vi.fn().mockResolvedValue(undefined);
     const sendText = vi.fn().mockResolvedValue(undefined);
     const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
-    const onSettled = makeOnFreshSettledDelivery(state, sendText);
+    const onSettled = makeOnFreshSettledDelivery(deliverBuffer, state, sendText);
 
     // Normal final — sent immediately
     await deliver(textPayload("Complete answer"), { kind: "final" });
@@ -506,7 +502,7 @@ describe("tool warning deferral", () => {
     const sendMedia = vi.fn().mockResolvedValue(undefined);
     const sendText = vi.fn().mockResolvedValue(undefined);
     const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
-    const onSettled = makeOnFreshSettledDelivery(state, sendText);
+    const onSettled = makeOnFreshSettledDelivery(deliverBuffer, state, sendText);
 
     // Tool text sent immediately — replySucceeded=true
     await deliver({ text: "Tool: ls output" }, { kind: "tool" });
@@ -526,7 +522,7 @@ describe("tool warning deferral", () => {
     const result = await onSettled();
     expect(result).toEqual({ visibleReplySent: true });
     expect(sendText).toHaveBeenCalledTimes(2);
-    expect(sendText).toHaveBeenLastCalledWith("write_file failed");
+    expect(sendText).toHaveBeenLastCalledWith("write_file failed", expect.any(AbortSignal));
   });
 
   it("onError prevents warning fallback delivery", async () => {
@@ -538,7 +534,7 @@ describe("tool warning deferral", () => {
     const sendError = vi.fn().mockResolvedValue(undefined);
     const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
     const onError = makeOnError(deliverBuffer, state, sendError);
-    const onSettled = makeOnFreshSettledDelivery(state, sendText);
+    const onSettled = makeOnFreshSettledDelivery(deliverBuffer, state, sendText);
 
     // Warning deferred
     await deliver(toolWarningPayload("write_file failed"), { kind: "final" });
@@ -553,5 +549,70 @@ describe("tool warning deferral", () => {
     const result = await onSettled();
     expect(result).toBeUndefined();
     expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("bounded immediate-final send: normal final and fallback send pass an AbortSignal", async () => {
+    const deliverBuffer = createDeliverBuffer();
+    const state = createDeliverState();
+    const sentMediaUrls = new Set<string>();
+    const sendMedia = vi.fn().mockResolvedValue(undefined);
+    const sendText = vi.fn().mockResolvedValue(undefined);
+    const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
+    const onSettled = makeOnFreshSettledDelivery(deliverBuffer, state, sendText);
+
+    // Normal final immediate send — must be bounded by a signal so a hung
+    // Octo sendMessage can't stall the per-group queue for the full dispatch
+    // timeout.
+    await deliver(textPayload("Final answer"), { kind: "final" });
+    expect(sendText).toHaveBeenCalledTimes(1);
+    const [, finalSignal] = sendText.mock.calls[0];
+    expect(finalSignal).toBeInstanceOf(AbortSignal);
+
+    // Fresh state: only a tool warning, delivered via onFreshSettledDelivery
+    // fallback — that send must also be bounded.
+    const deliverBuffer2 = createDeliverBuffer();
+    const state2 = createDeliverState();
+    const sendText2 = vi.fn().mockResolvedValue(undefined);
+    const deliver2 = makeDeliver(deliverBuffer2, state2, new Set<string>(), sendMedia, sendText2, defaultIsToolWarning);
+    const onSettled2 = makeOnFreshSettledDelivery(deliverBuffer2, state2, sendText2);
+
+    await deliver2(toolWarningPayload("write_file failed"), { kind: "final" });
+    expect(sendText2).not.toHaveBeenCalled();
+
+    await onSettled2();
+    expect(sendText2).toHaveBeenCalledTimes(1);
+    const [, fallbackSignal] = sendText2.mock.calls[0];
+    expect(fallbackSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("block then warning-only final → single send: block delivered, warning dropped", async () => {
+    const deliverBuffer = createDeliverBuffer();
+    const state = createDeliverState();
+    const sentMediaUrls = new Set<string>();
+    const sendMedia = vi.fn().mockResolvedValue(undefined);
+    const sendText = vi.fn().mockResolvedValue(undefined);
+    const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
+    const onSettled = makeOnFreshSettledDelivery(deliverBuffer, state, sendText);
+
+    // Block buffers the real user-facing reply
+    await deliver({ text: "Here is the buffered block reply" }, { kind: "block" });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(deliverBuffer.lastText).toBe("Here is the buffered block reply");
+
+    // Fallback-only tool-warning final — deferred
+    await deliver(toolWarningPayload("write_file failed"), { kind: "final" });
+    expect(state.pendingToolWarningFinal).toEqual({ text: "write_file failed" });
+
+    // onFreshSettledDelivery: buffered block is pending → drop the warning,
+    // do NOT send it, and clear pendingToolWarningFinal
+    const result = await onSettled();
+    expect(result).toBeUndefined();
+    expect(sendText).not.toHaveBeenCalled();
+    expect(state.pendingToolWarningFinal).toBeUndefined();
+
+    // finally flush delivers the block text — exactly one message overall
+    await runFinally(deliverBuffer, sendText, state);
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendText).toHaveBeenCalledWith("Here is the buffered block reply", expect.any(AbortSignal));
   });
 });

@@ -2598,7 +2598,7 @@ export async function handleInboundMessage(params: {
 
           if (kind === "tool") {
             // Verbose tool call output: send immediately
-            await resolveAndSendText(content);
+            await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
             replySucceeded = true;
             log?.info?.(`octo: [deliver] tool text sent (${content.length} chars)`);
             return;
@@ -2615,7 +2615,7 @@ export async function handleInboundMessage(params: {
               return;
             }
 
-            await resolveAndSendText(content);
+            await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
             replySucceeded = true;
             userFacingFinalDelivered = true;
             pendingToolWarningFinal = undefined;
@@ -2658,10 +2658,16 @@ export async function handleInboundMessage(params: {
           if (!pendingToolWarningFinal || userFacingFinalDelivered || deliveryErrorOccurred) {
             return undefined;
           }
+          // Buffered block text is the real user-facing reply; let the finally
+          // flush deliver it and drop the warning fallback (single message).
+          if (deliverBuffer.lastText && !deliverBuffer.textSent) {
+            pendingToolWarningFinal = undefined;
+            return undefined;
+          }
           const pending = pendingToolWarningFinal;
           pendingToolWarningFinal = undefined;
           try {
-            await resolveAndSendText(pending.text);
+            await resolveAndSendText(pending.text, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
             replySucceeded = true;
             log?.info?.(
               `octo: [deliver] pending tool warning sent as fallback (${pending.text.length} chars)`,
