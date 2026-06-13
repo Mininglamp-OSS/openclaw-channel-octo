@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.16](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.15...v1.0.16) (2026-06-13)
+
+
+### Added
+
+* **actions:** add scope:"parent" escape hatch + send receipt fields ([#98](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/98)) ([#110](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/110)) ([63c58fe](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/63c58fedf1bd6d21a1ac1f4cb1de2c65a81dfaa5))
+* **actions:** resolve named target to group/thread candidates ([#105](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/105)) ([#109](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/109)) ([a53fdfe](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/a53fdfe9a50f52e5daf810c68a97c0e48a11a0f7))
+* **agent-tools:** add write-secret action with internal deref ([#71](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/71)) ([5d73979](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/5d739790e4c082a5b07177910dc55f65fbeb4960))
+
+
+### Fixed
+
+* **ci:** add ready_for_review to check-sprint trigger types ([#49](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/49)) ([3bb69dc](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/3bb69dcbdb1a5a89e46c7e31cf0ddddb4264b1b5))
+* **inbound:** bound dispatch + apology + final flush against silent hangs (Refs [#75](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/75)) ([#83](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/83)) ([0a4f702](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/0a4f702995960bcaf88f64ed9b8b8f4bfa314ee2))
+* **inbound:** derive dispatch timeout from agents.defaults.timeoutSeconds ([#114](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/114)) ([99d9081](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/99d90816ece0f6f3b0024fe55bf762b5e4d1cb4b)), closes [#113](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/113)
+* **inbound:** prevent tool warning from overwriting final reply in deliver buffer ([#115](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/115)) ([558c2c4](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/558c2c424fdf75dc3548374b8dd7264faedf22e4))
+* **mention:** resolve outbound [@mention](https://github.com/mention) failures in proactive sends ([#85](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/85)) ([#86](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/86)) ([4bcdcf6](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/4bcdcf6a8a5b589e59f78f91451a205106d5ba03))
+* **routing:** auto-reroute bare-parent target inside thread session ([#98](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/98)) ([#100](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/100)) ([b5b34eb](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/b5b34eb5f299c2d84825df9f333ea0bcabb7bd96))
+* **upload:** file upload via backend-agnostic presigned PUT ([#66](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/66)) ([7ef1e25](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/7ef1e25036cf62440e14cb1bbab44b3b11535526))
+* **write-secret:** fail-closed jail + workspace default + resolve query contract (consolidates [#92](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/92)/[#95](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/95)/[#96](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/96)) ([#97](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/97)) ([d3b1ffb](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/d3b1ffb9b62a866d345404952a612fbc3fee910c))
+
+
+### Internal
+
+* **channels:** unify channel-prefix normalization ([#102](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/102)) ([#103](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/103)) ([7c55491](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/7c5549174acf6a65187021da54a9bb4483993a5a))
+* force patch release for v1.0.16 ([#107](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/107)) ([b60b5ab](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/b60b5ab219c033d1ca3accd69bee28bf00e7fd3f))
+
 ## [1.0.15](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.14...v1.0.15) (2026-06-08)
 
 ### Fixed
