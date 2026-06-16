@@ -380,6 +380,50 @@ describe("dispatch timeout derivation from config (issue #113)", () => {
     expect(resolveDispatchTimeoutMs({ agents: { defaults: {} } } as any, makeAccount())).toBe(660_000);
   });
 
+  describe("clamp to setTimeout ceiling (issue #121)", () => {
+    const CEIL = 2 ** 31 - 1; // 2_147_483_647, Node setTimeout 32-bit delay 上限
+
+    it("clamps absurd timeoutSeconds (MAX_SAFE_INTEGER) to 2^31-1 instead of overflowing setTimeout", () => {
+      const cfg = { agents: { defaults: { timeoutSeconds: Number.MAX_SAFE_INTEGER } } } as any;
+      const ms = resolveDispatchTimeoutMs(cfg, makeAccount());
+      expect(ms).toBe(CEIL);
+      expect(ms).toBeLessThanOrEqual(CEIL);
+    });
+
+    it("clamps a large-but-finite timeoutSeconds (30d → > 2^31 ms) to 2^31-1", () => {
+      const cfg = { agents: { defaults: { timeoutSeconds: 2_592_000 } } } as any; // 30 天
+      expect(resolveDispatchTimeoutMs(cfg, makeAccount())).toBe(CEIL);
+    });
+
+    it("clamps absurd explicit dispatchTimeoutMs (MAX_SAFE_INTEGER) to 2^31-1", () => {
+      const account = makeAccount();
+      (account.config as any).dispatchTimeoutMs = Number.MAX_SAFE_INTEGER;
+      const ms = resolveDispatchTimeoutMs({} as any, account);
+      expect(ms).toBe(CEIL);
+      expect(ms).toBeLessThanOrEqual(CEIL);
+    });
+
+    it("derived-path boundary: 2_147_423s (≤ ceil) not clamped, 2_147_424s (> ceil) clamped", () => {
+      // 2_147_423*1000 + 60_000 = 2_147_483_000 ≤ CEIL → 原样
+      expect(
+        resolveDispatchTimeoutMs({ agents: { defaults: { timeoutSeconds: 2_147_423 } } } as any, makeAccount()),
+      ).toBe(2_147_483_000);
+      // 2_147_424*1000 + 60_000 = 2_147_484_000 > CEIL → 夹到 CEIL
+      expect(
+        resolveDispatchTimeoutMs({ agents: { defaults: { timeoutSeconds: 2_147_424 } } } as any, makeAccount()),
+      ).toBe(CEIL);
+    });
+
+    it("explicit-path boundary: exactly ceil not clamped, ceil+1 clamped", () => {
+      const atCeil = makeAccount();
+      (atCeil.config as any).dispatchTimeoutMs = CEIL;
+      expect(resolveDispatchTimeoutMs({} as any, atCeil)).toBe(CEIL);
+      const overCeil = makeAccount();
+      (overCeil.config as any).dispatchTimeoutMs = 2 ** 31; // ceil + 1
+      expect(resolveDispatchTimeoutMs({} as any, overCeil)).toBe(CEIL);
+    });
+  });
+
   it("explicit dispatchTimeoutMs config wins over the derived value", () => {
     const account = makeAccount();
     account.config.dispatchTimeoutMs = 1_234_000;

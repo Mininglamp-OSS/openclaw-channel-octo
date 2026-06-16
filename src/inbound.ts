@@ -75,6 +75,12 @@ import { randomUUID } from "node:crypto";
 // Tests override via `_setDispatchTimeoutForTests` to keep the suite fast.
 const DISPATCH_TIMEOUT_BUFFER_MS = 60_000;
 const DEFAULT_AGENT_TIMEOUT_SECONDS = 600;
+// issue #121: 上限 clamp。dispatch 超时最终值会喂给 setTimeout,后者 delay 上限是
+// 32-bit signed int (2^31-1 ≈ 24.8 天);超限会被 Node 重置为 1ms 并抛
+// TimeoutOverflowWarning,导致每条消息秒发「处理超时」。夹到这个硬上限既堵死溢出,
+// 又因 24.8 天远超任何现实 agent 运行 → 对一切现实配置,兜底仍严格晚于 agent-run
+// 超时触发(保上面 #113 注释里的不变量),不会提前误杀健康长任务。
+const DISPATCH_TIMEOUT_MAX_MS = 2 ** 31 - 1;
 let dispatchTimeoutTestOverrideMs: number | null = null;
 // How long we wait for the user-facing "处理超时" apology to post, AND for the
 // happy-path buffered-text final flush, before giving up. The whole point of
@@ -111,14 +117,17 @@ export function resolveDispatchTimeoutMs(
   if (dispatchTimeoutTestOverrideMs !== null) return dispatchTimeoutTestOverrideMs;
   const explicit = account.config.dispatchTimeoutMs;
   if (typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0) {
-    return explicit;
+    return Math.min(explicit, DISPATCH_TIMEOUT_MAX_MS);
   }
   const configured = cfg.agents?.defaults?.timeoutSeconds;
   const agentTimeoutSeconds =
     typeof configured === "number" && Number.isFinite(configured) && configured > 0
       ? configured
       : DEFAULT_AGENT_TIMEOUT_SECONDS;
-  return agentTimeoutSeconds * 1000 + DISPATCH_TIMEOUT_BUFFER_MS;
+  return Math.min(
+    agentTimeoutSeconds * 1000 + DISPATCH_TIMEOUT_BUFFER_MS,
+    DISPATCH_TIMEOUT_MAX_MS,
+  );
 }
 
 export function _setDispatchApologyTimeoutForTests(ms: number | null): void {
