@@ -4,10 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [1.0.17](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.16...v1.0.17) (2026-06-17)
 
-
 ### Fixed
-
-* **inbound:** clamp dispatch timeout to setTimeout ceiling to prevent overflow ([#121](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/121)) ([#122](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/122)) ([64485f5](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/64485f547c634ed006eff78b3bcd063a41e94cda))
+- **把 dispatch 超时配成极大值，反而导致每条消息秒回「处理超时」**（#121, PR #122）：1.0.16（#114）把派发看门狗超时改成从 `agents.defaults.timeoutSeconds` / `channels.octo.dispatchTimeoutMs` 动态派生，但只校验了「有限且为正」，没设上限。当用户把超时配成极大值（如 `Number.MAX_SAFE_INTEGER`，本意是「别给我超时」）时，派生出的毫秒数（`× 1000 + 60s ≈ 9 × 10¹⁸ ms`）远超 Node `setTimeout` 的 32 位上限，被运行时悄悄重置成 1ms 并抛 `TimeoutOverflowWarning` —— 结果每条入站消息都瞬间触发看门狗、秒回「⚠️ 处理超时，请稍后重试。」，真正的答案反而迟到补上。
+  - 修复：新增上限常量 `DISPATCH_TIMEOUT_MAX_MS = 2³¹ − 1`（≈ 24.8 天，正是 `setTimeout` 的硬上限），对「显式配置」和「从 `timeoutSeconds` 派生」两条返回路径都用 `Math.min` 夹顶。
+  - 兼容性：上限远超任何现实的 agent 运行时长，clamp 只在「超时配到 ~24.85 天以上」这种荒谬值时才生效；一切现实配置的行为保持不变，仍维持 #114「派发看门狗严格晚于 agent-run 超时触发」的不变量，不会重蹈 #113 提前误杀健康长任务的覆辙。原有 NaN / 0 / 负数 / Infinity 的回退逻辑不动。
 
 ## [1.0.16](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.15...v1.0.16) (2026-06-13)
 
