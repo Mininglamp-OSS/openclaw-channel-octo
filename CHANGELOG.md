@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.17](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.16...v1.0.17) (2026-06-17)
+
+
+### Fixed
+
+* **inbound:** clamp dispatch timeout to setTimeout ceiling to prevent overflow ([#121](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/121)) ([#122](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/122)) ([64485f5](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/64485f547c634ed006eff78b3bcd063a41e94cda))
+
 ## [1.0.16](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.15...v1.0.16) (2026-06-13)
 
 ### Fixed
