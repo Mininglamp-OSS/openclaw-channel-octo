@@ -1058,7 +1058,7 @@ describe("octoSetupAdapter.validateInput token prefix", () => {
   });
 
   it("accepts a bf_ User Bot token", () => {
-    expect(validate({ botToken: "bf_0123456789abcdef" })).toBeUndefined();
+    expect(validate({ botToken: "bf_dummy_user_bot_token" })).toBeUndefined();
   });
 
   it("accepts an app_ App Bot token", () => {
@@ -1073,7 +1073,7 @@ describe("octoSetupAdapter.validateInput token prefix", () => {
   });
 
   it("rejects an unknown prefix", () => {
-    expect(validate({ botToken: "uk_0123456789abcdef" })).toBeTruthy();
+    expect(validate({ botToken: "uk_dummy_unknown_prefix" })).toBeTruthy();
   });
 
   it("rejects a too-short token even with a valid prefix", () => {
