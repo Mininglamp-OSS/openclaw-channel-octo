@@ -377,11 +377,15 @@ function cleanupStaleCaches(): void {
         // Note: uidToNameMap is a flat uid→name map (not keyed by groupId),
         // so we don't delete from it here — names remain valid across groups.
         _groupCacheTimestamps.get(accountId)?.delete(groupId);
-        // Same key (raw channel_id from touchCache) as _groupCacheTimestamps so
-        // the roster and its freshness timestamp share one lifecycle: roster
-        // exists iff timestamp exists. Deleting by parent groupNo here would
-        // break that invariant (timestamp kept fresh by a sibling thread while
-        // the roster is dropped → next message early-returns with no roster).
+        // Delete by the SAME key cleanup uses for _groupCacheTimestamps (raw
+        // channel_id from touchCache) so the roster is reclaimed on exactly the
+        // same cleanup pass as its freshness timestamp. (Steady-state they are
+        // not strictly 1:1 — refreshGroupMemberCache's failure branch keeps a
+        // backoff timestamp while deleting the roster — but the read path
+        // tolerates a missing roster via `?? []`, so co-deletion at cleanup is
+        // what matters here.) Deleting by parent groupNo instead would drop the
+        // roster while a sibling thread keeps the timestamp fresh, leaving the
+        // next message to early-return with no roster.
         _currentGroupMembersMaps.get(accountId)?.delete(groupId);
         activityMap.delete(groupId);
       }

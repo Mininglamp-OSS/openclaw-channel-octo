@@ -198,24 +198,41 @@ describe("#125 current-group roster (cross-group isolation)", () => {
     expect(currentGroupMembersMap.has(GROUP_A)).toBe(false);
   });
 
-  it("isolates rosters per account (same groupNo, two accounts)", async () => {
+  it("isolates rosters per account (two real account flows, separate per-account state)", async () => {
     installRuntimeStub();
-    installFetchStub({ [GROUP_A]: groupA });
-    const mapAcct1 = new Map<string, GroupMember[]>();
-    const mapAcct2 = new Map<string, GroupMember[]>();
+    // acct1 lives in GROUP_A (3 members); acct2 lives in GROUP_B (4 members).
+    installFetchStub({ [GROUP_A]: groupA, [GROUP_B]: groupB });
+
+    // Each account gets its OWN per-account state (as channel.ts does via the
+    // getOrCreate*(accountId) helpers) — nothing is shared between them.
+    const acct1 = {
+      account: makeAccount("acct1"),
+      currentGroupMembersMap: new Map<string, GroupMember[]>(),
+      memberMap: new Map<string, string>(),
+      uidToNameMap: new Map<string, string>(),
+      groupCacheTimestamps: new Map<string, number>(),
+    };
+    const acct2 = {
+      account: makeAccount("acct2"),
+      currentGroupMembersMap: new Map<string, GroupMember[]>(),
+      memberMap: new Map<string, string>(),
+      uidToNameMap: new Map<string, string>(),
+      groupCacheTimestamps: new Map<string, number>(),
+    };
     const common = {
       botUid: BOT_UID,
       groupHistories: new Map(),
       lastBotReplySeqMap: new Map(),
-      memberMap: new Map(),
-      uidToNameMap: new Map(),
-      groupCacheTimestamps: new Map(),
     };
 
-    await handleInboundMessage({ ...common, account: makeAccount("acct1"), currentGroupMembersMap: mapAcct1, message: makeTextMessage(GROUP_A, groupA[0].uid, "hi") });
+    // Drive a real inbound flow for BOTH accounts.
+    await handleInboundMessage({ ...common, ...acct1, message: makeTextMessage(GROUP_A, groupA[0].uid, "hi") });
+    await handleInboundMessage({ ...common, ...acct2, message: makeTextMessage(GROUP_B, groupB[0].uid, "hi") });
 
-    // acct2 has its own (empty) map; acct1's roster must not have leaked into it.
-    expect(mapAcct1.get(GROUP_A)?.length).toBe(3);
-    expect(mapAcct2.has(GROUP_A)).toBe(false);
+    // Each account's roster cache holds ONLY its own group — no cross-account bleed.
+    expect(acct1.currentGroupMembersMap.get(GROUP_A)?.map((m) => m.name)).toEqual(["Alice", "Bob", "Carol"]);
+    expect(acct1.currentGroupMembersMap.has(GROUP_B)).toBe(false);
+    expect(acct2.currentGroupMembersMap.get(GROUP_B)?.map((m) => m.name)).toEqual(["Dave", "Erin", "Frank", "Grace"]);
+    expect(acct2.currentGroupMembersMap.has(GROUP_A)).toBe(false);
   });
 });
