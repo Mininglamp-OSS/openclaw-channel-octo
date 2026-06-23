@@ -21,6 +21,7 @@ const isReplyPayloadNonTerminalToolErrorWarning =
     : undefined;
 const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
+import type { GroupMember } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
 import { normalizeAccountId } from "./account-id.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
@@ -1259,12 +1260,17 @@ async function refreshGroupMemberCache(opts: {
   // gate to suppress relaxation for ANY bot sender — including cross-process /
   // external bots this plugin never registered via registerKnownBot().
   memberRobotMap?: Map<string, boolean>;
+  // parent groupNo -> current group's roster (#125). When provided,
+  // refreshGroupMemberCache writes the freshly-fetched current-group roster
+  // here on success and deletes the entry on empty/failure (negative cache),
+  // so a stale roster is never re-injected into prompt context.
+  currentGroupMembersMap?: Map<string, GroupMember[]>;
   apiUrl: string;
   botToken: string;
   forceRefresh?: boolean;
   log?: ChannelLogSink;
 }): Promise<boolean> {
-  const { sessionId, memberMap, uidToNameMap, groupCacheTimestamps, memberRobotMap, apiUrl, botToken, log } = opts;
+  const { sessionId, memberMap, uidToNameMap, groupCacheTimestamps, memberRobotMap, currentGroupMembersMap, apiUrl, botToken, log } = opts;
   const forceRefresh = opts.forceRefresh ?? false;
 
   const lastFetched = groupCacheTimestamps.get(sessionId) ?? 0;
@@ -1309,15 +1315,22 @@ async function refreshGroupMemberCache(opts: {
         }
       }
       groupCacheTimestamps.set(sessionId, now);
+      // Cache the current group's roster (only this group's members) for the
+      // member-context prompt, keyed by parent groupNo (#125).
+      currentGroupMembersMap?.set(sessionId, members);
       log?.info?.(`octo: [CACHE] Loaded ${members.length} members, memberMap size: ${memberMap.size}`);
       return true;
     } else {
       groupCacheTimestamps.set(sessionId, now - GROUP_CACHE_EXPIRY_MS + 30000);
+      // Negative cache: drop any stale roster so we never re-inject it.
+      currentGroupMembersMap?.delete(sessionId);
       log?.warn?.(`octo: [CACHE] No members returned for group ${sessionId}, backoff 30s`);
       return false;
     }
   } catch (err) {
     groupCacheTimestamps.set(sessionId, now - GROUP_CACHE_EXPIRY_MS + 30000);
+    // Negative cache on failure: drop any stale roster.
+    currentGroupMembersMap?.delete(sessionId);
     log?.error?.(`octo: [CACHE] Failed to fetch group members: ${err}, backoff 30s`);
     return false;
   }
@@ -1349,22 +1362,21 @@ export function buildPersonaGroupSystemPrompt(
   );
 }
 
-export function buildMemberListPrefix(uidToNameMap: Map<string, string>): string {
-  if (uidToNameMap.size === 0) return "";
+export function buildMemberListPrefix(members: GroupMember[]): string {
+  if (members.length === 0) return "";
 
-  if (uidToNameMap.size <= 10) {
-    const members = Array.from(uidToNameMap.entries());
+  if (members.length <= 10) {
     const memberLines = members
-      .map(([uid, name]) => `  ${name} (${uid})`)
+      .map((m) => `  ${m.name} (${m.uid})`)
       .join("\n");
     // 真实形态示例锚点用真名 + 真 uid（来自内联名单）；格式说明/anti-pattern
     // 取自共享常量，三处同源不 drift。占位槽用尖括号，避免示例本身被
     // STRUCTURED_MENTION_PATTERN 解析成非法 {uid:"uid"}。
-    return `[Group Members]\n${memberLines}\n\n${MENTION_FORMAT_HINT}\n(e.g. @[${members[0][0]}:${members[0][1]}]).\n\n`;
+    return `[Group Members]\n${memberLines}\n\n${MENTION_FORMAT_HINT}\n(e.g. @[${members[0].uid}:${members[0].name}]).\n\n`;
   }
 
   return (
-    `[Group Info] This group has ${uidToNameMap.size} members — too many to list here.\n` +
+    `[Group Info] This group has ${members.length} members — too many to list here.\n` +
     `To @mention someone, FIRST look up their real uid and display name with the ` +
     `group management tool (octo_management action="group-members", ` +
     `target="group:<groupId>"); it returns each member's { uid, name }.\n` +
@@ -1421,6 +1433,14 @@ export async function handleInboundMessage(params: {
   uidToNameMap: Map<string, string>;  // uid -> displayName mapping (reverse)
   groupCacheTimestamps: Map<string, number>;  // groupId -> lastFetchedAt
   memberRobotMap?: Map<string, boolean>;  // uid -> robot flag (server-authoritative)
+  // parent groupNo -> current group's roster. Optional: when omitted (e.g.
+  // existing tests) it falls back to a throwaway Map below — member context
+  // still works WITHIN a single call (the refresh writes the roster, the
+  // prompt-build read reads it back), and only degrades to empty across calls
+  // (a cache-hit that skips refresh has nothing in the throwaway map). The
+  // persistent per-account map (real channel call site) enables cross-call
+  // reuse. (#125)
+  currentGroupMembersMap?: Map<string, GroupMember[]>;
   groupMdCache?: Map<string, { content: string; version: number }>;
   log?: ChannelLogSink;
   statusSink?: OctoStatusSink;
@@ -1430,6 +1450,9 @@ export async function handleInboundMessage(params: {
   // omits it so the gate logic below can read it unconditionally; the real
   // channel call site passes a persistent per-account map.
   const memberRobotMap = params.memberRobotMap ?? new Map<string, boolean>();
+  // Current-group roster cache (per-account, keyed by parent groupNo). Same
+  // fallback pattern as memberRobotMap so omitting it is harmless.
+  const currentGroupMembersMap = params.currentGroupMembersMap ?? new Map<string, GroupMember[]>();
 
   // Detect GROUP.md update/delete notification — refresh both memory + disk cache, do NOT pass to LLM
   const earlyEventType = (message.payload as any)?.event?.type;
@@ -1697,7 +1720,7 @@ export async function handleInboundMessage(params: {
     ? extractParentGroupNo(message.channel_id!)
     : sessionId;
   if (isGroup) {
-    await refreshGroupMemberCache({ sessionId: memberCacheGroupNo, memberMap, uidToNameMap, groupCacheTimestamps, memberRobotMap, apiUrl: account.config.apiUrl, botToken: account.config.botToken ?? "", log });
+    await refreshGroupMemberCache({ sessionId: memberCacheGroupNo, memberMap, uidToNameMap, groupCacheTimestamps, memberRobotMap, currentGroupMembersMap, apiUrl: account.config.apiUrl, botToken: account.config.botToken ?? "", log });
   }
 
   // --- Mention gating for group messages ---
@@ -2125,7 +2148,14 @@ export async function handleInboundMessage(params: {
 
   // memberListPrefix and historyPrefix are injected via before_prompt_build hook
   // (not persisted to session history). Only quotePrefix stays in Body.
-  const memberListPrefix = isGroup ? buildMemberListPrefix(uidToNameMap) : "";
+  // Use the CURRENT group's roster (per-group, keyed by parent groupNo), not the
+  // flat per-account uidToNameMap (which is the cross-group union) so the count
+  // and member list reflect this group only (#125). On fetch failure the entry
+  // is negative-cached (absent) → empty prefix, never a stale/foreign roster.
+  const currentGroupMembers = isGroup
+    ? (currentGroupMembersMap.get(memberCacheGroupNo) ?? [])
+    : [];
+  const memberListPrefix = isGroup ? buildMemberListPrefix(currentGroupMembers) : "";
   if (historyPrefix || memberListPrefix) {
     pendingInboundContext.set(route.sessionKey, { historyPrefix, memberListPrefix });
   }
@@ -2532,7 +2562,7 @@ export async function handleInboundMessage(params: {
 
         if (unresolvedNames.length > 0) {
           log?.info?.(`octo: [REPLY] ${unresolvedNames.length} unresolved names, force refreshing cache...`);
-          const refreshed = await refreshGroupMemberCache({ sessionId: memberCacheGroupNo, memberMap, uidToNameMap, groupCacheTimestamps, memberRobotMap, apiUrl: account.config.apiUrl, botToken: account.config.botToken ?? "", forceRefresh: true, log });
+          const refreshed = await refreshGroupMemberCache({ sessionId: memberCacheGroupNo, memberMap, uidToNameMap, groupCacheTimestamps, memberRobotMap, currentGroupMembersMap, apiUrl: account.config.apiUrl, botToken: account.config.botToken ?? "", forceRefresh: true, log });
           if (refreshed) {
             for (const { name, index } of unresolvedNames) {
               const uid = findUidByName(name, memberMap);
