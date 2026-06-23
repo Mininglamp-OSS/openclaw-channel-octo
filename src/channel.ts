@@ -477,6 +477,26 @@ const meta = {
 
 const ACCOUNT_ID_RE = /^[A-Za-z0-9_]+$/;
 
+// Two token prefixes bind through this channel:
+//   bf_*  — User Bot (BotFather /newbot): full group + thread + OBO access.
+//   app_* — App Bot (Admin 后台「应用 Bot」): DM-only, server-enforced.
+// The CLI's job is to let either bind; the capability boundary is enforced
+// server-side (octo-server bot_api rejects App Bot group/thread/OBO calls),
+// so we must not reject app_ here just because it can't do everything bf_ can.
+const BOT_TOKEN_PREFIXES = ["bf_", "app_"] as const;
+const BOT_TOKEN_ERROR =
+  "Bot token must start with 'bf_' (BotFather /newbot) or 'app_' (Admin App Bot) and be longer than 13 chars.";
+
+function isValidBotToken(v: unknown): v is string {
+  return (
+    typeof v === "string" &&
+    !!v.trim() &&
+    BOT_TOKEN_PREFIXES.some((p) => v.startsWith(p)) &&
+    v.length > 13
+  );
+}
+
+
 function setOctoAccountConfig(
   cfg: OpenClawConfig,
   accountId: string,
@@ -521,7 +541,7 @@ const octoSetupWizard = {
       return account.configured;
     },
     resolveStatusLines: async ({ cfg, accountId, configured }: { cfg: OpenClawConfig; accountId?: string; configured: boolean }) => {
-      if (!configured) return ["Octo: needs bot token (bf_*)"];
+      if (!configured) return ["Octo: needs bot token (bf_* or app_*)"];
       const account = resolveOctoAccount({ cfg, accountId: accountId ?? DEFAULT_ACCOUNT_ID });
       return [`Octo: configured (api: ${account.config.apiUrl})`];
     },
@@ -545,15 +565,13 @@ const octoSetupWizard = {
     const existing = resolveOctoAccount({ cfg, accountId });
 
     const botToken = await prompter.text({
-      message: "Bot token (bf_*)",
-      placeholder: "bf_...",
+      message: "Bot token (bf_* or app_*)",
+      placeholder: "bf_... or app_...",
       initialValue: existing.config.botToken ?? "",
       sensitive: true,
       validate: (v: string) => {
         if (!v || !v.trim()) return "Bot token is required.";
-        if (!v.startsWith("bf_") || v.length <= 13) {
-          return "Bot token must start with 'bf_'. Create one via /newbot in Octo BotFather.";
-        }
+        if (!isValidBotToken(v)) return BOT_TOKEN_ERROR;
         return undefined;
       },
     });
@@ -582,8 +600,8 @@ const octoSetupAdapter = {
     }
     const botToken = input.botToken ?? input.token;
     if (botToken !== undefined) {
-      if (typeof botToken !== "string" || !botToken.trim() || !botToken.startsWith("bf_") || botToken.length <= 13) {
-        return "Bot token must start with 'bf_' and be longer than 13 chars.";
+      if (!isValidBotToken(botToken)) {
+        return BOT_TOKEN_ERROR;
       }
     }
     const apiUrl = input.baseUrl ?? input.url ?? input.httpUrl;
