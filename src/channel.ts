@@ -620,7 +620,7 @@ const octoSetupAdapter = {
     // to DEFAULT_API_URL = "http://localhost:8090/api"), so the trailing ??
     // never fires in practice but is kept as a belt-and-suspenders default.
     const apiUrl = (input.baseUrl ?? input.url ?? input.httpUrl ?? existing.config.apiUrl).trim();
-    if (!botToken) throw new Error("Bot token is required. Pass --bot-token bf_xxx or --token bf_xxx.");
+    if (!botToken) throw new Error("Bot token is required. Pass --bot-token bf_xxx (or app_xxx) — also accepted via --token.");
     return setOctoAccountConfig(cfg, accountId, botToken, apiUrl);
   },
 };

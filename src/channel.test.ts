@@ -1065,11 +1065,11 @@ describe("octoSetupAdapter.validateInput token prefix", () => {
     // App Bot tokens (Admin 后台「应用 Bot」) are DM-only on the server side,
     // but the CLI must let them bind — the capability boundary is the server's
     // call, not the adapter's.
-    expect(validate({ botToken: "app_f33a87e108015aec1b6ad4410afebd82" })).toBeUndefined();
+    expect(validate({ botToken: "app_EXAMPLE_dummy_app_bot_token" })).toBeUndefined();
   });
 
   it("accepts app_ token via the `token` alias field", () => {
-    expect(validate({ token: "app_f33a87e108015aec1b6ad4410afebd82" })).toBeUndefined();
+    expect(validate({ token: "app_EXAMPLE_dummy_app_bot_token" })).toBeUndefined();
   });
 
   it("rejects an unknown prefix", () => {

@@ -64,7 +64,7 @@ Bot accounts are stored in `~/.openclaw/openclaw.json` under `channels.octo.acco
 
 Configuration fields per account:
 
-- `botToken` (required): Bot token from BotFather (`bf_` prefix)
+- `botToken` (required): Bot token. Either a User Bot token from BotFather (`bf_` prefix, full group + thread access) or an App Bot token from the Octo admin console (`app_` prefix, direct-message only — server-enforced).
 - `apiUrl` (required): Octo server REST API base URL (e.g. `https://your-server/api`). The default `http://localhost:8090/api` only works for a local Octo dev server with the standard `/api` mount.
 - `wsUrl` (optional): WebSocket URL. Auto-detected from `apiUrl` if omitted.
 - `cdnUrl` (optional): CDN base URL for media files
