@@ -4,11 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [1.0.18](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.17...v1.0.18) (2026-06-27)
 
-
 ### Fixed
-
-* **inbound:** scope group member context to current group, not cross-group union ([#126](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/126)) ([09243be](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/09243bec319b260a86b9ad975e35ad100319b3b0)), closes [#125](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/125)
-* **setup:** accept app_ App Bot tokens in bind/setup validation ([#130](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/130)) ([cabf114](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/cabf1148a4030d25cf04059e6bf72e42b130eb04))
+- **群成员上下文混入外群成员、人数虚高**（#125, PR #126）：群里 @bot 问「群里几个人」时，bot 答出的人数远多于实际，还会把**不在本群**的成员说成本群成员（真机 3 人群答「4 人，含 costest」，而 costest 属于该 bot 的另一个群；线上 7 人群答 87 人、不到 20 人群答 500 多人）。
+  - 根因：`buildMemberListPrefix` 把 **per-account 累积**的 `uidToNameMap` 当成「本群名单」喂给 `[Group Members]` / 成员数 prompt。该 map 按 accountId 共享，被启动 prefetch + 每条 inbound 刷新地**只 set、从不按群清理**，因此它实际是 bot 待过的**所有群成员的并集**——人数虚高 + 跨群成员泄漏。
+  - 修复：`refreshGroupMemberCache` 把本次拉到的**当前群名单**（按 parent groupNo 取，thread channelId 安全）写进新的 per-account `currentGroupMembersMap`，空返回 / fetch 失败时 `delete` 该条目（负缓存），避免再注入过期或外群名单；`buildMemberListPrefix` 改为接收当前群 `GroupMember[]` 而非累积 map；`cleanupStaleCaches` 同步清理新缓存，与 `groupCacheTimestamps` 共用 raw channel_id key、同生命周期。
+  - 兼容性：**不动** `uidToNameMap` 的累积语义——sender-name 解析、@mention 解析仍依赖它跨群累积，本次只把「成员名单」这一路独立出来。
+- **App Bot（`app_`）token 连绑都绑不上**（PR #130, refs octo-adapters#129）：setup / bind 的 token 校验此前**只接受 `bf_`** User Bot token，对 Admin 后台「应用 Bot」生成的 `app_` token 一律拒绝（`Bot token must start with 'bf_'`）。用户照着 Admin 连接指南拿 App Bot token 绑定时直接被挡，即便他只需要一个私聊场景的 Agent（App Bot 的私聊能力对此足够）。
+  - 修复：token 前缀白名单从 `{bf_}` 放宽到 `{bf_, app_}`，抽到共享 helper `isValidBotToken`，交互式 wizard 与非交互式 setup adapter 共用，避免两处判断漂移；同步更新 prompt / status / 报错文案说明两种合法前缀。仍挡掉空串、非字符串、长度不足、未知前缀（如误粘的 `uk_` API key）。
+  - 设计取舍：token 的能力边界由 **server 强制**（octo-server `bot_api` 按前缀分流鉴权，对 App Bot 的群 / thread / OBO 调用显式拒绝），因此客户端校验**不应**替 server 预先拒绝 `app_`——绑上后能做什么由 server 说了算，插件不复制 server 的权限逻辑。
 
 ## [1.0.17](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.16...v1.0.17) (2026-06-17)
 
