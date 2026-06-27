@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.18](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.17...v1.0.18) (2026-06-27)
+
+
+### Fixed
+
+* **inbound:** scope group member context to current group, not cross-group union ([#126](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/126)) ([09243be](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/09243bec319b260a86b9ad975e35ad100319b3b0)), closes [#125](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/125)
+* **setup:** accept app_ App Bot tokens in bind/setup validation ([#130](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/130)) ([cabf114](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/cabf1148a4030d25cf04059e6bf72e42b130eb04))
+
 ## [1.0.17](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.16...v1.0.17) (2026-06-17)
 
 ### Fixed

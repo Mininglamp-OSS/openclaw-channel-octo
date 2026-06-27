@@ -1,6 +1,6 @@
 {
   "name": "octo",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "description": "Octo channel plugin for OpenClaw",
   "license": "Apache-2.0",
   "main": "dist/index.js",
