@@ -357,17 +357,23 @@ export function isAccountRegisteredForGroup(groupNo: string, accountId: string):
 // --- Cache cleanup: evict groups inactive for >4 hours ---
 const CACHE_MAX_AGE_MS = 4 * 60 * 60 * 1000;
 const CACHE_CLEANUP_INTERVAL_MS = 30 * 60 * 1000;
+export const _test_CACHE_MAX_AGE_MS = CACHE_MAX_AGE_MS;
 const _cacheActivity = new Map<string, Map<string, number>>();
 
-function touchCache(accountId: string, groupId: string): void {
+export function touchCache(accountId: string, groupId: string): void {
   const id = normalizeAccountId(accountId);
   let m = _cacheActivity.get(id);
   if (!m) { m = new Map(); _cacheActivity.set(id, m); }
   m.set(groupId, Date.now());
 }
 
-function cleanupStaleCaches(): void {
+export function cleanupStaleCaches(): void {
   const cutoff = Date.now() - CACHE_MAX_AGE_MS;
+
+  // First pass: clean stale raw-key activity entries and their raw-keyed maps.
+  // Parent-keyed maps (_groupCacheTimestamps, _currentGroupMembersMaps) are
+  // handled in the second pass to avoid deleting entries that a sibling
+  // thread still needs (#128).
   for (const [accountId, activityMap] of _cacheActivity) {
     for (const [groupId, lastAccess] of activityMap) {
       if (lastAccess < cutoff) {
@@ -376,23 +382,74 @@ function cleanupStaleCaches(): void {
         _memberMaps.get(accountId)?.delete(groupId);
         // Note: uidToNameMap is a flat uid→name map (not keyed by groupId),
         // so we don't delete from it here — names remain valid across groups.
-        _groupCacheTimestamps.get(accountId)?.delete(groupId);
-        // Delete by the SAME key cleanup uses for _groupCacheTimestamps (raw
-        // channel_id from touchCache) so the roster is reclaimed on exactly the
-        // same cleanup pass as its freshness timestamp. (Steady-state they are
-        // not strictly 1:1 — refreshGroupMemberCache's failure branch keeps a
-        // backoff timestamp while deleting the roster — but the read path
-        // tolerates a missing roster via `?? []`, so co-deletion at cleanup is
-        // what matters here.) Deleting by parent groupNo instead would drop the
-        // roster while a sibling thread keeps the timestamp fresh, leaving the
-        // next message to early-return with no roster.
-        _currentGroupMembersMaps.get(accountId)?.delete(groupId);
         activityMap.delete(groupId);
       }
     }
     if (activityMap.size === 0) _cacheActivity.delete(accountId);
   }
+
+  // Second pass: clean parent-keyed maps (_groupCacheTimestamps,
+  // _currentGroupMembersMaps). These are keyed by parent groupNo (via
+  // extractParentGroupNo), not raw channel_id. Delete only when:
+  // 1. The timestamp is stale, AND
+  // 2. No live (non-stale) raw-key activity maps to this parent groupNo.
+  // This correctly handles: thread channels sharing a parent (sibling kept
+  // alive), orphaned parent entries (all threads gone), and plain groups
+  // (extractParentGroupNo returns the group as-is).
+  for (const [accountId, tsMap] of _groupCacheTimestamps) {
+    const activityMap = _cacheActivity.get(accountId);
+    for (const [groupNo, ts] of tsMap) {
+      if (ts >= cutoff) continue; // fresh — skip
+      // Check if any live raw-key activity maps to this parent groupNo
+      let hasLiveThread = false;
+      if (activityMap) {
+        for (const [rawKey, rawTs] of activityMap) {
+          if (rawTs >= cutoff && extractParentGroupNo(rawKey) === groupNo) {
+            hasLiveThread = true;
+            break;
+          }
+        }
+      }
+      if (!hasLiveThread) {
+        tsMap.delete(groupNo);
+        _currentGroupMembersMaps.get(accountId)?.delete(groupNo);
+      }
+    }
+    if (tsMap.size === 0) _groupCacheTimestamps.delete(accountId);
+  }
 }
+
+// --- Test-only exports for cache cleanup verification (issue #128) ---
+/** @internal — for testing only */
+export const _test_caches = {
+  get cacheActivity() { return _cacheActivity; },
+  get groupCacheTimestamps() { return _groupCacheTimestamps; },
+  get currentGroupMembersMaps() { return _currentGroupMembersMaps; },
+  clear() {
+    _cacheActivity.clear();
+    _groupCacheTimestamps.clear();
+    _currentGroupMembersMaps.clear();
+  },
+  /** Directly set a _cacheActivity entry (bypasses touchCache's Date.now()) */
+  setActivity(accountId: string, groupId: string, ts: number) {
+    const id = normalizeAccountId(accountId);
+    let m = _cacheActivity.get(id);
+    if (!m) { m = new Map(); _cacheActivity.set(id, m); }
+    m.set(groupId, ts);
+  },
+  /** Directly set a _groupCacheTimestamps entry */
+  setGroupCacheTimestamp(accountId: string, groupNo: string, ts: number) {
+    const id = normalizeAccountId(accountId);
+    const m = getOrCreateGroupCacheTimestamps(id);
+    m.set(groupNo, ts);
+  },
+  /** Directly set a _currentGroupMembersMaps entry */
+  setCurrentGroupMembers(accountId: string, groupNo: string, members: GroupMember[]) {
+    const id = normalizeAccountId(accountId);
+    const m = getOrCreateCurrentGroupMembersMap(id);
+    m.set(groupNo, members);
+  },
+};
 
 // Known bot robot_ids across all accounts — for bot-to-bot loop prevention.
 // Backed by the shared bot-registry so inbound.ts can consult the same set
