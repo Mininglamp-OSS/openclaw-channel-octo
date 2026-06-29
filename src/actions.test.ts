@@ -24,6 +24,10 @@ vi.mock("./inbound.js", async (importOriginal) => {
   };
 });
 
+// Static import resolves to the mocked module above; used by beforeEach to
+// re-seed automock defaults.
+import { uploadAndSendMedia, uploadMedia } from "./inbound.js";
+
 /**
  * Tests for message action handlers.
  * All API calls are mocked via global.fetch.
@@ -54,6 +58,20 @@ function jsonResponse(data: unknown, status = 200): Response {
 describe("handleOctoMessageAction", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    // vitest 4: restoreAllMocks no longer resets automock state (only manual
+    // vi.spyOn spies), so a persistent mockRejectedValue/mockResolvedValue set
+    // by an earlier test would leak into later ones. Re-seed the ./inbound.js
+    // automocks to their factory defaults so each test starts clean.
+    vi.mocked(uploadAndSendMedia).mockReset().mockResolvedValue(undefined);
+    vi.mocked(uploadMedia).mockReset().mockResolvedValue({
+      url: "https://cdn.example.com/uploaded.png",
+      filename: "uploaded.png",
+      size: 1234,
+      contentType: "image/png",
+      isImage: true,
+      width: 100,
+      height: 80,
+    });
     _clearOwnerRegistry();
     _clearMemberCache();
     _resetGroupMd();
