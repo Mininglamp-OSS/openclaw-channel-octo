@@ -948,6 +948,12 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         throw new Error("sendMedia called without mediaUrl");
       }
 
+      // Resolve + validate the target BEFORE any media work (download / presign
+      // / upload). resolveOutboundOctoTarget throws on an empty/prefix-only
+      // target (#138); doing it here means an unroutable send fails fast instead
+      // of burning an upload first (and orphaning the uploaded object).
+      const { channelId, channelType } = resolveOutboundOctoTarget(ctx.to, ctx.threadId);
+
       // 1. Resolve file — stream-based for HTTP/file paths, Buffer for data URIs
       let fileBuffer: Buffer | undefined;   // body for data: URIs (held in memory)
       let bodyPath: string | undefined;     // body streamed from disk (file:// / temp)
@@ -1054,11 +1060,8 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           contentDisposition: presign.contentDisposition,
         });
 
-        // 3. Resolve target — merge framework-provided threadId into
-        // CommunityTopic (channel_type=5) when ctx.to is a bare group.
-        const { channelId, channelType } = resolveOutboundOctoTarget(ctx.to, ctx.threadId);
-
         // 4. Determine message type and send
+        // (target already resolved + validated up front, before upload — #138)
         const msgType = contentType.startsWith("image/")
           ? MessageType.Image
           : MessageType.File;

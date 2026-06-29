@@ -179,6 +179,21 @@ export function resolveOutboundOctoTarget(
 
   const parsed = parseTarget(targetForParse, undefined, getKnownGroupIds());
 
+  // Fail-fast on a target that resolves to an empty channel — BEFORE the
+  // threadId merge below. parseTarget yields channelId="" for "", "group:",
+  // "user:", "group:@uid" (mention-only), etc. The framework outbound path
+  // (sendText/sendMedia) would otherwise POST channel_id="" and the server
+  // answers an opaque 500. The check must run here and not at the end: "group:"
+  // parses to {channelId:"", channelType:Group}, so a following threadId merge
+  // would synthesise a non-empty "____<short_id>" and slip past any end-of-
+  // function guard. A non-empty parsed channel can only grow longer through the
+  // merge, never become empty, so one check here covers every case. (#138)
+  if (!parsed.channelId.trim()) {
+    throw new Error(
+      "octo: outbound target resolves to an empty channel — a valid channel/user target is required",
+    );
+  }
+
   // Merge framework-provided threadId only when ctx.to was a bare group — if the
   // caller already encoded the thread via "____" in ctx.to, parsed.channelType
   // is already CommunityTopic and we pass through.
@@ -479,8 +494,14 @@ async function handleSend(params: {
   const { args, apiUrl, botToken, memberMap, uidToNameMap, currentChannelId, threadId, log } = params;
 
   const target = args.target as string | undefined;
-  if (!target) {
-    return { ok: false, error: "Missing required parameter: target" };
+  // Reject a missing, blank, or prefix-only target here so the agent gets a
+  // structured {ok:false} instead of a thrown error bubbling from the outbound
+  // resolver. stripAllChannelPrefixes collapses "group:"/"octo:"/"channel:" so
+  // a prefix-only target ("group:") is treated as empty. user:/group:@uid that
+  // slip past this early check are still caught by resolveOutboundOctoTarget's
+  // fail-fast (defense in depth). (#138)
+  if (!target || !stripAllChannelPrefixes(target.trim()).trim()) {
+    return { ok: false, error: "Missing or empty required parameter: target" };
   }
 
   // issue #98 scope:"parent" escape hatch (the follow-up #100 explicitly

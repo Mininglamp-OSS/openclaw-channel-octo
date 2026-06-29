@@ -120,6 +120,12 @@ export async function sendMediaMessage(params: {
   clientMsgNo?: string;
   signal?: AbortSignal;
 }): Promise<SendMessageResult | undefined> {
+  // Last-line guard: never POST an empty channel_id — the server answers an
+  // opaque 500. Upstream resolvers should already reject this, but any future
+  // caller that bypasses them is stopped here. (#138)
+  if (!params.channelId || !params.channelId.trim()) {
+    throw new Error("octo: channelId is required to send a message");
+  }
   const payload: Record<string, unknown> = {
     type: params.type,
     url: params.url,
@@ -262,6 +268,12 @@ export async function sendMessage(params: {
   clientMsgNo?: string;
   signal?: AbortSignal;
 }): Promise<SendMessageResult | undefined> {
+  // Last-line guard: never POST an empty channel_id — the server answers an
+  // opaque 500. Upstream resolvers should already reject this, but any future
+  // caller that bypasses them is stopped here. (#138)
+  if (!params.channelId || !params.channelId.trim()) {
+    throw new Error("octo: channelId is required to send a message");
+  }
   const payload: Record<string, unknown> = {
     type: MessageType.Text,
     content: params.content,
@@ -325,6 +337,12 @@ export async function sendRichTextMessage(params: {
   clientMsgNo?: string;
   signal?: AbortSignal;
 }): Promise<SendMessageResult | undefined> {
+  // Last-line guard: never POST an empty channel_id — the server answers an
+  // opaque 500. Upstream resolvers should already reject this, but any future
+  // caller that bypasses them is stopped here. (#138)
+  if (!params.channelId || !params.channelId.trim()) {
+    throw new Error("octo: channelId is required to send a message");
+  }
   const payload: Record<string, unknown> = {
     type: MessageType.RichText,
     content: params.blocks,

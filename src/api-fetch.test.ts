@@ -2135,3 +2135,85 @@ describe("httpStatusFromApiFetchError", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// #138 — channelId fail-fast: the HTTP layer is the last line of defense.
+// An empty channelId must never reach the server (which answers an opaque 500);
+// reject before fetch so the request never leaves the client.
+// ---------------------------------------------------------------------------
+describe("#138 — send functions reject empty channelId", () => {
+  const originalFetch = global.fetch;
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ message_id: 1 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    global.fetch = fetchSpy as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  it("sendMessage throws and does not call fetch", async () => {
+    const { sendMessage } = await import("./api-fetch.js");
+    for (const channelId of ["", "   "]) {
+      await expect(
+        sendMessage({
+          apiUrl: "http://localhost:8090",
+          botToken: "test-token",
+          channelId,
+          channelType: ChannelType.Group,
+          content: "hi",
+        }),
+      ).rejects.toThrow(/channelId/i);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("sendMediaMessage throws and does not call fetch", async () => {
+    const { sendMediaMessage } = await import("./api-fetch.js");
+    await expect(
+      sendMediaMessage({
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        channelId: "",
+        channelType: ChannelType.Group,
+        type: MessageType.Image,
+        url: "https://cdn.example.com/img.png",
+      }),
+    ).rejects.toThrow(/channelId/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("sendRichTextMessage throws and does not call fetch", async () => {
+    const { sendRichTextMessage } = await import("./api-fetch.js");
+    await expect(
+      sendRichTextMessage({
+        apiUrl: "http://localhost:8090",
+        botToken: "test-token",
+        channelId: "",
+        channelType: ChannelType.Group,
+        blocks: [],
+      }),
+    ).rejects.toThrow(/channelId/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not throw for a valid channelId (regression)", async () => {
+    const { sendMessage } = await import("./api-fetch.js");
+    await sendMessage({
+      apiUrl: "http://localhost:8090",
+      botToken: "test-token",
+      channelId: "chan1",
+      channelType: ChannelType.Group,
+      content: "hi",
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});

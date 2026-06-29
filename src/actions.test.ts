@@ -609,6 +609,26 @@ describe("handleOctoMessageAction", () => {
       expect(result.ok).toBe(false);
       expect(result.error).toContain("target");
     });
+
+    // #138: whitespace / prefix-only targets must also be rejected at the
+    // message-tool boundary — the old `if (!target)` let them through to the
+    // outbound path, which posted an empty channel_id and got a 500.
+    it("returns error (no fetch) for whitespace / prefix-only targets", async () => {
+      const fetchSpy = vi.fn();
+      globalThis.fetch = fetchSpy as any;
+      const { handleOctoMessageAction } = await import("./actions.js");
+      for (const bad of ["   ", "group:", "octo:", "channel:"]) {
+        const result = await handleOctoMessageAction({
+          action: "send",
+          args: { target: bad, message: "Hello" },
+          apiUrl: "http://localhost:8090",
+          botToken: "test-token",
+        });
+        expect(result.ok, `target=${JSON.stringify(bad)}`).toBe(false);
+        expect(result.error).toContain("target");
+      }
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
   });
 
   describe("send — missing message and media", () => {
@@ -3638,6 +3658,62 @@ describe("resolveOutboundOctoTarget", () => {
     const result = resolveOutboundOctoTarget("group:grp1", "____topic");
     expect(result.channelId).toBe("grp1");
     expect(result.channelType).toBe(ChannelType.Group);
+  });
+
+  // --- #138: fail-fast on a target that resolves to an empty channel ---
+  // parseTarget yields channelId="" for these; without this guard the framework
+  // outbound path would POST channel_id="" and the server answers an opaque 500.
+  describe("#138 — empty resolved channel rejected", () => {
+    it("throws on empty / whitespace / prefix-only / empty-entity targets", async () => {
+      const { resolveOutboundOctoTarget } = await import("./actions.js");
+      for (const bad of [
+        "",
+        "   ",
+        "group:",
+        "octo:",
+        "channel:",
+        "user:",
+        "octo:user:",
+        "group:@uid1,uid2",
+        "group:  ",
+      ]) {
+        expect(() => resolveOutboundOctoTarget(bad), `target=${JSON.stringify(bad)}`).toThrow(
+          /empty|target|channel/i,
+        );
+      }
+    });
+
+    it("throws when a threadId would synthesise a thread on an empty parent", async () => {
+      const { resolveOutboundOctoTarget } = await import("./actions.js");
+      // "group:" parses to {channelId:"", channelType:Group}; a naive end-of-function
+      // check would let the threadId merge produce "____t1" and slip through. The
+      // guard must fire BEFORE the merge.
+      expect(() => resolveOutboundOctoTarget("group:", "t1")).toThrow(/empty|target|channel/i);
+      expect(() => resolveOutboundOctoTarget("group:@uid1,uid2", "t1")).toThrow(
+        /empty|target|channel/i,
+      );
+    });
+
+    it("does NOT throw for valid targets (regression)", async () => {
+      const { resolveOutboundOctoTarget } = await import("./actions.js");
+      registerBotGroupIds(["grp1"]);
+      expect(resolveOutboundOctoTarget("group:grp1")).toEqual({
+        channelId: "grp1",
+        channelType: ChannelType.Group,
+      });
+      expect(resolveOutboundOctoTarget("group:grp1", "t1").channelType).toBe(
+        ChannelType.CommunityTopic,
+      );
+      expect(resolveOutboundOctoTarget("user:uid1")).toEqual({
+        channelId: "uid1",
+        channelType: ChannelType.DM,
+      });
+      expect(resolveOutboundOctoTarget("grp1").channelType).toBe(ChannelType.Group);
+      expect(resolveOutboundOctoTarget("group:grp1@uid1,uid2")).toEqual({
+        channelId: "grp1",
+        channelType: ChannelType.Group,
+      });
+    });
   });
 });
 

@@ -615,6 +615,32 @@ describe("outbound.sendMedia — threadId wiring", () => {
     expect(call.channelId).toBe("grp1____topicA");
     expect(call.channelType).toBe(5);
   });
+
+  // #138: an empty/prefix-only target must fail BEFORE any media work — no
+  // download, no presign, no upload — so we never burn an upload on a send
+  // that can't be routed (and never POST channel_id="").
+  it("rejects an empty target before uploading (no presign/upload)", async () => {
+    const { octoPlugin } = await import("./channel.js");
+    const { getUploadPresign, uploadFileToPresignedUrl, sendMediaMessage } = await import(
+      "./api-fetch.js"
+    );
+
+    for (const bad of ["", "group:"]) {
+      await expect(
+        octoPlugin.outbound!.sendMedia!({
+          cfg,
+          to: bad,
+          text: "",
+          mediaUrl: "data:text/plain;base64,aGVsbG8=",
+          accountId: "default",
+        } as any),
+      ).rejects.toThrow(/empty|target|channel/i);
+    }
+
+    expect(getUploadPresign).not.toHaveBeenCalled();
+    expect(uploadFileToPresignedUrl).not.toHaveBeenCalled();
+    expect(sendMediaMessage).not.toHaveBeenCalled();
+  });
 });
 
 /**
