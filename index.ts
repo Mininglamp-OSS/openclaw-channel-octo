@@ -26,6 +26,59 @@ import { resolvePersonaHintForSession } from "./src/persona-prompt.js";
 import { setOctoRuntime } from "./src/runtime.js";
 import { octoPlugin } from "./src/channel.js";
 import { createOctoManagementTools } from "./src/agent-tools.js";
+import { CHANNEL_ID } from "./src/constants.js";
+
+// ---------------------------------------------------------------------------
+// Tool-availability self-diagnostic (issue #137)
+//
+// Under a restrictive `tools.profile` (minimal/coding/messaging — and OpenClaw's
+// fresh-install default IS `coding`), OpenClaw does not register plugin tools, so
+// `octo_management` (which backs ALL Octo management actions: groups, threads,
+// GROUP.md, members, voice context, write-secret) is absent from the agent's tool
+// list. Without guidance the model mis-attributes the gap — it tells the user
+// "Octo can't do this" and suggests another platform, or (for write-secret)
+// suggests pasting the secret in plaintext, defeating the whole point of #71.
+//
+// We inject this as a SYSTEM section via before_prompt_build's
+// prependSystemContext. That path reaches the system prompt regardless of which
+// tools survive profile filtering — unlike channel `messageToolHints`, which the
+// system-prompt builder only expands when the `message` tool is available (and
+// the `message` tool is itself removed by restrictive profiles), so a hint hung
+// there would never appear in exactly the scenario it must cover.
+//
+// The text is conditional ("IF octo_management is not in your tools …") so it is
+// harmless for `full`-profile sessions where the tool is present.
+// ---------------------------------------------------------------------------
+export const OCTO_TOOL_AVAILABILITY_HINT =
+  "Octo management actions (create/manage groups, threads, GROUP.md/THREAD.md, " +
+  "member management, voice context, and write-secret) are provided by the " +
+  "`octo_management` tool. If `octo_management` is NOT in your available tools, this " +
+  "does NOT mean Octo lacks these capabilities — it means the current tool policy " +
+  "(the active `tools.profile` plus allow/deny lists) filtered the plugin tool out. " +
+  "OpenClaw's restrictive profiles (`minimal`, `coding`, `messaging`) exclude plugin " +
+  "tools by default; the `full` profile, or allowing it explicitly (global " +
+  "`tools.alsoAllow: [\"octo_management\"]` or per-agent " +
+  "`agents.list[].tools.alsoAllow: [\"octo_management\"]`), makes it available. In that " +
+  "situation, tell the user plainly that `octo_management` is unavailable due to the " +
+  "current tool policy (NOT that the feature is missing), and do NOT suggest switching " +
+  "to another platform or pasting a secret in plaintext. Whether to adjust the " +
+  "configuration is the user's decision.";
+
+/**
+ * Return the tool-availability diagnostic for an octo session, else null.
+ *
+ * before_prompt_build is a GLOBAL hook — it fires for non-octo sessions
+ * (telegram/webchat/…) too, so we must gate to Octo to avoid leaking the
+ * Octo-specific note into other channels' system prompts (issue #137 review).
+ *
+ * Gate on `messageProvider`, NOT `channelId`: in this hook ctx, `channelId`
+ * resolves to the per-conversation raw id (a group_no / uid), not the provider
+ * name — so `channelId === "octo"` would essentially never match in real
+ * sessions. `messageProvider` is the channel/provider id ("octo").
+ */
+export function _buildToolAvailabilityHint(messageProvider: string | undefined): string | null {
+  return messageProvider === CHANNEL_ID ? OCTO_TOOL_AVAILABILITY_HINT : null;
+}
 
 // ---------------------------------------------------------------------------
 // Plugin entry — uses defineBundledChannelEntry contract (OpenClaw 2026.5.x+).
@@ -170,6 +223,12 @@ export default defineBundledChannelEntry({
           })
         : undefined;
       if (personaHint) systemSections.push(personaHint);
+
+      // 4. Tool-availability self-diagnostic (#137) — gated to octo sessions
+      // via messageProvider (this is a global hook; ctx.channelId is the
+      // per-conversation raw id here, not the provider name).
+      const toolHint = _buildToolAvailabilityHint(ctx.messageProvider);
+      if (toolHint) systemSections.push(toolHint);
 
       if (contextSections.length === 0 && systemSections.length === 0) return;
       return {

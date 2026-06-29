@@ -72,6 +72,51 @@ Configuration fields per account:
 - `historyLimit` (optional): Group chat history message limit (default: 20)
 - `dispatchTimeoutMs` (optional): Per-inbound dispatch timeout in milliseconds — an infrastructure backstop that releases the per-group message queue if an upstream dispatch hangs. When unset, it is derived from OpenClaw's `agents.defaults.timeoutSeconds` (600 if unset) as `timeoutSeconds * 1000 + 60000`, so it always fires *after* the agent-run timeout: the agent terminates gracefully first, and this timeout only catches genuinely hung dispatches. Set explicitly only if you need to decouple it from the agent timeout.
 
+## Agent tools
+
+This plugin registers one agent tool, **`octo_management`**, covering all Octo
+management actions: listing groups, reading/updating GROUP.md and THREAD.md,
+managing threads and members, voice-correction context, and **`write-secret`**
+(writing a user's stored API key into a local file by alias, without ever
+exposing the plaintext to the model).
+
+`octo_management` is a **plugin tool**, and OpenClaw's `tools.profile` presets
+(`minimal`, `coding`, `messaging`, `full`) decide which tools the model sees
+*before* it sees them. Only `full` (`allow: ["*"]`) admits plugin tools; the
+three restrictive presets exclude plugin tools by default. So under `minimal`,
+`coding`, or `messaging`, `octo_management` is filtered out and **every action it
+provides — creating groups, threads, GROUP.md edits, and `write-secret` — becomes
+unavailable at once** (the agent simply does not see the tool).
+
+This matters because **a fresh OpenClaw install defaults `tools.profile` to
+`coding`**, not `full` — so out of the box, an Octo bot cannot use any
+`octo_management` action until the tool is allowed.
+
+To keep `octo_management` available under a restricted profile, add it via
+`tools.alsoAllow` (additive on top of the profile, the same way the bundled
+`browser` tool is enabled):
+
+```json5
+{
+  tools: {
+    profile: "coding",
+    alsoAllow: ["octo_management"],
+  },
+}
+```
+
+For a single agent, use `agents.list[].tools.alsoAllow: ["octo_management"]`.
+
+When `octo_management` is filtered out, the plugin injects a short system-prompt
+note so the agent attributes the gap correctly (a tools-profile restriction, not
+a missing Octo feature) instead of suggesting another platform or asking the user
+to paste a secret in plaintext. Whether to adjust the configuration is up to you.
+
+> Security note: `write-secret` exists precisely so users never have to paste a
+> plaintext key into chat. If the tool is unavailable because of the profile,
+> enable `octo_management` as above — do not work around it by pasting the
+> secret in plaintext.
+
 ## What it does
 
 1. Registers the bot with the Octo server via REST API
