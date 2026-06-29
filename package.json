@@ -51,7 +51,7 @@
     "@types/ws": "^8.5.10",
     "openclaw": "^2026.6.9",
     "typescript": "^6.0.3",
-    "vitest": "^3.0.0"
+    "vitest": "^4.1.9"
   },
   "openclaw": {
     "id": "octo",
