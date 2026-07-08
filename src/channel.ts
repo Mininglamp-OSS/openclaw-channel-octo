@@ -784,7 +784,12 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
     },
     extractToolSend: ({ args }: { args: Record<string, unknown> }) => {
       const target = args.target as string | undefined;
-      return target ? { target } : {};
+      // Return the canonical `to` field that openclaw core uses in
+      // isMessagingToolSendAction to recognise Octo sends as committed
+      // delivery evidence.  Without `to`, isDeliveredMessagingToolResult
+      // is false → messagingToolSentMediaUrls is never populated →
+      // image-only agent turns are classified as non_deliverable_terminal_turn.
+      return target ? { to: target } : {};
     },
     handleAction: async (ctx: any) => {
       // Resolve correct accountId: framework may pass wrong one when agent has multiple accounts.

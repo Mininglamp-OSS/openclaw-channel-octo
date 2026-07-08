@@ -857,8 +857,15 @@ async function handleSend(params: {
     .map(m => m.messageId)
     .filter((id): id is string => Boolean(id));
 
+  // Surface the sent media URLs at the top level of the result so that
+  // openclaw core's collectMessagingMediaUrlsFromToolResult can populate
+  // messagingToolSentMediaUrls for delivery-evidence accounting (required
+  // for image-only turns to pass hasCommittedMessagingDeliveryEvidence).
+  const sentMediaUrls = sentMedia.map(m => m.url);
+
   return {
     ok: true,
+    ...(sentMediaUrls.length > 0 ? { mediaUrls: sentMediaUrls } : {}),
     data: {
       sent: true,
       target,

@@ -2853,6 +2853,29 @@ export async function handleInboundMessage(params: {
       } catch (sendErr) {
         log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
       }
+    } else if (!deliveryErrorOccurred) {
+      // Dispatch itself rejected (e.g. non_deliverable_terminal_turn) and the
+      // onError callback was never invoked, so no fallback has been sent yet.
+      // Send one now so the user is not left with a silent failure.
+      clearInterval(typingInterval);
+      log?.error?.(
+        `octo: dispatch rejected (not a timeout), sending fallback message: ${String(err)}`,
+      );
+      deliverBuffer.lastText = null;
+      deliverBuffer.textSent = true;
+      try {
+        await sendMessage({
+          apiUrl,
+          botToken,
+          channelId: replyChannelId,
+          channelType: replyChannelType,
+          content: "Something went wrong while processing your request. Please try again.",
+          ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
+          signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+        });
+      } catch (sendErr) {
+        log?.error?.(`octo: failed to send dispatch-error fallback: ${String(sendErr)}`);
+      }
     }
     throw err;
   } finally {
