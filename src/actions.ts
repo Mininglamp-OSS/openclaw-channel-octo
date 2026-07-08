@@ -18,6 +18,7 @@ import {
   getGroupInfo,
   getGroupMd,
   updateGroupMd,
+  httpStatusFromApiFetchError,
 } from "./api-fetch.js";
 import { uploadAndSendMedia, uploadMedia, resolveRichTextContent, type UploadedMedia } from "./inbound.js";
 import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions, sanitizeOutboundMentions } from "./mention-utils.js";
@@ -408,6 +409,7 @@ async function sendRichTextCombined(params: {
     let delivered = 0;
     for (const { uploaded } of sideloads) {
       try {
+        log?.debug?.(`octo: sendMediaMessage attempt: channelId=${channelId} channelType=${channelType} mediaUrl=${uploaded.url} isImage=${uploaded.isImage}`);
         await sendMediaMessage({
           apiUrl,
           botToken,
@@ -423,7 +425,8 @@ async function sendRichTextCombined(params: {
         delivered += 1;
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        log?.error?.(`octo: sendMediaMessage failed for ${uploaded.url}: ${errMsg}`);
+        const httpStatus = httpStatusFromApiFetchError(err);
+        log?.error?.(`octo: sendMediaMessage failed: channelId=${channelId} channelType=${channelType} httpStatus=${httpStatus ?? "n/a"} mediaUrl=${uploaded.url} error=${errMsg}`);
         failedMedia.push({ url: uploaded.url, error: errMsg });
       }
     }
@@ -463,17 +466,27 @@ async function sendRichTextCombined(params: {
   blocks.push(...imageBlocks);
   const plain = finalMessage + RICH_TEXT_IMAGE_PLACEHOLDER.repeat(imageBlocks.length);
 
-  const sendResult = await sendRichTextMessage({
-    apiUrl,
-    botToken,
-    channelId,
-    channelType,
-    blocks,
-    plain,
-    ...(mentionUids.length > 0 ? { mentionUids } : {}),
-    ...(mentionEntities.length > 0 ? { mentionEntities } : {}),
-    mentionAll: hasAtAll || undefined,
-  });
+  log?.debug?.(`octo: sendRichTextMessage attempt: channelId=${channelId} channelType=${channelType} imageBlocks=${imageBlocks.length} hasText=${finalMessage.trim() !== ""}`);
+  let sendResult: Awaited<ReturnType<typeof sendRichTextMessage>>;
+  try {
+    sendResult = await sendRichTextMessage({
+      apiUrl,
+      botToken,
+      channelId,
+      channelType,
+      blocks,
+      plain,
+      ...(mentionUids.length > 0 ? { mentionUids } : {}),
+      ...(mentionEntities.length > 0 ? { mentionEntities } : {}),
+      mentionAll: hasAtAll || undefined,
+    });
+    const okId = sendResult?.message_id ? String(sendResult.message_id).trim() : undefined;
+    log?.debug?.(`octo: sendRichTextMessage ok: messageId=${okId ?? "(none)"} channelId=${channelId}`);
+  } catch (err) {
+    const httpStatus = httpStatusFromApiFetchError(err);
+    log?.error?.(`octo: sendRichTextMessage failed: channelId=${channelId} channelType=${channelType} httpStatus=${httpStatus ?? "n/a"} error=${err instanceof Error ? err.message : String(err)}`);
+    throw err;
+  }
   const messageId = sendResult?.message_id ? String(sendResult.message_id).trim() : undefined;
 
   const extraCount = await deliverSideloads();
@@ -806,21 +819,29 @@ async function handleSend(params: {
   if (message) {
     const { finalMessage, mentionUids, mentionEntities, hasAtAll } = resolveMentions(message);
 
-    const sendResult = await sendMessage({
-      apiUrl,
-      botToken,
-      channelId: effectiveChannelId,
-      channelType: effectiveChannelType,
-      content: finalMessage,
-      ...(mentionUids.length > 0 ? { mentionUids } : {}),
-      ...(mentionEntities.length > 0 ? { mentionEntities } : {}),
-      mentionAll: hasAtAll || undefined,
-    });
-    // Capture message_id so the LLM toolResult can reference this message
-    // (see issue #51). Octo API may rarely return an undefined/empty id
-    // even on 2xx — fall back to undefined and let the caller see no
-    // messageId rather than fabricate one.
-    textMessageId = sendResult?.message_id ? String(sendResult.message_id).trim() : undefined;
+    log?.debug?.(`octo: sendMessage attempt: target=${target} channelId=${effectiveChannelId} channelType=${effectiveChannelType} hasText=true mentionCount=${mentionUids.length}`);
+    try {
+      const sendResult = await sendMessage({
+        apiUrl,
+        botToken,
+        channelId: effectiveChannelId,
+        channelType: effectiveChannelType,
+        content: finalMessage,
+        ...(mentionUids.length > 0 ? { mentionUids } : {}),
+        ...(mentionEntities.length > 0 ? { mentionEntities } : {}),
+        mentionAll: hasAtAll || undefined,
+      });
+      // Capture message_id so the LLM toolResult can reference this message
+      // (see issue #51). Octo API may rarely return an undefined/empty id
+      // even on 2xx — fall back to undefined and let the caller see no
+      // messageId rather than fabricate one.
+      textMessageId = sendResult?.message_id ? String(sendResult.message_id).trim() : undefined;
+      log?.debug?.(`octo: sendMessage ok: messageId=${textMessageId ?? "(none)"} channelId=${effectiveChannelId}`);
+    } catch (err) {
+      const httpStatus = httpStatusFromApiFetchError(err);
+      log?.error?.(`octo: sendMessage failed: target=${target} channelId=${effectiveChannelId} channelType=${effectiveChannelType} httpStatus=${httpStatus ?? "n/a"} error=${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   // Send media
@@ -828,6 +849,7 @@ async function handleSend(params: {
   const failedMedia: { url: string; error: string }[] = [];
   for (const mediaUrl of mediaUrls) {
     try {
+      log?.debug?.(`octo: uploadAndSendMedia attempt: target=${target} channelId=${effectiveChannelId} channelType=${effectiveChannelType} mediaUrl=${mediaUrl}`);
       const mediaResult = await uploadAndSendMedia({
         mediaUrl,
         apiUrl,
@@ -837,10 +859,12 @@ async function handleSend(params: {
         log: log as any,
       });
       const mediaMessageId = mediaResult?.message_id ? String(mediaResult.message_id).trim() : undefined;
+      log?.debug?.(`octo: uploadAndSendMedia ok: messageId=${mediaMessageId ?? "(none)"} channelId=${effectiveChannelId} mediaUrl=${mediaUrl}`);
       sentMedia.push({ url: mediaUrl, messageId: mediaMessageId });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log?.error?.(`octo: uploadAndSendMedia failed for ${mediaUrl}: ${errMsg}`);
+      const httpStatus = httpStatusFromApiFetchError(err);
+      log?.error?.(`octo: uploadAndSendMedia failed: target=${target} channelId=${effectiveChannelId} channelType=${effectiveChannelType} httpStatus=${httpStatus ?? "n/a"} mediaUrl=${mediaUrl} attempt=1 error=${errMsg}`);
       failedMedia.push({ url: mediaUrl, error: errMsg });
     }
   }
