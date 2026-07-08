@@ -2853,10 +2853,15 @@ export async function handleInboundMessage(params: {
       } catch (sendErr) {
         log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
       }
-    } else if (!deliveryErrorOccurred) {
+    } else if (!deliveryErrorOccurred && !replySucceeded) {
       // Dispatch itself rejected (e.g. non_deliverable_terminal_turn) and the
-      // onError callback was never invoked, so no fallback has been sent yet.
+      // onError callback was never invoked, AND no visible reply has been
+      // delivered to the user yet, so no fallback has been sent yet.
       // Send one now so the user is not left with a silent failure.
+      // Guard on !replySucceeded prevents a spurious error message when the
+      // dispatcher already sent a visible reply before the top-level rejection
+      // (e.g. a post-delivery terminal throw): without this guard the user
+      // would receive both a real answer and a contradictory error message.
       clearInterval(typingInterval);
       log?.error?.(
         `octo: dispatch rejected (not a timeout), sending fallback message: ${String(err)}`,
@@ -2869,7 +2874,7 @@ export async function handleInboundMessage(params: {
           botToken,
           channelId: replyChannelId,
           channelType: replyChannelType,
-          content: "Something went wrong while processing your request. Please try again.",
+          content: "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
           ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
           signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
         });
