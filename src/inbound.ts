@@ -2857,29 +2857,48 @@ export async function handleInboundMessage(params: {
       // Dispatch itself rejected (e.g. non_deliverable_terminal_turn) and the
       // onError callback was never invoked, AND no visible reply has been
       // delivered to the user yet, so no fallback has been sent yet.
-      // Send one now so the user is not left with a silent failure.
       // Guard on !replySucceeded prevents a spurious error message when the
       // dispatcher already sent a visible reply before the top-level rejection
       // (e.g. a post-delivery terminal throw): without this guard the user
       // would receive both a real answer and a contradictory error message.
       clearInterval(typingInterval);
-      log?.error?.(
-        `octo: dispatch rejected (not a timeout), sending fallback message: ${String(err)}`,
-      );
-      deliverBuffer.lastText = null;
-      deliverBuffer.textSent = true;
-      try {
-        await sendMessage({
-          apiUrl,
-          botToken,
-          channelId: replyChannelId,
-          channelType: replyChannelType,
-          content: "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
-          ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-          signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-        });
-      } catch (sendErr) {
-        log?.error?.(`octo: failed to send dispatch-error fallback: ${String(sendErr)}`);
+      if (deliverBuffer.lastText && !deliverBuffer.textSent) {
+        // A blocks-only reply was buffered (replySucceeded is not set for block
+        // kind until the finally flush). Deliver the buffered text instead of
+        // sending a contradictory error message: the agent produced a real
+        // answer and the user should see it.
+        const bufferedText = deliverBuffer.lastText;
+        deliverBuffer.lastText = null;
+        deliverBuffer.textSent = true;
+        log?.info?.(
+          `octo: dispatch rejected but buffered block text exists; delivering instead of error fallback (${bufferedText.length} chars)`,
+        );
+        try {
+          await resolveAndSendText(bufferedText, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+          replySucceeded = true;
+        } catch (sendErr) {
+          log?.error?.(`octo: failed to deliver buffered block text on dispatch error: ${String(sendErr)}`);
+        }
+      } else {
+        // No buffered content and no reply delivered — send the error fallback.
+        log?.error?.(
+          `octo: dispatch rejected (not a timeout), sending fallback message: ${String(err)}`,
+        );
+        deliverBuffer.lastText = null;
+        deliverBuffer.textSent = true;
+        try {
+          await sendMessage({
+            apiUrl,
+            botToken,
+            channelId: replyChannelId,
+            channelType: replyChannelType,
+            content: "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
+            ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
+            signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+          });
+        } catch (sendErr) {
+          log?.error?.(`octo: failed to send dispatch-error fallback: ${String(sendErr)}`);
+        }
       }
     }
     throw err;

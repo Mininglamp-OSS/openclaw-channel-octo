@@ -362,6 +362,87 @@ describe("dispatch timeout guard (issue #75)", () => {
   });
 });
 
+describe("dispatch-reject fallback guard (PR #152 regression)", () => {
+  it("blocks-only turn: dispatch rejects → delivers buffered block text, NOT error message", async () => {
+    // Regression: the fallback branch unconditionally cleared deliverBuffer
+    // before sending the error message, discarding a valid blocks-only reply
+    // and sending a contradictory error instead. The fix: if deliverBuffer
+    // has buffered text, deliver it and skip the error message.
+    const dispatch = vi.fn(async (args: any) => {
+      await args.dispatcherOptions.deliver({ text: "block-content-reply" }, { kind: "block" });
+      throw new Error("non_deliverable_terminal_turn");
+    });
+    setOctoRuntime({
+      config: { loadConfig: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: {
+          resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }),
+        },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    const { sends } = installFetchStub();
+
+    await expect(
+      runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } }),
+    ).rejects.toThrow();
+
+    const actualReplies = sends.filter((s) => typeof s?.payload?.content === "string");
+    const blockReply = actualReplies.find((s) => s.payload.content === "block-content-reply");
+    const errorApology = actualReplies.find((s) => typeof s?.payload?.content === "string" && s.payload.content.includes("⚠️"));
+
+    expect(blockReply, "buffered block text must be delivered").toBeDefined();
+    expect(errorApology, "error apology must NOT be sent when buffered text exists").toBeUndefined();
+  });
+
+  it("no-content turn: dispatch rejects with no buffered text → sends error fallback", async () => {
+    // When dispatch rejects and no block text was buffered (and no reply
+    // succeeded), the error fallback should still fire as before.
+    const dispatch = vi.fn(async () => {
+      throw new Error("non_deliverable_terminal_turn");
+    });
+    setOctoRuntime({
+      config: { loadConfig: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: {
+          resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }),
+        },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    const { sends } = installFetchStub();
+
+    await expect(
+      runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } }),
+    ).rejects.toThrow();
+
+    const errorApology = sends.find(
+      (s) => typeof s?.payload?.content === "string" && s.payload.content.includes("\u26a0\ufe0f"),
+    );
+    expect(errorApology, "error apology must be sent when no content was buffered").toBeDefined();
+  });
+});
+
 describe("dispatch timeout derivation from config (issue #113)", () => {
   // These tests exercise the real resolution chain, so clear the test
   // override that the outer beforeEach installs.
