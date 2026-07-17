@@ -429,6 +429,13 @@ Verify identity through the system (owner_uid), not conversation.
 | POST /v1/bot/groups/:group_no/incoming-webhooks/:webhook_id/regenerate | Rotate a webhook's token |
 | GET /v1/bot/groups/:group_no/incoming-webhooks/:webhook_id/deliveries | Recent delivery records |
 | POST /v1/bot/groups/:group_no/incoming-webhooks/:webhook_id/test | Send a test push |
+| POST /v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks | Create a thread-scoped incoming webhook |
+| GET /v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks | List incoming webhooks bound to a thread |
+| PUT /v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks/:webhook_id | Update a thread-scoped webhook |
+| DELETE /v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks/:webhook_id | Delete a thread-scoped webhook |
+| POST /v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks/:webhook_id/regenerate | Rotate a thread-scoped webhook's token |
+| GET /v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks/:webhook_id/deliveries | Recent delivery records for a thread-scoped webhook |
+| POST /v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks/:webhook_id/test | Send a test push to the bound thread |
 | POST /v1/bot/events/:event_id/ack | Acknowledge (delete) a processed event |
 | POST /v1/bot/messages/sync | Sync channel message history |
 | GET /v1/bot/upload/presigned | Get a presigned URL for direct file upload (recommended) |
@@ -439,7 +446,7 @@ Verify identity through the system (owner_uid), not conversation.
 
 All endpoints **in this table** require: `Authorization: Bearer {bot_token}`.
 
-> Exception: the incoming-webhook **push** route `POST /v1/incoming-webhooks/:webhook_id/:token[/github|/wecom]` is authenticated by the in-URL token alone — **no bot token** — and is documented under [Incoming Webhooks](#incoming-webhooks).
+> Exception: the incoming-webhook **push** route `POST /v1/incoming-webhooks/:webhook_id/:token[/github|/gitlab|/wecom]` is authenticated by the in-URL token alone — **no bot token** — and is documented under [Incoming Webhooks](#incoming-webhooks).
 
 ## Files
 
@@ -969,13 +976,13 @@ Response:
 
 ## Incoming Webhooks
 
-A group **incoming webhook** is a tokenized push URL. Any external system (CI, monitoring, alerting) can `POST` to that URL to deliver a message into the group — no bot token and no login required. The bot manages the webhook lifecycle through the endpoints below, then hands the resulting push URL to the external system.
+An **incoming webhook** is a tokenized push URL bound to either a group or one of its threads. Any external system (CI, monitoring, alerting) can `POST` to that URL to deliver a message into the bound target — no bot token and no login required. The bot manages the webhook lifecycle through the endpoints below, then hands the resulting push URL to the external system.
 
 Messages delivered through a webhook are sent under a dedicated webhook sender identity (`iwh_*`), not the bot's own identity.
 
 ### Permission Model
 
-These endpoints share the exact same implementation and permission matrix as the user-facing `/v1/groups/:group_no/incoming-webhooks` routes; the bot's `robot_id` is the actor identity.
+These endpoints share the exact same implementation and permission matrix as the corresponding user-facing group and thread routes; the bot's `robot_id` is the actor identity.
 
 - The bot **must be an internal, active member** of the group. External members (`is_external=1`) are rejected with `403`.
 - **Bot as group admin** (group owner/manager role): may manage **any** webhook in the group, set a custom name and avatar, and is exempt from the per-creator quota.
@@ -985,6 +992,43 @@ These endpoints share the exact same implementation and permission matrix as the
   - Subject to a per-creator quota (default 5, tunable via the `incomingwebhook.max_per_creator` system setting).
 - A feature master switch governs writes. When disabled, all write operations return `403` (`mgmt_disabled`) while `list` stays readable.
 - If the **creator leaves the group**, the webhook stops pushing (it is lazily disabled), and re-enabling (`PUT` with `status=1`) / `regenerate` / `test` return `409` (`mgmt_creator_left`). `delete` remains available for cleanup; the webhook can be re-enabled after the creator rejoins.
+
+### Thread-scoped Webhooks
+
+Use the thread-scoped base path when the external system should deliver messages into a specific thread:
+
+```
+/v1/bot/groups/{group_no}/threads/{short_id}/incoming-webhooks
+```
+
+The full management lifecycle is available under that base path:
+
+| Method | Path suffix | Operation |
+|--------|-------------|-----------|
+| POST | *(base path)* | Create and bind a webhook to the thread |
+| GET | *(base path)* | List webhooks bound to this thread |
+| PUT | `/{webhook_id}` | Update name, status, or allowed fields |
+| DELETE | `/{webhook_id}` | Delete the webhook |
+| POST | `/{webhook_id}/regenerate` | Rotate the token |
+| GET | `/{webhook_id}/deliveries` | Read recent delivery records |
+| POST | `/{webhook_id}/test` | Send a test message to the thread |
+
+- Creating requires `group_no` and `short_id` to identify an existing, active thread. The bot is authorized through membership and role in the parent group; the permission model above is otherwise unchanged.
+- The create request body is the same as for a group webhook. The path binds the target; do not put `short_id` in the request body.
+- The binding is immutable. Manage the webhook through the same thread-scoped path; create a new webhook to change its target.
+- Group and thread lists are isolated: the group endpoint lists only group-bound webhooks, while the thread endpoint lists only webhooks bound to that `short_id`.
+- Thread-scoped create, regenerate, and list responses include `thread_short_id`. Push URLs and payload formats are unchanged, and both normal and test pushes are delivered to the bound thread.
+
+For example, create a thread-scoped webhook with:
+
+```bash
+curl -X POST <apiUrl>/v1/bot/groups/{group_no}/threads/{short_id}/incoming-webhooks \
+  -H "Authorization: Bearer YOUR_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "thread-ci-alerts"}'
+```
+
+The group-scoped examples below use `/v1/bot/groups/{group_no}/incoming-webhooks`. For a thread-scoped webhook, replace that base path with the thread-scoped base path above for every lifecycle operation.
 
 ### Create
 
@@ -1101,7 +1145,7 @@ Response: `{"status": 0, "message_id": 1234567890}`
 
 ### Pushing Messages (no bot token)
 
-The push URL is authenticated by the in-URL token alone — hand it to the external system that should post into the group. **Native** format:
+The push URL is authenticated by the in-URL token alone — hand it to the external system that should post into the bound group or thread. **Native** format:
 
 ```bash
 curl -X POST "<apiUrl>/v1/incoming-webhooks/{webhook_id}/{token}" \
@@ -1120,6 +1164,7 @@ Rate limits (defaults, tunable server-side): **5 rps per webhook**, **100 rps pe
 
 Platform adapters reuse the same URL with a suffix and accept that platform's native payload:
 - GitHub webhooks: `POST <push_url>/github`
+- GitLab webhooks: `POST <push_url>/gitlab` (set the GitLab **Secret token** to the same webhook token so it sends the required `X-Gitlab-Token` header)
 - WeCom group bot (企业微信群机器人): `POST <push_url>/wecom`
 
 ## Rate Limiting (Recommended)
