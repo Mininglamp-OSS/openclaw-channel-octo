@@ -4,42 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [1.1.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.19...v1.1.0) (2026-07-20)
 
-
 ### Added
-
-* **cards:** add account-level progress and display switches ([#159](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/159)) ([3fa47b7](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/3fa47b712dcaf6715549b871741036c4d7e7a604))
-* **cards:** add interactive card messages and agent progress UX ([714c431](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/714c431c7b22b309c166173b4794bf5771db64cf))
-* **cards:** P2 octo/v2 interactive card callbacks (Action.Submit) + per-account card switches ([#165](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/165)) ([4cc4233](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/4cc423330fde6d43b839d090332b711506173755))
-* InteractiveCard(17) 适配 —— 入站消费 + 出站 hook 驱动进度卡 ([d9c7ce1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/d9c7ce1f4700f38c0863f67b92c2c231910369bd))
-* **p1:** add display-card foundation and progress UX ([a825d5f](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/a825d5f035a97222478757b30a0c816fe8e5a9f4))
-* **p1:** align agent progress card layout ([5564dfe](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/5564dfecb3bed3183261c8328a48ba5bce1c1180))
-* **p1:** refine display cards and conflict fallback ([395cecd](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/395cecd0a45ff17cf833df4d1967985169bd49ff))
-* 波 C —— D12 元素/输入能力协商 + 服务端权威 limits + ColumnSet 渲染 ([c1ec816](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/c1ec816fc0459923ea152b0bd33a600167b84e66))
-
+- **交互卡片消息完整落地：展示卡 + Agent 进度卡 + octo/v2 回调卡**（#156 / #159 / #165）：本版把 InteractiveCard（`payload.type=17`）从无到有做成一条完整能力线，让 bot 能发结构化卡片而不只是纯文本。
+  - **展示卡（`octo/v1`，`octo_send_display_card` 工具）**：非交互的结构化输出——状态报告、键值摘要、三列 KPI/天气条、表格、可折叠详情、本地复制按钮、安全导航链接。工具自动做能力协商，服务端不支持的元素降级为纯文本，作者无需自己判断兼容性。
+  - **Agent 进度卡**：长任务运行时以进度卡展示执行阶段与工具调用，随执行 edit 帧更新，让用户看得到"在干什么、跑到哪"，而非只有一个 typing 指示器。
+  - **octo/v2 回调卡（`octo_send_card` 工具，#165）**：带 `Action.Submit` 按钮与 `text/number/date/time/toggle/choice` 输入的交互卡；按钮点击经服务端权威事件回流为**同一会话内新的、可信的 agent 轮次**。含 `/v1/bot/events` 短轮询（磁盘游标、进程重启后续跑，游标先落盘后 ack，崩溃至多重放不丢）、卡片 action 派发与 in-place 状态帧（处理中 / 完成 / 失败,含输入冻结与幂等 claim/complete/release）。
+  - **能力协商与服务端权威（D12）**：卡片元素/输入/actions 由 `GET /v1/bot/card/profile` 的 manifest 决定，`card_version` 精确匹配 `1.5`，`limits.*` 服务端权威并递归生效，ColumnSet/Table 等按需渲染，不支持则降级。
+- **账号级卡片开关（`cardProgress` / `cardDisplay` / `cardInteraction`，#159 / #165）**：进度卡、展示卡、交互卡可按 bot 独立关闭（顶层默认 + `accounts.<id>` 覆盖，与 `requireMention` 同款分层）。三态语义——只有显式 `false` 强制关，`true` / 省略都跟随服务端能力；只作收窄、不能强开，`card_version` 等 fail-closed 底线保留。开关同时作用于工具发现与执行两道关。
 
 ### Fixed
+- **纯图片回合被误判为"未投递"**（#152）：agent 一个回合只发图片、不发文字时，OpenClaw core 认不出这是成功投递，把整回合判成 `non_deliverable_terminal_turn`。根因是出向 `extractToolSend` 返回的是 `target` 而非 core 识别的 canonical `to` 字段、结果里也没上浮媒体 URL，导致 core 的两个投递证据信号都拿不到。
+  - 修复：`extractToolSend` 返回 `{ to }`、发送结果顶层补 `mediaUrls`，让 core 的 `isMessagingToolSendAction` / `collectMessagingMediaUrlsFromToolResult` 正确认账。同时修掉 dispatch reject 兜底分支无条件清空 deliverBuffer 的问题——加 `!replySucceeded` 守卫，有缓冲的 block 文本时优先投递而非发矛盾的错误兜底，不再吞掉有效回复。
+- **历史注入不尊重会话重置（/new），穿透污染新会话**（#155）：用户 `/new` 重置会话后，注入的群历史仍会带入重置点之前的内容，污染新会话上下文。修复后历史注入以会话重置点为界，不再穿透。
+- **卡片链路安全加固**：交互卡的信任边界与脱敏做了系统性收敛——卡片文本 / data / facts 中的内嵌 URL 统一降级为 `scheme://<registrable-domain>`（扩到任意 scheme，堵非 http 凭据 URI 泄露）、工具名 label 与工具错误文本同样脱敏 + 截断、首帧 4xx fail-closed、提交表单值当作数据而非控制文本并按原卡输入 id 校验，消除进度卡与错误路径的泄露 sink。
+- **session 初始化 CAS 瞬时竞态导致的 inbound 失败**：对 core 的 session-init 冲突做重试，吸收该瞬时竞态。
 
-* add Octo fallback and image-only delivery evidence ([#152](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/152)) ([f847299](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/f8472995dd89b7c22ece78b1635bd8c74141160f))
-* **cards:** harden redaction and preserve valid blocks ([86aaff6](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/86aaff69369421665117eb16946b80f3f591360b))
-* **deps:** raise openclaw floor to &gt;=2026.6.9 for getSessionEntry export ([cd9b3ab](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/cd9b3ab3ddbf2e0a85f3d376f6e171ea9c683f47))
-* harden interactive card delivery and rendering ([42939a2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/42939a22a508944300f3d45c8fc318edbbc06e31))
-* **history:** respect session reset (/new) when injecting channel history ([6908710](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/6908710edc20363b863b1725c847497bd525c801)), closes [#155](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/155)
-* **history:** 历史注入尊重会话重置(/new),不再穿透污染新会话 ([#155](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/155)) ([64552b4](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/64552b4fa5c8ec148fa7a55d8605c0200d1b7d36))
-* **inbound:** retry session-init conflicts (core CAS transient race) ([9182889](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/91828895d1061567d7b10d630f22708f4613c8f9))
-* label update-plan progress steps ([98458ba](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/98458ba97e3c26284ce683a20e3b49b211256887))
-* propagate card actions in live e2e ([af694c8](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/af694c8369063b07d271694d20094549c5a40789))
-* stop auto-replying inbound final text ([6d4ab0f](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/6d4ab0f9a820b5243848d1ea6e64b3f0dea0d3f6))
-* URL 降级扩到任意 scheme(堵非 http 凭据 URI 泄露)+ 工具名 label 脱敏 ([45c95e8](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/45c95e80b9276d66629632b839d9df240b4a78ed))
-* URL 降级提到统一 choke point + 收敛 error 过度脱敏与 gate 探测风暴 ([94ed809](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/94ed809d65246e545517f0397bbf60ff6eb3d85a))
-* 工具错误文本同样脱敏+截断,消除进度卡未覆盖的泄露 sink ([f0d9932](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/f0d9932ccd598573a485408d4e50c623b638e6fc))
-* 收敛 PR [#154](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/154) review 的并发/隔离/脱敏问题 ([dba4a3c](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/dba4a3c2f8fe236872c8b94353475ec314a8f96e))
-* 收敛二次复核的 J2 残留缺口与 O2 过度误伤 ([7ac55ac](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/7ac55ace382929e0112c7f8651a0d9d790a10505))
-* 错误文本内嵌 URL 降级(对称参数路径)+ 首帧 4xx fail-closed ([6917b7a](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/6917b7a41c964ca7439cea240ad8c7f0f6c4fdbb))
-
+### Changed
+- **依赖 floor 提升到 openclaw >= 2026.6.9**：新增功能依赖 `getSessionEntry` 等 export，相应抬高 peer-dep 下限。
 
 ### Internal
-
-* **cards:** share capability derivation ([e94efed](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/e94efed9bc5b274316c6aa5b167784cdb334a093))
+- 抽出共享的卡片能力推导（`deriveCardCaps`），进度卡与展示卡复用同一能力判断，避免两处漂移。
 
 ## [1.0.19](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.18...v1.0.19) (2026-06-29)
 
