@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.19...v1.1.0) (2026-07-20)
+
+
+### Added
+
+* **cards:** add account-level progress and display switches ([#159](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/159)) ([3fa47b7](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/3fa47b712dcaf6715549b871741036c4d7e7a604))
+* **cards:** add interactive card messages and agent progress UX ([714c431](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/714c431c7b22b309c166173b4794bf5771db64cf))
+* **cards:** P2 octo/v2 interactive card callbacks (Action.Submit) + per-account card switches ([#165](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/165)) ([4cc4233](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/4cc423330fde6d43b839d090332b711506173755))
+* InteractiveCard(17) 适配 —— 入站消费 + 出站 hook 驱动进度卡 ([d9c7ce1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/d9c7ce1f4700f38c0863f67b92c2c231910369bd))
+* **p1:** add display-card foundation and progress UX ([a825d5f](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/a825d5f035a97222478757b30a0c816fe8e5a9f4))
+* **p1:** align agent progress card layout ([5564dfe](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/5564dfecb3bed3183261c8328a48ba5bce1c1180))
+* **p1:** refine display cards and conflict fallback ([395cecd](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/395cecd0a45ff17cf833df4d1967985169bd49ff))
+* 波 C —— D12 元素/输入能力协商 + 服务端权威 limits + ColumnSet 渲染 ([c1ec816](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/c1ec816fc0459923ea152b0bd33a600167b84e66))
+
+
+### Fixed
+
+* add Octo fallback and image-only delivery evidence ([#152](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/152)) ([f847299](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/f8472995dd89b7c22ece78b1635bd8c74141160f))
+* **cards:** harden redaction and preserve valid blocks ([86aaff6](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/86aaff69369421665117eb16946b80f3f591360b))
+* **deps:** raise openclaw floor to &gt;=2026.6.9 for getSessionEntry export ([cd9b3ab](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/cd9b3ab3ddbf2e0a85f3d376f6e171ea9c683f47))
+* harden interactive card delivery and rendering ([42939a2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/42939a22a508944300f3d45c8fc318edbbc06e31))
+* **history:** respect session reset (/new) when injecting channel history ([6908710](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/6908710edc20363b863b1725c847497bd525c801)), closes [#155](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/155)
+* **history:** 历史注入尊重会话重置(/new),不再穿透污染新会话 ([#155](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/155)) ([64552b4](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/64552b4fa5c8ec148fa7a55d8605c0200d1b7d36))
+* **inbound:** retry session-init conflicts (core CAS transient race) ([9182889](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/91828895d1061567d7b10d630f22708f4613c8f9))
+* label update-plan progress steps ([98458ba](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/98458ba97e3c26284ce683a20e3b49b211256887))
+* propagate card actions in live e2e ([af694c8](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/af694c8369063b07d271694d20094549c5a40789))
+* stop auto-replying inbound final text ([6d4ab0f](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/6d4ab0f9a820b5243848d1ea6e64b3f0dea0d3f6))
+* URL 降级扩到任意 scheme(堵非 http 凭据 URI 泄露)+ 工具名 label 脱敏 ([45c95e8](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/45c95e80b9276d66629632b839d9df240b4a78ed))
+* URL 降级提到统一 choke point + 收敛 error 过度脱敏与 gate 探测风暴 ([94ed809](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/94ed809d65246e545517f0397bbf60ff6eb3d85a))
+* 工具错误文本同样脱敏+截断,消除进度卡未覆盖的泄露 sink ([f0d9932](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/f0d9932ccd598573a485408d4e50c623b638e6fc))
+* 收敛 PR [#154](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/154) review 的并发/隔离/脱敏问题 ([dba4a3c](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/dba4a3c2f8fe236872c8b94353475ec314a8f96e))
+* 收敛二次复核的 J2 残留缺口与 O2 过度误伤 ([7ac55ac](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/7ac55ace382929e0112c7f8651a0d9d790a10505))
+* 错误文本内嵌 URL 降级(对称参数路径)+ 首帧 4xx fail-closed ([6917b7a](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/6917b7a41c964ca7439cea240ad8c7f0f6c4fdbb))
+
+
+### Internal
+
+* **cards:** share capability derivation ([e94efed](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/e94efed9bc5b274316c6aa5b167784cdb334a093))
+
 ## [1.0.19](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.18...v1.0.19) (2026-06-29)
 
 ### Added
