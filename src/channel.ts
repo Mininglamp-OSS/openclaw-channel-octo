@@ -58,7 +58,7 @@ const SESSION_INIT_RETRY = { retries: 4, backoffMs: 1500 } as const;
 import { ChannelType, MessageType, type BotMessage, type MessagePayload, type SendMessageResult } from "./types.js";
 import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions, sanitizeOutboundMentions, MENTION_FORMAT_HINT } from "./mention-utils.js";
 import type { MentionEntity } from "./types.js";
-import { handleOctoMessageAction, parseTarget, resolveOutboundOctoTarget, normalizeOutboundChannelPrefix, extractInlineMentionUids } from "./actions.js";
+import { handleOctoMessageAction, parseTarget, resolveOutboundOctoTarget, normalizeOutboundChannelPrefix, extractInlineMentionUids, type MessageActionResult } from "./actions.js";
 import { getOrCreateGroupMdCache, registerBotGroupIds, getKnownGroupIds, writeGroupMdToDisk, extractParentGroupNo } from "./group-md.js";
 import { registerOwnerUid } from "./owner-registry.js";
 import { registerKnownBot, isKnownBot } from "./bot-registry.js";
@@ -647,6 +647,49 @@ const octoSetupAdapter = {
   },
 };
 
+/**
+ * Wrap a plugin action payload as an OpenClaw AgentToolResult.
+ *
+ * The host feeds `result.content` straight into its Codex dynamic tool-result
+ * conversion (`convertToolContents` → `content.reduce`) with no Array.isArray
+ * guard, so a bare `{ ok, data }` return (content === undefined) throws
+ * "Cannot read properties of undefined (reading 'reduce')" *after* the send
+ * already succeeded. Returning a `content[]` satisfies that contract.
+ *
+ * The raw payload is kept in `details`: the host reads `details.ok` /
+ * `details.error` to classify success vs failure, and `extractToolPayload`
+ * reads `details` for delivery evidence — so success/error semantics and
+ * downstream inspection are preserved unchanged.
+ *
+ * Compact (non-pretty) JSON on purpose: read/search/group-md payloads can carry
+ * large histories, member rosters or full GROUP.md; pretty-printing inflates
+ * them ~30% and trips the host's dynamic tool-result char cap sooner.
+ */
+export function toActionToolResult(payload: MessageActionResult): {
+  content: { type: "text"; text: string }[];
+  details: MessageActionResult;
+} {
+  let text: string;
+  try {
+    const serialized = JSON.stringify(payload);
+    // JSON.stringify can return undefined WITHOUT throwing (e.g. a root-level
+    // toJSON() returning undefined). Coerce to a fixed string so content.text
+    // is always a valid string and the host's content.reduce never breaks.
+    text = typeof serialized === "string" ? serialized : "[unserializable payload]";
+  } catch {
+    // Last-resort net: a throwing JSON.stringify (circular ref / BigInt). Use a
+    // fixed string and do NOT read back the payload here — this branch exists
+    // precisely so the helper never throws, so it must not re-invoke any
+    // payload getter/toString that could itself throw. The raw payload is still
+    // available in `details` for the host's error classification.
+    text = "[unserializable payload]";
+  }
+  return {
+    content: [{ type: "text", text }],
+    details: payload,
+  };
+}
+
 export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
   id: "octo",
   meta,
@@ -787,12 +830,12 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         accountId,
       });
       if (!account.config.botToken) {
-        return { ok: false, error: "Octo botToken is not configured" };
+        return toActionToolResult({ ok: false, error: "Octo botToken is not configured" });
       }
       const memberMap = getOrCreateMemberMap(accountId);
       const uidToNameMap = getOrCreateUidToNameMap(accountId);
       const groupMdCache = getOrCreateGroupMdCache(accountId);
-      return handleOctoMessageAction({
+      const result = await handleOctoMessageAction({
         action: ctx.action,
         args: ctx.params ?? {},
         apiUrl: account.config.apiUrl,
@@ -806,6 +849,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         accountId,
         log: ctx.log,
       });
+      // Exceptions are intentionally not caught here: the host wraps tool
+      // execution in its own try/catch and depends on the throw for the
+      // after-tool-call error hook and failed-idempotency-key retention.
+      return toActionToolResult(result);
     },
   } as any, // TODO: remove when SDK types support this
   agentPrompt: {
