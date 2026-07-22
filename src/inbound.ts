@@ -2859,7 +2859,17 @@ export async function handleInboundMessage(params: {
       core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: config,
-      replyOptions: {},
+      // DM defaults to message_tool_only on some harnesses (e.g. Codex's
+      // defaultVisibleReplies="message_tool"), so an agent that doesn't call
+      // the message tool leaves the DM with no visible reply (#172). Request
+      // automatic delivery ONLY for a DM whose operator has NOT configured
+      // messages.visibleReplies — the requested mode outranks config, so
+      // injecting it for a group or over an explicit setting would change
+      // group behaviour and override operator intent.
+      replyOptions:
+        !isGroup && config.messages?.visibleReplies === undefined
+          ? { sourceReplyDeliveryMode: "automatic" as const }
+          : {},
       // onFreshSettledDelivery is only present on newer SDK dispatcher options.
       // On older SDK the property is ignored (and never invoked, since
       // pendingToolWarningFinal is only set when the tool-warning classifier
