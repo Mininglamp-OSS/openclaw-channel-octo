@@ -3540,6 +3540,71 @@ describe("resolveOutboundOctoTarget", () => {
     expect(resolveOutboundOctoTarget("group:grp1", "").channelType).toBe(ChannelType.Group);
   });
 
+  // DM routing regression: a DM target (octo:<uid>) must resolve to DM
+  // (channel_type=1). Collapsing it to group sends channel_type=2 for a DM id
+  // and the server rejects it (query_failed / 400).
+  it("routes bare octo:<uid> (not a known group) as a DM", async () => {
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    _resetGroupMd();
+    registerBotGroupIds(["grp1"]); // uid1 is NOT a known group
+    const r = resolveOutboundOctoTarget("octo:uid1");
+    expect(r.channelId).toBe("uid1");
+    expect(r.channelType).toBe(ChannelType.DM);
+  });
+
+  it("routes octo:user:<uid> and user:<uid> as DM", async () => {
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    _resetGroupMd();
+    expect(resolveOutboundOctoTarget("octo:user:uid1").channelType).toBe(ChannelType.DM);
+    expect(resolveOutboundOctoTarget("user:uid1").channelType).toBe(ChannelType.DM);
+  });
+
+  // Negative regression: the DM fix must NOT turn real groups into DMs.
+  it("keeps known groups as Group across octo:/bare/group:/octo:channel: forms", async () => {
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    _resetGroupMd();
+    registerBotGroupIds(["grp1"]);
+    expect(resolveOutboundOctoTarget("octo:grp1").channelType).toBe(ChannelType.Group);
+    expect(resolveOutboundOctoTarget("grp1").channelType).toBe(ChannelType.Group);
+    expect(resolveOutboundOctoTarget("group:grp1").channelType).toBe(ChannelType.Group);
+    expect(resolveOutboundOctoTarget("octo:channel:grp1").channelType).toBe(ChannelType.Group);
+  });
+
+  // Regression: stacked namespace prefixes must still collapse to a clean
+  // channelId (not leave inner `octo:`/`group:` fragments in the id).
+  it("collapses stacked octo:group:/octo:channel: prefixes to a clean group id", async () => {
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    _resetGroupMd();
+    registerBotGroupIds(["grp1"]);
+    for (const t of ["octo:group:octo:grp1", "octo:channel:group:grp1", "octo:group:grp1"]) {
+      const r = resolveOutboundOctoTarget(t);
+      expect(r.channelId).toBe("grp1");
+      expect(r.channelType).toBe(ChannelType.Group);
+    }
+  });
+
+  // Regression: a group/channel target carrying an @mention suffix must have the
+  // suffix stripped from the channelId (goes through the group: arm).
+  it("strips @mention suffix from octo:channel:<group>@uids", async () => {
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    _resetGroupMd();
+    registerBotGroupIds(["grp1"]);
+    const r = resolveOutboundOctoTarget("octo:channel:grp1@uid1,uid2");
+    expect(r.channelId).toBe("grp1");
+    expect(r.channelType).toBe(ChannelType.Group);
+  });
+
+  it("preserves Community Topic (channel_type=5) and thread id across octo: forms", async () => {
+    const { resolveOutboundOctoTarget } = await import("./actions.js");
+    _resetGroupMd();
+    registerBotGroupIds(["grp1"]);
+    for (const t of ["octo:group:grp1____topicA", "octo:channel:grp1____topicA", "octo:grp1____topicA"]) {
+      const r = resolveOutboundOctoTarget(t);
+      expect(r.channelId).toBe("grp1____topicA");
+      expect(r.channelType).toBe(ChannelType.CommunityTopic);
+    }
+  });
+
   it("strips inline mention-UID suffix before parsing", async () => {
     const { resolveOutboundOctoTarget } = await import("./actions.js");
     registerBotGroupIds(["grp1"]);
@@ -3752,6 +3817,31 @@ describe("normalizeOutboundChannelPrefix", () => {
     expect(normalizeOutboundChannelPrefix("group:grp1")).toBe("group:grp1");
     expect(normalizeOutboundChannelPrefix("user:uid1")).toBe("user:uid1");
     expect(normalizeOutboundChannelPrefix("bare_id")).toBe("bare_id");
+  });
+
+  // octo: is a namespace prefix, not a channel-kind marker. A DM target
+  // octo:<uid> must NOT be collapsed to group:<uid> (that sends channel_type=2
+  // for a DM id → server query_failed / 400). Resolve by inner shape instead.
+  it("resolves octo:user:<uid> to a clean DM target", async () => {
+    const { normalizeOutboundChannelPrefix } = await import("./actions.js");
+    expect(normalizeOutboundChannelPrefix("octo:user:uid1")).toBe("user:uid1");
+  });
+
+  it("canonicalises octo:group: / octo:channel: to a single group: form", async () => {
+    const { normalizeOutboundChannelPrefix } = await import("./actions.js");
+    expect(normalizeOutboundChannelPrefix("octo:group:grp1")).toBe("group:grp1");
+    // channel: is a group-channel alias → canonicalised to group: (same as the
+    // existing `channel:<id>` → `group:<id>` behaviour), never left as octo:.
+    expect(normalizeOutboundChannelPrefix("octo:channel:grp1")).toBe("group:grp1");
+    // Stacked forms collapse recursively rather than leaving inner fragments.
+    expect(normalizeOutboundChannelPrefix("octo:group:octo:grp1")).toBe("group:grp1");
+  });
+
+  it("collapses bare octo:<id> to a clean bare id (no octo: prefix, not forced to group)", async () => {
+    const { normalizeOutboundChannelPrefix } = await import("./actions.js");
+    // Output never carries octo:; the bare id is left for parseTarget/knownGroupIds
+    // to classify (DM unless it is a known group).
+    expect(normalizeOutboundChannelPrefix("octo:uid1")).toBe("uid1");
   });
 });
 

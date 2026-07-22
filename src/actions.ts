@@ -106,26 +106,45 @@ function stripGroupPrefix(raw: string): string {
  * canonical bare groupId.
  *
  * Rules:
+ *   - `octo:` namespace prefix → resolve by its INNER shape, never by the
+ *     generic group fallback. `octo:` alone carries no user/group semantics, so
+ *     the bare form (`octo:<id>`) must be left for parseTarget/knownGroupIds to
+ *     classify. Collapsing `octo:<uid>` (a DM) to `group:<uid>` would send
+ *     channel_type=2 for a DM id and the server rejects it (query_failed / 400).
  *   - No leading channel-namespace prefix at all → pass through (bare IDs,
  *     thread channel IDs like `grp1____x`, and other shapes parseTarget
  *     handles natively).
  *   - Stacked channel-namespace prefix wrapping a `user:` DM (e.g.
  *     `"octo:user:uid123"`) → unwrap to clean `user:uid123` so the DM path
  *     fires correctly.
- *   - Any other leading channel-namespace prefix(es) → strip recursively and
- *     re-prefix canonically as `group:` so parseTarget sees ONE known shape.
+ *   - An explicit `group:`/`channel:` token anywhere (after any leading `octo:`)
+ *     means a group/channel target → recursively collapse and re-prefix as a
+ *     single `group:` (so parseTarget sees ONE known shape and the group: arm of
+ *     resolveOutboundOctoTarget can strip any `@mention` suffix).
+ *   - Only an `octo:` namespace prefix with no group/channel/user hint
+ *     (`octo:<id>`) is ambiguous: return the collapsed bare id and let
+ *     parseTarget/knownGroupIds classify it (known group → Group, else DM). Do
+ *     NOT default it to group — that would send channel_type=2 for a DM id and
+ *     the server rejects it (query_failed / 400).
  */
 export function normalizeOutboundChannelPrefix(ctxTo: string): string {
   const bare = stripAllChannelPrefixes(ctxTo);
-  // No channel-namespace prefix to strip — let parseTarget handle it natively
-  // (covers bare groupNo, `grp1____x` thread refs, `user:<uid>` DMs).
+  // No leading channel-namespace prefix to strip — let parseTarget handle it
+  // natively (bare groupNo, `grp1____x` thread refs, `user:<uid>` DMs).
   if (bare === ctxTo) return ctxTo;
-  // Stacked channel-namespace prefix wrapping a user: DM — return the clean
-  // user: form so parseTarget routes it as DM, not as a group with `user:` in
-  // the channelId.
+  // `user:` DM marker survives stripAllChannelPrefixes (it never strips user:) —
+  // route as DM, not a group with `user:` embedded in the channelId.
   if (bare.startsWith("user:")) return bare;
-  // Channel-group target — canonicalise to a single leading `group:`.
-  return "group:" + bare;
+  // Distinguish an explicit group/channel target from a bare `octo:<id>`. Strip
+  // only the leading `octo:` runs, then look for a group:/channel: marker.
+  const afterOcto = ctxTo.replace(/^(?:octo:)+/, "");
+  if (afterOcto.startsWith("group:") || afterOcto.startsWith("channel:")) {
+    // Explicit group/channel (possibly stacked) — canonicalise to one `group:`.
+    return "group:" + bare;
+  }
+  // Bare `octo:<id>` — no user/group hint. Return the collapsed bare id so
+  // parseTarget/knownGroupIds decides (known group → Group, otherwise DM).
+  return bare;
 }
 
 /**
