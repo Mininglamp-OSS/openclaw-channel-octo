@@ -136,13 +136,15 @@ function safeToolName(tool: string): string {
 }
 
 function actionDetail(step: CardStep): string {
+  if (step.tool === SUBAGENT_WAIT_STEP_TOOL) {
+    const label = step.status === "running" ? "等待子任务结果…" : "子任务已返回";
+    const duration = fmtDuration(step.durationMs);
+    return duration ? `${label} · ${duration}` : label;
+  }
   const error = sanitizeErrorText(step.error);
   const parts = [step.summary, step.status === "error" ? error : step.resultSummary]
     .filter((value): value is string => !!value);
   if (parts.length > 0) return parts.join(" · ");
-  if (step.tool === SUBAGENT_WAIT_STEP_TOOL) {
-    return step.status === "running" ? "等待子任务结果…" : "子任务已返回";
-  }
   if (step.status === "running") return "运行中…";
   if (step.status === "error") return "调用失败";
   return "已完成";
