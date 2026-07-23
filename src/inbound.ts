@@ -2833,6 +2833,14 @@ export async function handleInboundMessage(params: {
   };
 
   let replySucceeded = false;
+  const captureReasoning = (payload: {
+    text?: string;
+    isReasoningSnapshot?: boolean;
+  }): void => {
+    recordCardReasoning(route.sessionKey, payload.text ?? "", {
+      snapshot: payload.isReasoningSnapshot === true,
+    });
+  };
 
   // Timeout guard: see resolveDispatchTimeoutMs at top of file. Without this,
   // an upstream dispatch hang would leave the per-group queue's Promise chain
@@ -2874,8 +2882,11 @@ export async function handleInboundMessage(params: {
       // group behaviour and override operator intent.
       replyOptions:
         !isGroup && config.messages?.visibleReplies === undefined
-          ? { sourceReplyDeliveryMode: "automatic" as const }
-          : {},
+          ? {
+              sourceReplyDeliveryMode: "automatic" as const,
+              onReasoningStream: captureReasoning,
+            }
+          : { onReasoningStream: captureReasoning },
       // onFreshSettledDelivery is only present on newer SDK dispatcher options.
       // On older SDK the property is ignored (and never invoked, since
       // pendingToolWarningFinal is only set when the tool-warning classifier
@@ -2883,11 +2894,10 @@ export async function handleInboundMessage(params: {
       dispatcherOptions: ({
         deliver: async (payload: ReplyPayload, info: { kind: ReplyDispatchKind }) => {
           // Reasoning is not a normal chat reply. Capture its user-visible lane for the
-          // progress card, preserving OpenClaw snapshot-vs-delta semantics.
+          // progress card as a compatibility fallback for hosts that deliver reasoning
+          // payloads through the dispatcher instead of onReasoningStream.
           if (payload.isReasoning) {
-            recordCardReasoning(route.sessionKey, payload.text ?? "", {
-              snapshot: payload.isReasoningSnapshot === true,
-            });
+            captureReasoning(payload);
             return;
           }
 
