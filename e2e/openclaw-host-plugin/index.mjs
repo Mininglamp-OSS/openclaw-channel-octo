@@ -76,16 +76,18 @@ function scriptedReply(body) {
 
   if (allText.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") &&
       allText.includes(`CHILD_E2E_OK:${marker}`)) {
-    return { text: `PARENT_E2E_OK:${marker}` };
+    return { text: `PARENT_E2E_OK:${marker}`, reasoning: "Visible reasoning checkpoint." };
   }
   if (allText.includes(`Ordinary user follow-up for ${marker}`)) {
-    return { text: `FOLLOWUP_E2E_OK:${marker}` };
+    return { text: `FOLLOWUP_E2E_OK:${marker}`, reasoning: "Visible reasoning checkpoint." };
   }
 
   const isChild = allText.includes("[Subagent Task]");
   const toolMessages = messages.filter((message) => message?.role === "tool");
   if (isChild) {
-    if (toolMessages.length > 0) return { text: `CHILD_E2E_OK:${marker}` };
+    if (toolMessages.length > 0) {
+      return { text: `CHILD_E2E_OK:${marker}`, reasoning: "Visible reasoning checkpoint." };
+    }
     const delay = Number(allText.match(/sleep (\d+)/)?.[1] ?? 10);
     return {
       tool: "exec",
@@ -95,6 +97,7 @@ function scriptedReply(body) {
         timeout: delay + 15,
         background: false,
       },
+      reasoning: "Visible reasoning checkpoint.",
     };
   }
 
@@ -105,6 +108,21 @@ function scriptedReply(body) {
       tool: "sessions_yield",
       arguments: { message: "Waiting for protected child completion event." },
       delayMs: 2_000,
+      reasoning: "Visible reasoning checkpoint.",
+    };
+  }
+  const preflightFinished = toolMessages.some((message) =>
+    message?.name === "exec" || contentText(message?.content).includes("OCTO_TOOL_E2E_OK"));
+  if (!preflightFinished) {
+    return {
+      tool: "exec",
+      arguments: {
+        command: "printf OCTO_TOOL_E2E_OK",
+        yieldMs: 1_000,
+        timeout: 10,
+        background: false,
+      },
+      reasoning: "Visible reasoning checkpoint. Verify the tool input and result before delegation.",
     };
   }
   const delay = Number(allText.match(/sleep (\d+)/)?.[1] ?? 10);
@@ -120,6 +138,7 @@ function scriptedReply(body) {
       model: MODEL_REF,
       cleanup: "delete",
     },
+    reasoning: "Visible reasoning checkpoint.",
   };
 }
 
@@ -142,6 +161,15 @@ function sendScriptedResponse(res, body, reply) {
     });
     const emit = (chunk) => res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     emit({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+    if (reply.reasoning) {
+      emit({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{ index: 0, delta: { reasoning_content: reply.reasoning }, finish_reason: null }],
+      });
+    }
     emit({
       id,
       object: "chat.completion.chunk",
@@ -174,6 +202,7 @@ function sendScriptedResponse(res, body, reply) {
       message: {
         role: "assistant",
         content: toolCall ? null : reply.text ?? "",
+        ...(reply.reasoning ? { reasoning_content: reply.reasoning } : {}),
         ...(toolCall ? { tool_calls: [toolCall] } : {}),
       },
       finish_reason: finishReason,
@@ -231,6 +260,7 @@ function resolveAccountId(config, requested) {
 }
 
 function buildPrompt(kind, marker, childDelaySeconds) {
+  if (kind === "configure-reasoning") return "/reasoning stream";
   if (kind === "followup") {
     return `Ordinary user follow-up for ${marker}. Do not call tools. Reply exactly FOLLOWUP_E2E_OK:${marker}`;
   }
@@ -243,8 +273,9 @@ function buildPrompt(kind, marker, childDelaySeconds) {
   ].join(" ");
   return [
     `OpenClaw host E2E marker: ${marker}.`,
-    `You MUST call sessions_spawn exactly once with runtime=\"subagent\", mode=\"run\", context=\"isolated\", model=\"${MODEL_REF}\".`,
-    "Call sessions_spawn as your first tool. Do not call agents_list; omit agentId.",
+    "First call exec exactly once with command=\"printf OCTO_TOOL_E2E_OK\", yieldMs=1000, timeout=10, background=false.",
+    `After exec succeeds, call sessions_spawn exactly once with runtime=\"subagent\", mode=\"run\", context=\"isolated\", model=\"${MODEL_REF}\".`,
+    "Do not call agents_list; omit agentId.",
     `Set the child task exactly to ${JSON.stringify(childTask)}.`,
     "After spawn succeeds, do not poll with sessions_list, sessions_history, exec sleep, or any other tool.",
     "Call sessions_yield and end this turn while waiting for the protected completion event.",
@@ -271,7 +302,9 @@ export default {
 
     const runRequest = async (params) => {
       try {
-        const kind = params.kind === "followup" ? "followup" : "spawn";
+        const kind = params.kind === "followup" || params.kind === "configure-reasoning"
+          ? params.kind
+          : "spawn";
         const marker = requiredString(params, "marker");
         const targetUid = requiredString(params, "targetUid");
         const sessionKey = requiredString(params, "sessionKey");
@@ -292,7 +325,6 @@ export default {
         if (!account.configured || !account.config.botToken) {
           throw new Error(`Octo account ${accountId} is not configured`);
         }
-
         const now = Date.now();
         await handleInboundMessage({
           account,

@@ -85,6 +85,19 @@ function readGatewayLogs() {
   }).join("\n");
 }
 
+function readSessionSettings() {
+  try {
+    const store = JSON.parse(fs.readFileSync("/root/.openclaw-dev/agents/main/sessions/sessions.json", "utf8"));
+    const entry = store[sessionKey] ?? {};
+    return {
+      thinkingLevel: entry.thinkingLevel,
+      reasoningLevel: entry.reasoningLevel,
+    };
+  } catch {
+    return {};
+  }
+}
+
 function latestAcceptedEdit(messageId) {
   const edits = readJsonLines("/tmp/octo-host-e2e/card-edits.jsonl")
     .filter((row) => row?.ok === true && row?.messageId === messageId &&
@@ -149,6 +162,7 @@ const texts = rows.map((row) => ({ role: row.message?.role, text: messageText(ro
 const trajectoryText = JSON.stringify(trajectoryRows);
 const gatewayLogs = readGatewayLogs();
 const cards = await recentCards();
+const sessionSettings = readSessionSettings();
 
 const phaseEvidence = {
   paused: gatewayLogs.includes(`finalized session=${sessionKey} phase=paused`) ||
@@ -168,5 +182,6 @@ console.log(JSON.stringify({
   followupReply: texts.some(({ role, text }) => role === "assistant" && text.includes(`FOLLOWUP_E2E_OK:${marker}`)),
   parentReply: texts.some(({ role, text }) => role === "assistant" && text.includes(`PARENT_E2E_OK:${marker}`)),
   phases: ["paused", "resuming", "done"].filter((phase) => phaseEvidence[phase]),
+  sessionSettings,
   cards,
 }));

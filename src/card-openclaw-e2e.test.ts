@@ -25,6 +25,7 @@ type Evidence = {
   followupReply: boolean;
   parentReply: boolean;
   phases: string[];
+  sessionSettings: { thinkingLevel?: string; reasoningLevel?: string };
   cards: Array<{
     messageId: string;
     timestampMs: number;
@@ -116,6 +117,12 @@ async function runLifecycleFlow({
   expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
   const marker = randomUUID();
   const sessionKey = `agent:main:octo-host-e2e:${marker}`;
+  await callBridge({
+    kind: "configure-reasoning",
+    marker,
+    targetUid,
+    sessionKey,
+  });
   const startedAtMs = Date.now();
 
   await callBridge({
@@ -136,6 +143,9 @@ async function runLifecycleFlow({
     60_000,
   );
   expect(paused.cards).toHaveLength(1);
+  expect(paused.sessionSettings).toMatchObject({
+    reasoningLevel: "stream",
+  });
 
   // A normal user run starts on the same session while the child is still
   // sleeping. It must not claim or finish the retained background-task card.
@@ -161,7 +171,7 @@ async function runLifecycleFlow({
     expect(checkpoint.cards).toHaveLength(1);
     expect(checkpoint.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
     expect(checkpoint.cards[0]?.plainSource).toBe("accepted-edit");
-    expect(checkpoint.cards[0]?.plain).toContain("⏳ 等待子任务");
+    expect(checkpoint.cards[0]?.plain).toContain("已转入后台，等待子任务结果…");
   }
 
   const completed = await waitForEvidence(
@@ -198,7 +208,7 @@ async function runLifecycleFlow({
   expect(completed.cards[0]?.plain).toContain("exec · printf · exit 0");
   if (pausedCheckpointDelayMs !== undefined) {
     expect(completed.cards[0]?.plainSource).toBe("accepted-edit");
-    const waitDuration = completed.cards[0]?.plain.match(/等待子任务 · ([\d.]+)s/)?.[1];
+    const waitDuration = completed.cards[0]?.plain.match(/子任务已返回 · ([\d.]+)s/)?.[1];
     expect(waitDuration, completed.cards[0]?.plain).toBeDefined();
     expect(Number(waitDuration)).toBeGreaterThanOrEqual(pausedCheckpointDelayMs / 1_000);
   }
