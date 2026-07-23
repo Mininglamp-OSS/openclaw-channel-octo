@@ -95,17 +95,34 @@ function installFetchStub() {
 function installRuntime(
   hooks: Record<string, (event: unknown, ctx: unknown) => unknown>,
   finalText: string,
+  opts: { reasoningText?: string } = {},
 ) {
   setOctoRuntime({
     config: { loadConfig: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: async (args: any) => {
-          hooks.before_tool_call({ toolName: "read", toolCallId: "read-1" }, { sessionKey: "sk-merge" });
+          const hookCtx = opts.reasoningText
+            ? { sessionKey: "sk-merge", runId: "run-merge" }
+            : { sessionKey: "sk-merge" };
+          if (opts.reasoningText) {
+            hooks.before_agent_run({}, hookCtx);
+            hooks.model_call_started({ callId: "call-merge" }, hookCtx);
+            await args.replyOptions.onReasoningStream({
+              text: opts.reasoningText,
+              isReasoningSnapshot: true,
+            });
+          }
+          hooks.before_tool_call({ toolName: "read", toolCallId: "read-1" }, hookCtx);
           await new Promise((resolve) => setTimeout(resolve, 850));
           hooks.after_tool_call(
-            { toolName: "read", toolCallId: "read-1", durationMs: 20 },
-            { sessionKey: "sk-merge" },
+            {
+              toolName: "read",
+              toolCallId: "read-1",
+              durationMs: 20,
+              result: { details: { status: "completed" } },
+            },
+            hookCtx,
           );
           await args.dispatcherOptions.deliver({ text: finalText }, { kind: "final" });
         },
@@ -169,6 +186,22 @@ describe("inbound final response progress-card merge", () => {
     const contentEdit = JSON.parse(edits[0].content_edit as string);
     expect(contentEdit.transient).toBeUndefined();
     expect(JSON.stringify(contentEdit.card)).toContain("渠道 B 的下降主要来自权益认知不足");
+  });
+
+  it("captures reasoning snapshots in the progress card without sending a reasoning text message", async () => {
+    const { sends } = installFetchStub();
+    const hooks = collectCardHooks();
+    installRuntime(hooks, "最终结论", { reasoningText: "先核对渠道数据，再给出结论。" });
+
+    await runInbound();
+
+    const cardSends = sends.filter((body) => (body.payload as { type?: number } | undefined)?.type === 17);
+    const textSends = sends.filter((body) => (body.payload as { type?: number } | undefined)?.type === 1);
+    expect(cardSends).toHaveLength(1);
+    expect(textSends).toHaveLength(0);
+    const card = (cardSends[0]?.payload as { card: Record<string, unknown> }).card;
+    expect(JSON.stringify(card)).toContain("先核对渠道数据，再给出结论。");
+    expect(JSON.stringify(card)).toContain("read");
   });
 
   it("keeps mention-bearing final text on the normal message path", async () => {
