@@ -18,6 +18,7 @@ import { ChannelType, CARD_PROFILE, CARD_VERSION } from "./types.js";
 import { sendCardMessage, editCardMessage, getCardProfile, httpStatusFromApiFetchError } from "./api-fetch.js";
 import { deriveCardCaps } from "./card-caps.js";
 import { renderProgressCard, renderProgressResponseCard, summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState, type CardCaps } from "./card-render.js";
+import { renderReasoningProcessCard, summarizeToolResult } from "./reasoning-process.js";
 import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.js";
 
 /** dispatch 侧登记的发送上下文。 */
@@ -207,6 +208,37 @@ function scheduleFlush(sessionKey: string, entry: CardEntry): void {
   }, FLUSH_DEBOUNCE_MS);
 }
 
+function entryProgressState(
+  sessionKey: string,
+  entry: CardEntry,
+  phase: CardProgressState["phase"] = entry.phase,
+  opts: { elapsedMs?: number; errorText?: string } = {},
+): CardProgressState {
+  const runId = entry.continuationRunId ?? entry.runId;
+  return {
+    reasoningId: runId ? `${sessionKey}:${runId}` : sessionKey,
+    phase,
+    steps: entry.steps,
+    ...(opts.elapsedMs !== undefined ? { elapsedMs: opts.elapsedMs } : {}),
+    ...(opts.errorText ? { errorText: opts.errorText } : {}),
+  };
+}
+
+function usesReasoningProcessContract(entry: CardEntry): boolean {
+  return entry.steps.some((step) => !!step.modelCallId || !!step.thought);
+}
+
+function renderEntryProgress(
+  sessionKey: string,
+  entry: CardEntry,
+  state: CardProgressState,
+): { card: Record<string, unknown>; plain: string } {
+  const caps = capsCache.get(entry.ctx.apiUrl);
+  return usesReasoningProcessContract(entry)
+    ? renderReasoningProcessCard(state, caps)
+    : renderProgressCard(state, caps);
+}
+
 async function flush(sessionKey: string): Promise<void> {
   const entry = cards.get(sessionKey);
   if (!entry || entry.skip) return;
@@ -253,7 +285,11 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     }
 
     entry.dirty = false;
-    const { card, plain } = renderProgressCard({ phase: entry.phase, steps: entry.steps }, capsCache.get(entry.ctx.apiUrl));
+    const { card, plain } = renderEntryProgress(
+      sessionKey,
+      entry,
+      entryProgressState(sessionKey, entry),
+    );
     if (!Array.isArray(card.body) || card.body.length === 0) {
       warn("rendered card cannot fit negotiated capabilities/limits; disabling for session");
       entry.skip = true;
@@ -386,16 +422,14 @@ async function editTrackedCardState(
     endRunningThinking(entry, now);
     if (phase !== "paused") endSubagentWait(entry, now);
     entry.phase = phase;
-    const state: CardProgressState = {
-      phase,
-      steps: entry.steps,
+    const state = entryProgressState(sessionKey, entry, phase, {
       elapsedMs: Date.now() - entry.startedAt,
       ...(opts.errorText ? { errorText: opts.errorText } : {}),
-    };
+    });
     const abort = new AbortController();
     entry.stateEditAbort = abort;
     try {
-      const { card, plain } = renderProgressCard(state, capsCache.get(entry.ctx.apiUrl));
+      const { card, plain } = renderEntryProgress(sessionKey, entry, state);
       if (!Array.isArray(card.body) || card.body.length === 0) return;
       await editCardMessage({
         apiUrl: entry.ctx.apiUrl,
@@ -500,14 +534,15 @@ export async function finalizeCard(
     return;
   }
 
-  const state: CardProgressState = {
-    phase: opts.success ? "done" : "error",
-    steps: entry.steps,
+  const terminalPhase: CardProgressState["phase"] = entry.phase === "stopped"
+    ? "stopped"
+    : opts.success ? "done" : "error";
+  const state = entryProgressState(sessionKey, entry, terminalPhase, {
     elapsedMs: Date.now() - entry.startedAt,
     ...(opts.errorText ? { errorText: opts.errorText } : {}),
-  };
+  });
   try {
-    const { card, plain } = renderProgressCard(state, capsCache.get(entry.ctx.apiUrl));
+    const { card, plain } = renderEntryProgress(sessionKey, entry, state);
     if (!Array.isArray(card.body) || card.body.length === 0) {
       warn("terminal card cannot fit negotiated capabilities/limits; leaving last valid frame");
       return;
@@ -626,6 +661,43 @@ function endRunningThinking(entry: CardEntry, now: number): void {
   if (!last || last.tool !== "__thinking__" || last.status !== "running") return;
   last.status = "done";
   if (typeof last.startedAt === "number") last.durationMs = Math.max(0, now - last.startedAt);
+}
+
+const MAX_REASONING_CAPTURE = 4_000;
+
+/** Capture OpenClaw's user-visible reasoning lane without sending it as a normal message. */
+export function recordCardReasoning(
+  sessionKey: string,
+  text: string,
+  opts: { snapshot?: boolean } = {},
+): void {
+  const entry = cards.get(sessionKey);
+  if (!entry || entry.skip || !text) return;
+  let thinking: CardStep | undefined;
+  for (let index = entry.steps.length - 1; index >= 0; index--) {
+    if (entry.steps[index]?.tool === "__thinking__") {
+      thinking = entry.steps[index];
+      break;
+    }
+  }
+  if (!thinking) {
+    thinking = { tool: "__thinking__", status: "running", startedAt: Date.now() };
+    entry.steps.push(thinking);
+  }
+  const next = opts.snapshot ? text : `${thinking.thought ?? ""}${text}`;
+  thinking.thought = next.slice(0, MAX_REASONING_CAPTURE);
+  if (entry.messageId || entry.steps.some((step) => step.tool !== "__thinking__")) {
+    scheduleFlush(sessionKey, entry);
+  }
+}
+
+/** Best-effort answering transition inferred from the first non-reasoning reply payload. */
+export function markCardAnswering(sessionKey: string): void {
+  const entry = cards.get(sessionKey);
+  if (!entry || entry.skip || entry.phase === "stopped" || entry.phase === "error") return;
+  endRunningThinking(entry, Date.now());
+  entry.phase = "answering";
+  if (entry.messageId) scheduleFlush(sessionKey, entry);
 }
 
 /**
@@ -793,6 +865,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       target.status = e.error ? "error" : "done";
       if (typeof e.durationMs === "number") target.durationMs = e.durationMs;
       if (e.error) target.error = e.error;
+      if (!e.error) target.resultSummary = summarizeToolResult(e.toolName, e.result);
     }
     if (e.toolName === "sessions_spawn" && !e.error) {
       const childSessionKey = acceptedSpawnChildSessionKey(e.result);
@@ -804,7 +877,8 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     scheduleFlush(sk!, entry);
   });
 
-  api.on("model_call_started", (_event: unknown, ctx: unknown) => {
+  api.on("model_call_started", (event: unknown, ctx: unknown) => {
+    const e = (event ?? {}) as { callId?: string };
     const sk = (ctx as { sessionKey?: string })?.sessionKey;
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip) return;
@@ -816,11 +890,39 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     // 首段思考(尚无真实工具步)→ header 显示"🤖 思考中…";真实工具跑过后保持"正在处理…"。
     const hadRealStep = entry.steps.some((s) => s.tool !== "__thinking__");
     if (!hadRealStep) entry.phase = "thinking";
-    entry.steps.push({ tool: "__thinking__", status: "running", startedAt: Date.now() });
+    entry.steps.push({
+      tool: "__thinking__",
+      status: "running",
+      startedAt: Date.now(),
+      ...(e.callId ? { modelCallId: e.callId } : {}),
+    });
     // 懒发契约(模块头:"首个工具事件懒发占位卡"):**纯思考不发首帧卡**。仅当卡已存在(messageId)
     // 或已有真实工具步时才刷新 —— 否则纯文本 / 纯 display-card turn 的思考步会误发一张占位卡,
     // 并在收尾时 finalize 成误导性的"⚠️ 已中断",正是 P1-h 想消除的噪音。
     if (entry.messageId || hadRealStep) scheduleFlush(sk!, entry);
+  });
+
+  api.on("model_call_ended", (event: unknown, ctx: unknown) => {
+    const e = (event ?? {}) as {
+      callId?: string;
+      durationMs?: number;
+      outcome?: "completed" | "error";
+      failureKind?: string;
+      errorCategory?: string;
+    };
+    const sk = (ctx as { sessionKey?: string })?.sessionKey;
+    const entry = sk ? cards.get(sk) : undefined;
+    if (!entry || entry.skip || !claimRun(entry, ctx)) return;
+    const target = e.callId
+      ? entry.steps.find((step) => step.tool === "__thinking__" && step.modelCallId === e.callId)
+      : undefined;
+    if (target) {
+      target.status = e.outcome === "error" ? "error" : "done";
+      if (typeof e.durationMs === "number") target.durationMs = e.durationMs;
+      if (e.outcome === "error") target.error = e.errorCategory ?? e.failureKind;
+    }
+    if (e.failureKind === "aborted") entry.phase = "stopped";
+    if (entry.messageId) scheduleFlush(sk!, entry);
   });
 
   const hasLifecycleSubscription = registerCardLifecycleSubscription(api);

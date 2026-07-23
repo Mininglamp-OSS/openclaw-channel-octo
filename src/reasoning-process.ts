@@ -1,0 +1,412 @@
+import { CARD_PLACEHOLDER, CARD_VERSION } from "./types.js";
+import { cardFitsLimits } from "./card-limits.js";
+import {
+  OCTO_CARD_LAYOUTS,
+  SUBAGENT_WAIT_STEP_TOOL,
+  cardSupports,
+  fmtDuration,
+  isSensitive,
+  renderProgressCard,
+  sanitizeErrorText,
+  type CardCaps,
+  type CardProgressState,
+  type CardStep,
+} from "./card-render.js";
+
+export type ReasoningProcessState = "reasoning" | "answering" | "completed" | "stopped" | "error";
+export type ReasoningStatusTone = "Accent" | "Good" | "Warning" | "Attention";
+export type ReasoningActionTone = "Accent" | "Good" | "Attention";
+
+export interface ReasoningProcessAction {
+  tool: string;
+  detail: string;
+  statusGlyph: string;
+  statusTone: ReasoningActionTone;
+}
+
+export interface ReasoningProcessPhase {
+  thought: string;
+  actions: ReasoningProcessAction[];
+}
+
+/** ai.reasoning-process@0.1.0 data contract. */
+export interface ReasoningProcessData {
+  reasoningId: string;
+  state: ReasoningProcessState;
+  title: string;
+  statusLabel: string;
+  statusTone: ReasoningStatusTone;
+  timerText: string;
+  traceExpanded: boolean;
+  traceCollapsed: boolean;
+  collapsedSummary: string;
+  progressText?: string;
+  phases: ReasoningProcessPhase[];
+  errorTitle?: string;
+  errorMessage?: string;
+}
+
+const FALLBACK_THOUGHT = "正在处理当前阶段。";
+const THOUGHT_MAX = 280;
+const TOOL_NAME_MAX = 80;
+const MAX_RENDERED_PHASES = 6;
+const MAX_RENDERED_ACTIONS = 12;
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function finiteCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : undefined;
+}
+
+function candidateRecords(result: unknown): Record<string, unknown>[] {
+  const root = asRecord(result);
+  if (!root) return [];
+  const records = [root];
+  for (const key of ["details", "meta", "metadata", "summary"] as const) {
+    const candidate = asRecord(root[key]);
+    if (candidate) records.push(candidate);
+  }
+  return records;
+}
+
+/**
+ * after_tool_call.result may contain whole files, command output, HTTP bodies, or credentials.
+ * Only structural allowlisted fields are retained; arbitrary content text is never inspected.
+ */
+export function summarizeToolResult(toolName: string | undefined, result: unknown): string {
+  if (result === undefined || result === null) return "";
+  if (Array.isArray(result)) return `${result.length} results`;
+  const records = candidateRecords(result);
+  for (const record of records) {
+    const exitCode = finiteCount(record.exitCode ?? record.exit_code ?? record.code);
+    if (exitCode !== undefined && ["exec", "bash", "shell", "process"].includes(toolName ?? "")) {
+      return `exit ${exitCode}`;
+    }
+  }
+  for (const record of records) {
+    const count = finiteCount(
+      record.matchCount ?? record.match_count ?? record.resultCount ?? record.result_count ??
+      record.totalCount ?? record.total_count,
+    );
+    if (count !== undefined) return `${count} results`;
+  }
+  for (const record of records) {
+    const count = finiteCount(record.fileCount ?? record.file_count ?? record.changedFiles);
+    if (count !== undefined) return `${count} files`;
+    const bytes = finiteCount(record.bytes ?? record.byteLength ?? record.writtenBytes);
+    if (bytes !== undefined) return `${bytes} bytes`;
+  }
+  for (const record of records) {
+    const status = typeof record.status === "string" ? record.status.toLowerCase() : "";
+    if (["accepted", "queued", "waiting"].includes(status)) return status;
+    if (["completed", "complete", "success", "succeeded", "ok", "done"].includes(status)) {
+      return "completed";
+    }
+  }
+  return "completed";
+}
+
+/** Reasoning lane text is visible to channel members, so fail closed on protected/secret shapes. */
+export function sanitizeReasoningThought(text: string | undefined): string {
+  if (!text) return FALLBACK_THOUGHT;
+  const normalized = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized ||
+      normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
+      normalized.includes("<<<END_OPENCLAW_INTERNAL_CONTEXT>>>") ||
+      /(?:https?:\/\/|wss?:\/\/|\b(?:postgres|mysql|redis|ssh):\/\/)/i.test(normalized) ||
+      isSensitive(normalized, true)) {
+    return FALLBACK_THOUGHT;
+  }
+  return normalized.length > THOUGHT_MAX ? normalized.slice(0, THOUGHT_MAX) + "…" : normalized;
+}
+
+function safeToolName(tool: string): string {
+  if (tool === "__thinking__") return "think";
+  if (tool === SUBAGENT_WAIT_STEP_TOOL) return "wait";
+  if (!tool || isSensitive(tool, true)) return "tool";
+  return tool.length > TOOL_NAME_MAX ? tool.slice(0, TOOL_NAME_MAX) + "…" : tool;
+}
+
+function actionDetail(step: CardStep): string {
+  const error = sanitizeErrorText(step.error);
+  const parts = [step.summary, step.status === "error" ? error : step.resultSummary]
+    .filter((value): value is string => !!value);
+  if (parts.length > 0) return parts.join(" · ");
+  if (step.tool === SUBAGENT_WAIT_STEP_TOOL) {
+    return step.status === "running" ? "等待子任务结果…" : "子任务已返回";
+  }
+  if (step.status === "running") return "运行中…";
+  if (step.status === "error") return "调用失败";
+  return "已完成";
+}
+
+function actionFromStep(step: CardStep): ReasoningProcessAction {
+  return {
+    tool: safeToolName(step.tool),
+    detail: actionDetail(step),
+    statusGlyph: "●",
+    statusTone: step.status === "running" ? "Accent" : step.status === "error" ? "Attention" : "Good",
+  };
+}
+
+function phasesFromSteps(steps: CardStep[]): ReasoningProcessPhase[] {
+  const phases: ReasoningProcessPhase[] = [];
+  let current: ReasoningProcessPhase | undefined;
+  for (const step of steps) {
+    if (step.tool === "__thinking__") {
+      current = {
+        thought: sanitizeReasoningThought(step.thought),
+        actions: [],
+      };
+      phases.push(current);
+      continue;
+    }
+    if (!current) {
+      current = { thought: FALLBACK_THOUGHT, actions: [] };
+      phases.push(current);
+    }
+    current.actions.push(actionFromStep(step));
+  }
+  if (phases.length === 0) phases.push({ thought: FALLBACK_THOUGHT, actions: [] });
+  for (let index = 0; index < phases.length; index++) {
+    const phase = phases[index]!;
+    if (phase.actions.length > 0) continue;
+    const thinking = steps.filter((step) => step.tool === "__thinking__")[index];
+    const duration = fmtDuration(thinking?.durationMs);
+    const detail = thinking?.status === "running" ? "正在组织下一步…"
+      : thinking?.status === "error" ? "阶段已停止"
+        : "已完成阶段分析";
+    phase.actions.push({
+      tool: "think",
+      detail: duration ? `${detail} · ${duration}` : detail,
+      statusGlyph: "●",
+      statusTone: thinking?.status === "running" ? "Accent"
+        : thinking?.status === "error" ? "Attention"
+          : "Good",
+    });
+  }
+  return phases;
+}
+
+function contractState(phase: CardProgressState["phase"]): ReasoningProcessState {
+  if (phase === "answering") return "answering";
+  if (phase === "done") return "completed";
+  if (phase === "stopped") return "stopped";
+  if (phase === "error" || phase === "expired") return "error";
+  return "reasoning";
+}
+
+export function buildReasoningProcessData(state: CardProgressState): ReasoningProcessData {
+  const phases = phasesFromSteps(state.steps);
+  const mapped = contractState(state.phase);
+  const elapsed = fmtDuration(state.elapsedMs) || "0ms";
+  const toolCount = state.steps.filter((step) =>
+    step.tool !== "__thinking__" && step.tool !== SUBAGENT_WAIT_STEP_TOOL).length;
+  const active = mapped === "reasoning" || mapped === "answering";
+  const errorMessage = sanitizeErrorText(state.errorText) ||
+    (state.phase === "expired" ? "等待后台任务结果超时。" : "推理服务中断，已保留完成的过程。");
+  const base: ReasoningProcessData = {
+    reasoningId: state.reasoningId?.trim() || "octo-progress",
+    state: mapped,
+    title: "已深度思考",
+    statusLabel: mapped === "reasoning" ? "思考中"
+      : mapped === "answering" ? "回答中"
+        : mapped === "completed" ? "已完成"
+          : mapped === "stopped" ? "已停止"
+            : "生成失败",
+    statusTone: mapped === "reasoning" || mapped === "answering" ? "Accent"
+      : mapped === "completed" ? "Good"
+        : mapped === "stopped" ? "Warning"
+          : "Attention",
+    timerText: mapped === "reasoning" ? "正在深度思考…"
+      : mapped === "answering" ? "正在生成回答…"
+        : mapped === "stopped" ? `已思考 ${elapsed} · 已停止于第 ${phases.length} 段`
+          : mapped === "error" ? "已中断"
+            : `用时 ${elapsed} · ${phases.length} 段推理 · ${toolCount} 次工具调用`,
+    traceExpanded: active || mapped === "error",
+    traceCollapsed: !active && mapped !== "error",
+    collapsedSummary: mapped === "answering" ? "推理已完成 · 回答正在生成"
+      : mapped === "stopped" ? `已保留停止前的 ${phases.length} 段推理过程`
+        : mapped === "error" ? "生成已中断 · 点击可查看停止前的过程"
+          : mapped === "completed" ? `已思考 ${elapsed} · 推理过程已收起`
+            : "推理仍在进行 · 点击可查看当前过程",
+    phases,
+  };
+  if (mapped === "reasoning") {
+    base.progressText = state.phase === "paused" ? "已转入后台，等待子任务结果…"
+      : state.phase === "resuming" ? "子任务已返回，正在整理结果…"
+        : "正在执行下一步…";
+  } else if (mapped === "answering") {
+    base.progressText = "推理已完成，正在生成回答…";
+  } else if (mapped === "error") {
+    base.errorTitle = "生成失败";
+    base.errorMessage = errorMessage;
+  }
+  return base;
+}
+
+function trimForRender(data: ReasoningProcessData): ReasoningProcessData {
+  let remaining = MAX_RENDERED_ACTIONS;
+  const visible: ReasoningProcessPhase[] = [];
+  for (const phase of data.phases.slice(-MAX_RENDERED_PHASES).reverse()) {
+    if (remaining <= 0) break;
+    const actions = phase.actions.slice(-remaining);
+    remaining -= actions.length;
+    visible.push({ thought: phase.thought, actions });
+  }
+  return { ...data, phases: visible.reverse() };
+}
+
+function textBlock(text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return { type: "TextBlock", text, wrap: true, ...extra };
+}
+
+function actionRow(action: ReasoningProcessAction, first: boolean): Record<string, unknown> {
+  return {
+    type: "ColumnSet",
+    spacing: first ? "None" : "Small",
+    columns: [
+      { type: "Column", width: "auto", items: [textBlock(action.statusGlyph, { color: action.statusTone, size: "Small", spacing: "None" })] },
+      { type: "Column", width: "auto", items: [textBlock(action.tool, { weight: "Bolder", size: "Small", spacing: "None" })] },
+      { type: "Column", width: "stretch", items: [textBlock(action.detail, { isSubtle: true, size: "Small", spacing: "None" })] },
+    ],
+  };
+}
+
+function phaseBlock(phase: ReasoningProcessPhase, first: boolean): Record<string, unknown> {
+  return {
+    type: "Container",
+    spacing: first ? "None" : "Large",
+    separator: !first,
+    items: [
+      textBlock(phase.thought, { size: "Small", spacing: "None" }),
+      {
+        type: "Container",
+        style: "emphasis",
+        spacing: "Small",
+        items: phase.actions.map((action, index) => actionRow(action, index === 0)),
+      },
+    ],
+  };
+}
+
+function plainText(data: ReasoningProcessData): string {
+  const lines = [`${data.statusLabel} · ${data.timerText}`];
+  for (const phase of data.phases) {
+    lines.push(phase.thought);
+    for (const action of phase.actions) lines.push(`${action.tool} · ${action.detail}`);
+  }
+  if (data.progressText) lines.push(data.progressText);
+  if (data.errorMessage) lines.push(data.errorMessage);
+  return lines.join("\n") || CARD_PLACEHOLDER;
+}
+
+/** Render the toggle-only octo/v1 product variant of ai.reasoning-process@0.1.0. */
+export function renderReasoningProcessCard(
+  state: CardProgressState,
+  caps?: CardCaps,
+): { card: Record<string, unknown>; plain: string } {
+  if (!cardSupports(caps, "TextBlock") || !cardSupports(caps, "Container") || !cardSupports(caps, "ColumnSet")) {
+    return renderProgressCard(state, caps);
+  }
+  const data = trimForRender(buildReasoningProcessData(state));
+  const canToggle = cardSupports(caps, "ActionSet") && cardSupports(caps, "Action.ToggleVisibility");
+  const traceVisible = canToggle ? data.traceExpanded : true;
+  const body: Record<string, unknown>[] = [
+    {
+      type: "Container",
+      id: "octo-surface-accent-header-reasoning-active",
+      style: "accent",
+      bleed: true,
+      spacing: "None",
+      items: [{
+        type: "ColumnSet",
+        spacing: "None",
+        columns: [
+          {
+            type: "Column",
+            width: "stretch",
+            items: [
+              textBlock(`✦  ${data.title}`, { color: "Accent", weight: "Bolder", spacing: "None" }),
+              textBlock(data.timerText, { size: "Small", isSubtle: true, spacing: "Small" }),
+            ],
+          },
+          {
+            type: "Column",
+            width: "auto",
+            items: [textBlock(data.statusLabel, {
+              color: data.statusTone,
+              weight: "Bolder",
+              size: "Small",
+              spacing: "None",
+            })],
+          },
+        ],
+      }],
+    },
+    {
+      type: "Container",
+      id: "trace_panel",
+      isVisible: traceVisible,
+      spacing: "Large",
+      items: [
+        ...data.phases.map((phase, index) => phaseBlock(phase, index === 0)),
+        ...(data.progressText ? [textBlock(`◌  ${data.progressText}`, { color: "Accent", size: "Small", spacing: "Large" })] : []),
+        ...(data.errorMessage ? [{
+          type: "Container",
+          style: "attention",
+          spacing: "Large",
+          items: [
+            textBlock(data.errorTitle ?? "生成失败", { weight: "Bolder", color: "Attention", spacing: "None" }),
+            textBlock(data.errorMessage, { size: "Small", spacing: "Small" }),
+          ],
+        }] : []),
+      ],
+    },
+    {
+      type: "Container",
+      id: "collapsed_panel",
+      isVisible: canToggle ? data.traceCollapsed : false,
+      spacing: "Medium",
+      items: [textBlock(`✓  ${data.collapsedSummary}`, { size: "Small", isSubtle: true, spacing: "None" })],
+    },
+  ];
+  if (canToggle) {
+    body.push({
+      type: "Container",
+      style: "emphasis",
+      bleed: true,
+      separator: true,
+      spacing: "Large",
+      items: [{
+        type: "ActionSet",
+        horizontalAlignment: "Right",
+        actions: [{
+          type: "Action.ToggleVisibility",
+          id: "reasoning_toggle",
+          title: "显示 / 隐藏推理",
+          targetElements: ["trace_panel", "collapsed_panel"],
+        }],
+      }],
+    });
+  }
+  const card: Record<string, unknown> = {
+    $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+    type: "AdaptiveCard",
+    version: CARD_VERSION,
+    body,
+    metadata: { octo_layout: OCTO_CARD_LAYOUTS.agentProgressV1 },
+  };
+  const plain = plainText(data);
+  return cardFitsLimits(card, plain, caps)
+    ? { card, plain }
+    : renderProgressCard(state, caps);
+}

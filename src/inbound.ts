@@ -26,7 +26,13 @@ import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.
 import { normalizeAccountId } from "./account-id.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
-import { setCardContext, finalizeCard, finalizeCardWithResponse } from "./card-progress.js";
+import {
+  setCardContext,
+  finalizeCard,
+  finalizeCardWithResponse,
+  markCardAnswering,
+  recordCardReasoning,
+} from "./card-progress.js";
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER, CARD_PLACEHOLDER } from "./types.js";
 import type { RichTextBlock } from "./types.js";
 import { getOctoRuntime } from "./runtime.js";
@@ -2876,8 +2882,14 @@ export async function handleInboundMessage(params: {
       // exists), so the cast keeps both versions type-correct.
       dispatcherOptions: ({
         deliver: async (payload: ReplyPayload, info: { kind: ReplyDispatchKind }) => {
-          // Skip reasoning blocks
-          if (payload.isReasoning) return;
+          // Reasoning is not a normal chat reply. Capture its user-visible lane for the
+          // progress card, preserving OpenClaw snapshot-vs-delta semantics.
+          if (payload.isReasoning) {
+            recordCardReasoning(route.sessionKey, payload.text ?? "", {
+              snapshot: payload.isReasoningSnapshot === true,
+            });
+            return;
+          }
 
           const kind = info.kind;
 
@@ -2909,6 +2921,10 @@ export async function handleInboundMessage(params: {
             return;
           }
           if (!content) return;
+
+          // OpenClaw has no exact "answer generation started" hook. The first
+          // non-reasoning, non-tool text is the documented best-effort boundary.
+          if (kind !== "tool") markCardAnswering(route.sessionKey);
 
           if (kind === "tool") {
             // Verbose tool call output: send immediately

@@ -52,12 +52,20 @@ export interface CardStep {
    * continuation 收尾，duration = now - startedAt。渲染层只看 durationMs。
    */
   startedAt?: number;
+  /** OpenClaw model_call_started.callId; used to close the matching reasoning phase. */
+  modelCallId?: string;
+  /** User-visible reasoning lane text associated with this model call. */
+  thought?: string;
+  /** Bounded structural summary derived from after_tool_call.result. */
+  resultSummary?: string;
 }
 
 /** 进度卡的渲染状态。 */
 export interface CardProgressState {
-  phase: "thinking" | "tool" | "paused" | "resuming" | "expired" | "done" | "error";
+  phase: "thinking" | "tool" | "paused" | "resuming" | "answering" | "expired" | "done" | "stopped" | "error";
   steps: CardStep[];
+  /** Stable contract identifier: sessionKey + runId when the host provides runId. */
+  reasoningId?: string;
   elapsedMs?: number;
   errorText?: string;
 }
@@ -401,6 +409,8 @@ function headerText(state: CardProgressState): string {
       return "⏸️ 等待任务结果";
     case "resuming":
       return "🤖 正在整理结果";
+    case "answering":
+      return "🤖 正在生成回答";
     case "expired":
       return "⏱️ 等待超时";
     case "error": {
@@ -415,6 +425,8 @@ function headerText(state: CardProgressState): string {
       if (secs) parts.push(secs);
       return parts.join(" · ");
     }
+    case "stopped":
+      return "⚠️ 已停止";
   }
 }
 
@@ -815,7 +827,7 @@ export function renderProgressCard(
   const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true });
   const headerItems = progressHeaderItems(state, header, state.steps, total, visible, canRichText);
   const canToggle = supportsTerminalCollapse(caps);
-  const isTerminal = state.phase === "done" || state.phase === "error" || state.phase === "expired";
+  const isTerminal = state.phase === "done" || state.phase === "stopped" || state.phase === "error" || state.phase === "expired";
   const detailVisible = !(canToggle && isTerminal);
   const columns: Record<string, unknown>[] = [
     {
