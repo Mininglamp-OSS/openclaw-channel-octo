@@ -128,10 +128,10 @@ describe("reasoning detail sanitization", () => {
 
   it("redacts secret-shaped or protected internal reasoning and bounds visible text", () => {
     expect(sanitizeReasoningThought("Authorization: Bearer abcdefghijklmnop"))
-      .toBe("正在处理当前阶段。");
+      .toBe("Working through this step.");
     expect(sanitizeReasoningThought(
       "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>> private completion event",
-    )).toBe("正在处理当前阶段。");
+    )).toBe("Working through this step.");
     expect(sanitizeReasoningThought("x".repeat(600)).length).toBeLessThanOrEqual(281);
   });
 });
