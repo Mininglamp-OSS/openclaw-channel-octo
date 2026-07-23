@@ -5,7 +5,7 @@ import {
   sanitizeReasoningThought,
   summarizeToolResult,
 } from "./reasoning-process.js";
-import type { CardProgressState } from "./card-render.js";
+import { SUBAGENT_WAIT_STEP_TOOL, type CardProgressState } from "./card-render.js";
 
 function state(overrides: Partial<CardProgressState> = {}): CardProgressState {
   return {
@@ -108,6 +108,17 @@ describe("ai.reasoning-process@0.1.0 contract", () => {
       statusGlyph: "●",
       statusTone: "Accent",
     }]);
+  });
+
+  it("keeps the completed subagent wait duration in action detail", () => {
+    const data = buildReasoningProcessData(state({
+      steps: [
+        { tool: "__thinking__", status: "done", thought: "等待后台任务完成。" },
+        { tool: SUBAGENT_WAIT_STEP_TOOL, status: "done", durationMs: 75_000 },
+      ],
+    }));
+
+    expect(data.phases[0]?.actions[0]?.detail).toBe("子任务已返回 · 75.0s");
   });
 });
 
