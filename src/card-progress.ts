@@ -684,7 +684,13 @@ export function recordCardReasoning(
     thinking = { tool: "__thinking__", status: "running", startedAt: Date.now() };
     entry.steps.push(thinking);
   }
-  const next = opts.snapshot ? text : `${thinking.thought ?? ""}${text}`;
+  const previous = thinking.thought ?? "";
+  // OpenClaw harnesses do not all stamp snapshot metadata consistently. Treat
+  // a repeated/full-prefix value as a snapshot so the agent-event lane and the
+  // reply callback can coexist without duplicating the same reasoning text.
+  const next = opts.snapshot || text === previous || text.startsWith(previous)
+    ? text
+    : `${previous}${text}`;
   thinking.thought = next.slice(0, MAX_REASONING_CAPTURE);
   if (entry.messageId || entry.steps.some((step) => step.tool !== "__thinking__")) {
     scheduleFlush(sessionKey, entry);
@@ -925,6 +931,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     if (entry.messageId) scheduleFlush(sk!, entry);
   });
 
+  registerCardReasoningSubscription(api);
   const hasLifecycleSubscription = registerCardLifecycleSubscription(api);
   if (!hasLifecycleSubscription) {
     api.on("agent_end", (event: unknown, ctx: unknown) => {
@@ -953,26 +960,54 @@ type CardLifecycleSubscription = {
   handle: (event: CardLifecycleEvent) => void | Promise<void>;
 };
 
+type CardAgentEventRegister = (subscription: CardLifecycleSubscription) => void;
+
+function resolveCardAgentEventRegister(api: OpenClawPluginApi): CardAgentEventRegister | undefined {
+  const compat = api as unknown as {
+    agent?: {
+      events?: {
+        registerAgentEventSubscription?: CardAgentEventRegister;
+      };
+    };
+    registerAgentEventSubscription?: CardAgentEventRegister;
+  };
+  const nested = compat.agent?.events?.registerAgentEventSubscription;
+  if (nested) {
+    return (subscription) => nested.call(compat.agent!.events, subscription);
+  }
+  const flat = compat.registerAgentEventSubscription;
+  return flat ? (subscription) => flat.call(compat, subscription) : undefined;
+}
+
+function registerCardReasoningSubscription(api: OpenClawPluginApi): boolean {
+  const register = resolveCardAgentEventRegister(api);
+  if (!register) return false;
+  register({
+    id: "octo-card-progress-reasoning",
+    description: "Capture OpenClaw thinking events for Octo progress cards",
+    streams: ["thinking"],
+    handle: (event) => {
+      if (event.stream !== "thinking" || !event.sessionKey || !event.runId) return;
+      const entry = cards.get(event.sessionKey);
+      if (!entry || entry.skip || !claimRun(entry, { runId: event.runId })) return;
+      const text = typeof event.data.text === "string"
+        ? event.data.text
+        : typeof event.data.delta === "string" ? event.data.delta : "";
+      if (!text) return;
+      recordCardReasoning(event.sessionKey, text, {
+        snapshot: typeof event.data.text === "string",
+      });
+    },
+  });
+  return true;
+}
+
 /**
  * 2026.7.x 提供 nested agent.events facade；旧 SDK 没有该字段，因此运行时 feature-detect，
  * 并保留 flat API 兼容。旧 host 至少仍可通过成功的 sessions_yield tool hook 显示 paused。
  */
 function registerCardLifecycleSubscription(api: OpenClawPluginApi): boolean {
-  const compat = api as unknown as {
-    agent?: {
-      events?: {
-        registerAgentEventSubscription?: (subscription: CardLifecycleSubscription) => void;
-      };
-    };
-    registerAgentEventSubscription?: (subscription: CardLifecycleSubscription) => void;
-  };
-  const nested = compat.agent?.events?.registerAgentEventSubscription;
-  const flat = compat.registerAgentEventSubscription;
-  const register = nested
-    ? (subscription: CardLifecycleSubscription) => nested.call(compat.agent!.events, subscription)
-    : flat
-      ? (subscription: CardLifecycleSubscription) => flat.call(compat, subscription)
-      : undefined;
+  const register = resolveCardAgentEventRegister(api);
   if (!register) {
     dbg("agent lifecycle subscription API unavailable; using sessions_yield tool fallback");
     return false;
