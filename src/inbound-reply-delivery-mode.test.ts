@@ -162,21 +162,24 @@ describe("#172 DM reply delivery mode", () => {
     const { dispatch } = installRuntime({});
     await runDm();
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(replyOptionsOf(dispatch)).toEqual({ sourceReplyDeliveryMode: "automatic" });
+    expect(replyOptionsOf(dispatch)).toEqual({
+      sourceReplyDeliveryMode: "automatic",
+      onReasoningStream: expect.any(Function),
+    });
   });
 
   it("DM with explicit messages.visibleReplies=message_tool → NOT overridden ({})", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { visibleReplies: "message_tool" } });
     await runDm();
-    expect(replyOptionsOf(dispatch)).toEqual({});
+    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function) });
   });
 
   it("DM with explicit messages.visibleReplies=automatic → not injected, left to host ({})", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { visibleReplies: "automatic" } });
     await runDm();
-    expect(replyOptionsOf(dispatch)).toEqual({});
+    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function) });
   });
 
   it("DM ignores groupChat.visibleReplies → still injects automatic (DM only reads messages.visibleReplies)", async () => {
@@ -187,21 +190,24 @@ describe("#172 DM reply delivery mode", () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { groupChat: { visibleReplies: "message_tool" } } });
     await runDm();
-    expect(replyOptionsOf(dispatch)).toEqual({ sourceReplyDeliveryMode: "automatic" });
+    expect(replyOptionsOf(dispatch)).toEqual({
+      sourceReplyDeliveryMode: "automatic",
+      onReasoningStream: expect.any(Function),
+    });
   });
 
   it("group → never injects automatic ({})", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({});
     await runGroup();
-    expect(replyOptionsOf(dispatch)).toEqual({});
+    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function) });
   });
 
   it("group with groupChat.visibleReplies=message_tool → preserved, not overridden ({})", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { groupChat: { visibleReplies: "message_tool" } } });
     await runGroup();
-    expect(replyOptionsOf(dispatch)).toEqual({});
+    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function) });
   });
 
   // Plugin delivery-callback regression (NOT evidence that automatic makes the
