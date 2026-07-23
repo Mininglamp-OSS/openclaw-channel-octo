@@ -23,9 +23,10 @@ type AgentEvent = {
 function makeApi(opts: { lifecycle?: boolean } = {}): {
   handlers: Record<string, (e: unknown, c: unknown) => unknown>;
   emitLifecycle: (event: AgentEvent) => Promise<void>;
+  emitAgentEvent: (event: AgentEvent) => Promise<void>;
 } {
   const handlers: Record<string, (e: unknown, c: unknown) => unknown> = {};
-  let lifecycleHandler: ((event: AgentEvent) => void | Promise<void>) | undefined;
+  const agentEventHandlers = new Map<string, (event: AgentEvent) => void | Promise<void>>();
   const api: Record<string, unknown> = {
     on: (name: string, fn: (e: unknown, c: unknown) => unknown) => { handlers[name] = fn; },
   };
@@ -33,11 +34,13 @@ function makeApi(opts: { lifecycle?: boolean } = {}): {
     api.agent = {
       events: {
         registerAgentEventSubscription: (subscription: {
+          id: string;
           streams?: string[];
           handle: (event: AgentEvent) => void | Promise<void>;
         }) => {
-          expect(subscription.streams).toEqual(["lifecycle"]);
-          lifecycleHandler = subscription.handle;
+          for (const stream of subscription.streams ?? []) {
+            agentEventHandlers.set(stream, subscription.handle);
+          }
         },
       },
     };
@@ -46,8 +49,14 @@ function makeApi(opts: { lifecycle?: boolean } = {}): {
   return {
     handlers,
     emitLifecycle: async (event) => {
-      expect(lifecycleHandler).toBeTypeOf("function");
-      await lifecycleHandler!(event);
+      const handler = agentEventHandlers.get("lifecycle");
+      expect(handler).toBeTypeOf("function");
+      await handler!(event);
+    },
+    emitAgentEvent: async (event) => {
+      const handler = agentEventHandlers.get(event.stream);
+      expect(handler).toBeTypeOf("function");
+      await handler!(event);
     },
   };
 }
@@ -1233,6 +1242,49 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(text).toContain("npm");
     expect(text).toContain("exit 0");
     expect(text).not.toContain("should-not-render");
+  });
+
+  it("captures host thinking agent events as reasoning snapshots", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers, emitAgentEvent } = makeApi();
+    const ctx = { sessionKey: "reasoning-agent-event", runId: "run-1" };
+
+    setCardContext("reasoning-agent-event", {
+      apiUrl: "https://reasoning-event.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    await emitAgentEvent({
+      runId: "run-1",
+      sessionKey: "reasoning-agent-event",
+      stream: "thinking",
+      data: {
+        text: "Inspect the tool input before running it.",
+        delta: "Inspect the tool input before running it.",
+      },
+    });
+    handlers.before_tool_call(
+      { toolName: "exec", toolCallId: "tool-1", params: { command: "printf ok" } },
+      ctx,
+    );
+    handlers.after_tool_call({
+      toolName: "exec",
+      toolCallId: "tool-1",
+      result: { details: { exitCode: 0 } },
+    }, ctx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).toContain("Inspect the tool input before running it.");
+    expect(progressCardText(card)).toContain("exec");
+    expect(progressCardText(card)).toContain("printf");
+    expect(progressCardText(card)).toContain("exit 0");
   });
 
   it("uses model_call_ended duration and preserves aborted as stopped at finalize", async () => {
