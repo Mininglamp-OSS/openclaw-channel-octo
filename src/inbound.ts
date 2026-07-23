@@ -2647,6 +2647,36 @@ export async function handleInboundMessage(params: {
   const apiUrl = account.config.apiUrl;
   const botToken = account.config.botToken ?? "";
 
+  // Mirror OpenClaw's user-visible reasoning gate for the transcript-hook
+  // compatibility path. An inline directive wins, followed by persisted
+  // session state and then the per-agent/global default. Unauthorized turns
+  // stay off so provider-private thinking is never surfaced accidentally.
+  let reasoningVisibility: "off" | "on" | "stream" = "off";
+  if (commandAuthorized) {
+    const directiveLevel = commandBody.match(/(?:^|\s)\/reasoning\s+(on|off|stream)(?=\s|$)/i)?.[1]
+      ?.toLowerCase();
+    if (directiveLevel === "on" || directiveLevel === "off" || directiveLevel === "stream") {
+      reasoningVisibility = directiveLevel;
+    } else {
+      let persistedLevel: string | undefined;
+      try {
+        const storePath = core.channel.session.resolveStorePath(config.session?.store, {
+          agentId: route.agentId,
+        });
+        persistedLevel = getSessionEntry({
+          storePath,
+          sessionKey: route.sessionKey,
+        })?.reasoningLevel;
+      } catch {
+        // Session reads are best-effort; configured defaults remain available.
+      }
+      const agentDefault = config.agents?.list?.find((entry) =>
+        entry.id?.toLowerCase() === route.agentId?.toLowerCase())?.reasoningDefault;
+      const resolved = persistedLevel ?? agentDefault ?? config.agents?.defaults?.reasoningDefault;
+      if (resolved === "on" || resolved === "stream") reasoningVisibility = resolved;
+    }
+  }
+
   // 波 B:登记进度卡发送上下文(hook 侧懒发/更新时用)。route.sessionKey 桥接
   // dispatch↔hook(H1 实证一致)。OBO(persona-clone)场景由 setCardContext 内部标记跳过。
   setCardContext(route.sessionKey, {
@@ -2655,6 +2685,7 @@ export async function handleInboundMessage(params: {
     channelId: replyChannelId,
     channelType: replyChannelType,
     cardProgress: account.config.cardProgress,
+    reasoningVisibility,
     ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
   });
 

@@ -31,6 +31,8 @@ export interface CardContext {
   cardProgress?: boolean;
   /** persona-clone 身份;存在则跳过卡片(服务端拒 type-17 OBO)。 */
   onBehalfOf?: string;
+  /** OpenClaw reasoning visibility resolved for this turn/session. */
+  reasoningVisibility?: "off" | "on" | "stream";
 }
 
 interface CardEntry {
@@ -839,6 +841,32 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       ...(e.toolCallId ? { toolCallId: e.toolCallId } : {}),
     });
     scheduleFlush(sk!, entry);
+  });
+
+  // OpenClaw 2026.6.9 persists provider thinking blocks even on paths where
+  // onReasoningStream is not forwarded to channel dispatchers. This synchronous
+  // hook is the compatibility lane. Never read it unless the user/session has
+  // explicitly enabled reasoning visibility; provider-private thinking remains
+  // hidden when reasoning is off.
+  api.on("before_message_write", (event: unknown, ctx: unknown) => {
+    const root = asRecord(event);
+    const sk = typeof root?.sessionKey === "string"
+      ? root.sessionKey
+      : (ctx as { sessionKey?: string })?.sessionKey;
+    const entry = sk ? cards.get(sk) : undefined;
+    if (!entry || entry.skip ||
+        (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
+      return;
+    }
+    const message = asRecord(root?.message);
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+    const thought = message.content
+      .map((part) => asRecord(part))
+      .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
+      .map((part) => part!.thinking as string)
+      .join("\n")
+      .trim();
+    if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
   });
 
   api.on("after_tool_call", (event: unknown, ctx: unknown) => {
