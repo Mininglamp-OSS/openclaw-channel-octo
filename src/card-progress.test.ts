@@ -1330,6 +1330,38 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(progressCardText(card)).toContain("Read the command input, then verify its exit status.");
   });
 
+  it("keeps persisted thinking blocks hidden when reasoning visibility is off", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const ctx = { sessionKey: "reasoning-hidden", runId: "run-1" };
+
+    setCardContext("reasoning-hidden", {
+      apiUrl: "https://reasoning-hidden.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "off",
+    });
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    handlers.before_message_write({
+      sessionKey: "reasoning-hidden",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "MUST STAY HIDDEN" }],
+      },
+    }, ctx);
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, ctx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN");
+    expect(progressCardText(card)).toContain("Thinking through...");
+  });
+
   it("uses model_call_ended duration and preserves aborted as stopped at finalize", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
