@@ -459,6 +459,39 @@ function markCardPaused(sessionKey: string, runId?: string, expectedEntry?: Card
 }
 
 /**
+ * 收尾兜底:把滞留在 pausedCards 里、已无 continuation 认领的孤儿卡直接收到终态。
+ *
+ * 背景:continuation run 若只产出 final text、没有新工具调用,setCardContext 为它新建的
+ * cards[sessionKey] 是张空 entry(无 messageId),而真正可见的卡仍在 pausedCards。此时
+ * finalizeCard 的正常分支会因 !messageId 早退,paused 卡永远停在「正在处理/等待任务结果」,
+ * 直到 1h TTL 才误标为「等待超时」——即便任务其实成功。
+ *
+ * 仅在安全时接管:同身份、有 messageId、未被 skip,且**不属于**「仍在等子任务
+ * (childSessionKeys 非空)或已被 continuation 认领(continuationRunId 已设)」的 subagent-yield
+ * 流程。后者由 lifecycle / agent_end 的 finishPausedCard 负责收尾,若在这里抢先关掉,真正的
+ * completion run 回来时卡已不在,也会误伤「等待期间无关用户消息不得劫持 paused 卡」的语义。
+ */
+async function finalizeOrphanedPausedCard(
+  sessionKey: string,
+  opts: { success: boolean; errorText?: string },
+  identity?: string,
+): Promise<void> {
+  const paused = pausedCards.get(sessionKey);
+  if (!paused || paused.skip || !paused.messageId) return;
+  if (paused.continuationRunId || paused.childSessionKeys.size > 0) return;
+  if (identity !== undefined && paused.identity !== identity) return;
+  const phase = opts.success ? "done" : "error";
+  await editTrackedCardState(
+    sessionKey,
+    paused,
+    phase,
+    opts.errorText ? { errorText: opts.errorText } : {},
+  );
+  releasePausedCard(sessionKey, paused, `finalized orphaned paused card phase=${phase}`);
+  dbg(`finalized orphaned paused card session=${sessionKey} phase=${phase}`);
+}
+
+/**
  * dispatch `finally` 收尾:完成/失败时清理；yield 时保留原卡供 continuation 更新。
  * 幂等:未登记或没发过占位卡则仅清理。
  */
@@ -467,7 +500,12 @@ export async function finalizeCard(
   opts: { success: boolean; errorText?: string } = { success: true },
 ): Promise<void> {
   const entry = cards.get(sessionKey);
-  if (!entry) return;
+  // 本 run 没登记 entry(host 不经 setCardContext 直接恢复会话),但真正可见的卡可能仍
+  // 滞留在 pausedCards —— 走兜底,别把它撂在那儿冻结。
+  if (!entry) {
+    await finalizeOrphanedPausedCard(sessionKey, opts);
+    return;
+  }
   // 等待 in-flight flush 落定后再接管。否则:首帧 send 尚未 return 时 messageId 未就绪,
   // 直接删 entry 会跳过终态帧,占位卡「正在处理…」永久冻结;若有 in-flight 中间帧
   // (transient)edit,还可能后于终态帧落库、把「✅ 已完成」覆盖回「正在处理」。await 后
@@ -493,7 +531,15 @@ export async function finalizeCard(
   }
 
   // 从没发过卡(skip / 无工具调用)→ 无需收尾帧。
-  if (entry.skip || !entry.messageId) return;
+  if (entry.skip || !entry.messageId) {
+    // 常见于 yield 后的 continuation run:setCardContext 为它新建了空 entry(无 messageId),
+    // 而真正可见的卡还在 pausedCards。若本 run 已收尾(非 paused/resuming),把那张孤儿卡收到终态,
+    // 否则它会一直停在「正在处理/等待任务结果」,直到 1h TTL 才误标超时——即便任务已成功。
+    if (!retainForContinuation) {
+      await finalizeOrphanedPausedCard(sessionKey, opts, entry.identity);
+    }
+    return;
+  }
 
   if (retainForContinuation) {
     await editTrackedCardState(sessionKey, entry, entry.phase);
