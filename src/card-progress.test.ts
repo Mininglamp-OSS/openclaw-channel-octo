@@ -643,9 +643,10 @@ describe("card-progress 状态机 + hook + 节流", () => {
     await finalizeCard("yield-bare", { success: false });
     calls.length = 0;
 
-    // continuation run-b:新 dispatch 重置 context(空 entry、无 messageId),只产出 final text
+    // 同一 run resume 后的 continuation:新 dispatch 重置 context(空 entry、无 messageId),
+    // before_agent_run 用原 runId 重新绑定(resumed run 保留 runId),只产出 final text。
     setCardContext("yield-bare", ctx);
-    handlers.before_agent_run({ prompt: "继续:这是最终战报,没有 completion event", messages: [] }, { sessionKey: "yield-bare", runId: "run-b" });
+    handlers.before_agent_run({ prompt: "继续:这是最终战报,没有 completion event", messages: [] }, { sessionKey: "yield-bare", runId: "run-a" });
     await finalizeCard("yield-bare", { success: true });
 
     const doneEdit = calls.find((call) => {
@@ -682,7 +683,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     calls.length = 0;
 
     setCardContext("yield-bare-err", ctx);
-    handlers.before_agent_run({ prompt: "继续", messages: [] }, { sessionKey: "yield-bare-err", runId: "run-b" });
+    handlers.before_agent_run({ prompt: "继续", messages: [] }, { sessionKey: "yield-bare-err", runId: "run-a" });
     await finalizeCard("yield-bare-err", { success: false, errorText: "boom" });
 
     const errEdit = calls.find((call) => {
@@ -691,6 +692,47 @@ describe("card-progress 状态机 + hook + 节流", () => {
       return progressHeaderText(env.card).includes("已中断");
     });
     expect(errEdit).toBeTruthy();
+  });
+
+  it("bare yield 等待期间无关 run 收尾不得接管原 paused 卡,真正 resume 才收尾", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi({ lifecycle: false });
+    const ctx = {
+      apiUrl: "https://yield-bare-intervene.test",
+      botToken: "bf",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+    };
+    // run-a:真实工具发卡 → bare sessions_yield → paused(pausedFromRunId=run-a)
+    setCardContext("yield-bare-intervene", ctx);
+    handlers.before_agent_run({}, { sessionKey: "yield-bare-intervene", runId: "run-a" });
+    handlers.before_tool_call({ toolName: "run_command", toolCallId: "cmd-1" }, { sessionKey: "yield-bare-intervene", runId: "run-a" });
+    handlers.after_tool_call({ toolName: "run_command", toolCallId: "cmd-1", durationMs: 10 }, { sessionKey: "yield-bare-intervene", runId: "run-a" });
+    handlers.before_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, { sessionKey: "yield-bare-intervene", runId: "run-a" });
+    handlers.after_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1", durationMs: 5 }, { sessionKey: "yield-bare-intervene", runId: "run-a" });
+    await vi.advanceTimersByTimeAsync(900);
+    await finalizeCard("yield-bare-intervene", { success: false });
+    calls.length = 0;
+
+    // 等待期间到达的**无关** run(不同 runId)只产出 final text 并收尾 ——
+    // 缺乏 run 归属,绝不能把原 paused 任务误标 done 并移除。
+    setCardContext("yield-bare-intervene", ctx);
+    handlers.before_agent_run({ prompt: "等待期间的无关用户消息", messages: [] }, { sessionKey: "yield-bare-intervene", runId: "run-unrelated" });
+    await finalizeCard("yield-bare-intervene", { success: true });
+    expect(calls.some((call) => call.url.includes("/message/edit"))).toBe(false);
+
+    // 真正的 resume(原 run 保留 runId)收尾时,才把 paused 卡收到终态
+    calls.length = 0;
+    setCardContext("yield-bare-intervene", ctx);
+    handlers.before_agent_run({ prompt: "真正 resume 后的最终战报", messages: [] }, { sessionKey: "yield-bare-intervene", runId: "run-a" });
+    await finalizeCard("yield-bare-intervene", { success: true });
+    const doneEdit = calls.find((call) => {
+      if (!call.url.includes("/message/edit")) return false;
+      const env = JSON.parse(call.body!.content_edit as string);
+      return progressHeaderText(env.card).includes("✅ 已完成");
+    });
+    expect(doneEdit).toBeTruthy();
   });
 
   it("兜底不得劫持仍在等子任务的 subagent-yield paused 卡", async () => {
