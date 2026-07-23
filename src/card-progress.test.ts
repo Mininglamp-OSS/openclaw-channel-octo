@@ -7,6 +7,8 @@ import {
   finalizeCardWithResponse,
   registerCardProgress,
   bindCardRun,
+  markCardAnswering,
+  recordCardReasoning,
   _resetCardProgressForTests,
 } from "./card-progress.js";
 
@@ -1168,6 +1170,137 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const joined = progressCardText(card);
     expect(joined).toContain("💭 思考"); // thinking step 出现
     expect(joined).toContain("读取文件");  // 后续 tool step 也在
+  });
+
+  it("captures reasoning snapshots and tool output summaries into the contract card", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
+    const fn = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
+      if (String(url).includes("/card/profile")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            enabled: true,
+            profiles: ["octo/v1"],
+            elements: ["TextBlock", "Container", "ColumnSet", "ActionSet"],
+            actions: ["Action.ToggleVisibility"],
+            limits: { max_nodes: 200 },
+          }),
+        };
+      }
+      if (String(url).includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "reasoning-card" }) };
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const ctx = { sessionKey: "reasoning-capture", runId: "run-1" };
+
+    setCardContext("reasoning-capture", {
+      apiUrl: "https://reasoning.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    recordCardReasoning("reasoning-capture", "partial text", { snapshot: false });
+    recordCardReasoning("reasoning-capture", "先核对仓库，再执行测试。", { snapshot: true });
+    handlers.before_tool_call(
+      { toolName: "exec", toolCallId: "tool-1", params: { command: "npm test" } },
+      ctx,
+    );
+    handlers.after_tool_call({
+      toolName: "exec",
+      toolCallId: "tool-1",
+      durationMs: 50,
+      result: {
+        details: { exitCode: 0, status: "completed" },
+        content: [{ type: "text", text: "Authorization: Bearer should-not-render" }],
+      },
+    }, ctx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    const text = progressCardText(card);
+    expect(text).toContain("先核对仓库，再执行测试。");
+    expect(text).not.toContain("partial text");
+    expect(text).toContain("exec");
+    expect(text).toContain("npm");
+    expect(text).toContain("exit 0");
+    expect(text).not.toContain("should-not-render");
+  });
+
+  it("uses model_call_ended duration and preserves aborted as stopped at finalize", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const ctx = { sessionKey: "reasoning-stopped", runId: "run-1" };
+
+    setCardContext("reasoning-stopped", {
+      apiUrl: "https://reasoning-stopped.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    recordCardReasoning("reasoning-stopped", "正在核对数据。", { snapshot: true });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, ctx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", result: {} }, ctx);
+    await vi.advanceTimersByTimeAsync(900);
+    handlers.model_call_started({ callId: "call-2" }, ctx);
+    handlers.model_call_ended({
+      callId: "call-2",
+      durationMs: 1_200,
+      outcome: "error",
+      failureKind: "aborted",
+    }, ctx);
+    await finalizeCard("reasoning-stopped", { success: false });
+
+    const edit = calls.filter((call) => call.url.includes("/message/edit")).pop();
+    expect(edit).toBeTruthy();
+    const envelope = JSON.parse(edit!.body!.content_edit as string);
+    expect(progressCardText(envelope.card)).toContain("已停止");
+    expect(progressCardText(envelope.card)).not.toContain("生成失败");
+    expect(JSON.stringify(envelope.card)).toContain("1.2s");
+  });
+
+  it("exposes answering as the first non-reasoning reply state", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+
+    setCardContext("reasoning-answering", {
+      apiUrl: "https://reasoning-answering.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    handlers.model_call_started({ callId: "call-1" }, { sessionKey: "reasoning-answering" });
+    handlers.before_tool_call(
+      { toolName: "read", toolCallId: "tool-1" },
+      { sessionKey: "reasoning-answering" },
+    );
+    handlers.after_tool_call(
+      { toolName: "read", toolCallId: "tool-1", result: {} },
+      { sessionKey: "reasoning-answering" },
+    );
+    await vi.advanceTimersByTimeAsync(900);
+    calls.length = 0;
+
+    markCardAnswering("reasoning-answering");
+    await vi.advanceTimersByTimeAsync(900);
+
+    const edit = calls.find((call) => call.url.includes("/message/edit"));
+    expect(edit).toBeTruthy();
+    const envelope = JSON.parse(edit!.body!.content_edit as string);
+    expect(progressCardText(envelope.card)).toContain("回答中");
+    expect(progressCardText(envelope.card)).toContain("正在生成回答");
   });
 
   it("P1-g: 多次 model_call_started 累积多步 thinking(同类合并压缩)", async () => {
