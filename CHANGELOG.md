@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.1.0...v1.1.2) (2026-07-23)
+
+
+### Fixed
+
+* **actions:** return AgentToolResult from handleAction so host tool-result conversion doesn't throw ([#171](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/171)) ([#175](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/175)) ([d6b773b](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/d6b773b67e88a75533d1b4a60f31a7656330791b))
+* **cards:** keep yielded progress cards updateable ([#178](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/178)) ([256e60f](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/256e60fff7a3a8a27fea555faa8d3a1db2690d9e)), closes [#176](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/176)
+* **inbound:** request automatic reply delivery for unconfigured DMs ([#172](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/172)) ([#177](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/177)) ([a659923](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/a6599233261707066d6e72bbcc024e043556c47e))
+* **routing:** resolve octo:&lt;uid&gt; DM target as DM, not group ([#170](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/170)) ([#173](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/173)) ([5e31325](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/5e31325d233c4a87a036b07f076cccbcba08e203))
+
+
+### Internal
+
+* release 1.1.2 ([#179](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/179)) ([c3e2b54](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/c3e2b54e614b2846273e5b0fcf57b9832b601441))
+
 ## [1.1.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.19...v1.1.0) (2026-07-20)
 
 ### Added
