@@ -4,18 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [1.1.2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.1.0...v1.1.2) (2026-07-23)
 
+> 版本号从 1.1.0 直接跳到 1.1.2：1.1.1 此前因 ClawHub 发布重试被占用（内容等同 1.1.0），本次跳过以避免版本号语义歧义。
 
 ### Fixed
-
-* **actions:** return AgentToolResult from handleAction so host tool-result conversion doesn't throw ([#171](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/171)) ([#175](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/175)) ([d6b773b](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/d6b773b67e88a75533d1b4a60f31a7656330791b))
-* **cards:** keep yielded progress cards updateable ([#178](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/178)) ([256e60f](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/256e60fff7a3a8a27fea555faa8d3a1db2690d9e)), closes [#176](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/176)
-* **inbound:** request automatic reply delivery for unconfigured DMs ([#172](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/172)) ([#177](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/177)) ([a659923](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/a6599233261707066d6e72bbcc024e043556c47e))
-* **routing:** resolve octo:&lt;uid&gt; DM target as DM, not group ([#170](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/170)) ([#173](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/173)) ([5e31325](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/5e31325d233c4a87a036b07f076cccbcba08e203))
-
-
-### Internal
-
-* release 1.1.2 ([#179](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/179)) ([c3e2b54](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/c3e2b54e614b2846273e5b0fcf57b9832b601441))
+- **`sessions_yield` 让出等待期间，进度卡被误判为「已中断」**（#176, PR #178）：agent 主动 `sessions_yield` 让出、等待子任务（subagent）结果时，dispatch 收尾把进度卡渲染成终态「⚠️ 已中断」，用户误以为任务失败，且子任务真正完成后回来也无卡可更新。
+  - 根因：yield 属于「正常暂停等待」而非「运行结束」，但收尾路径只有 done / error 两种终态；且下一条 inbound 的 `setCardContext` 会覆盖同 sessionKey 的 `messageId`，让后台任务回流时找不到原卡。
+  - 修复：`sessions_yield` 成功后进度卡进入 `paused`（⏸️ 等待任务结果），并把卡从活跃 `cards` 挪进独立的 `pausedCards`，与后续 inbound 隔离，避免 messageId 被覆盖。受信子任务完成事件回流 → `resuming`（🤖 正在整理结果）→ `done`（✅ 已完成），全程复用同一张卡。
+  - 安全与健壮性：completion 事件仅认 host 生成的受保护 internal-context 块 + `childSessionKeys` 白名单，用户伪造文本命不中；乱序 start/end 编辑经尾指针串行化，迟到帧不会覆盖终态；跨身份同 sessionKey 碰撞 fail-closed；paused 卡有 1 小时 TTL 有界回收；旧 host 无 lifecycle API 时回退到 `agent_end` + 成功的 `sessions_yield` tool hook。
+  - 体验：终态卡新增「⏸️ 等待子任务 · <时长>」独立明细，把后台等待时间与工具执行耗时分开计，不再让大段端到端时长无法解释。
+- **主动 / 工具驱动的私聊(DM)发送报 `400 query_failed`**（#170, PR #173）：经通用 `message` 工具向 DM 目标发送时，请求以群(`channel_type=2`)身份查询 DM uid，服务端查无此群返回 400。普通 DM 回复不受影响（inbound 路径直接钉 `ChannelType.DM`），只有 `message(action=send)` 这条路踩到。
+  - 根因：DM 目标形如 `octo:<uid>`，`normalizeOutboundChannelPrefix` 落到通用群兜底(`group:` + bare)，把 DM 当群。
+  - 修复：`octo:` 视为命名空间前缀而非频道类型标记，按内层形状解析——`user:`（含 `octo:user:`）→ DM；显式 `group:`/`channel:` token → 归一到单一 `group:`；裸 `octo:<id>` 无 user/group 线索 → 交由 `parseTarget`/`knownGroupIds` 分类（已知群→Group，否则→DM）。输出不再携带 `octo:`。DM 卡片共用 `resolveOutboundOctoTarget`，同样受益。
+- **`message` 工具发送成功后，工具卡抛 `Cannot read properties of undefined (reading 'reduce')`**（#171, PR #175）：消息已成功投递，但工具结果转换阶段报错。与 #170 不同层、不同根因。
+  - 根因：`handleAction` 返回裸业务 JSON(`{ ok, data }`)、无 `content` 字段，而 host 的 Codex 动态工具结果转换对 `result.content` 直接 `reduce`、无 `Array.isArray` 守卫，`undefined.reduce` 在消息投递**之后**抛出。
+  - 修复：新增 `toActionToolResult` helper，把两条返回路径都包成合法 `AgentToolResult`——`content[]` 满足 host 契约让 reduce 不再抛；原始 payload 保留在 `details` 里，host 的成功/失败分类与下游 payload 提取行为不变；紧凑 JSON 避免膨胀大的 read/search/group-md 结果；序列化带 try/catch + 类型守卫，helper 永远返回字符串、绝不在发送成功后自身失败。异常刻意不在此捕获，交由 host 的 after-tool-call 错误 hook 与失败幂等键保留逻辑处理。
+- **未配置的私聊(DM)不自动投递回复**（#172, PR #177）：收到 DM（回执 + typing 正常）但 bot 无可见回复，同会话后续 DM 排队堵在其后；群聊不受影响。
+  - 根因：DM 与群共用一次 dispatch，`replyOptions` 未请求投递模式；host 对 DM 按 `ChatType` 解析，Codex harness 的 `defaultVisibleReplies` 为 `message_tool`，导致**未配置的 DM** 解析成 `message_tool_only`——agent 不调 message 工具时最终文本不自动投递。群聊走 `groupChat.visibleReplies ?? messages.visibleReplies` 兜底为 `automatic`，故一直正常。
+  - 修复:仅对「operator 未设 `messages.visibleReplies`」的 DM 请求 `sourceReplyDeliveryMode: "automatic"`,纠正这一处隐式 harness 默认。因请求模式优先级高于 config,刻意**不**注入群聊、也不覆盖已显式配置的 `visibleReplies` / `groupChat.visibleReplies`,以免改变群行为或越过 operator 意图。
 
 ## [1.1.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.19...v1.1.0) (2026-07-20)
 
