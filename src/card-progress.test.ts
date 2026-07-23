@@ -1287,6 +1287,49 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(progressCardText(card)).toContain("exit 0");
   });
 
+  it("captures persisted thinking blocks only when reasoning visibility is enabled", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const ctx = { sessionKey: "reasoning-message-write", runId: "run-1" };
+
+    setCardContext("reasoning-message-write", {
+      apiUrl: "https://reasoning-write.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
+    });
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    handlers.before_message_write({
+      sessionKey: "reasoning-message-write",
+      message: {
+        role: "assistant",
+        content: [{
+          type: "thinking",
+          thinking: "Read the command input, then verify its exit status.",
+          thinkingSignature: "reasoning_content",
+        }],
+      },
+    }, ctx);
+    handlers.before_tool_call(
+      { toolName: "exec", toolCallId: "tool-1", params: { command: "printf ok" } },
+      ctx,
+    );
+    handlers.after_tool_call({
+      toolName: "exec",
+      toolCallId: "tool-1",
+      result: { details: { exitCode: 0 } },
+    }, ctx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).toContain("Read the command input, then verify its exit status.");
+  });
+
   it("uses model_call_ended duration and preserves aborted as stopped at finalize", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
