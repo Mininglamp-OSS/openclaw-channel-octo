@@ -46,7 +46,7 @@ export interface ReasoningProcessData {
   errorMessage?: string;
 }
 
-const FALLBACK_THOUGHT = "正在处理当前阶段。";
+const FALLBACK_THOUGHT = "Working through this step.";
 const THOUGHT_MAX = 280;
 const TOOL_NAME_MAX = 80;
 const MAX_RENDERED_PHASES = 6;
