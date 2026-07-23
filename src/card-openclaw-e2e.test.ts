@@ -186,8 +186,16 @@ async function runLifecycleFlow({
     context: "isolated",
     model: "octo-e2e/scripted",
   });
+  const exec = completed.toolCalls.find((call) => call.name === "exec");
+  expect(exec?.arguments).toMatchObject({
+    command: "printf OCTO_TOOL_E2E_OK",
+  });
   expect(completed.cards).toHaveLength(1);
   expect(completed.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
+  expect(completed.cards[0]?.plain).toContain("Visible reasoning checkpoint.");
+  // The visible card must contain both the allowlisted input summary (`printf`)
+  // and the structured output summary (`exit 0`) from the same real tool call.
+  expect(completed.cards[0]?.plain).toContain("exec · printf · exit 0");
   if (pausedCheckpointDelayMs !== undefined) {
     expect(completed.cards[0]?.plainSource).toBe("accepted-edit");
     const waitDuration = completed.cards[0]?.plain.match(/等待子任务 · ([\d.]+)s/)?.[1];
