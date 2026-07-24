@@ -128,6 +128,25 @@ describe("ai.reasoning-process@0.1.0 contract", () => {
 
     expect(data.phases[0]?.actions[0]?.detail).toBe("Subtask returned · 75.0s");
   });
+
+  it("uses English fallback copy when phase and action details are unavailable", () => {
+    const detailFor = (step: CardProgressState["steps"][number]): string | undefined =>
+      buildReasoningProcessData(state({ steps: [step] })).phases[0]?.actions[0]?.detail;
+
+    expect(detailFor({ tool: "__thinking__", status: "running" })).toBe("Planning next step...");
+    expect(detailFor({ tool: "__thinking__", status: "error" })).toBe("Phase stopped");
+    expect(detailFor({ tool: "__thinking__", status: "done" })).toBe("Phase complete");
+    expect(detailFor({ tool: "read", status: "running" })).toBe("Running...");
+    expect(detailFor({ tool: "read", status: "error" })).toBe("Call failed");
+    expect(detailFor({ tool: "read", status: "done" })).toBe("Completed");
+    expect(detailFor({ tool: SUBAGENT_WAIT_STEP_TOOL, status: "running" }))
+      .toBe("Waiting for subtask...");
+
+    expect(buildReasoningProcessData(state({ phase: "expired" })).errorMessage)
+      .toBe("Timed out waiting for the background task.");
+    expect(buildReasoningProcessData(state({ phase: "error" })).errorMessage)
+      .toBe("Reasoning was interrupted. Completed steps were preserved.");
+  });
 });
 
 describe("reasoning detail sanitization", () => {
