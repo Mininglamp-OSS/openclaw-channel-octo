@@ -70,9 +70,51 @@ function scriptedReply(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const allText = messages.map((message) => contentText(message?.content)).join("\n");
   const marker = allText.match(/(?:CHILD|PARENT)_E2E_OK:([0-9a-f-]{36})/i)?.[1] ??
+    allText.match(/FILES_E2E_WORKFLOW:([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/OpenClaw host E2E marker: ([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/Ordinary user follow-up for ([0-9a-f-]{36})/i)?.[1];
   if (!marker) return { text: "E2E_SCRIPT_ERROR: missing marker" };
+
+  const toolMessages = messages.filter((message) => message?.role === "tool");
+
+  if (allText.includes(`FILES_E2E_WORKFLOW:${marker}`)) {
+    const workDir = `/tmp/octo-realistic-e2e/${marker}`;
+    const inputPath = `${workDir}/input.txt`;
+    const reportPath = `${workDir}/report.txt`;
+    if (toolMessages.length === 0) {
+      return {
+        tool: "read",
+        arguments: { path: inputPath },
+        reasoning: "I’ll inspect the source file before making changes.",
+      };
+    }
+    if (toolMessages.length === 1) {
+      return {
+        tool: "write",
+        arguments: { path: reportPath, content: "Processed: alpha=7\n" },
+        reasoning: "The input is valid; I’ll write the derived report.",
+        // Keep this realistic multi-step task above the progress-card debounce
+        // threshold so the test exercises a visible send followed by edits.
+        delayMs: 1_200,
+      };
+    }
+    if (toolMessages.length === 2) {
+      return {
+        tool: "exec",
+        arguments: {
+          command: `wc -c ${reportPath}`,
+          yieldMs: 1_000,
+          timeout: 10,
+          background: false,
+        },
+        reasoning: "The report is written; I’ll verify its size with a command.",
+      };
+    }
+    return {
+      text: `FILES_E2E_OK:${marker}`,
+      reasoning: "The read, write, and command checks are complete.",
+    };
+  }
 
   if (allText.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") &&
       allText.includes(`CHILD_E2E_OK:${marker}`)) {
@@ -83,7 +125,6 @@ function scriptedReply(body) {
   }
 
   const isChild = allText.includes("[Subagent Task]");
-  const toolMessages = messages.filter((message) => message?.role === "tool");
   if (isChild) {
     if (toolMessages.length > 0) {
       return { text: `CHILD_E2E_OK:${marker}`, reasoning: "Visible reasoning checkpoint." };
@@ -264,6 +305,16 @@ function buildPrompt(kind, marker, childDelaySeconds) {
   if (kind === "followup") {
     return `Ordinary user follow-up for ${marker}. Do not call tools. Reply exactly FOLLOWUP_E2E_OK:${marker}`;
   }
+  if (kind === "file-tools") {
+    const workDir = `/tmp/octo-realistic-e2e/${marker}`;
+    return [
+      `FILES_E2E_WORKFLOW:${marker}`,
+      `Read ${workDir}/input.txt.`,
+      `Write the processed value to ${workDir}/report.txt.`,
+      "Run wc -c against the report to verify the write.",
+      `After all three tools succeed, reply exactly FILES_E2E_OK:${marker}`,
+    ].join(" ");
+  }
   const childResult = `CHILD_E2E_OK:${marker}`;
   const childTask = [
     `Call exec exactly once with arguments {\"command\":\"sleep ${childDelaySeconds}\",\"yieldMs\":${(childDelaySeconds + 5) * 1_000},\"timeout\":${childDelaySeconds + 15},\"background\":false}.`,
@@ -302,7 +353,8 @@ export default {
 
     const runRequest = async (params) => {
       try {
-        const kind = params.kind === "followup" || params.kind === "configure-reasoning"
+        const kind = params.kind === "followup" || params.kind === "configure-reasoning" ||
+          params.kind === "file-tools"
           ? params.kind
           : "spawn";
         const marker = requiredString(params, "marker");

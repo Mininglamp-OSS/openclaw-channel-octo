@@ -46,7 +46,10 @@ function findParentTranscript() {
     const file = path.join(dir, name);
     const rows = readJsonLines(file);
     const serialized = JSON.stringify(rows);
-    if (serialized.includes(marker) && serialized.includes("sessions_yield")) return { file, rows };
+    if (serialized.includes(marker) &&
+        (serialized.includes("sessions_yield") || serialized.includes("FILES_E2E_WORKFLOW"))) {
+      return { file, rows };
+    }
   }
   return { file: undefined, rows: [] };
 }
