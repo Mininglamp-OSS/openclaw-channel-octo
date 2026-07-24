@@ -137,7 +137,7 @@ function safeToolName(tool: string): string {
 
 function actionDetail(step: CardStep): string {
   if (step.tool === SUBAGENT_WAIT_STEP_TOOL) {
-    const label = step.status === "running" ? "等待子任务结果…" : "子任务已返回";
+    const label = step.status === "running" ? "Waiting for subtask..." : "Subtask returned";
     const duration = fmtDuration(step.durationMs);
     return duration ? `${label} · ${duration}` : label;
   }
@@ -145,9 +145,9 @@ function actionDetail(step: CardStep): string {
   const parts = [step.summary, step.status === "error" ? error : step.resultSummary]
     .filter((value): value is string => !!value);
   if (parts.length > 0) return parts.join(" · ");
-  if (step.status === "running") return "运行中…";
-  if (step.status === "error") return "调用失败";
-  return "已完成";
+  if (step.status === "running") return "Running...";
+  if (step.status === "error") return "Call failed";
+  return "Completed";
 }
 
 function actionFromStep(step: CardStep): ReasoningProcessAction {
@@ -183,9 +183,9 @@ function phasesFromSteps(steps: CardStep[]): ReasoningProcessPhase[] {
     if (phase.actions.length > 0) continue;
     const thinking = steps.filter((step) => step.tool === "__thinking__")[index];
     const duration = fmtDuration(thinking?.durationMs);
-    const detail = thinking?.status === "running" ? "正在组织下一步…"
-      : thinking?.status === "error" ? "阶段已停止"
-        : "已完成阶段分析";
+    const detail = thinking?.status === "running" ? "Planning next step..."
+      : thinking?.status === "error" ? "Phase stopped"
+        : "Phase complete";
     phase.actions.push({
       tool: "think",
       detail: duration ? `${detail} · ${duration}` : detail,
@@ -214,7 +214,9 @@ export function buildReasoningProcessData(state: CardProgressState): ReasoningPr
     step.tool !== "__thinking__" && step.tool !== SUBAGENT_WAIT_STEP_TOOL).length;
   const active = mapped === "reasoning" || mapped === "answering";
   const errorMessage = sanitizeErrorText(state.errorText) ||
-    (state.phase === "expired" ? "等待后台任务结果超时。" : "推理服务中断，已保留完成的过程。");
+    (state.phase === "expired"
+      ? "Timed out waiting for the background task."
+      : "Reasoning was interrupted. Completed steps were preserved.");
   const base: ReasoningProcessData = {
     reasoningId: state.reasoningId?.trim() || "octo-progress",
     state: mapped,
@@ -243,9 +245,9 @@ export function buildReasoningProcessData(state: CardProgressState): ReasoningPr
     phases,
   };
   if (mapped === "reasoning") {
-    base.progressText = state.phase === "paused" ? "已转入后台，等待子任务结果…"
-      : state.phase === "resuming" ? "子任务已返回，正在整理结果…"
-        : "正在执行下一步…";
+    base.progressText = state.phase === "paused" ? "Waiting for subtask..."
+      : state.phase === "resuming" ? "Subtask returned. Wrapping up..."
+        : "Working through...";
   } else if (mapped === "answering") {
     base.progressText = "推理已完成，正在生成回答…";
   } else if (mapped === "error") {
