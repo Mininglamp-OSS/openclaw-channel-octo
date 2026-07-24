@@ -95,6 +95,26 @@ function mockFetch(opts: { enabled?: boolean; sendId?: string; profile?: Record<
   return { fn, calls };
 }
 
+function registryProfile(version = "9.8.7"): Record<string, unknown> {
+  return {
+    enabled: true,
+    profiles: ["octo/v1", "octo/v2"],
+    templating: {
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [{
+        id: "ai.reasoning-process",
+        version,
+        views: [
+          { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+          { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
+          { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+        ],
+      }],
+    },
+  };
+}
+
 function elementText(e: Record<string, unknown>): string {
   if (typeof e.text === "string") return e.text;
   if (Array.isArray(e.inlines)) return e.inlines.map((i) => (i as { text?: string }).text ?? "").join("");
@@ -364,6 +384,38 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edits).toHaveLength(2);
     expect(edits[0]?.body).toEqual(edits[1]?.body);
     expect(edits[0]?.body?.card_seq).toBe(1);
+  });
+
+  it("Model A stopped 状态始终是非 transient 终态", async () => {
+    const { fn, calls } = mockFetch({ profile: registryProfile(), sendId: "stopped-card" });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "registry-stopped", runId: "run-1" };
+    setCardContext("registry-stopped", {
+      apiUrl: "https://registry-stopped.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.model_call_started({ callId: "call-1" }, hookCtx);
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", result: {} }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    calls.length = 0;
+
+    handlers.model_call_ended({
+      callId: "call-1",
+      durationMs: 10,
+      outcome: "error",
+      failureKind: "aborted",
+    }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const edit = calls.find((call) => call.url.includes("/message/edit"))?.body;
+    expect(edit).toMatchObject({ state: "stopped", card_seq: 1 });
+    expect(edit).not.toHaveProperty("transient");
   });
 
   it("OBO 场景跳过(不发任何请求)", async () => {
