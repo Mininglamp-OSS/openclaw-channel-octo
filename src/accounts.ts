@@ -1,6 +1,6 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
-import type { OctoConfig } from "./config-schema.js";
+import type { OctoConfig, ReasoningCardTemplateMode } from "./config-schema.js";
 import { getChannelConfig } from "./constants.js";
 
 export type ResolvedOctoAccount = {
@@ -19,6 +19,7 @@ export type ResolvedOctoAccount = {
     historyLimit?: number;  // 群聊历史消息条数限制
     historyPromptTemplate?: string;  // Template for group history context injection
     cardProgress?: boolean;  // false disables automatic progress cards for this account
+    reasoningCardTemplateMode?: ReasoningCardTemplateMode;
     cardDisplay?: boolean;  // false disables the display-card tool for this account
     cardInteraction?: boolean;  // false disables interactive authoring and callback polling
     onBehalfOf?: string;  // Persona clone: grantor uid
@@ -105,6 +106,7 @@ export function resolveOctoAccount(params: {
       historyLimit: accountConfig.historyLimit ?? channel.historyLimit ?? 20,
       historyPromptTemplate: accountConfig.historyPromptTemplate ?? channel.historyPromptTemplate,
       cardProgress: accountConfig.cardProgress ?? channel.cardProgress,
+      reasoningCardTemplateMode: accountConfig.reasoningCardTemplateMode ?? channel.reasoningCardTemplateMode,
       cardDisplay: accountConfig.cardDisplay ?? channel.cardDisplay,
       cardInteraction: accountConfig.cardInteraction ?? channel.cardInteraction,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,

@@ -64,7 +64,7 @@ Bot accounts are stored in `~/.openclaw/openclaw.json` under `channels.octo.acco
 
 Configuration fields per account:
 
-`cardProgress`, `cardDisplay`, and `cardInteraction` may also be set directly under `channels.octo` as defaults for every account. An explicit per-account `true` or `false` overrides the corresponding top-level value.
+`cardProgress`, `reasoningCardTemplateMode`, `cardDisplay`, and `cardInteraction` may also be set directly under `channels.octo` as defaults for every account. An explicit per-account value overrides the corresponding top-level value.
 
 - `botToken` (required): Bot token. Either a User Bot token from BotFather (`bf_` prefix, full group + thread access) or an App Bot token from the Octo admin console (`app_` prefix, direct-message only — server-enforced).
 - `apiUrl` (required): Octo server REST API base URL (e.g. `https://your-server/api`). The default `http://localhost:8090/api` only works for a local Octo dev server with the standard `/api` mount.
@@ -73,6 +73,7 @@ Configuration fields per account:
 - `requireMention` (optional): Only respond when @mentioned in groups
 - `pollIntervalMs` (optional): Short-poll interval for `card_action` callbacks after this account sends an interactive card (default `2000`, minimum `500`).
 - `cardProgress` (optional): Set `false` to force-disable automatic progress cards for this account. Omitted or `true` follows the server card capability gate.
+- `reasoningCardTemplateMode` (optional): Registry migration mode for automatic reasoning cards. `off` (default) keeps local Model B rendering; `shadow` validates Registry discovery but still sends Model B; `experimental` sends Model A only when the server advertises exactly one compatible `ai.reasoning-process` template, otherwise it falls back to Model B. This does not affect `octo_send_display_card` or `octo_send_card`.
 - `cardDisplay` (optional): Set `false` to hide and reject the `octo_send_display_card` tool for this account. Omitted or `true` follows the server card capability gate.
 - `cardInteraction` (optional): Set `false` to hide `octo_send_card` and prevent new interactive-card callback polling for this account. Omitted or `true` follows the server `octo/v2` capability gate.
 - `historyLimit` (optional): Group chat history message limit (default: 20)

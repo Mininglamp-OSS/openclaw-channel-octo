@@ -74,6 +74,11 @@
             "type": "boolean",
             "description": "When omitted or true, follow the server card capability gate; false force-disables automatic progress cards. Per-account values override the top-level value."
           },
+          "reasoningCardTemplateMode": {
+            "type": "string",
+            "enum": ["off", "shadow", "experimental"],
+            "description": "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A only when one compatible Bot-catalog template is advertised. Defaults to off; per-account values override the top-level value."
+          },
           "cardDisplay": {
             "type": "boolean",
             "description": "When omitted or true, follow the server card capability gate; false force-disables the octo_send_display_card tool. Per-account values override the top-level value."
@@ -135,6 +140,11 @@
                 "cardProgress": {
                   "type": "boolean",
                   "description": "When omitted or true, follow the server card capability gate; false force-disables automatic progress cards. Per-account values override the top-level value."
+                },
+                "reasoningCardTemplateMode": {
+                  "type": "string",
+                  "enum": ["off", "shadow", "experimental"],
+                  "description": "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A only when one compatible Bot-catalog template is advertised. Defaults to off; per-account values override the top-level value."
                 },
                 "cardDisplay": {
                   "type": "boolean",

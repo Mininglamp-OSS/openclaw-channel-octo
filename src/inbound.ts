@@ -2685,6 +2685,7 @@ export async function handleInboundMessage(params: {
     channelId: replyChannelId,
     channelType: replyChannelType,
     cardProgress: account.config.cardProgress,
+    reasoningCardTemplateMode: account.config.reasoningCardTemplateMode,
     reasoningVisibility,
     ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
   });

@@ -82,6 +82,19 @@ async function updateStatus(params: {
 
 export async function handleCardAction(params: Params): Promise<CardActionHandleResult> {
   const { action } = params;
+  const isReasoningControl =
+    (action.actionId === "reasoning_stop" || action.actionId === "reasoning_retry") &&
+    action.data?.action === action.actionId &&
+    action.data?.owner === "ai" &&
+    action.data?.action_type === "reasoning.control";
+  if (isReasoningControl) {
+    // The event poller will persist and ACK this normally. ACK means queue
+    // consumption only; no cancellation/retry side effect is performed here.
+    params.log?.warn?.(
+      `octo: reasoning control is not supported action=${action.actionId} event=${action.eventId}`,
+    );
+    return "ignored";
+  }
   const pendingSession = lookupCardSession(action.messageId);
   if (!pendingSession) {
     params.log?.warn?.(`octo: ignoring card_action for unknown/expired message=${action.messageId}`);

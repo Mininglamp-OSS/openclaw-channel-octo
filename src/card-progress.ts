@@ -15,11 +15,26 @@
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { ChannelType, CARD_PROFILE, CARD_VERSION } from "./types.js";
-import { sendCardMessage, editCardMessage, getCardProfile, httpStatusFromApiFetchError } from "./api-fetch.js";
+import {
+  editCardMessage,
+  editTemplateCardMessage,
+  getCardProfile,
+  httpStatusFromApiFetchError,
+  sendCardMessage,
+  sendTemplateCardMessage,
+  type CardProfileManifest,
+  type CardTemplateRef,
+} from "./api-fetch.js";
 import { deriveCardCaps } from "./card-caps.js";
 import { renderProgressCard, renderProgressResponseCard, summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState, type CardCaps } from "./card-render.js";
-import { renderReasoningProcessCard, summarizeToolResult } from "./reasoning-process.js";
+import {
+  buildReasoningProcessWireData,
+  renderReasoningProcessCard,
+  selectReasoningProcessTemplate,
+  summarizeToolResult,
+} from "./reasoning-process.js";
 import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.js";
+import type { ReasoningCardTemplateMode } from "./config-schema.js";
 
 /** dispatch 侧登记的发送上下文。 */
 export interface CardContext {
@@ -29,6 +44,8 @@ export interface CardContext {
   channelType: ChannelType;
   /** false force-disables automatic progress cards for this account/session. */
   cardProgress?: boolean;
+  /** Explicit Registry migration gate. Defaults to off (local Model B). */
+  reasoningCardTemplateMode?: ReasoningCardTemplateMode;
   /** persona-clone 身份;存在则跳过卡片(服务端拒 type-17 OBO)。 */
   onBehalfOf?: string;
   /** OpenClaw reasoning visibility resolved for this turn/session. */
@@ -72,6 +89,14 @@ interface CardEntry {
   pausedExpiryTimer?: ReturnType<typeof setTimeout>;
   /** replacement/clear 时主动取消 profile/send/edit,缩小 stale side-effect 窗口。 */
   flushAbort?: AbortController;
+  /** Pinned once before the first send; one message must never switch wire modes. */
+  deliveryMode?: "model-a" | "model-b";
+  /** Manifest-selected ref, pinned for every frame of a Model A message. */
+  templateRef?: CardTemplateRef;
+  /** Next positive CAS value for a Model A edit. */
+  nextCardSeq: number;
+  /** Stable for every frame, including paused continuation runs. */
+  reasoningId?: string;
 }
 
 /** key = sessionKey(H1 实证:全 hook 一致)。跨账号碰撞由 entry.identity + fail-closed 兜底。 */
@@ -83,8 +108,14 @@ const cards = new Map<string, CardEntry>();
  */
 const pausedCards = new Map<string, CardEntry>();
 
-/** D12 gate 结果缓存,key = apiUrl(同部署同结果),避免每 session 重复探测。 */
-const gateCache = new Map<string, boolean>();
+type CachedCardProfile = {
+  enabled: boolean;
+  manifest: CardProfileManifest;
+  expiresAt: number;
+};
+
+/** Short-lived deployment capability cache; expiry lets new messages observe rollouts. */
+const profileCache = new Map<string, CachedCardProfile>();
 
 /**
  * D12 能力(elements/limits 派生的渲染 caps)缓存,key = apiUrl(部署级,同 gate)。gateEnabled
@@ -95,6 +126,8 @@ const capsCache = new Map<string, CardCaps>();
 
 const FLUSH_DEBOUNCE_MS = 800;
 const EDIT_TIMEOUT_MS = 10_000;
+const PROFILE_CACHE_TTL_MS = 60_000;
+const REGISTRY_EDIT_RETRY_DELAYS_MS = [100, 250] as const;
 const PAUSED_CARD_TTL_MS = 60 * 60 * 1000;
 const INTERNAL_CONTEXT_BEGIN = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
 const INTERNAL_CONTEXT_END = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
@@ -152,6 +185,7 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
     startedAt: Date.now(),
     dirty: false,
     inFlight: false,
+    nextCardSeq: 1,
     // Account config is a per-session narrowing decision. Keep it out of the
     // apiUrl-keyed gate/caps caches, which contain deployment capability facts
     // shared by multiple accounts.
@@ -166,8 +200,9 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
  * `null`=**瞬时探测失败**(5xx/网络,不缓存、不 skip,下次 flush 重探)。
  */
 async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<boolean | null> {
-  const cached = gateCache.get(ctx.apiUrl);
-  if (cached !== undefined) return cached;
+  const cached = profileCache.get(ctx.apiUrl);
+  if (cached && cached.expiresAt > Date.now()) return cached.enabled;
+  if (cached) profileCache.delete(ctx.apiUrl);
   try {
     const m = await getCardProfile({ apiUrl: ctx.apiUrl, botToken: ctx.botToken, signal });
     // 能力清单是部署级事实(与 enabled 无关),探到就缓存供渲染裁剪。
@@ -191,7 +226,11 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
       }
     }
     // 只缓存**确定结果**(manifest 明确 enabled/disabled/不兼容,或 available:false 回退 env)。
-    gateCache.set(ctx.apiUrl, enabled);
+    profileCache.set(ctx.apiUrl, {
+      enabled,
+      manifest: m,
+      expiresAt: Date.now() + PROFILE_CACHE_TTL_MS,
+    });
     return enabled;
   } catch (err: unknown) {
     // 瞬时失败(5xx/网络抖动)不缓存、不 skip —— 否则一次抖动会让该 apiUrl(缓存)或
@@ -199,6 +238,24 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
     warn(`card gate probe failed (not caching): ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
+}
+
+function resolveEntryDeliveryMode(entry: CardEntry): void {
+  if (entry.deliveryMode) return;
+  const requested = entry.ctx.reasoningCardTemplateMode ?? "off";
+  const templateRef = selectReasoningProcessTemplate(
+    profileCache.get(entry.ctx.apiUrl)?.manifest.templating,
+  );
+  if (requested === "shadow") {
+    dbg(`Registry shadow discovery compatible=${!!templateRef}`);
+  }
+  if (requested === "experimental" && templateRef) {
+    entry.deliveryMode = "model-a";
+    entry.templateRef = templateRef;
+    dbg(`selected Registry reasoning template ${templateRef.id}@${templateRef.version}`);
+    return;
+  }
+  entry.deliveryMode = "model-b";
 }
 
 function scheduleFlush(sessionKey: string, entry: CardEntry): void {
@@ -217,8 +274,9 @@ function entryProgressState(
   opts: { elapsedMs?: number; errorText?: string } = {},
 ): CardProgressState {
   const runId = entry.continuationRunId ?? entry.runId;
+  entry.reasoningId ??= runId ? `${sessionKey}:${runId}` : sessionKey;
   return {
-    reasoningId: runId ? `${sessionKey}:${runId}` : sessionKey,
+    reasoningId: entry.reasoningId,
     phase,
     steps: entry.steps,
     ...(opts.elapsedMs !== undefined ? { elapsedMs: opts.elapsedMs } : {}),
@@ -239,6 +297,93 @@ function renderEntryProgress(
   return usesReasoningProcessContract(entry)
     ? renderReasoningProcessCard(state, caps)
     : renderProgressCard(state, caps);
+}
+
+function isRetryableRegistryEditError(error: unknown): boolean {
+  const transportStatus = httpStatusFromApiFetchError(error);
+  const message = error instanceof Error ? error.message : String(error);
+  const semanticStatus = Number(message.match(/"http_status"\s*:\s*(\d{3})/)?.[1]);
+  return transportStatus === undefined || transportStatus === 429 || transportStatus >= 500 ||
+    (Number.isFinite(semanticStatus) && semanticStatus >= 500);
+}
+
+async function waitForRegistryRetry(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw signal.reason;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function editTemplateCardWithRetry(
+  params: Parameters<typeof editTemplateCardMessage>[0],
+): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await editTemplateCardMessage(params);
+      return;
+    } catch (error) {
+      const delay = REGISTRY_EDIT_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined || params.signal?.aborted || !isRetryableRegistryEditError(error)) throw error;
+      await waitForRegistryRetry(delay, params.signal ?? new AbortController().signal);
+    }
+  }
+}
+
+async function editEntryProgress(params: {
+  sessionKey: string;
+  entry: CardEntry;
+  state: CardProgressState;
+  transient?: boolean;
+  signal: AbortSignal;
+}): Promise<boolean> {
+  const { entry, state } = params;
+  if (!entry.messageId) return false;
+  if (entry.deliveryMode === "model-a") {
+    const data = buildReasoningProcessWireData(state);
+    if (!data || !entry.templateRef) return false;
+    const cardSeq = entry.nextCardSeq;
+    await editTemplateCardWithRetry({
+      apiUrl: entry.ctx.apiUrl,
+      botToken: entry.ctx.botToken,
+      messageId: entry.messageId,
+      channelId: entry.ctx.channelId,
+      channelType: entry.ctx.channelType,
+      templateRef: entry.templateRef,
+      state: data.state,
+      data,
+      cardSeq,
+      ...((data.state === "reasoning" || data.state === "answering")
+        ? { transient: true }
+        : {}),
+      signal: params.signal,
+    });
+    entry.nextCardSeq = cardSeq + 1;
+    return true;
+  }
+
+  const { card, plain } = renderEntryProgress(params.sessionKey, entry, state);
+  if (!Array.isArray(card.body) || card.body.length === 0) return false;
+  await editCardMessage({
+    apiUrl: entry.ctx.apiUrl,
+    botToken: entry.ctx.botToken,
+    messageId: entry.messageId,
+    channelId: entry.ctx.channelId,
+    channelType: entry.ctx.channelType,
+    card,
+    plain,
+    ...(params.transient ? { transient: true } : {}),
+    ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
+    signal: params.signal,
+  });
+  return true;
 }
 
 async function flush(sessionKey: string): Promise<void> {
@@ -284,31 +429,45 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         entry.dirty = false;
         return;
       }
+      resolveEntryDeliveryMode(entry);
     }
 
     entry.dirty = false;
-    const { card, plain } = renderEntryProgress(
-      sessionKey,
-      entry,
-      entryProgressState(sessionKey, entry),
-    );
-    if (!Array.isArray(card.body) || card.body.length === 0) {
-      warn("rendered card cannot fit negotiated capabilities/limits; disabling for session");
-      entry.skip = true;
-      return;
-    }
+    const state = entryProgressState(sessionKey, entry);
     if (!entry.messageId) {
       if (!isCurrentEntry(sessionKey, entry)) return;
-      const res = await sendCardMessage({
-        apiUrl: entry.ctx.apiUrl,
-        botToken: entry.ctx.botToken,
-        channelId: entry.ctx.channelId,
-        channelType: entry.ctx.channelType,
-        card,
-        plain,
-        ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
-        signal,
-      });
+      let res;
+      if (entry.deliveryMode === "model-a") {
+        const data = buildReasoningProcessWireData(state);
+        if (!data || !entry.templateRef) return;
+        res = await sendTemplateCardMessage({
+          apiUrl: entry.ctx.apiUrl,
+          botToken: entry.ctx.botToken,
+          channelId: entry.ctx.channelId,
+          channelType: entry.ctx.channelType,
+          templateRef: entry.templateRef,
+          state: data.state,
+          data,
+          signal,
+        });
+      } else {
+        const { card, plain } = renderEntryProgress(sessionKey, entry, state);
+        if (!Array.isArray(card.body) || card.body.length === 0) {
+          warn("rendered card cannot fit negotiated capabilities/limits; disabling for session");
+          entry.skip = true;
+          return;
+        }
+        res = await sendCardMessage({
+          apiUrl: entry.ctx.apiUrl,
+          botToken: entry.ctx.botToken,
+          channelId: entry.ctx.channelId,
+          channelType: entry.ctx.channelType,
+          card,
+          plain,
+          ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
+          signal,
+        });
+      }
       entry.messageId = res?.message_id;
       if (!isCurrentEntry(sessionKey, entry)) return;
       if (!entry.messageId) {
@@ -319,16 +478,11 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
       dbg(`placeholder sent messageId=${entry.messageId} steps=${entry.steps.length}`);
     } else {
       if (!isCurrentEntry(sessionKey, entry)) return;
-      await editCardMessage({
-        apiUrl: entry.ctx.apiUrl,
-        botToken: entry.ctx.botToken,
-        messageId: entry.messageId,
-        channelId: entry.ctx.channelId,
-        channelType: entry.ctx.channelType,
-        card,
-        plain,
-        transient: true, // 进度中间帧不进修订历史(D10);终态帧由 finalizeCard 不带 transient
-        ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
+      await editEntryProgress({
+        sessionKey,
+        entry,
+        state,
+        transient: true,
         signal,
       });
       if (!isCurrentEntry(sessionKey, entry)) return;
@@ -339,7 +493,8 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     // 确定性拒绝(4xx,除可重试的 429)→ fail-closed,别对着必然失败的 server 逐事件重试。
     // 5xx / 网络 / 429 保持可重试(与 gate 的瞬时失败处理一致)。
     const status = httpStatusFromApiFetchError(err);
-    if (status !== undefined && status >= 400 && status < 500 && status !== 429) {
+    if (entry.deliveryMode === "model-a" ||
+        (status !== undefined && status >= 400 && status < 500 && status !== 429)) {
       entry.skip = true;
     }
   } finally {
@@ -431,22 +586,16 @@ async function editTrackedCardState(
     const abort = new AbortController();
     entry.stateEditAbort = abort;
     try {
-      const { card, plain } = renderEntryProgress(sessionKey, entry, state);
-      if (!Array.isArray(card.body) || card.body.length === 0) return;
-      await editCardMessage({
-        apiUrl: entry.ctx.apiUrl,
-        botToken: entry.ctx.botToken,
-        messageId: entry.messageId,
-        channelId: entry.ctx.channelId,
-        channelType: entry.ctx.channelType,
-        card,
-        plain,
+      await editEntryProgress({
+        sessionKey,
+        entry,
+        state,
         ...(opts.transient ? { transient: true } : {}),
-        ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
         signal: AbortSignal.any([abort.signal, AbortSignal.timeout(EDIT_TIMEOUT_MS)]),
       });
       dbg(`transitioned session=${sessionKey} phase=${phase}`);
     } catch (err: unknown) {
+      if (entry.deliveryMode === "model-a") entry.skip = true;
       if (!abort.signal.aborted) {
         warn(`state transition failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -544,22 +693,16 @@ export async function finalizeCard(
     ...(opts.errorText ? { errorText: opts.errorText } : {}),
   });
   try {
-    const { card, plain } = renderEntryProgress(sessionKey, entry, state);
-    if (!Array.isArray(card.body) || card.body.length === 0) {
-      warn("terminal card cannot fit negotiated capabilities/limits; leaving last valid frame");
-      return;
-    }
-    await editCardMessage({
-      apiUrl: entry.ctx.apiUrl,
-      botToken: entry.ctx.botToken,
-      messageId: entry.messageId,
-      channelId: entry.ctx.channelId,
-      channelType: entry.ctx.channelType,
-      card,
-      plain,
-      ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
+    const edited = await editEntryProgress({
+      sessionKey,
+      entry,
+      state,
       signal: AbortSignal.timeout(EDIT_TIMEOUT_MS),
     });
+    if (!edited) {
+      warn("terminal card data is unavailable; leaving last valid frame");
+      return;
+    }
     dbg(`finalized session=${sessionKey} phase=${state.phase} steps=${entry.steps.length}`);
   } catch (err: unknown) {
     warn(`finalize failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -587,6 +730,9 @@ export async function finalizeCardWithResponse(
   }
   endRunningThinking(entry, Date.now());
   if (entry.skip || !entry.messageId || cards.get(sessionKey) !== entry) return false;
+  // Registry-authored messages can only be updated with template_ref + state + data.
+  // The final answer remains on the normal text path for Model A.
+  if (entry.deliveryMode === "model-a") return false;
 
   const rendered = renderProgressResponseCard({
     phase: "done",
@@ -646,7 +792,7 @@ export function _resetCardProgressForTests(): void {
   }
   cards.clear();
   pausedCards.clear();
-  gateCache.clear();
+  profileCache.clear();
   capsCache.clear();
 }
 

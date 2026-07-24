@@ -1,4 +1,5 @@
 import { CARD_PLACEHOLDER, CARD_VERSION } from "./types.js";
+import type { CardTemplateRef, CardTemplatingCapability } from "./api-fetch.js";
 import { cardFitsLimits } from "./card-limits.js";
 import {
   OCTO_CARD_LAYOUTS,
@@ -51,6 +52,35 @@ const THOUGHT_MAX = 280;
 const TOOL_NAME_MAX = 80;
 const MAX_RENDERED_PHASES = 6;
 const MAX_RENDERED_ACTIONS = 12;
+const REASONING_TEMPLATE_ID = "ai.reasoning-process";
+const TEMPLATE_WIRE = "template-ref/v1";
+
+const REQUIRED_VIEWS = [
+  { name: "active", states: ["reasoning", "answering"], wireProfile: "octo/v2", actions: ["reasoning_stop"] },
+  { name: "error", states: ["error"], wireProfile: "octo/v2", actions: ["reasoning_retry"] },
+  { name: "result", states: ["completed", "stopped"], wireProfile: "octo/v1", actions: [] },
+] as const;
+
+/** Select only an unambiguous Bot-catalog entry with the contract shape this producer implements. */
+export function selectReasoningProcessTemplate(
+  templating: CardTemplatingCapability | undefined,
+): CardTemplateRef | null {
+  if (!templating?.supported || templating.wire !== TEMPLATE_WIRE) return null;
+  const compatible = templating.templates.filter((template) => {
+    if (template.id !== REASONING_TEMPLATE_ID || !template.version.trim()) return false;
+    return REQUIRED_VIEWS.every((required) => {
+      const view = template.views.find((candidate) => candidate.name === required.name);
+      if (!view || view.wire_profile !== required.wireProfile) return false;
+      const states = new Set(view.states);
+      const actions = new Set(view.submit_actions);
+      return required.states.every((state) => states.has(state)) &&
+        required.actions.every((action) => actions.has(action));
+    });
+  });
+  return compatible.length === 1
+    ? { id: compatible[0]!.id, version: compatible[0]!.version }
+    : null;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -159,7 +189,10 @@ function actionFromStep(step: CardStep): ReasoningProcessAction {
   };
 }
 
-function phasesFromSteps(steps: CardStep[]): ReasoningProcessPhase[] {
+function phasesFromSteps(
+  steps: CardStep[],
+  opts: { synthesizeEmptyActions?: boolean } = { synthesizeEmptyActions: true },
+): ReasoningProcessPhase[] {
   const phases: ReasoningProcessPhase[] = [];
   let current: ReasoningProcessPhase | undefined;
   for (const step of steps) {
@@ -178,6 +211,7 @@ function phasesFromSteps(steps: CardStep[]): ReasoningProcessPhase[] {
     current.actions.push(actionFromStep(step));
   }
   if (phases.length === 0) phases.push({ thought: FALLBACK_THOUGHT, actions: [] });
+  if (opts.synthesizeEmptyActions === false) return phases;
   for (let index = 0; index < phases.length; index++) {
     const phase = phases[index]!;
     if (phase.actions.length > 0) continue;
@@ -207,7 +241,13 @@ function contractState(phase: CardProgressState["phase"]): ReasoningProcessState
 }
 
 export function buildReasoningProcessData(state: CardProgressState): ReasoningProcessData {
-  const phases = phasesFromSteps(state.steps);
+  return buildReasoningProcessDataWithPhases(state, phasesFromSteps(state.steps));
+}
+
+function buildReasoningProcessDataWithPhases(
+  state: CardProgressState,
+  phases: ReasoningProcessPhase[],
+): ReasoningProcessData {
   const mapped = contractState(state.phase);
   const elapsed = fmtDuration(state.elapsedMs) || "0ms";
   const toolCount = state.steps.filter((step) =>
@@ -267,6 +307,14 @@ function trimForRender(data: ReasoningProcessData): ReasoningProcessData {
     visible.push({ thought: phase.thought, actions });
   }
   return { ...data, phases: visible.reverse() };
+}
+
+/** Build bounded Registry data without inventing synthetic tool actions for empty model calls. */
+export function buildReasoningProcessWireData(state: CardProgressState): ReasoningProcessData | null {
+  const phases = phasesFromSteps(state.steps, { synthesizeEmptyActions: false })
+    .filter((phase) => phase.actions.length > 0);
+  if (phases.length === 0) return null;
+  return trimForRender(buildReasoningProcessDataWithPhases(state, phases));
 }
 
 function textBlock(text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
