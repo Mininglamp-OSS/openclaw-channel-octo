@@ -495,7 +495,18 @@ function validateTemplateFrame(params: {
   state: string;
   data: object;
 }): void {
-  if (!params.templateRef.id.trim() || !params.templateRef.version.trim()) {
+  const templateRef = params.templateRef as unknown;
+  if (templateRef === null || typeof templateRef !== "object" || Array.isArray(templateRef)) {
+    throw new Error("octo: templateRef must contain exactly id and version");
+  }
+  const templateRefKeys = Object.keys(templateRef);
+  if (templateRefKeys.length !== 2 ||
+      !templateRefKeys.includes("id") ||
+      !templateRefKeys.includes("version")) {
+    throw new Error("octo: templateRef must contain exactly id and version");
+  }
+  const { id, version } = templateRef as Record<string, unknown>;
+  if (typeof id !== "string" || typeof version !== "string" || !id.trim() || !version.trim()) {
     throw new Error("octo: templateRef id/version are required");
   }
   if (!params.state.trim()) throw new Error("octo: template state is required");

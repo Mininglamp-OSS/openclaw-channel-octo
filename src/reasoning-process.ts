@@ -74,6 +74,7 @@ export function selectReasoningProcessTemplate(
       const states = new Set(view.states);
       const actions = new Set(view.submit_actions);
       return required.states.every((state) => states.has(state)) &&
+        actions.size === required.actions.length &&
         required.actions.every((action) => actions.has(action));
     });
   });
