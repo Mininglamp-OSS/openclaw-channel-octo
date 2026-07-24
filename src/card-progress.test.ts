@@ -244,8 +244,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
             id: "ai.reasoning-process",
             version: "9.8.7",
             views: [
-              { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: [] },
-              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: [] },
+              { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
               { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
             ],
           }],
@@ -282,8 +282,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
             id: "ai.reasoning-process",
             version: "9.8.7",
             views: [
-              { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: [] },
-              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: [] },
+              { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
               { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
             ],
           }],
@@ -306,6 +306,64 @@ describe("card-progress 状态机 + hook + 节流", () => {
 
     expect(await finalizeCardWithResponse("registry-no-raw", "最终回答")).toBe(false);
     expect(calls).toEqual([]);
+  });
+
+  it("Model A edit 的 5xx 重试复用完全相同的 body 和 card_seq", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
+    let editAttempts = 0;
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
+      if (String(url).includes("/card/profile")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            enabled: true,
+            profiles: ["octo/v1", "octo/v2"],
+            templating: {
+              supported: true,
+              wire: "template-ref/v1",
+              templates: [{
+                id: "ai.reasoning-process",
+                version: "9.8.7",
+                views: [
+                  { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+                  { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
+                  { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+                ],
+              }],
+            },
+          }),
+        };
+      }
+      if (String(url).includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "retry-card" }) };
+      }
+      editAttempts += 1;
+      return editAttempts === 1
+        ? { ok: false, status: 503, statusText: "down", text: async () => "temporary" }
+        : { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    setCardContext("registry-retry", {
+      apiUrl: "https://registry-retry.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.model_call_started({ callId: "call-1" }, { sessionKey: "registry-retry" });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, { sessionKey: "registry-retry" });
+    await vi.advanceTimersByTimeAsync(900);
+    calls.length = 0;
+
+    markCardAnswering("registry-retry");
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const edits = calls.filter((call) => call.url.includes("/message/edit"));
+    expect(edits).toHaveLength(2);
+    expect(edits[0]?.body).toEqual(edits[1]?.body);
+    expect(edits[0]?.body?.card_seq).toBe(1);
   });
 
   it("OBO 场景跳过(不发任何请求)", async () => {
