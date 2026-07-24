@@ -178,7 +178,7 @@ async function runLifecycleFlow({
     expect(checkpoint.cards).toHaveLength(1);
     expect(checkpoint.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
     expect(checkpoint.cards[0]?.plainSource).toBe("accepted-edit");
-    expect(checkpoint.cards[0]?.plain).toContain("已转入后台，等待子任务结果…");
+    expect(checkpoint.cards[0]?.plain).toContain("Waiting for subtask...");
   }
 
   const completed = await waitForEvidence(
@@ -215,7 +215,7 @@ async function runLifecycleFlow({
   expect(completed.cards[0]?.plain).toContain("exec · printf · exit 0");
   if (pausedCheckpointDelayMs !== undefined) {
     expect(completed.cards[0]?.plainSource).toBe("accepted-edit");
-    const waitDuration = completed.cards[0]?.plain.match(/子任务已返回 · ([\d.]+)s/)?.[1];
+    const waitDuration = completed.cards[0]?.plain.match(/Subtask returned · ([\d.]+)s/)?.[1];
     expect(waitDuration, completed.cards[0]?.plain).toBeDefined();
     expect(Number(waitDuration)).toBeGreaterThanOrEqual(pausedCheckpointDelayMs / 1_000);
   }

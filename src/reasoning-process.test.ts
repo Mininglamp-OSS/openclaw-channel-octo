@@ -70,7 +70,15 @@ describe("ai.reasoning-process@0.1.0 contract", () => {
       statusTone: "Accent",
       traceExpanded: true,
       traceCollapsed: false,
-      progressText: "正在执行下一步…",
+      progressText: "Working through...",
+    });
+    expect(buildReasoningProcessData(state({ phase: "paused" }))).toMatchObject({
+      state: "reasoning",
+      progressText: "Waiting for subtask...",
+    });
+    expect(buildReasoningProcessData(state({ phase: "resuming" }))).toMatchObject({
+      state: "reasoning",
+      progressText: "Subtask returned. Wrapping up...",
     });
     expect(buildReasoningProcessData(state({ phase: "answering" }))).toMatchObject({
       state: "answering",
@@ -118,7 +126,7 @@ describe("ai.reasoning-process@0.1.0 contract", () => {
       ],
     }));
 
-    expect(data.phases[0]?.actions[0]?.detail).toBe("子任务已返回 · 75.0s");
+    expect(data.phases[0]?.actions[0]?.detail).toBe("Subtask returned · 75.0s");
   });
 });
 
