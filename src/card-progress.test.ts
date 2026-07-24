@@ -5,6 +5,7 @@ import {
   setCardContext,
   finalizeCard,
   finalizeCardWithResponse,
+  clearCard,
   registerCardProgress,
   bindCardRun,
   markCardAnswering,
@@ -416,6 +417,55 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((call) => call.url.includes("/message/edit"))?.body;
     expect(edit).toMatchObject({ state: "stopped", card_seq: 1 });
     expect(edit).not.toHaveProperty("transient");
+  });
+
+  it("manifest 短 TTL 到期后新消息可发现刚部署的 Registry 能力", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
+    let profileCalls = 0;
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
+      if (String(url).includes("/card/profile")) {
+        profileCalls += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => profileCalls === 1
+            ? { enabled: true, profiles: ["octo/v1"] }
+            : registryProfile(),
+        };
+      }
+      if (String(url).includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: `m-${profileCalls}` }) };
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const context = {
+      apiUrl: "https://registry-rollout.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental" as const,
+    };
+
+    setCardContext("before-rollout", context);
+    handlers.model_call_started({ callId: "call-1" }, { sessionKey: "before-rollout" });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, { sessionKey: "before-rollout" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect((calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as Record<string, unknown>))
+      .toHaveProperty("card");
+    clearCard("before-rollout");
+    calls.length = 0;
+
+    await vi.advanceTimersByTimeAsync(60_001);
+    setCardContext("after-rollout", context);
+    handlers.model_call_started({ callId: "call-2" }, { sessionKey: "after-rollout" });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-2" }, { sessionKey: "after-rollout" });
+    await vi.advanceTimersByTimeAsync(900);
+
+    expect(profileCalls).toBe(2);
+    expect((calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as Record<string, unknown>))
+      .toHaveProperty("template_ref.version", "9.8.7");
   });
 
   it("OBO 场景跳过(不发任何请求)", async () => {
