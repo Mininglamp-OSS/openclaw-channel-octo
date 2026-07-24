@@ -468,6 +468,58 @@ describe("card-progress 状态机 + hook + 节流", () => {
       .toHaveProperty("template_ref.version", "9.8.7");
   });
 
+  it("Model A reasoningId 在 paused continuation 跨 run 后保持不变", async () => {
+    const { fn, calls } = mockFetch({ profile: registryProfile(), sendId: "continuation-card" });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = "registry-continuation";
+    const childSessionKey = "agent:main:subagent:registry-child";
+    setCardContext(sessionKey, {
+      apiUrl: "https://registry-continuation.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, { sessionKey, runId: "run-original" });
+    handlers.model_call_started({ callId: "call-1" }, { sessionKey, runId: "run-original" });
+    handlers.before_tool_call(
+      { toolName: "sessions_spawn", toolCallId: "spawn-1" },
+      { sessionKey, runId: "run-original" },
+    );
+    handlers.after_tool_call({
+      toolName: "sessions_spawn",
+      toolCallId: "spawn-1",
+      result: { details: { status: "accepted", childSessionKey } },
+    }, { sessionKey, runId: "run-original" });
+    handlers.before_tool_call(
+      { toolName: "sessions_yield", toolCallId: "yield-1" },
+      { sessionKey, runId: "run-original" },
+    );
+    handlers.after_tool_call(
+      { toolName: "sessions_yield", toolCallId: "yield-1", result: {} },
+      { sessionKey, runId: "run-original" },
+    );
+    await vi.advanceTimersByTimeAsync(900);
+    const firstData = (calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as {
+      data?: { reasoningId?: string };
+    }).data;
+    expect(firstData?.reasoningId).toBe(`${sessionKey}:run-original`);
+
+    await finalizeCard(sessionKey, { success: false });
+    calls.length = 0;
+    handlers.before_agent_run(
+      { prompt: completionPrompt(childSessionKey), messages: [] },
+      { sessionKey, runId: "run-continuation" },
+    );
+    await vi.runAllTicks();
+
+    const continuationData = calls.find((call) => call.url.includes("/message/edit"))?.body?.data as {
+      reasoningId?: string;
+    };
+    expect(continuationData?.reasoningId).toBe(firstData?.reasoningId);
+  });
+
   it("OBO 场景跳过(不发任何请求)", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
