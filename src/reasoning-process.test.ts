@@ -212,6 +212,23 @@ describe("reasoning process template discovery", () => {
       templates: [template("9.8.7")],
     })).toBeNull();
   });
+
+  it.each(["active", "result", "error"] as const)(
+    "fails closed when the %s view advertises an extra submit action",
+    (viewName) => {
+      const candidate = template("9.8.7");
+      expect(selectReasoningProcessTemplate({
+        supported: true,
+        wire: "template-ref/v1",
+        templates: [{
+          ...candidate,
+          views: candidate.views.map((view) => view.name === viewName
+            ? { ...view, submit_actions: [...view.submit_actions, "future_action"] }
+            : view),
+        }],
+      })).toBeNull();
+    },
+  );
 });
 
 describe("reasoning detail sanitization", () => {

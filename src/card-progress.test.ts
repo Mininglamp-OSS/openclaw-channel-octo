@@ -419,6 +419,32 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edit).not.toHaveProperty("transient");
   });
 
+  it("Model A error 状态始终是非 transient 终态", async () => {
+    const { fn, calls } = mockFetch({ profile: registryProfile(), sendId: "error-card" });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "registry-error", runId: "run-1" };
+    setCardContext("registry-error", {
+      apiUrl: "https://registry-error.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.model_call_started({ callId: "call-1" }, hookCtx);
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", result: {} }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    calls.length = 0;
+
+    await finalizeCard("registry-error", { success: false, errorText: "provider timeout" });
+
+    const edit = calls.find((call) => call.url.includes("/message/edit"))?.body;
+    expect(edit).toMatchObject({ state: "error", card_seq: 1 });
+    expect(edit).not.toHaveProperty("transient");
+  });
+
   it("manifest 短 TTL 到期后新消息可发现刚部署的 Registry 能力", async () => {
     const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
     let profileCalls = 0;

@@ -201,6 +201,24 @@ describe("sendTemplateCardMessage Registry 出站组包", () => {
     })).rejects.toThrow(/data.state must match state/);
     expect(global.fetch).not.toHaveBeenCalled();
   });
+
+  it("拒绝带第三个字段的 template_ref，且不发起请求", async () => {
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    await expect(sendTemplateCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      templateRef: {
+        id: "ai.reasoning-process",
+        version: "9.8.7",
+        channel: "octo",
+      } as never,
+      state: "reasoning",
+      data: { state: "reasoning" },
+    })).rejects.toThrow(/exactly id and version/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
 });
 
 describe("getCardProfile (D12 feature-detect)", () => {
@@ -478,5 +496,25 @@ describe("editTemplateCardMessage Registry 编辑组包", () => {
       data: { state: "completed" },
       cardSeq: 0,
     })).rejects.toThrow(/positive safe integer/);
+  });
+
+  it("拒绝带第三个字段的 template_ref，且不发起请求", async () => {
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    await expect(editTemplateCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      messageId: "m1",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      templateRef: {
+        id: "ai.reasoning-process",
+        version: "9.8.7",
+        variant: "compact",
+      } as never,
+      state: "completed",
+      data: { state: "completed" },
+      cardSeq: 1,
+    })).rejects.toThrow(/exactly id and version/);
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });
