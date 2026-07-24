@@ -643,6 +643,83 @@ describe("outbound.sendMedia — threadId wiring", () => {
   });
 });
 
+// #183: OpenClaw tools (e.g. image generation) hand sendMedia a bare local
+// absolute path — no file:// scheme. It must go through the local-file read +
+// presigned-upload path, NOT the HTTP branch's `new URL(mediaUrl)` (which
+// throws `TypeError: Invalid URL` on a leading-slash path and drops the media).
+describe("outbound.sendMedia — bare local absolute path (#183)", () => {
+  const cfg = {
+    channels: {
+      octo: {
+        apiUrl: "https://api.example",
+        accounts: {
+          default: { botToken: "bf_test", apiUrl: "https://api.example" },
+        },
+      },
+    },
+  };
+
+  let tmpFile: string;
+
+  beforeEach(async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const nodePath = await import("node:path");
+    const dir = mkdtempSync(nodePath.join(tmpdir(), "octo-sendmedia-"));
+    tmpFile = nodePath.join(dir, "image-1---abcd.jpg");
+    writeFileSync(tmpFile, Buffer.from("fake-jpeg-bytes"));
+
+    const apiFetch = await import("./api-fetch.js");
+    (apiFetch.sendMediaMessage as any).mockClear();
+    (apiFetch.getUploadPresign as any).mockClear();
+    (apiFetch.uploadFileToPresignedUrl as any).mockClear();
+  });
+
+  afterEach(async () => {
+    const { rmSync } = await import("node:fs");
+    const nodePath = await import("node:path");
+    try {
+      rmSync(nodePath.dirname(tmpFile), { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  });
+
+  it("uploads a bare absolute path via the local-file branch (no Invalid URL)", async () => {
+    const { octoPlugin } = await import("./channel.js");
+    const { getUploadPresign, uploadFileToPresignedUrl, sendMediaMessage } =
+      await import("./api-fetch.js");
+
+    // Drain the lazily-opened read stream inside sendMedia's await so the fd is
+    // consumed and closed before afterEach removes the temp dir (otherwise the
+    // deferred open() races the rmSync and surfaces a spurious ENOENT).
+    (uploadFileToPresignedUrl as any).mockImplementationOnce(async (arg: any) => {
+      const body = arg.fileBody;
+      if (body && typeof body.on === "function") {
+        await new Promise<void>((resolve, reject) => {
+          body.on("data", () => {});
+          body.on("end", resolve);
+          body.on("error", reject);
+        });
+      }
+      return { url: "https://cdn.example/file.jpg" };
+    });
+
+    await octoPlugin.outbound!.sendMedia!({
+      cfg,
+      to: "group:grp1",
+      text: "",
+      mediaUrl: tmpFile,
+      accountId: "default",
+    } as any);
+
+    // Presign is called with the basename — proving we treated it as a local
+    // file, not an HTTP URL (which would have thrown before reaching presign).
+    expect(getUploadPresign).toHaveBeenCalledTimes(1);
+    const presignArgs = (getUploadPresign as any).mock.calls[0][0];
+    expect(presignArgs.filename).toBe("image-1---abcd.jpg");
+    expect(sendMediaMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
 /**
  * Streaming size cap for the outbound HTTP-URL branch.
  *

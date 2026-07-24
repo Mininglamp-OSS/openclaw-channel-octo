@@ -1083,8 +1083,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         if ((ctx as Record<string, unknown>).filename) {
           filename = String((ctx as Record<string, unknown>).filename);
         }
-      } else if (mediaUrl.startsWith("file://")) {
-        const filePath = decodeURIComponent(mediaUrl.slice(7));
+      } else if (mediaUrl.startsWith("file://") || path.isAbsolute(mediaUrl)) {
+        // Local file — either a file:// URL or a bare absolute path. OpenClaw
+        // tools (e.g. image generation) hand us the latter with no scheme
+        // (#183); it must read from disk, not fall through to `new URL()`,
+        // which throws `TypeError: Invalid URL` on a leading-slash path.
+        const filePath = mediaUrl.startsWith("file://")
+          ? decodeURIComponent(mediaUrl.slice(7))
+          : mediaUrl;
         const st = statSync(filePath);
         if (st.size > MAX_UPLOAD_SIZE) {
           throw new Error(`File too large (${st.size} bytes, max ${MAX_UPLOAD_SIZE})`);
