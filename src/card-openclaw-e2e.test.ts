@@ -34,6 +34,13 @@ type Evidence = {
   }>;
 };
 
+type BridgeResult = {
+  ok?: boolean;
+  sessionKey?: string;
+  kind?: string;
+  error?: string;
+};
+
 const container = process.env.OCTO_E2E_CONTAINER ?? "ocprobe";
 const targetUid = process.env.OCTO_E2E_TARGET_UID ?? "";
 
@@ -45,7 +52,7 @@ async function dockerExec(args: string[], timeout = 120_000): Promise<string> {
   return stdout;
 }
 
-async function callBridge(params: Record<string, unknown>): Promise<void> {
+async function callBridge(params: Record<string, unknown>): Promise<BridgeResult> {
   const requestId = `${String(params.kind)}-${String(params.marker)}`;
   const requestPath = `/tmp/octo-host-e2e/${requestId}.request.json`;
   const resultPath = `/tmp/octo-host-e2e/${requestId}.result.json`;
@@ -71,10 +78,10 @@ async function callBridge(params: Record<string, unknown>): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, 500));
       continue;
     }
-    const result = JSON.parse(output) as { ok?: boolean; sessionKey?: string; error?: string };
+    const result = JSON.parse(output) as BridgeResult;
     expect(result.ok, result.error).toBe(true);
     expect(result.sessionKey).toBe(params.sessionKey);
-    return;
+    return result;
   }
   throw new Error(`bridge request timed out: ${requestId}`);
 }
@@ -229,4 +236,72 @@ suite("OpenClaw sessions_spawn + sessions_yield card lifecycle E2E", () => {
       pausedCheckpointDelayMs: 60_000,
     });
   }, 240_000);
+});
+
+suite("OpenClaw realistic filesystem tool workflow E2E", () => {
+  it("reads an input file, writes a report, and verifies it with exec", async () => {
+    expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
+    const marker = randomUUID();
+    const sessionKey = `agent:main:octo-host-e2e:${marker}`;
+    const workDir = `/tmp/octo-realistic-e2e/${marker}`;
+    const inputPath = `${workDir}/input.txt`;
+    const reportPath = `${workDir}/report.txt`;
+
+    await dockerExec([
+      container,
+      "node", "-e",
+      "const fs=require('fs'),path=require('path'),p=process.argv[1];fs.mkdirSync(path.dirname(p),{recursive:true});fs.writeFileSync(p,process.argv[2])",
+      inputPath,
+      "alpha=7\n",
+    ]);
+
+    try {
+      await callBridge({ kind: "configure-reasoning", marker, targetUid, sessionKey });
+      const startedAtMs = Date.now();
+      const accepted = await callBridge({ kind: "file-tools", marker, targetUid, sessionKey });
+      expect(accepted.kind).toBe("file-tools");
+
+      const completed = await waitForEvidence(
+        marker,
+        sessionKey,
+        startedAtMs,
+        (evidence) => evidence.cards.some((card) =>
+          card.plain.includes("exec · wc · exit 0")),
+        60_000,
+      );
+      const names = completed.toolCalls.map((call) => call.name);
+      expect(names).toEqual(["read", "write", "exec"]);
+      expect(completed.toolCalls[0]?.arguments).toMatchObject({ path: inputPath });
+      expect(completed.toolCalls[1]?.arguments).toMatchObject({
+        path: reportPath,
+        content: "Processed: alpha=7\n",
+      });
+      expect(completed.toolCalls[2]?.arguments).toMatchObject({
+        command: `wc -c ${reportPath}`,
+      });
+
+      const report = await dockerExec([
+        container,
+        "node", "-e",
+        "process.stdout.write(require('fs').readFileSync(process.argv[1],'utf8'))",
+        reportPath,
+      ]);
+      expect(report).toBe("Processed: alpha=7\n");
+      expect(completed.cards).toHaveLength(1);
+      const plain = completed.cards[0]?.plain ?? "";
+      expect(plain).toContain("I’ll inspect the source file before making changes.");
+      expect(plain).toContain("read");
+      expect(plain).toContain("input.txt");
+      expect(plain).toContain("write");
+      expect(plain).toContain("report.txt");
+      expect(plain).toContain("exec · wc · exit 0");
+    } finally {
+      await dockerExec([
+        container,
+        "node", "-e",
+        "require('fs').rmSync(process.argv[1],{recursive:true,force:true})",
+        workDir,
+      ]);
+    }
+  }, 120_000);
 });
