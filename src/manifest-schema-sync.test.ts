@@ -53,6 +53,18 @@ describe("openclaw.plugin.json channelConfigs", () => {
     },
   );
 
+  it("reasoningCardTemplateMode is synced at top-level and per-account", () => {
+    const manifestProps = manifest.channelConfigs.octo.schema.properties;
+    const manifestAccountProps = manifestProps.accounts.additionalProperties.properties;
+    const tsProps = OctoConfigJsonSchema.schema.properties as Record<string, any>;
+    const tsAccountProps = (tsProps.accounts as any).additionalProperties.properties;
+
+    expect(tsProps.reasoningCardTemplateMode.enum).toEqual(["off", "shadow", "experimental"]);
+    expect(tsAccountProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
+    expect(manifestProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
+    expect(manifestAccountProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
+  });
+
   // Description drift guard: secretsFileRoot carries operator-facing semantics
   // (the write-secret jail default + fail-closed behavior). A stale manifest
   // description here drifts from the schema, so pin both copies to

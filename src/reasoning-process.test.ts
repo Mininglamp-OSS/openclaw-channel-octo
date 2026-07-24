@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildReasoningProcessWireData,
   buildReasoningProcessData,
   renderReasoningProcessCard,
   sanitizeReasoningThought,
+  selectReasoningProcessTemplate,
   summarizeToolResult,
 } from "./reasoning-process.js";
 import { SUBAGENT_WAIT_STEP_TOOL, type CardProgressState } from "./card-render.js";
@@ -146,6 +148,69 @@ describe("ai.reasoning-process@0.1.0 contract", () => {
       .toBe("Timed out waiting for the background task.");
     expect(buildReasoningProcessData(state({ phase: "error" })).errorMessage)
       .toBe("Reasoning was interrupted. Completed steps were preserved.");
+  });
+
+  it("builds bounded wire data from real actions and drops action-less model-call phases", () => {
+    const data = buildReasoningProcessWireData(state({
+      phase: "answering",
+      steps: [
+        { tool: "__thinking__", status: "done", modelCallId: "call-1", thought: "核对输入。" },
+        { tool: "read", status: "done", toolCallId: "tool-1", summary: "README.md" },
+        { tool: "__thinking__", status: "running", modelCallId: "call-2", thought: "组织答案。" },
+      ],
+    }));
+
+    expect(data).not.toBeNull();
+    expect(data?.state).toBe("answering");
+    expect(data?.phases).toEqual([{
+      thought: "核对输入。",
+      actions: [{ tool: "read", detail: "README.md", statusGlyph: "●", statusTone: "Good" }],
+    }]);
+  });
+
+  it("returns no wire data before a real displayable action exists", () => {
+    expect(buildReasoningProcessWireData(state({
+      phase: "reasoning" as never,
+      steps: [{ tool: "__thinking__", status: "running", thought: "正在计划。" }],
+    }))).toBeNull();
+  });
+});
+
+describe("reasoning process template discovery", () => {
+  const template = (version: string) => ({
+    id: "ai.reasoning-process",
+    version,
+    views: [
+      { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+      { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+      { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
+    ],
+  });
+
+  it("selects the sole compatible manifest version without hardcoding it", () => {
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [template("9.8.7")],
+    })).toEqual({ id: "ai.reasoning-process", version: "9.8.7" });
+  });
+
+  it("fails closed for multiple compatible versions or incompatible view/state shapes", () => {
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [template("1.0.0"), template("2.0.0")],
+    })).toBeNull();
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [{ ...template("9.8.7"), views: template("9.8.7").views.slice(0, 2) }],
+    })).toBeNull();
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "other-wire",
+      templates: [template("9.8.7")],
+    })).toBeNull();
   });
 });
 

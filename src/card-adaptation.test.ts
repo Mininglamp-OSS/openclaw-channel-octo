@@ -6,7 +6,13 @@ import {
   CARD_PLACEHOLDER,
 } from "./types.js";
 import { resolveCardPlain, resolveInnerMessageText, resolveApiMessagePlaceholder } from "./inbound.js";
-import { sendCardMessage, getCardProfile, editCardMessage } from "./api-fetch.js";
+import {
+  editCardMessage,
+  editTemplateCardMessage,
+  getCardProfile,
+  sendCardMessage,
+  sendTemplateCardMessage,
+} from "./api-fetch.js";
 
 /**
  * InteractiveCard(=17) 适配 — 波 0 入站派生 + 波 A 出站原语。
@@ -143,6 +149,60 @@ describe("sendCardMessage 出站组包", () => {
   });
 });
 
+describe("sendTemplateCardMessage Registry 出站组包", () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("只发送 template_ref + state + data，不混入 Model B 渲染字段", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: vi.fn().mockResolvedValue('{"message_id":"registry-1"}'),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await sendTemplateCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      templateRef: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "reasoning",
+      data: { state: "reasoning", reasoningId: "run-1" },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.payload).toEqual({
+      type: MessageType.InteractiveCard,
+      template_ref: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "reasoning",
+      data: { state: "reasoning", reasoningId: "run-1" },
+    });
+    expect(body.payload).not.toHaveProperty("card");
+    expect(body.payload).not.toHaveProperty("plain");
+    expect(body.payload).not.toHaveProperty("profile");
+    expect(body.payload).not.toHaveProperty("card_version");
+  });
+
+  it("拒绝 outer state 与 data.state 不一致", async () => {
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    await expect(sendTemplateCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      templateRef: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "reasoning",
+      data: { state: "completed" },
+    })).rejects.toThrow(/data.state must match state/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+
 describe("getCardProfile (D12 feature-detect)", () => {
   const originalFetch = global.fetch;
   afterEach(() => {
@@ -175,6 +235,19 @@ describe("getCardProfile (D12 feature-detect)", () => {
           max_input_text_bytes: 4096,
           max_inputs_bytes: 16384,
         },
+        templating: {
+          supported: true,
+          wire: "template-ref/v1",
+          templates: [{
+            id: "ai.reasoning-process",
+            version: "9.8.7",
+            views: [
+              { name: "active", states: ["answering", "reasoning"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
+              { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+            ],
+          }],
+        },
       }),
     }) as unknown as typeof fetch;
 
@@ -199,6 +272,19 @@ describe("getCardProfile (D12 feature-detect)", () => {
       max_depth: 16,
       max_input_text_bytes: 4096,
       max_inputs_bytes: 16384,
+    });
+    expect(m.templating).toEqual({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [{
+        id: "ai.reasoning-process",
+        version: "9.8.7",
+        views: [
+          { name: "active", states: ["answering", "reasoning"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+          { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
+          { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+        ],
+      }],
     });
   });
 
@@ -338,5 +424,59 @@ describe("editCardMessage 出站组包", () => {
       profile: "octo/v2",
       card_seq: 3,
     }));
+  });
+});
+
+describe("editTemplateCardMessage Registry 编辑组包", () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("发送 root-level template fields、正整数 card_seq 和 transient，不携带 content_edit", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await editTemplateCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      messageId: "m1",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      templateRef: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "answering",
+      data: { state: "answering", reasoningId: "run-1" },
+      cardSeq: 1,
+      transient: true,
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body).toEqual({
+      message_id: "m1",
+      channel_id: "g1",
+      channel_type: ChannelType.Group,
+      template_ref: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "answering",
+      data: { state: "answering", reasoningId: "run-1" },
+      card_seq: 1,
+      transient: true,
+    });
+    expect(body).not.toHaveProperty("content_edit");
+  });
+
+  it("拒绝非正整数 card_seq", async () => {
+    await expect(editTemplateCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      messageId: "m1",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      templateRef: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "completed",
+      data: { state: "completed" },
+      cardSeq: 0,
+    })).rejects.toThrow(/positive safe integer/);
   });
 });

@@ -76,12 +76,16 @@ function completionPrompt(childSessionKey: string): string {
 }
 
 /** mock fetch,按 url 分派 getCardProfile / sendMessage / message-edit,记录请求。 */
-function mockFetch(opts: { enabled?: boolean; sendId?: string } = {}) {
+function mockFetch(opts: { enabled?: boolean; sendId?: string; profile?: Record<string, unknown> } = {}) {
   const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
   const fn = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
     calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
     if (String(url).includes("/v1/bot/card/profile")) {
-      return { ok: true, status: 200, json: async () => ({ enabled: opts.enabled ?? true, profiles: ["octo/v1"] }) };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => opts.profile ?? ({ enabled: opts.enabled ?? true, profiles: ["octo/v1"] }),
+      };
     }
     if (String(url).includes("/v1/bot/sendMessage")) {
       return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: opts.sendId ?? "card1" }) };
@@ -156,6 +160,152 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const editEnv = JSON.parse(edit!.body!.content_edit as string);
     expect(editEnv.type).toBe(17);
     expect(editEnv.transient).toBe(true); // 进度中间帧不进修订历史(D10)
+  });
+
+  it("experimental 模式用 manifest 版本发送 Registry 推理卡并以递增 seq 更新状态", async () => {
+    const profile = {
+      enabled: true,
+      profiles: ["octo/v1", "octo/v2"],
+      card_version: "1.5",
+      elements: ["TextBlock", "Container", "ColumnSet", "ActionSet"],
+      actions: ["Action.ToggleVisibility"],
+      templating: {
+        supported: true,
+        wire: "template-ref/v1",
+        templates: [{
+          id: "ai.reasoning-process",
+          version: "9.8.7",
+          views: [
+            { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+            { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
+            { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+          ],
+        }],
+      },
+    };
+    const { fn, calls } = mockFetch({ profile, sendId: "registry-card" });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "registry-progress", runId: "run-1" };
+
+    setCardContext("registry-progress", {
+      apiUrl: "https://registry-progress.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.model_call_started({ callId: "call-1" }, hookCtx);
+    recordCardReasoning("registry-progress", "先核对输入。", { snapshot: true });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1", params: { path: "README.md" } }, hookCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", result: {} }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    const sendPayload = send?.body?.payload as Record<string, unknown>;
+    expect(sendPayload).toMatchObject({
+      type: 17,
+      template_ref: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "reasoning",
+      data: { state: "reasoning", reasoningId: "registry-progress:run-1" },
+    });
+    expect(sendPayload).not.toHaveProperty("card");
+
+    calls.length = 0;
+    markCardAnswering("registry-progress");
+    await vi.advanceTimersByTimeAsync(900);
+    const answering = calls.find((call) => call.url.includes("/message/edit"))?.body;
+    expect(answering).toMatchObject({
+      template_ref: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "answering",
+      card_seq: 1,
+      transient: true,
+    });
+    expect(answering).not.toHaveProperty("content_edit");
+
+    calls.length = 0;
+    await finalizeCard("registry-progress", { success: true });
+    const completed = calls.find((call) => call.url.includes("/message/edit"))?.body;
+    expect(completed).toMatchObject({ state: "completed", card_seq: 2 });
+    expect(completed).not.toHaveProperty("transient");
+    expect(completed).not.toHaveProperty("content_edit");
+  });
+
+  it("shadow 模式只验证 manifest，仍发送 Model B 完整卡", async () => {
+    const { fn, calls } = mockFetch({
+      profile: {
+        enabled: true,
+        profiles: ["octo/v1", "octo/v2"],
+        templating: {
+          supported: true,
+          wire: "template-ref/v1",
+          templates: [{
+            id: "ai.reasoning-process",
+            version: "9.8.7",
+            views: [
+              { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: [] },
+              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: [] },
+              { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+            ],
+          }],
+        },
+      },
+    });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    setCardContext("shadow-progress", {
+      apiUrl: "https://shadow-progress.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "shadow",
+    });
+    handlers.model_call_started({ callId: "call-1" }, { sessionKey: "shadow-progress" });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, { sessionKey: "shadow-progress" });
+    await vi.advanceTimersByTimeAsync(900);
+
+    const payload = calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as Record<string, unknown>;
+    expect(payload).toHaveProperty("card");
+    expect(payload).not.toHaveProperty("template_ref");
+  });
+
+  it("Model A 卡禁止用 raw content_edit 合并最终回答", async () => {
+    const { fn, calls } = mockFetch({
+      profile: {
+        enabled: true,
+        profiles: ["octo/v1", "octo/v2"],
+        templating: {
+          supported: true,
+          wire: "template-ref/v1",
+          templates: [{
+            id: "ai.reasoning-process",
+            version: "9.8.7",
+            views: [
+              { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: [] },
+              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: [] },
+              { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+            ],
+          }],
+        },
+      },
+    });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    setCardContext("registry-no-raw", {
+      apiUrl: "https://registry-no-raw.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.model_call_started({ callId: "call-1" }, { sessionKey: "registry-no-raw" });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, { sessionKey: "registry-no-raw" });
+    await vi.advanceTimersByTimeAsync(900);
+    calls.length = 0;
+
+    expect(await finalizeCardWithResponse("registry-no-raw", "最终回答")).toBe(false);
+    expect(calls).toEqual([]);
   });
 
   it("OBO 场景跳过(不发任何请求)", async () => {
