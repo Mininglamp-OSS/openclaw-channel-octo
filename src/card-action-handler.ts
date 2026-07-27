@@ -88,6 +88,8 @@ export async function handleCardAction(params: Params): Promise<CardActionHandle
     action.data?.owner === "ai" &&
     action.data?.action_type === "reasoning.control";
   if (isReasoningControl) {
+    // TODO: Before these controls gain side effects, move handling below
+    // lookupCardSession + identity verification and authorize the card owner.
     // The event poller will persist and ACK this normally. ACK means queue
     // consumption only; no cancellation/retry side effect is performed here.
     params.log?.warn?.(

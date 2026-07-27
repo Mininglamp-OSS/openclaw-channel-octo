@@ -109,12 +109,11 @@ const cards = new Map<string, CardEntry>();
 const pausedCards = new Map<string, CardEntry>();
 
 type CachedCardProfile = {
-  enabled: boolean;
   manifest: CardProfileManifest;
   expiresAt: number;
 };
 
-/** Short-lived deployment capability cache; expiry lets new messages observe rollouts. */
+/** Short-lived bot-scoped profile cache; expiry lets new messages observe catalog rollouts. */
 const profileCache = new Map<string, CachedCardProfile>();
 
 /**
@@ -148,6 +147,11 @@ const dbg: (msg: string) => void = process.env.OCTO_CARD_DEBUG
  */
 function contextIdentity(ctx: CardContext): string {
   return JSON.stringify([ctx.apiUrl, ctx.channelId, ctx.channelType, ctx.onBehalfOf ?? "", ctx.botToken]);
+}
+
+/** Profile enabled/catalog facts are authorized by botToken, not shared by an apiUrl deployment. */
+function profileCacheKey(ctx: CardContext): string {
+  return JSON.stringify([ctx.apiUrl, ctx.botToken]);
 }
 
 /**
@@ -187,8 +191,7 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
     inFlight: false,
     nextCardSeq: 1,
     // Account config is a per-session narrowing decision. Keep it out of the
-    // apiUrl-keyed gate/caps caches, which contain deployment capability facts
-    // shared by multiple accounts.
+    // bot-scoped profile cache and apiUrl-keyed deployment render-caps cache.
     skip: collision || !!ctx.onBehalfOf || ctx.cardProgress === false,
   });
   dbg(`context set session=${sessionKey} channel=${ctx.channelId} obo=${!!ctx.onBehalfOf} collision=${collision}`);
@@ -200,38 +203,20 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
  * `null`=**瞬时探测失败**(5xx/网络,不缓存、不 skip,下次 flush 重探)。
  */
 async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<boolean | null> {
-  const cached = profileCache.get(ctx.apiUrl);
-  if (cached && cached.expiresAt > Date.now()) return cached.enabled;
-  if (cached) profileCache.delete(ctx.apiUrl);
+  const cacheKey = profileCacheKey(ctx);
+  const cached = profileCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return profileEnabledForContext(ctx, cached.manifest);
+  if (cached) profileCache.delete(cacheKey);
   try {
     const m = await getCardProfile({ apiUrl: ctx.apiUrl, botToken: ctx.botToken, signal });
     // 能力清单是部署级事实(与 enabled 无关),探到就缓存供渲染裁剪。
     capsCache.set(ctx.apiUrl, deriveCardCaps(m));
-    let enabled = m.available ? m.enabled : process.env.OCTO_CARD_MESSAGE_ENABLED === "1";
-    // 版本协商:manifest **明确 advertise** 了 profiles/card_version 却不含我们出站发送的
-    // octo/v1 + 1.5 时,判定不兼容 → 关闭,避免协议演进后 send/edit 撞 400(字段缺省则不设限,
-    // 与当前 server 行为一致)。
-    if (enabled && m.available) {
-      if (Array.isArray(m.profiles) && m.profiles.length > 0 && !m.profiles.includes(CARD_PROFILE)) {
-        dbg(`gate: profile ${CARD_PROFILE} not advertised (${m.profiles.join(",")}) → disabled`);
-        enabled = false;
-      } else if (typeof m.card_version === "string" && m.card_version !== CARD_VERSION) {
-        dbg(`gate: card_version ${m.card_version} != ${CARD_VERSION} → disabled`);
-        enabled = false;
-      } else if (Array.isArray(m.elements) && !m.elements.includes("TextBlock")) {
-        // 所有安全降级最终都依赖 TextBlock。显式空数组或缺 TextBlock 是权威不支持,
-        // 不能退回旧部署 baseline,否则会稳定撞 server 400。
-        dbg("gate: TextBlock not advertised → disabled");
-        enabled = false;
-      }
-    }
-    // 只缓存**确定结果**(manifest 明确 enabled/disabled/不兼容,或 available:false 回退 env)。
-    profileCache.set(ctx.apiUrl, {
-      enabled,
+    // Profile 来自带 botToken 的请求，其中 enabled/templating 都是 Bot 级事实。
+    profileCache.set(cacheKey, {
       manifest: m,
       expiresAt: Date.now() + PROFILE_CACHE_TTL_MS,
     });
-    return enabled;
+    return profileEnabledForContext(ctx, m);
   } catch (err: unknown) {
     // 瞬时失败(5xx/网络抖动)不缓存、不 skip —— 否则一次抖动会让该 apiUrl(缓存)或
     // 该 session(skip)的卡片进度永久关闭。返回 null,下次 flush(仍在 !messageId 期间)重探。
@@ -240,11 +225,36 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
   }
 }
 
+function profileEnabledForContext(ctx: CardContext, manifest: CardProfileManifest): boolean {
+  let enabled = manifest.available
+    ? manifest.enabled
+    : process.env.OCTO_CARD_MESSAGE_ENABLED === "1";
+  const registryCompatible = ctx.reasoningCardTemplateMode === "experimental" &&
+    !!selectReasoningProcessTemplate(manifest.templating);
+  // Model A 由 Registry 模板自己的 wire/views 契约协商，不依赖 Model B 的 Adaptive Card
+  // profile/card_version/elements。仅在实际走 Model B 时应用下面的渲染兼容 gate。
+  if (enabled && manifest.available && !registryCompatible) {
+    if (Array.isArray(manifest.profiles) && manifest.profiles.length > 0 &&
+        !manifest.profiles.includes(CARD_PROFILE)) {
+      dbg(`gate: profile ${CARD_PROFILE} not advertised (${manifest.profiles.join(",")}) → disabled`);
+      enabled = false;
+    } else if (typeof manifest.card_version === "string" && manifest.card_version !== CARD_VERSION) {
+      dbg(`gate: card_version ${manifest.card_version} != ${CARD_VERSION} → disabled`);
+      enabled = false;
+    } else if (Array.isArray(manifest.elements) && !manifest.elements.includes("TextBlock")) {
+      // Model B 的所有安全降级最终都依赖 TextBlock。显式空数组或缺 TextBlock 是权威不支持。
+      dbg("gate: TextBlock not advertised → disabled");
+      enabled = false;
+    }
+  }
+  return enabled;
+}
+
 function resolveEntryDeliveryMode(entry: CardEntry): void {
   if (entry.deliveryMode) return;
   const requested = entry.ctx.reasoningCardTemplateMode ?? "off";
   const templateRef = selectReasoningProcessTemplate(
-    profileCache.get(entry.ctx.apiUrl)?.manifest.templating,
+    profileCache.get(profileCacheKey(entry.ctx))?.manifest.templating,
   );
   if (requested === "shadow") {
     dbg(`Registry shadow discovery compatible=${!!templateRef}`);
@@ -439,7 +449,11 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
       let res;
       if (entry.deliveryMode === "model-a") {
         const data = buildReasoningProcessWireData(state);
-        if (!data || !entry.templateRef) return;
+        if (!data) {
+          dbg("model-a first frame deferred: no phases with actions yet");
+          return;
+        }
+        if (!entry.templateRef) return;
         res = await sendTemplateCardMessage({
           apiUrl: entry.ctx.apiUrl,
           botToken: entry.ctx.botToken,
@@ -493,8 +507,7 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     // 确定性拒绝(4xx,除可重试的 429)→ fail-closed,别对着必然失败的 server 逐事件重试。
     // 5xx / 网络 / 429 保持可重试(与 gate 的瞬时失败处理一致)。
     const status = httpStatusFromApiFetchError(err);
-    if (entry.deliveryMode === "model-a" ||
-        (status !== undefined && status >= 400 && status < 500 && status !== 429)) {
+    if (status !== undefined && status >= 400 && status < 500 && status !== 429) {
       entry.skip = true;
     }
   } finally {

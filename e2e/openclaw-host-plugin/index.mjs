@@ -41,7 +41,10 @@ function ensureEditObserver(api) {
     if (url.endsWith("/v1/bot/message/edit") && typeof init?.body === "string") {
       try {
         const request = JSON.parse(init.body);
-        const envelope = JSON.parse(request.content_edit);
+        const envelope = typeof request.content_edit === "string"
+          ? JSON.parse(request.content_edit)
+          : request.template_ref ? request : undefined;
+        if (!envelope) return response;
         fs.mkdirSync(REQUEST_DIR, { recursive: true });
         fs.appendFileSync(EDIT_LOG, JSON.stringify({
           timestampMs: Date.now(),
@@ -50,6 +53,10 @@ function ensureEditObserver(api) {
           ok: response.ok,
           transient: envelope.transient === true,
           plain: typeof envelope.plain === "string" ? envelope.plain : "",
+          ...(envelope.template_ref ? { templateRef: envelope.template_ref } : {}),
+          ...(typeof envelope.state === "string" ? { state: envelope.state } : {}),
+          ...(envelope.data && typeof envelope.data === "object" ? { data: envelope.data } : {}),
+          ...(Number.isSafeInteger(envelope.card_seq) ? { cardSeq: envelope.card_seq } : {}),
         }) + "\n");
       } catch (error) {
         api.logger.warn(`octo-host-e2e edit observer: ${error}`);

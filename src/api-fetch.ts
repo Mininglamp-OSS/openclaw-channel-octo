@@ -509,8 +509,16 @@ function validateTemplateFrame(params: {
   if (typeof id !== "string" || typeof version !== "string" || !id.trim() || !version.trim()) {
     throw new Error("octo: templateRef id/version are required");
   }
-  if (!params.state.trim()) throw new Error("octo: template state is required");
-  if ((params.data as { state?: unknown }).state !== params.state) {
+  if (typeof params.state !== "string" || !params.state.trim()) {
+    throw new Error("octo: template state is required");
+  }
+  const data = params.data as unknown;
+  if (data === null || typeof data !== "object" || Array.isArray(data) ||
+      (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null) ||
+      !Object.hasOwn(data, "state")) {
+    throw new Error("octo: data must be a plain object with own state");
+  }
+  if ((data as { state: unknown }).state !== params.state) {
     throw new Error("octo: data.state must match state");
   }
 }
@@ -590,8 +598,8 @@ export async function editCardMessage(params: {
     envelope.plain = params.plain;
   }
   if (params.cardSeq !== undefined) {
-    if (!Number.isSafeInteger(params.cardSeq) || params.cardSeq < 0) {
-      throw new Error("octo: cardSeq must be a non-negative safe integer");
+    if (!Number.isSafeInteger(params.cardSeq) || params.cardSeq <= 0) {
+      throw new Error("octo: cardSeq must be a positive safe integer");
     }
     envelope.card_seq = params.cardSeq;
   }
