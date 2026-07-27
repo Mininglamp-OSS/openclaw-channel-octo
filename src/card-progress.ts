@@ -28,6 +28,7 @@ import {
 import { deriveCardCaps } from "./card-caps.js";
 import { renderProgressCard, renderProgressResponseCard, summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState, type CardCaps } from "./card-render.js";
 import {
+  buildReasoningProcessId,
   buildReasoningProcessWireData,
   renderReasoningProcessCard,
   selectReasoningProcessTemplate,
@@ -284,7 +285,7 @@ function entryProgressState(
   opts: { elapsedMs?: number; errorText?: string } = {},
 ): CardProgressState {
   const runId = entry.continuationRunId ?? entry.runId;
-  entry.reasoningId ??= runId ? `${sessionKey}:${runId}` : sessionKey;
+  entry.reasoningId ??= buildReasoningProcessId(sessionKey, runId);
   return {
     reasoningId: entry.reasoningId,
     phase,
@@ -295,7 +296,9 @@ function entryProgressState(
 }
 
 function usesReasoningProcessContract(entry: CardEntry): boolean {
-  return entry.steps.some((step) => !!step.modelCallId || !!step.thought);
+  const reasoningVisible = entry.ctx.reasoningVisibility === "on" ||
+    entry.ctx.reasoningVisibility === "stream";
+  return reasoningVisible && entry.steps.some((step) => !!step.thought?.trim());
 }
 
 function renderEntryProgress(
@@ -856,6 +859,24 @@ export function recordCardReasoning(
   if (entry.messageId || entry.steps.some((step) => step.tool !== "__thinking__")) {
     scheduleFlush(sessionKey, entry);
   }
+}
+
+/**
+ * Bind dispatcher reasoning capture to the exact card-entry generation that created it.
+ * A late callback from a timed-out turn cannot resolve by sessionKey into a replacement entry.
+ */
+export function createCardReasoningRecorder(sessionKey: string): (
+  text: string,
+  opts?: { snapshot?: boolean },
+) => void {
+  const generation = cards.get(sessionKey);
+  return (text, opts = {}) => {
+    if (!generation || cards.get(sessionKey) !== generation || generation.skip ||
+        (generation.ctx.reasoningVisibility !== "on" && generation.ctx.reasoningVisibility !== "stream")) {
+      return;
+    }
+    recordCardReasoning(sessionKey, text, opts);
+  };
 }
 
 /** Best-effort answering transition inferred from the first non-reasoning reply payload. */

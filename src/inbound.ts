@@ -31,7 +31,7 @@ import {
   finalizeCard,
   finalizeCardWithResponse,
   markCardAnswering,
-  recordCardReasoning,
+  createCardReasoningRecorder,
 } from "./card-progress.js";
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER, CARD_PLACEHOLDER } from "./types.js";
 import type { RichTextBlock } from "./types.js";
@@ -2689,6 +2689,7 @@ export async function handleInboundMessage(params: {
     reasoningVisibility,
     ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
   });
+  const recordReasoningForGeneration = createCardReasoningRecorder(route.sessionKey);
 
   // 已读回执 + 正在输入 — fire-and-forget
   if (isOBOv2) {
@@ -2873,7 +2874,7 @@ export async function handleInboundMessage(params: {
     // is off, but provider-private text must never reach a channel-visible card
     // even if a host integration emits it unexpectedly.
     if (reasoningVisibility !== "on" && reasoningVisibility !== "stream") return;
-    recordCardReasoning(route.sessionKey, payload.text ?? "", {
+    recordReasoningForGeneration(payload.text ?? "", {
       snapshot: payload.isReasoningSnapshot === true,
     });
   };

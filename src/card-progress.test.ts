@@ -214,6 +214,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
       botToken: "bf",
       channelId: "g",
       channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
       reasoningCardTemplateMode: "experimental",
     });
     handlers.before_agent_run({}, hookCtx);
@@ -1762,6 +1763,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
       botToken: "bf",
       channelId: "g",
       channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
     });
     handlers.before_agent_run({}, ctx);
     handlers.model_call_started({ callId: "call-1" }, ctx);
@@ -1944,7 +1946,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(send).toBeTruthy();
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN");
-    expect(progressCardText(card)).toContain("Thinking through...");
+    expect(progressCardText(card)).not.toContain("Thinking through...");
+    expect(progressCardText(card)).toContain("推理与工具调用");
   });
 
   it("uses model_call_ended duration and preserves aborted as stopped at finalize", async () => {
@@ -1958,6 +1961,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
       botToken: "bf",
       channelId: "g",
       channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
     });
     handlers.before_agent_run({}, ctx);
     handlers.model_call_started({ callId: "call-1" }, ctx);
@@ -1992,8 +1996,10 @@ describe("card-progress 状态机 + hook + 节流", () => {
       botToken: "bf",
       channelId: "g",
       channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
     });
     handlers.model_call_started({ callId: "call-1" }, { sessionKey: "reasoning-answering" });
+    recordCardReasoning("reasoning-answering", "正在核对输入。", { snapshot: true });
     handlers.before_tool_call(
       { toolName: "read", toolCallId: "tool-1" },
       { sessionKey: "reasoning-answering" },

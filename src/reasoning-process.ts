@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { CARD_PLACEHOLDER, CARD_VERSION } from "./types.js";
 import type { CardTemplateRef, CardTemplatingCapability } from "./api-fetch.js";
 import { cardFitsLimits } from "./card-limits.js";
@@ -30,7 +31,7 @@ export interface ReasoningProcessPhase {
   actions: ReasoningProcessAction[];
 }
 
-/** ai.reasoning-process@0.1.0 data contract. */
+/** Shared producer contract for ai.reasoning-process@0.1.0 and bounded successor 0.2.0. */
 export interface ReasoningProcessData {
   reasoningId: string;
   state: ReasoningProcessState;
@@ -54,6 +55,15 @@ const MAX_RENDERED_PHASES = 6;
 const MAX_RENDERED_ACTIONS = 12;
 const REASONING_TEMPLATE_ID = "ai.reasoning-process";
 const TEMPLATE_WIRE = "template-ref/v1";
+const SUPPORTED_TEMPLATE_VERSIONS = new Set(["0.1.0", "0.2.0"]);
+export const REASONING_ID_MAX_LENGTH = 512;
+
+/** Preserve short IDs; use a stable collision-resistant digest instead of unsafe truncation. */
+export function buildReasoningProcessId(sessionKey: string, runId?: string): string {
+  const raw = runId ? `${sessionKey}:${runId}` : sessionKey;
+  if ([...raw].length <= REASONING_ID_MAX_LENGTH) return raw;
+  return `octo-reasoning:sha256:${createHash("sha256").update(raw).digest("hex")}`;
+}
 
 const REQUIRED_VIEWS = [
   { name: "active", states: ["reasoning", "answering"], wireProfile: "octo/v2", actions: ["reasoning_stop"] },
@@ -67,7 +77,7 @@ export function selectReasoningProcessTemplate(
 ): CardTemplateRef | null {
   if (!templating?.supported || templating.wire !== TEMPLATE_WIRE) return null;
   const compatible = templating.templates.filter((template) => {
-    if (template.id !== REASONING_TEMPLATE_ID || !template.version.trim()) return false;
+    if (template.id !== REASONING_TEMPLATE_ID || !SUPPORTED_TEMPLATE_VERSIONS.has(template.version)) return false;
     return REQUIRED_VIEWS.every((required) => {
       const view = template.views.find((candidate) => candidate.name === required.name);
       if (!view || view.wire_profile !== required.wireProfile) return false;
@@ -362,7 +372,7 @@ function plainText(data: ReasoningProcessData): string {
   return lines.join("\n") || CARD_PLACEHOLDER;
 }
 
-/** Render the toggle-only octo/v1 product variant of ai.reasoning-process@0.1.0. */
+/** Render the local toggle-only variant of the shared 0.1.0/0.2.0 data contract. */
 export function renderReasoningProcessCard(
   state: CardProgressState,
   caps?: CardCaps,
