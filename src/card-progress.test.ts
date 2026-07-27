@@ -1764,6 +1764,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
       botToken: "bf",
       channelId: "g",
       channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
     });
     handlers.before_agent_run({}, ctx);
     handlers.model_call_started({ callId: "call-1" }, ctx);
@@ -1794,6 +1795,37 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(progressCardText(card)).toContain("exec");
     expect(progressCardText(card)).toContain("printf");
     expect(progressCardText(card)).toContain("exit 0");
+  });
+
+  it("keeps host thinking agent events hidden when reasoning visibility is off", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers, emitAgentEvent } = makeApi();
+    const ctx = { sessionKey: "reasoning-agent-event-hidden", runId: "run-1" };
+
+    setCardContext("reasoning-agent-event-hidden", {
+      apiUrl: "https://reasoning-event-hidden.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "off",
+    });
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    await emitAgentEvent({
+      runId: "run-1",
+      sessionKey: "reasoning-agent-event-hidden",
+      stream: "thinking",
+      data: { text: "MUST STAY HIDDEN FROM THINKING EVENTS" },
+    });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, ctx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN");
+    expect(progressCardText(card)).toContain("Thinking through...");
   });
 
   it("captures persisted thinking blocks only when reasoning visibility is enabled", async () => {

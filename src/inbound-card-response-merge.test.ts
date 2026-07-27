@@ -95,10 +95,18 @@ function installFetchStub() {
 function installRuntime(
   hooks: Record<string, (event: unknown, ctx: unknown) => unknown>,
   finalText: string,
-  opts: { reasoningText?: string } = {},
+  opts: {
+    reasoningText?: string;
+    reasoningDelivery?: "stream" | "dispatcher";
+    reasoningVisibility?: "off" | "on" | "stream";
+  } = {},
 ) {
   setOctoRuntime({
-    config: { loadConfig: () => ({}) },
+    config: {
+      loadConfig: () => opts.reasoningVisibility && opts.reasoningVisibility !== "off"
+        ? { agents: { defaults: { reasoningDefault: opts.reasoningVisibility } } }
+        : {},
+    },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: async (args: any) => {
@@ -108,10 +116,18 @@ function installRuntime(
           if (opts.reasoningText) {
             hooks.before_agent_run({}, hookCtx);
             hooks.model_call_started({ callId: "call-merge" }, hookCtx);
-            await args.replyOptions.onReasoningStream({
-              text: opts.reasoningText,
-              isReasoningSnapshot: true,
-            });
+            if (opts.reasoningDelivery === "dispatcher") {
+              await args.dispatcherOptions.deliver({
+                text: opts.reasoningText,
+                isReasoning: true,
+                isReasoningSnapshot: true,
+              }, { kind: "block" });
+            } else {
+              await args.replyOptions.onReasoningStream({
+                text: opts.reasoningText,
+                isReasoningSnapshot: true,
+              });
+            }
           }
           hooks.before_tool_call({ toolName: "read", toolCallId: "read-1" }, hookCtx);
           await new Promise((resolve) => setTimeout(resolve, 850));
@@ -191,7 +207,10 @@ describe("inbound final response progress-card merge", () => {
   it("captures reasoning snapshots in the progress card without sending a reasoning text message", async () => {
     const { sends } = installFetchStub();
     const hooks = collectCardHooks();
-    installRuntime(hooks, "最终结论", { reasoningText: "先核对渠道数据，再给出结论。" });
+    installRuntime(hooks, "最终结论", {
+      reasoningText: "先核对渠道数据，再给出结论。",
+      reasoningVisibility: "stream",
+    });
 
     await runInbound();
 
@@ -203,6 +222,29 @@ describe("inbound final response progress-card merge", () => {
     expect(JSON.stringify(card)).toContain("先核对渠道数据，再给出结论。");
     expect(JSON.stringify(card)).toContain("read");
   });
+
+  it.each(["stream", "dispatcher"] as const)(
+    "keeps %s reasoning payloads out of progress cards when visibility is off",
+    async (reasoningDelivery) => {
+      const { sends } = installFetchStub();
+      const hooks = collectCardHooks();
+      installRuntime(hooks, "最终结论", {
+        reasoningText: `MUST STAY HIDDEN FROM ${reasoningDelivery}`,
+        reasoningDelivery,
+        reasoningVisibility: "off",
+      });
+
+      await runInbound();
+
+      const cardSend = sends.find((body) =>
+        (body.payload as { type?: number } | undefined)?.type === 17);
+      expect(cardSend).toBeTruthy();
+      expect(JSON.stringify(cardSend?.payload)).not.toContain("MUST STAY HIDDEN");
+      const textSends = sends.filter((body) =>
+        (body.payload as { type?: number } | undefined)?.type === 1);
+      expect(textSends).toHaveLength(0);
+    },
+  );
 
   it("keeps mention-bearing final text on the normal message path", async () => {
     const { sends } = installFetchStub();
