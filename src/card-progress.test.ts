@@ -253,6 +253,86 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(completed).not.toHaveProperty("content_edit");
   });
 
+  it("同 apiUrl 的不同 bot 各自使用自己的 Registry catalog", async () => {
+    const calls: Array<{ url: string; body?: Record<string, unknown>; token?: string }> = [];
+    global.fetch = vi.fn().mockImplementation(async (
+      url: string,
+      init?: { body?: string; headers?: HeadersInit },
+    ) => {
+      const token = new Headers(init?.headers).get("Authorization")?.replace(/^Bearer /, "");
+      calls.push({
+        url: String(url),
+        ...(init?.body ? { body: JSON.parse(init.body) as Record<string, unknown> } : {}),
+        ...(token ? { token } : {}),
+      });
+      if (String(url).includes("/card/profile")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => registryProfile(token === "bot-a" ? "1.0.0" : "2.0.0"),
+        };
+      }
+      if (String(url).includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: `card-${token}` }) };
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+    const { handlers } = makeApi();
+
+    for (const [sessionKey, botToken] of [["bot-a-session", "bot-a"], ["bot-b-session", "bot-b"]]) {
+      setCardContext(sessionKey, {
+        apiUrl: "https://shared-registry.test",
+        botToken,
+        channelId: `channel-${botToken}`,
+        channelType: ChannelType.Group,
+        reasoningCardTemplateMode: "experimental",
+      });
+      handlers.model_call_started({ callId: `call-${botToken}` }, { sessionKey });
+      handlers.before_tool_call(
+        { toolName: "read", toolCallId: `tool-${botToken}` },
+        { sessionKey },
+      );
+      await vi.advanceTimersByTimeAsync(900);
+    }
+
+    expect(calls.filter((call) => call.url.includes("/card/profile")).map((call) => call.token))
+      .toEqual(["bot-a", "bot-b"]);
+    expect(calls.filter((call) => call.url.includes("/sendMessage")).map((call) =>
+      ((call.body?.payload as { template_ref?: { version?: string } }).template_ref?.version)))
+      .toEqual(["1.0.0", "2.0.0"]);
+  });
+
+  it("兼容 Registry 模板不受 Model B card_version/elements gate 限制", async () => {
+    const { fn, calls } = mockFetch({
+      profile: {
+        ...registryProfile(),
+        card_version: "9.9",
+        elements: [],
+      },
+      sendId: "registry-without-model-b",
+    });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    setCardContext("registry-without-model-b", {
+      apiUrl: "https://registry-without-model-b.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.model_call_started({ callId: "call-1" }, { sessionKey: "registry-without-model-b" });
+    handlers.before_tool_call(
+      { toolName: "read", toolCallId: "tool-1" },
+      { sessionKey: "registry-without-model-b" },
+    );
+    await vi.advanceTimersByTimeAsync(900);
+
+    const payload = calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as
+      Record<string, unknown> | undefined;
+    expect(payload).toHaveProperty("template_ref.version", "9.8.7");
+    expect(payload).not.toHaveProperty("card");
+  });
+
   it("shadow 模式只验证 manifest，仍发送 Model B 完整卡", async () => {
     const { fn, calls } = mockFetch({
       profile: {
@@ -385,6 +465,47 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edits).toHaveLength(2);
     expect(edits[0]?.body).toEqual(edits[1]?.body);
     expect(edits[0]?.body?.card_seq).toBe(1);
+  });
+
+  it.each([429, 503])("Model A 首帧 %i 后下个事件仍可重试", async (failureStatus) => {
+    const calls: string[] = [];
+    let sendAttempts = 0;
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      calls.push(String(url));
+      if (String(url).includes("/card/profile")) {
+        return { ok: true, status: 200, json: async () => registryProfile() };
+      }
+      if (String(url).includes("/sendMessage")) {
+        sendAttempts += 1;
+        if (sendAttempts === 1) {
+          return {
+            ok: false,
+            status: failureStatus,
+            statusText: "temporary",
+            text: async () => "temporary",
+          };
+        }
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "retry-card" }) };
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = `registry-send-retry-${failureStatus}`;
+    setCardContext(sessionKey, {
+      apiUrl: `https://registry-send-retry-${failureStatus}.test`,
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.model_call_started({ callId: "call-1" }, { sessionKey });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, { sessionKey });
+    await vi.advanceTimersByTimeAsync(900);
+
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", result: {} }, { sessionKey });
+    await vi.advanceTimersByTimeAsync(900);
+
+    expect(calls.filter((url) => url.includes("/sendMessage"))).toHaveLength(2);
   });
 
   it("Model A stopped 状态始终是非 transient 终态", async () => {

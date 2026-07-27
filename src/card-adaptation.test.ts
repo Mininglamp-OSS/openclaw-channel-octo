@@ -202,6 +202,38 @@ describe("sendTemplateCardMessage Registry 出站组包", () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
+  it("拒绝非字符串 state，并返回稳定的契约错误", async () => {
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    await expect(sendTemplateCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      templateRef: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: null as never,
+      data: { state: null },
+    })).rejects.toThrow(/template state is required/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["null", null],
+    ["array", [{ state: "reasoning" }]],
+    ["prototype state", Object.create({ state: "reasoning" })],
+  ])("拒绝非 plain own-state data: %s", async (_label, data) => {
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    await expect(sendTemplateCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      templateRef: { id: "ai.reasoning-process", version: "9.8.7" },
+      state: "reasoning",
+      data: data as never,
+    })).rejects.toThrow(/data must be a plain object with own state/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
   it("拒绝带第三个字段的 template_ref，且不发起请求", async () => {
     global.fetch = vi.fn() as unknown as typeof fetch;
     await expect(sendTemplateCardMessage({
@@ -442,6 +474,20 @@ describe("editCardMessage 出站组包", () => {
       profile: "octo/v2",
       card_seq: 3,
     }));
+  });
+
+  it("拒绝 cardSeq=0，且不发起请求", async () => {
+    global.fetch = vi.fn() as unknown as typeof fetch;
+    await expect(editCardMessage({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      messageId: "m2",
+      channelId: "g1",
+      channelType: ChannelType.Group,
+      card: { type: "AdaptiveCard", body: [] },
+      cardSeq: 0,
+    })).rejects.toThrow(/positive safe integer/);
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });
 
