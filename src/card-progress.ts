@@ -1176,7 +1176,11 @@ function registerCardReasoningSubscription(api: OpenClawPluginApi): boolean {
     handle: (event) => {
       if (event.stream !== "thinking" || !event.sessionKey || !event.runId) return;
       const entry = cards.get(event.sessionKey);
-      if (!entry || entry.skip || !claimRun(entry, { runId: event.runId })) return;
+      if (!entry || entry.skip ||
+          (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream") ||
+          !claimRun(entry, { runId: event.runId })) {
+        return;
+      }
       const text = typeof event.data.text === "string"
         ? event.data.text
         : typeof event.data.delta === "string" ? event.data.delta : "";

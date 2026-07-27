@@ -2869,6 +2869,10 @@ export async function handleInboundMessage(params: {
     text?: string;
     isReasoningSnapshot?: boolean;
   }): void => {
+    // Defense in depth: hosts normally suppress these callbacks while reasoning
+    // is off, but provider-private text must never reach a channel-visible card
+    // even if a host integration emits it unexpectedly.
+    if (reasoningVisibility !== "on" && reasoningVisibility !== "stream") return;
     recordCardReasoning(route.sessionKey, payload.text ?? "", {
       snapshot: payload.isReasoningSnapshot === true,
     });

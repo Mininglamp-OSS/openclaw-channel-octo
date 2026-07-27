@@ -3,6 +3,7 @@ import { handleInboundMessage } from "./inbound.js";
 import { registerCardProgress, _resetCardProgressForTests } from "./card-progress.js";
 import { setOctoRuntime } from "./runtime.js";
 import { _clearKnownBots } from "./bot-registry.js";
+import { _clearOwnerRegistry, registerOwnerUid } from "./owner-registry.js";
 import { ChannelType, MessageType } from "./types.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 
@@ -36,7 +37,11 @@ function makeMessage() {
     channel_id: GROUP_ID,
     channel_type: ChannelType.Group,
     timestamp: Math.floor(Date.now() / 1000),
-    payload: { type: MessageType.Text, content: "分析渠道 B" },
+    payload: {
+      type: MessageType.Text,
+      content: "分析渠道 B",
+      mention: { uids: [BOT_UID] },
+    },
   };
 }
 
@@ -174,12 +179,15 @@ async function runInbound() {
 describe("inbound final response progress-card merge", () => {
   beforeEach(() => {
     _clearKnownBots();
+    _clearOwnerRegistry();
+    registerOwnerUid("acct1", HUMAN_UID);
     _resetCardProgressForTests();
     process.env.OCTO_CARD_MERGE_FINAL = "1";
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    _clearOwnerRegistry();
     _resetCardProgressForTests();
     vi.restoreAllMocks();
     if (originalMergeFlag === undefined) delete process.env.OCTO_CARD_MERGE_FINAL;
