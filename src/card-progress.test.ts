@@ -96,7 +96,7 @@ function mockFetch(opts: { enabled?: boolean; sendId?: string; profile?: Record<
   return { fn, calls };
 }
 
-function registryProfile(version = "9.8.7"): Record<string, unknown> {
+function registryProfile(version = "0.2.0"): Record<string, unknown> {
   return {
     enabled: true,
     profiles: ["octo/v1", "octo/v2"],
@@ -195,7 +195,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
         wire: "template-ref/v1",
         templates: [{
           id: "ai.reasoning-process",
-          version: "9.8.7",
+          version: "0.2.0",
           views: [
             { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
             { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
@@ -227,7 +227,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const sendPayload = send?.body?.payload as Record<string, unknown>;
     expect(sendPayload).toMatchObject({
       type: 17,
-      template_ref: { id: "ai.reasoning-process", version: "9.8.7" },
+      template_ref: { id: "ai.reasoning-process", version: "0.2.0" },
       state: "reasoning",
       data: { state: "reasoning", reasoningId: "registry-progress:run-1" },
     });
@@ -238,7 +238,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     await vi.advanceTimersByTimeAsync(900);
     const answering = calls.find((call) => call.url.includes("/message/edit"))?.body;
     expect(answering).toMatchObject({
-      template_ref: { id: "ai.reasoning-process", version: "9.8.7" },
+      template_ref: { id: "ai.reasoning-process", version: "0.2.0" },
       state: "answering",
       card_seq: 1,
       transient: true,
@@ -269,7 +269,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
         return {
           ok: true,
           status: 200,
-          json: async () => registryProfile(token === "bot-a" ? "1.0.0" : "2.0.0"),
+          json: async () => registryProfile(token === "bot-a" ? "0.1.0" : "0.2.0"),
         };
       }
       if (String(url).includes("/sendMessage")) {
@@ -299,7 +299,48 @@ describe("card-progress 状态机 + hook + 节流", () => {
       .toEqual(["bot-a", "bot-b"]);
     expect(calls.filter((call) => call.url.includes("/sendMessage")).map((call) =>
       ((call.body?.payload as { template_ref?: { version?: string } }).template_ref?.version)))
-      .toEqual(["1.0.0", "2.0.0"]);
+      .toEqual(["0.1.0", "0.2.0"]);
+  });
+
+  it("reasoningId 在 512 字符边界保留原值，513 字符使用稳定摘要", async () => {
+    const { fn, calls } = mockFetch({ profile: registryProfile(), sendId: "reasoning-id-card" });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+
+    const sendReasoningId = async (sessionKey: string, runId: string): Promise<string> => {
+      setCardContext(sessionKey, {
+        apiUrl: "https://reasoning-id.test",
+        botToken: "bf",
+        channelId: "g",
+        channelType: ChannelType.Group,
+        reasoningCardTemplateMode: "experimental",
+      });
+      const hookCtx = { sessionKey, runId };
+      handlers.before_agent_run({}, hookCtx);
+      handlers.model_call_started({ callId: `call-${runId}` }, hookCtx);
+      handlers.before_tool_call({ toolName: "read", toolCallId: `tool-${runId}` }, hookCtx);
+      await vi.advanceTimersByTimeAsync(900);
+      const payload = calls.filter((call) => call.url.includes("/sendMessage")).at(-1)?.body?.payload as {
+        data?: { reasoningId?: string };
+      };
+      clearCard(sessionKey);
+      return payload.data?.reasoningId ?? "";
+    };
+
+    const runId = "r";
+    const session512 = "x".repeat(510);
+    const raw512 = `${session512}:${runId}`;
+    expect([...raw512]).toHaveLength(512);
+    expect(await sendReasoningId(session512, runId)).toBe(raw512);
+
+    const session513 = "x".repeat(511);
+    const raw513 = `${session513}:${runId}`;
+    expect([...raw513]).toHaveLength(513);
+    const hashed = await sendReasoningId(session513, runId);
+    expect(hashed).toMatch(/^octo-reasoning:sha256:[a-f0-9]{64}$/);
+    expect([...hashed]).toHaveLength(86);
+    expect(await sendReasoningId(session513, runId)).toBe(hashed);
+    expect(await sendReasoningId("y".repeat(511), runId)).not.toBe(hashed);
   });
 
   it("兼容 Registry 模板不受 Model B card_version/elements gate 限制", async () => {
@@ -329,7 +370,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
 
     const payload = calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as
       Record<string, unknown> | undefined;
-    expect(payload).toHaveProperty("template_ref.version", "9.8.7");
+    expect(payload).toHaveProperty("template_ref.version", "0.2.0");
     expect(payload).not.toHaveProperty("card");
   });
 
@@ -343,7 +384,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
           wire: "template-ref/v1",
           templates: [{
             id: "ai.reasoning-process",
-            version: "9.8.7",
+            version: "0.2.0",
             views: [
               { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
               { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
@@ -381,7 +422,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
           wire: "template-ref/v1",
           templates: [{
             id: "ai.reasoning-process",
-            version: "9.8.7",
+            version: "0.2.0",
             views: [
               { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
               { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
@@ -426,7 +467,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
               wire: "template-ref/v1",
               templates: [{
                 id: "ai.reasoning-process",
-                version: "9.8.7",
+                version: "0.2.0",
                 views: [
                   { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
                   { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
@@ -612,7 +653,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
 
     expect(profileCalls).toBe(2);
     expect((calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as Record<string, unknown>))
-      .toHaveProperty("template_ref.version", "9.8.7");
+      .toHaveProperty("template_ref.version", "0.2.0");
   });
 
   it("Model A reasoningId 在 paused continuation 跨 run 后保持不变", async () => {
@@ -1819,13 +1860,16 @@ describe("card-progress 状态机 + hook + 节流", () => {
       data: { text: "MUST STAY HIDDEN FROM THINKING EVENTS" },
     });
     handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, ctx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", durationMs: 20 }, ctx);
     await vi.advanceTimersByTimeAsync(900);
 
     const send = calls.find((call) => call.url.includes("/sendMessage"));
     expect(send).toBeTruthy();
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN");
-    expect(progressCardText(card)).toContain("Thinking through...");
+    expect(progressCardText(card)).not.toContain("Thinking through...");
+    expect(progressCardText(card)).toContain("推理与工具调用");
+    expect(progressCardText(card)).toContain("读取文件 · 20ms");
   });
 
   it("captures persisted thinking blocks only when reasoning visibility is enabled", async () => {

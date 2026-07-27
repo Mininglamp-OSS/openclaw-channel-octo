@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleInboundMessage } from "./inbound.js";
-import { registerCardProgress, _resetCardProgressForTests } from "./card-progress.js";
+import {
+  registerCardProgress,
+  setCardContext,
+  _resetCardProgressForTests,
+} from "./card-progress.js";
 import { setOctoRuntime } from "./runtime.js";
 import { _clearKnownBots } from "./bot-registry.js";
 import { _clearOwnerRegistry, registerOwnerUid } from "./owner-registry.js";
@@ -104,6 +108,10 @@ function installRuntime(
     reasoningText?: string;
     reasoningDelivery?: "stream" | "dispatcher";
     reasoningVisibility?: "off" | "on" | "stream";
+    captureReasoningCallback?: (callback: (payload: {
+      text?: string;
+      isReasoningSnapshot?: boolean;
+    }) => void) => void;
   } = {},
 ) {
   setOctoRuntime({
@@ -115,6 +123,10 @@ function installRuntime(
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: async (args: any) => {
+          if (opts.captureReasoningCallback) {
+            opts.captureReasoningCallback(args.replyOptions.onReasoningStream);
+            return;
+          }
           const hookCtx = opts.reasoningText
             ? { sessionKey: "sk-merge", runId: "run-merge" }
             : { sessionKey: "sk-merge" };
@@ -253,6 +265,36 @@ describe("inbound final response progress-card merge", () => {
       expect(textSends).toHaveLength(0);
     },
   );
+
+  it("drops a late reasoning callback after the session entry generation is replaced", async () => {
+    const { sends } = installFetchStub();
+    const hooks = collectCardHooks();
+    let staleCapture: ((payload: { text?: string; isReasoningSnapshot?: boolean }) => void) | undefined;
+    installRuntime(hooks, "", {
+      reasoningVisibility: "stream",
+      captureReasoningCallback: (callback) => { staleCapture = callback; },
+    });
+    await runInbound();
+    expect(staleCapture).toBeTypeOf("function");
+
+    setCardContext("sk-merge", {
+      apiUrl: API,
+      botToken: "tok",
+      channelId: GROUP_ID,
+      channelType: ChannelType.Group,
+      reasoningVisibility: "off",
+    });
+    const currentRun = { sessionKey: "sk-merge", runId: "run-current" };
+    hooks.before_agent_run({}, currentRun);
+    staleCapture!({ text: "STALE TURN MUST NOT LEAK", isReasoningSnapshot: true });
+    hooks.before_tool_call({ toolName: "read", toolCallId: "read-current" }, currentRun);
+    await new Promise((resolve) => setTimeout(resolve, 850));
+
+    const cardSend = sends.find((body) =>
+      (body.payload as { type?: number } | undefined)?.type === 17);
+    expect(cardSend).toBeTruthy();
+    expect(JSON.stringify(cardSend?.payload)).not.toContain("STALE TURN MUST NOT LEAK");
+  });
 
   it("keeps mention-bearing final text on the normal message path", async () => {
     const { sends } = installFetchStub();

@@ -35,7 +35,7 @@ function state(overrides: Partial<CardProgressState> = {}): CardProgressState {
   };
 }
 
-describe("ai.reasoning-process@0.1.0 contract", () => {
+describe("ai.reasoning-process successor-compatible contract", () => {
   it("builds the completed ViewModel with raw tool names and sanitized action detail", () => {
     const data = buildReasoningProcessData(state());
 
@@ -187,36 +187,47 @@ describe("reasoning process template discovery", () => {
     ],
   });
 
-  it("selects the sole compatible manifest version without hardcoding it", () => {
+  it.each(["0.1.0", "0.2.0"])("selects the supported %s contract", (version) => {
     expect(selectReasoningProcessTemplate({
       supported: true,
       wire: "template-ref/v1",
-      templates: [template("9.8.7")],
-    })).toEqual({ id: "ai.reasoning-process", version: "9.8.7" });
+      templates: [template(version)],
+    })).toEqual({ id: "ai.reasoning-process", version });
   });
+
+  it.each(["0.3.0", "1.0.0", "9.8.7"])(
+    "fails closed for unknown contract version %s even when views match",
+    (version) => {
+      expect(selectReasoningProcessTemplate({
+        supported: true,
+        wire: "template-ref/v1",
+        templates: [template(version)],
+      })).toBeNull();
+    },
+  );
 
   it("fails closed for multiple compatible versions or incompatible view/state shapes", () => {
     expect(selectReasoningProcessTemplate({
       supported: true,
       wire: "template-ref/v1",
-      templates: [template("1.0.0"), template("2.0.0")],
+      templates: [template("0.1.0"), template("0.2.0")],
     })).toBeNull();
     expect(selectReasoningProcessTemplate({
       supported: true,
       wire: "template-ref/v1",
-      templates: [{ ...template("9.8.7"), views: template("9.8.7").views.slice(0, 2) }],
+      templates: [{ ...template("0.2.0"), views: template("0.2.0").views.slice(0, 2) }],
     })).toBeNull();
     expect(selectReasoningProcessTemplate({
       supported: true,
       wire: "other-wire",
-      templates: [template("9.8.7")],
+      templates: [template("0.2.0")],
     })).toBeNull();
   });
 
   it.each(["active", "result", "error"] as const)(
     "fails closed when the %s view advertises an extra submit action",
     (viewName) => {
-      const candidate = template("9.8.7");
+      const candidate = template("0.2.0");
       expect(selectReasoningProcessTemplate({
         supported: true,
         wire: "template-ref/v1",
