@@ -1846,6 +1846,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const { handlers, emitAgentEvent } = makeApi();
 
     expect(handlers.before_message_write).toBeUndefined();
+    expect(handlers.llm_output).toBeTypeOf("function");
 
     setCardContext("reasoning-stale-message-write", {
       apiUrl: "https://reasoning-stale-write.test",
@@ -1867,12 +1868,26 @@ describe("card-progress 状态机 + hook + 节流", () => {
     handlers.before_agent_run({}, currentCtx);
     handlers.model_call_started({ callId: "call-current" }, currentCtx);
 
+    handlers.llm_output({
+      runId: "run-old",
+      lastAssistant: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "STALE PRIVATE REASONING" }],
+      },
+    }, { sessionKey: "reasoning-stale-message-write", runId: "run-old" });
     await emitAgentEvent({
       runId: "run-old",
       sessionKey: "reasoning-stale-message-write",
       stream: "thinking",
       data: { text: "STALE PRIVATE REASONING" },
     });
+    handlers.llm_output({
+      runId: "run-current",
+      lastAssistant: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "CURRENT VISIBLE REASONING" }],
+      },
+    }, currentCtx);
     handlers.before_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
     handlers.after_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
     await vi.advanceTimersByTimeAsync(900);
@@ -1881,6 +1896,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(send).toBeTruthy();
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     expect(progressCardText(card)).not.toContain("STALE PRIVATE REASONING");
+    expect(progressCardText(card)).toContain("CURRENT VISIBLE REASONING");
   });
 
   it("keeps host thinking agent events hidden when reasoning visibility is off", async () => {
@@ -1920,7 +1936,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
   it("captures persisted thinking blocks only when reasoning visibility is enabled", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
-    const { handlers } = makeApi({ lifecycle: false });
+    const { handlers } = makeApi();
     const ctx = { sessionKey: "reasoning-message-write", runId: "run-1" };
 
     setCardContext("reasoning-message-write", {
@@ -1932,9 +1948,9 @@ describe("card-progress 状态机 + hook + 节流", () => {
     });
     handlers.before_agent_run({}, ctx);
     handlers.model_call_started({ callId: "call-1" }, ctx);
-    handlers.before_message_write({
-      sessionKey: "reasoning-message-write",
-      message: {
+    handlers.llm_output({
+      runId: "run-1",
+      lastAssistant: {
         role: "assistant",
         content: [{
           type: "thinking",
@@ -1963,7 +1979,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
   it("keeps persisted thinking blocks hidden when reasoning visibility is off", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
-    const { handlers } = makeApi({ lifecycle: false });
+    const { handlers } = makeApi();
     const ctx = { sessionKey: "reasoning-hidden", runId: "run-1" };
 
     setCardContext("reasoning-hidden", {
@@ -1975,9 +1991,9 @@ describe("card-progress 状态机 + hook + 节流", () => {
     });
     handlers.before_agent_run({}, ctx);
     handlers.model_call_started({ callId: "call-1" }, ctx);
-    handlers.before_message_write({
-      sessionKey: "reasoning-hidden",
-      message: {
+    handlers.llm_output({
+      runId: "run-1",
+      lastAssistant: {
         role: "assistant",
         content: [{ type: "thinking", thinking: "MUST STAY HIDDEN" }],
       },
