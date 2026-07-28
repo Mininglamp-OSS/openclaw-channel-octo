@@ -1845,7 +1845,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     global.fetch = fn as unknown as typeof fetch;
     const { handlers, emitAgentEvent } = makeApi();
 
-    expect(handlers.before_message_write).toBeUndefined();
+    expect(handlers.before_message_write).toBeTypeOf("function");
     expect(handlers.llm_output).toBeTypeOf("function");
 
     setCardContext("reasoning-stale-message-write", {
@@ -1855,7 +1855,9 @@ describe("card-progress 状态机 + hook + 节流", () => {
       channelType: ChannelType.Group,
       reasoningVisibility: "stream",
     });
-    handlers.before_agent_run({}, { sessionKey: "reasoning-stale-message-write", runId: "run-old" });
+    const oldCtx = { sessionKey: "reasoning-stale-message-write", runId: "run-old" };
+    handlers.before_agent_run({}, oldCtx);
+    handlers.model_call_started({ callId: "call-old" }, oldCtx);
 
     setCardContext("reasoning-stale-message-write", {
       apiUrl: "https://reasoning-stale-write.test",
@@ -1868,6 +1870,13 @@ describe("card-progress 状态机 + hook + 节流", () => {
     handlers.before_agent_run({}, currentCtx);
     handlers.model_call_started({ callId: "call-current" }, currentCtx);
 
+    handlers.before_message_write({
+      sessionKey: "reasoning-stale-message-write",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "STALE PRIVATE REASONING" }],
+      },
+    }, {});
     handlers.llm_output({
       runId: "run-old",
       lastAssistant: {
@@ -1881,13 +1890,14 @@ describe("card-progress 状态机 + hook + 节流", () => {
       stream: "thinking",
       data: { text: "STALE PRIVATE REASONING" },
     });
-    handlers.llm_output({
-      runId: "run-current",
-      lastAssistant: {
+    handlers.model_call_ended({ callId: "call-old", outcome: "completed" }, oldCtx);
+    handlers.before_message_write({
+      sessionKey: "reasoning-stale-message-write",
+      message: {
         role: "assistant",
         content: [{ type: "thinking", thinking: "CURRENT VISIBLE REASONING" }],
       },
-    }, currentCtx);
+    }, {});
     handlers.before_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
     handlers.after_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
     await vi.advanceTimersByTimeAsync(900);
