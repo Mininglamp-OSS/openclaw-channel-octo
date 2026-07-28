@@ -663,8 +663,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     });
     handlers.before_agent_run({}, hookCtx);
     handlers.model_call_started({ callId: "call-1" }, hookCtx);
-    // host 照常投递思考文本;可见性关闭 → 三条车道都不得落到卡上。
-    handlers.before_message_write({
+    // host 照常投递无 runId 的持久化 hook；该车道已 fail-close，不得落到卡上。
+    handlers.before_message_write?.({
       sessionKey: "registry-reasoning-off",
       message: { role: "assistant", content: [{ type: "thinking", thinking: "MUST STAY HIDDEN" }] },
     }, {});
@@ -1950,13 +1950,16 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(progressCardText(card)).toContain("exit 0");
   });
 
-  it("does not expose stale before_message_write capture when a run-aware thinking subscription exists", async () => {
+  it("registers only run-aware reasoning capture lanes", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
     const { handlers, emitAgentEvent } = makeApi();
+    const { handlers: legacyHandlers } = makeApi({ lifecycle: false });
 
-    expect(handlers.before_message_write).toBeTypeOf("function");
+    expect(handlers.before_message_write).toBeUndefined();
     expect(handlers.llm_output).toBeTypeOf("function");
+    expect(legacyHandlers.before_message_write).toBeUndefined();
+    expect(legacyHandlers.llm_output).toBeTypeOf("function");
 
     setCardContext("reasoning-stale-message-write", {
       apiUrl: "https://reasoning-stale-write.test",
@@ -1981,7 +1984,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     handlers.model_call_started({ callId: "call-current" }, currentCtx);
 
     handlers.model_call_ended({ callId: "call-old", outcome: "completed" }, oldCtx);
-    handlers.before_message_write({
+    handlers.before_message_write?.({
       sessionKey: "reasoning-stale-message-write",
       message: {
         role: "assistant",
@@ -2002,9 +2005,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
       data: { text: "STALE PRIVATE REASONING" },
     });
     handlers.model_call_ended({ callId: "call-current", outcome: "completed" }, currentCtx);
-    // 两个 run 同时挂着 token 时,无 runId 的 before_message_write 无法归属 → fail closed。
-    // 当前 run 的推理由带 runId 的车道(thinking 订阅 / llm_output)负责,不依赖这条兼容车道。
-    handlers.before_message_write({
+    // 当前 run 的推理仅由带 runId 的车道(thinking 订阅 / llm_output)负责。
+    handlers.before_message_write?.({
       sessionKey: "reasoning-stale-message-write",
       message: {
         role: "assistant",
@@ -2058,11 +2060,11 @@ describe("card-progress 状态机 + hook + 节流", () => {
     handlers.model_call_ended({ callId: "call-current", outcome: "completed" }, currentCtx);
     handlers.model_call_ended({ callId: "call-old", outcome: "completed" }, oldCtx);
 
-    handlers.before_message_write({
+    handlers.before_message_write?.({
       sessionKey,
       message: { role: "assistant", content: [{ type: "thinking", thinking: "STALE PRIVATE REASONING" }] },
     }, {});
-    handlers.before_message_write({
+    handlers.before_message_write?.({
       sessionKey,
       message: { role: "assistant", content: [{ type: "thinking", thinking: "ALSO UNATTRIBUTABLE" }] },
     }, {});
@@ -2188,10 +2190,10 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(progressCardText(card)).not.toContain("DROPPED TOKEN PRIVATE REASONING");
   });
 
-  it("单 run 的多次 model_call_ended 仍可按 token 归属捕获中间思考", async () => {
+  it("单 run 的多次 thinking agent event 仍可按 runId 捕获中间思考", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
-    const { handlers } = makeApi();
+    const { handlers, emitAgentEvent } = makeApi();
     const sessionKey = "reasoning-owned-model-write";
     const ctx = { sessionKey, runId: "run-1" };
 
@@ -2205,18 +2207,22 @@ describe("card-progress 状态机 + hook + 节流", () => {
     handlers.before_agent_run({}, ctx);
     handlers.model_call_started({ callId: "call-1" }, ctx);
     handlers.model_call_ended({ callId: "call-1", outcome: "completed" }, ctx);
-    handlers.before_message_write({
+    await emitAgentEvent({
+      runId: "run-1",
       sessionKey,
-      message: { role: "assistant", content: [{ type: "thinking", thinking: "FIRST INTERMEDIATE BLOCK" }] },
-    }, {});
+      stream: "thinking",
+      data: { text: "FIRST INTERMEDIATE BLOCK" },
+    });
     handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, ctx);
     handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", durationMs: 20 }, ctx);
     handlers.model_call_started({ callId: "call-2" }, ctx);
     handlers.model_call_ended({ callId: "call-2", outcome: "completed" }, ctx);
-    handlers.before_message_write({
+    await emitAgentEvent({
+      runId: "run-1",
       sessionKey,
-      message: { role: "assistant", content: [{ type: "thinking", thinking: "SECOND INTERMEDIATE BLOCK" }] },
-    }, {});
+      stream: "thinking",
+      data: { text: "SECOND INTERMEDIATE BLOCK" },
+    });
     await vi.advanceTimersByTimeAsync(900);
 
     const send = calls.find((call) => call.url.includes("/sendMessage"));

@@ -107,7 +107,6 @@ type CachedCardProfile = {
 
 type CardProgressSharedState = {
   cards: Map<string, CardEntry>;
-  pendingModelWrites: Map<string, Array<{ runId: string; endedAt: number }>>;
   pausedCards: Map<string, CardEntry>;
   profileCache: Map<string, CachedCardProfile>;
   capsCache: Map<string, CardCaps>;
@@ -126,7 +125,6 @@ function getCardProgressSharedState(): CardProgressSharedState {
   if (existing) return existing;
   const created: CardProgressSharedState = {
     cards: new Map(),
-    pendingModelWrites: new Map(),
     pausedCards: new Map(),
     profileCache: new Map(),
     capsCache: new Map(),
@@ -139,56 +137,6 @@ const sharedState = getCardProgressSharedState();
 
 /** key = sessionKey(H1 实证:全 hook 一致)。跨账号碰撞由 entry.identity + fail-closed 兜底。 */
 const cards = sharedState.cards;
-
-/** Run tokens awaiting their matching runId-less assistant persistence hook. */
-const pendingModelWrites = sharedState.pendingModelWrites;
-const PENDING_MODEL_WRITE_TTL_MS = 30_000;
-const MAX_PENDING_MODEL_WRITES = 16;
-
-function queuePendingModelWrite(sessionKey: string, runId: string): void {
-  const cutoff = Date.now() - PENDING_MODEL_WRITE_TTL_MS;
-  const queue = (pendingModelWrites.get(sessionKey) ?? [])
-    .filter((item) => item.endedAt >= cutoff);
-  queue.push({ runId, endedAt: Date.now() });
-  pendingModelWrites.set(sessionKey, queue.slice(-MAX_PENDING_MODEL_WRITES));
-}
-
-/**
- * Resolve the owning run for a runId-less assistant persistence hook.
- *
- * An id-less write is attributable only while **one** run on this sessionKey is awaiting
- * persistence. Two overlapping runs (a superseded turn plus its replacement) carry nothing in the
- * hook body that ties the text to either, and FIFO order does not follow write order: the host
- * dispatches `model_call_ended` through a bounded fire-and-forget queue (droppable) while this
- * hook runs synchronously inside appendMessage, so the superseded run's token can arrive last.
- * Shifting the head there published a reasoning-off turn's private thinking into the replacement
- * turn's card *and* starved the real write. Cross-run ambiguity therefore fails closed: consume
- * nothing, capture nothing, and let the TTL / agent_end reclaim the tokens. Several tokens from
- * the *same* run are unambiguous (same entry, same visibility) so the head is consumed normally.
- */
-function takeOwnedModelWrite(sessionKey: string, entry: CardEntry): string | undefined {
-  const cutoff = Date.now() - PENDING_MODEL_WRITE_TTL_MS;
-  const live = (pendingModelWrites.get(sessionKey) ?? []).filter((item) => item.endedAt >= cutoff);
-  const head = live[0];
-  if (!head) {
-    pendingModelWrites.delete(sessionKey);
-    return undefined;
-  }
-  if (live.some((item) => item.runId !== head.runId) || !claimRun(entry, { runId: head.runId })) {
-    pendingModelWrites.set(sessionKey, live);
-    return undefined;
-  }
-  live.shift();
-  if (live.length === 0) pendingModelWrites.delete(sessionKey);
-  else pendingModelWrites.set(sessionKey, live);
-  return head.runId;
-}
-
-function clearPendingModelRun(sessionKey: string, runId: string): void {
-  const queue = pendingModelWrites.get(sessionKey)?.filter((item) => item.runId !== runId);
-  if (!queue || queue.length === 0) pendingModelWrites.delete(sessionKey);
-  else pendingModelWrites.set(sessionKey, queue);
-}
 
 /**
  * 已经结束当前 dispatch、但仍等待 continuation 的卡片。与 cards 分开保存，避免下一条
@@ -899,7 +847,6 @@ export function _resetCardProgressForTests(): void {
   }
   cards.clear();
   pausedCards.clear();
-  pendingModelWrites.clear();
   profileCache.clear();
   capsCache.clear();
 }
@@ -1117,10 +1064,9 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     scheduleFlush(sk!, entry);
   });
 
-  // OpenClaw 2026.6.9 persists provider thinking even when the streaming agent
+  // OpenClaw 2026.6.9 may persist provider thinking even when the streaming agent
   // event lane emits nothing for a provider. llm_output exposes that persisted
-  // assistant message together with runId, unlike before_message_write; using it
-  // keeps the compatibility capture without letting a superseded run write into
+  // assistant message together with runId, so a superseded run cannot write into
   // the current sessionKey generation.
   api.on("llm_output", (event: unknown, ctx: unknown) => {
     const root = asRecord(event);
@@ -1135,34 +1081,6 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     }
     const message = asRecord(root?.lastAssistant);
     if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
-    const thought = message.content
-      .map((part) => asRecord(part))
-      .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
-      .map((part) => part!.thinking as string)
-      .join("\n")
-      .trim();
-    if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
-  });
-
-  // 2026.6.9 persists every intermediate provider thinking block here, after
-  // model_call_ended, while llm_output is emitted only once for the complete run.
-  // The hook itself has no runId, so ownership comes from the token left by the matching
-  // model_call_ended — and only while that attribution is unambiguous (see
-  // takeOwnedModelWrite). Visibility is read off the entry that owns the matched run, so a
-  // reasoning-off turn's thinking can never ride the next turn's visibility.
-  api.on("before_message_write", (event: unknown, ctx: unknown) => {
-    const root = asRecord(event);
-    const sk = typeof root?.sessionKey === "string"
-      ? root.sessionKey
-      : (ctx as { sessionKey?: string })?.sessionKey;
-    const message = asRecord(root?.message);
-    if (!sk || message?.role !== "assistant" || !Array.isArray(message.content)) return;
-    const entry = cards.get(sk);
-    if (!entry || entry.skip ||
-        (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
-      return;
-    }
-    if (!takeOwnedModelWrite(sk, entry)) return;
     const thought = message.content
       .map((part) => asRecord(part))
       .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
@@ -1242,20 +1160,12 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
   api.on("model_call_ended", (event: unknown, ctx: unknown) => {
     const e = (event ?? {}) as {
       callId?: string;
-      runId?: string;
       durationMs?: number;
       outcome?: "completed" | "error";
       failureKind?: string;
       errorCategory?: string;
     };
-    const { sessionKey: sk, runId: contextRunId } = (ctx ?? {}) as {
-      sessionKey?: string;
-      runId?: string;
-    };
-    const runId = e.runId ?? contextRunId;
-    // Only sessions with a live card entry can ever consume a token; queueing for every
-    // OpenClaw session in the process would grow the map beyond the tracked cards.
-    if (sk && runId && cards.has(sk)) queuePendingModelWrite(sk, runId);
+    const { sessionKey: sk } = (ctx ?? {}) as { sessionKey?: string };
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip || !claimRun(entry, ctx)) return;
     const target = e.callId
@@ -1276,7 +1186,6 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     const { sessionKey, runId: contextRunId } = (ctx ?? {}) as { sessionKey?: string; runId?: string };
     const runId = e.runId ?? contextRunId;
     if (!sessionKey || !runId) return;
-    clearPendingModelRun(sessionKey, runId);
     if (hasLifecycleSubscription) return;
     const entry = pausedCards.get(sessionKey);
     if (!entry || entry.continuationRunId !== runId) return;
