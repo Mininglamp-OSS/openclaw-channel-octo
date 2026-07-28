@@ -1064,6 +1064,10 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     scheduleFlush(sk!, entry);
   });
 
+  // Intentionally do not register before_message_write for reasoning capture: that hook has no
+  // runId, and neither FIFO model-end tokens nor sessionKey can prove ownership after a yield,
+  // replacement, or dropped hook. Providers visible only through that lane fall back to generic
+  // thought copy; privacy takes precedence over intermediate-text coverage.
   // OpenClaw 2026.6.9 may persist provider thinking even when the streaming agent
   // event lane emits nothing for a provider. llm_output exposes that persisted
   // assistant message together with runId, so a superseded run cannot write into
