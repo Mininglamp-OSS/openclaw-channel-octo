@@ -175,8 +175,11 @@ describe("card-progress 状态机 + hook + 节流", () => {
       channelType: ChannelType.Group,
     });
 
-    // OpenClaw 会分别加载 bundled channel 与 embedded agent runtime。重置模块缓存模拟
-    // 第二份 card-progress 模块记录；两边仍处于同一 Node 进程、共享 globalThis。
+    // OpenClaw 会分别加载 bundled channel 与 embedded agent runtime。真实 host 中它们可处于
+    // 不同 global realm，但仍属于同一 Node 进程。删除 realm 槽位并重置模块缓存来模拟该边界；
+    // 进度状态必须锚定 process，而不能只锚定 globalThis。
+    const realmRoot = globalThis as unknown as Record<PropertyKey, unknown>;
+    delete realmRoot[Symbol.for("openclaw.octo.card-progress-state.v1")];
     vi.resetModules();
     const agentRuntimeInstance = await import("./card-progress.js");
     const { handlers } = makeApi({ register: agentRuntimeInstance.registerCardProgress });
