@@ -105,6 +105,9 @@ const cards = new Map<string, CardEntry>();
 
 /** Active provider calls by session/run/call; used to run-own hooks that omit runId. */
 const activeModelCalls = new Map<string, Map<string, Set<string>>>();
+const pendingModelWrites = new Map<string, Array<{ runId: string; endedAt: number }>>();
+const PENDING_MODEL_WRITE_TTL_MS = 30_000;
+const MAX_PENDING_MODEL_WRITES = 16;
 
 function beginActiveModelCall(sessionKey: string, runId: string, callId: string): void {
   let runs = activeModelCalls.get(sessionKey);
@@ -134,6 +137,33 @@ function clearActiveModelRun(sessionKey: string, runId: string): void {
   if (!runs) return;
   runs.delete(runId);
   if (runs.size === 0) activeModelCalls.delete(sessionKey);
+}
+
+function queuePendingModelWrite(sessionKey: string, runId: string): void {
+  const cutoff = Date.now() - PENDING_MODEL_WRITE_TTL_MS;
+  const queue = (pendingModelWrites.get(sessionKey) ?? [])
+    .filter((item) => item.endedAt >= cutoff);
+  queue.push({ runId, endedAt: Date.now() });
+  pendingModelWrites.set(sessionKey, queue.slice(-MAX_PENDING_MODEL_WRITES));
+}
+
+function takePendingModelWrite(sessionKey: string): string | undefined {
+  const cutoff = Date.now() - PENDING_MODEL_WRITE_TTL_MS;
+  const queue = pendingModelWrites.get(sessionKey);
+  if (!queue) return undefined;
+  while (queue.length > 0) {
+    const item = queue.shift()!;
+    if (queue.length === 0) pendingModelWrites.delete(sessionKey);
+    if (item.endedAt >= cutoff) return item.runId;
+  }
+  pendingModelWrites.delete(sessionKey);
+  return undefined;
+}
+
+function clearPendingModelRun(sessionKey: string, runId: string): void {
+  const queue = pendingModelWrites.get(sessionKey)?.filter((item) => item.runId !== runId);
+  if (!queue || queue.length === 0) pendingModelWrites.delete(sessionKey);
+  else pendingModelWrites.set(sessionKey, queue);
 }
 
 function soleActiveModelRun(sessionKey: string): string | undefined {
@@ -847,6 +877,7 @@ export function _resetCardProgressForTests(): void {
   cards.clear();
   pausedCards.clear();
   activeModelCalls.clear();
+  pendingModelWrites.clear();
   profileCache.clear();
   capsCache.clear();
 }
@@ -1091,24 +1122,24 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
   });
 
-  // 2026.6.9 persists every intermediate provider thinking block here, while
-  // llm_output is emitted only once for the complete agent run. The hook itself
-  // has no runId, so accept it only when exactly one provider run is active for
-  // this session and that run owns the current card entry. Overlapping stale and
-  // replacement runs are ambiguous and fail closed.
+  // 2026.6.9 persists every intermediate provider thinking block here, after
+  // model_call_ended, while llm_output is emitted only once for the complete run.
+  // The hook itself has no runId, so consume the FIFO token left by the matching
+  // model_call_ended and require that run to own the current card entry. A stale
+  // run's late write consumes its own token but cannot contaminate a replacement.
   api.on("before_message_write", (event: unknown, ctx: unknown) => {
     const root = asRecord(event);
     const sk = typeof root?.sessionKey === "string"
       ? root.sessionKey
       : (ctx as { sessionKey?: string })?.sessionKey;
+    const message = asRecord(root?.message);
+    if (!sk || message?.role !== "assistant" || !Array.isArray(message.content)) return;
+    const runId = takePendingModelWrite(sk) ?? soleActiveModelRun(sk);
     const entry = sk ? cards.get(sk) : undefined;
-    const runId = sk ? soleActiveModelRun(sk) : undefined;
     if (!entry || entry.skip || !runId || !claimRun(entry, { runId }) ||
         (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
       return;
     }
-    const message = asRecord(root?.message);
-    if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
     const thought = message.content
       .map((part) => asRecord(part))
       .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
@@ -1204,7 +1235,10 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       runId?: string;
     };
     const runId = e.runId ?? contextRunId;
-    if (sk && runId) endActiveModelCall(sk, runId, e.callId ?? "__unknown__");
+    if (sk && runId) {
+      endActiveModelCall(sk, runId, e.callId ?? "__unknown__");
+      queuePendingModelWrite(sk, runId);
+    }
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip || !claimRun(entry, ctx)) return;
     const target = e.callId
@@ -1226,6 +1260,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     const runId = e.runId ?? contextRunId;
     if (!sessionKey || !runId) return;
     clearActiveModelRun(sessionKey, runId);
+    clearPendingModelRun(sessionKey, runId);
     if (hasLifecycleSubscription) return;
     const entry = pausedCards.get(sessionKey);
     if (!entry || entry.continuationRunId !== runId) return;

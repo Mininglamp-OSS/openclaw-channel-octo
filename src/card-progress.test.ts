@@ -1870,6 +1870,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     handlers.before_agent_run({}, currentCtx);
     handlers.model_call_started({ callId: "call-current" }, currentCtx);
 
+    handlers.model_call_ended({ callId: "call-old", outcome: "completed" }, oldCtx);
     handlers.before_message_write({
       sessionKey: "reasoning-stale-message-write",
       message: {
@@ -1890,7 +1891,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
       stream: "thinking",
       data: { text: "STALE PRIVATE REASONING" },
     });
-    handlers.model_call_ended({ callId: "call-old", outcome: "completed" }, oldCtx);
+    handlers.model_call_ended({ callId: "call-current", outcome: "completed" }, currentCtx);
     handlers.before_message_write({
       sessionKey: "reasoning-stale-message-write",
       message: {
