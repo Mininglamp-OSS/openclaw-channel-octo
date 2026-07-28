@@ -31,8 +31,52 @@ type Evidence = {
     timestampMs: number;
     plain: string;
     plainSource?: "original-message" | "accepted-edit";
+    templateRef?: { id: string; version: string };
+    state?: string;
+    data?: Record<string, unknown>;
+    cardSeq?: number;
+    transient?: boolean;
+    editCardSeqs: number[];
   }>;
 };
+
+type CardEvidence = Evidence["cards"][number];
+
+function cardText(card: CardEvidence | undefined): string {
+  if (!card) return "";
+  if (card.plain) return card.plain;
+  const data = card.data;
+  if (!data) return "";
+  const phases = Array.isArray(data.phases) ? data.phases : [];
+  return [
+    data.title,
+    data.statusLabel,
+    data.timerText,
+    data.progressText,
+    data.errorTitle,
+    data.errorMessage,
+    ...phases.flatMap((phase) => {
+      if (!phase || typeof phase !== "object" || Array.isArray(phase)) return [];
+      const record = phase as Record<string, unknown>;
+      const actions = Array.isArray(record.actions) ? record.actions : [];
+      return [
+        record.thought,
+        ...actions.flatMap((action) => {
+          if (!action || typeof action !== "object" || Array.isArray(action)) return [];
+          const actionRecord = action as Record<string, unknown>;
+          return [actionRecord.tool, actionRecord.detail];
+        }),
+      ];
+    }),
+  ].filter((value): value is string => typeof value === "string" && value.length > 0).join(" · ");
+}
+
+function expectStrictlyIncreasing(values: number[]): void {
+  expect(values.length).toBeGreaterThan(0);
+  for (let index = 1; index < values.length; index++) {
+    expect(values[index]).toBeGreaterThan(values[index - 1]!);
+  }
+}
 
 type BridgeResult = {
   ok?: boolean;
@@ -178,7 +222,8 @@ async function runLifecycleFlow({
     expect(checkpoint.cards).toHaveLength(1);
     expect(checkpoint.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
     expect(checkpoint.cards[0]?.plainSource).toBe("accepted-edit");
-    expect(checkpoint.cards[0]?.plain).toContain("Waiting for subtask...");
+    expect(cardText(checkpoint.cards[0])).toContain("Waiting for subtask...");
+    expect(checkpoint.cards[0]?.transient).toBe(true);
   }
 
   const completed = await waitForEvidence(
@@ -209,14 +254,19 @@ async function runLifecycleFlow({
   });
   expect(completed.cards).toHaveLength(1);
   expect(completed.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
-  expect(completed.cards[0]?.plain).toContain("Visible reasoning checkpoint.");
+  expect(completed.cards[0]?.templateRef).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+  expect(completed.cards[0]?.state).toBe("completed");
+  expect(completed.cards[0]?.transient).toBe(false);
+  expectStrictlyIncreasing(completed.cards[0]?.editCardSeqs ?? []);
+  expect(cardText(completed.cards[0])).toContain("Visible reasoning checkpoint.");
   // The visible card must contain both the allowlisted input summary (`printf`)
   // and the structured output summary (`exit 0`) from the same real tool call.
-  expect(completed.cards[0]?.plain).toContain("exec · printf · exit 0");
+  expect(cardText(completed.cards[0])).toContain("exec · printf · exit 0");
   if (pausedCheckpointDelayMs !== undefined) {
     expect(completed.cards[0]?.plainSource).toBe("accepted-edit");
-    const waitDuration = completed.cards[0]?.plain.match(/Subtask returned · ([\d.]+)s/)?.[1];
-    expect(waitDuration, completed.cards[0]?.plain).toBeDefined();
+    const text = cardText(completed.cards[0]);
+    const waitDuration = text.match(/Subtask returned · ([\d.]+)s/)?.[1];
+    expect(waitDuration, text).toBeDefined();
     expect(Number(waitDuration)).toBeGreaterThanOrEqual(pausedCheckpointDelayMs / 1_000);
   }
   expect(completed.phases).toEqual(["paused", "resuming", "done"]);
@@ -266,7 +316,7 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
         sessionKey,
         startedAtMs,
         (evidence) => evidence.cards.some((card) =>
-          card.plain.includes("exec · wc · exit 0")),
+          cardText(card).includes("exec · wc · exit 0")),
         60_000,
       );
       const names = completed.toolCalls.map((call) => call.name);
@@ -288,13 +338,19 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
       ]);
       expect(report).toBe("Processed: alpha=7\n");
       expect(completed.cards).toHaveLength(1);
-      const plain = completed.cards[0]?.plain ?? "";
-      expect(plain).toContain("I’ll inspect the source file before making changes.");
-      expect(plain).toContain("read");
-      expect(plain).toContain("input.txt");
-      expect(plain).toContain("write");
-      expect(plain).toContain("report.txt");
-      expect(plain).toContain("exec · wc · exit 0");
+      const text = cardText(completed.cards[0]);
+      expect(completed.cards[0]?.templateRef).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+      expect(completed.cards[0]?.state).toBe("completed");
+      expect(completed.cards[0]?.transient).toBe(false);
+      expectStrictlyIncreasing(completed.cards[0]?.editCardSeqs ?? []);
+      expect(text).toContain("I’ll inspect the source file before making changes.");
+      expect(text).toContain("The input is valid; I’ll write the derived report.");
+      expect(text).toContain("The report is written; I’ll verify its size with a command.");
+      expect(text).toContain("read");
+      expect(text).toContain("input.txt");
+      expect(text).toContain("write");
+      expect(text).toContain("report.txt");
+      expect(text).toContain("exec · wc · exit 0");
     } finally {
       await dockerExec([
         container,

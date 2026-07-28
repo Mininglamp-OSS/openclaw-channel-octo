@@ -101,12 +101,11 @@ function readSessionSettings() {
   }
 }
 
-function latestAcceptedEdit(messageId) {
-  const edits = readJsonLines("/tmp/octo-host-e2e/card-edits.jsonl")
+function acceptedEdits(messageId) {
+  return readJsonLines("/tmp/octo-host-e2e/card-edits.jsonl")
     .filter((row) => row?.ok === true && row?.messageId === messageId &&
       Number(row?.timestampMs ?? 0) >= startedAtMs - 5_000)
     .sort((a, b) => Number(a.timestampMs ?? 0) - Number(b.timestampMs ?? 0));
-  return edits.at(-1);
 }
 
 async function recentCards() {
@@ -136,7 +135,8 @@ async function recentCards() {
       const timestampMs = Number(message.timestamp ?? 0) * 1000;
       if (payload.type !== 17 || timestampMs < startedAtMs - 5_000) return [];
       const messageId = String(message.message_idstr ?? message.message_id ?? "");
-      const edit = latestAcceptedEdit(messageId);
+      const edits = acceptedEdits(messageId);
+      const edit = edits.at(-1);
       return [{
         messageId,
         timestampMs,
@@ -144,6 +144,18 @@ async function recentCards() {
           ? edit.plain
           : typeof payload.plain === "string" ? payload.plain : "",
         plainSource: edit ? "accepted-edit" : "original-message",
+        ...(edit?.templateRef || payload.template_ref
+          ? { templateRef: edit?.templateRef ?? payload.template_ref }
+          : {}),
+        ...(typeof edit?.state === "string" || typeof payload.state === "string"
+          ? { state: edit?.state ?? payload.state }
+          : {}),
+        ...(edit?.data || payload.data ? { data: edit?.data ?? payload.data } : {}),
+        ...(Number.isSafeInteger(edit?.cardSeq) ? { cardSeq: edit.cardSeq } : {}),
+        ...(edit ? { transient: edit.transient === true } : {}),
+        editCardSeqs: edits
+          .map((row) => row?.cardSeq)
+          .filter((value) => Number.isSafeInteger(value)),
       }];
     } catch {
       return [];
