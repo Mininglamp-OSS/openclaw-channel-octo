@@ -609,6 +609,45 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edit).not.toHaveProperty("transient");
   });
 
+  it("reasoning 关闭时 experimental 仍选 Model A,phases 用占位思考且不含任何捕获文本", async () => {
+    // 已文档化行为(README `reasoningCardTemplateMode`):Model A 的选择只取决于模板兼容性,
+    // 与 reasoning 可见性无关。可见性关闭的一轮不会有任何 thought 被捕获,卡片用
+    // FALLBACK_THOUGHT 承载真实工具行 —— 这里把它锁成显式期望,而不是隐式副产品。
+    const { fn, calls } = mockFetch({ profile: registryProfile(), sendId: "no-reasoning-card" });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "registry-reasoning-off", runId: "run-1" };
+    setCardContext("registry-reasoning-off", {
+      apiUrl: "https://registry-reasoning-off.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "off",
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.model_call_started({ callId: "call-1" }, hookCtx);
+    // host 照常投递思考文本;可见性关闭 → 三条车道都不得落到卡上。
+    handlers.before_message_write({
+      sessionKey: "registry-reasoning-off",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "MUST STAY HIDDEN" }] },
+    }, {});
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1", params: { path: "README.md" } }, hookCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", result: {} }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const payload = calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as {
+      template_ref?: Record<string, unknown>;
+      data?: { phases?: Array<{ thought: string; actions: unknown[] }> };
+    };
+    expect(payload?.template_ref).toMatchObject({ id: "ai.reasoning-process" });
+    const phases = payload?.data?.phases ?? [];
+    expect(phases.length).toBeGreaterThan(0);
+    expect(phases.every((phase) => phase.thought === "Thinking through...")).toBe(true);
+    expect(phases.some((phase) => phase.actions.length > 0)).toBe(true);
+    expect(JSON.stringify(payload?.data)).not.toContain("MUST STAY HIDDEN");
+  });
+
   it("Model A paused 帧是持久帧(可能挂 1h,不能进 transient)", async () => {
     // contractState 把 paused 映射成 reasoning,但 markCardPaused 明确不要 transient:
     // yielded 卡最长可挂 PAUSED_CARD_TTL_MS(1h),必须进修订历史,与 Model B 语义一致。
