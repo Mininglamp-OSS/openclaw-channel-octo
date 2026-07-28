@@ -103,41 +103,10 @@ interface CardEntry {
 /** key = sessionKey(H1 实证:全 hook 一致)。跨账号碰撞由 entry.identity + fail-closed 兜底。 */
 const cards = new Map<string, CardEntry>();
 
-/** Active provider calls by session/run/call; used to run-own hooks that omit runId. */
-const activeModelCalls = new Map<string, Map<string, Set<string>>>();
+/** Run tokens awaiting their matching runId-less assistant persistence hook. */
 const pendingModelWrites = new Map<string, Array<{ runId: string; endedAt: number }>>();
 const PENDING_MODEL_WRITE_TTL_MS = 30_000;
 const MAX_PENDING_MODEL_WRITES = 16;
-
-function beginActiveModelCall(sessionKey: string, runId: string, callId: string): void {
-  let runs = activeModelCalls.get(sessionKey);
-  if (!runs) {
-    runs = new Map();
-    activeModelCalls.set(sessionKey, runs);
-  }
-  let calls = runs.get(runId);
-  if (!calls) {
-    calls = new Set();
-    runs.set(runId, calls);
-  }
-  calls.add(callId);
-}
-
-function endActiveModelCall(sessionKey: string, runId: string, callId: string): void {
-  const runs = activeModelCalls.get(sessionKey);
-  const calls = runs?.get(runId);
-  if (!runs || !calls) return;
-  calls.delete(callId);
-  if (calls.size === 0) runs.delete(runId);
-  if (runs.size === 0) activeModelCalls.delete(sessionKey);
-}
-
-function clearActiveModelRun(sessionKey: string, runId: string): void {
-  const runs = activeModelCalls.get(sessionKey);
-  if (!runs) return;
-  runs.delete(runId);
-  if (runs.size === 0) activeModelCalls.delete(sessionKey);
-}
 
 function queuePendingModelWrite(sessionKey: string, runId: string): void {
   const cutoff = Date.now() - PENDING_MODEL_WRITE_TTL_MS;
@@ -164,11 +133,6 @@ function clearPendingModelRun(sessionKey: string, runId: string): void {
   const queue = pendingModelWrites.get(sessionKey)?.filter((item) => item.runId !== runId);
   if (!queue || queue.length === 0) pendingModelWrites.delete(sessionKey);
   else pendingModelWrites.set(sessionKey, queue);
-}
-
-function soleActiveModelRun(sessionKey: string): string | undefined {
-  const runs = activeModelCalls.get(sessionKey);
-  return runs?.size === 1 ? runs.keys().next().value : undefined;
 }
 
 /**
@@ -876,7 +840,6 @@ export function _resetCardProgressForTests(): void {
   }
   cards.clear();
   pausedCards.clear();
-  activeModelCalls.clear();
   pendingModelWrites.clear();
   profileCache.clear();
   capsCache.clear();
@@ -1134,7 +1097,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       : (ctx as { sessionKey?: string })?.sessionKey;
     const message = asRecord(root?.message);
     if (!sk || message?.role !== "assistant" || !Array.isArray(message.content)) return;
-    const runId = takePendingModelWrite(sk) ?? soleActiveModelRun(sk);
+    const runId = takePendingModelWrite(sk);
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip || !runId || !claimRun(entry, { runId }) ||
         (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
@@ -1192,16 +1155,11 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
   });
 
   api.on("model_call_started", (event: unknown, ctx: unknown) => {
-    const e = (event ?? {}) as { callId?: string; runId?: string };
-    const { sessionKey: sk, runId: contextRunId } = (ctx ?? {}) as {
-      sessionKey?: string;
-      runId?: string;
-    };
+    const e = (event ?? {}) as { callId?: string };
+    const sk = (ctx as { sessionKey?: string })?.sessionKey;
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip) return;
     if (!claimRun(entry, ctx)) return; // 外来 run 的迟到 model_call → 丢弃
-    const runId = e.runId ?? contextRunId;
-    if (sk && runId) beginActiveModelCall(sk, runId, e.callId ?? "__unknown__");
     // P1-g:每次 model_call 产一步"思考"。若上一步就是 running thinking(model_call_started
     // 被连续投递),忽略(去重)。
     const last = entry.steps[entry.steps.length - 1];
@@ -1235,10 +1193,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       runId?: string;
     };
     const runId = e.runId ?? contextRunId;
-    if (sk && runId) {
-      endActiveModelCall(sk, runId, e.callId ?? "__unknown__");
-      queuePendingModelWrite(sk, runId);
-    }
+    if (sk && runId) queuePendingModelWrite(sk, runId);
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip || !claimRun(entry, ctx)) return;
     const target = e.callId
@@ -1259,7 +1214,6 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     const { sessionKey, runId: contextRunId } = (ctx ?? {}) as { sessionKey?: string; runId?: string };
     const runId = e.runId ?? contextRunId;
     if (!sessionKey || !runId) return;
-    clearActiveModelRun(sessionKey, runId);
     clearPendingModelRun(sessionKey, runId);
     if (hasLifecycleSubscription) return;
     const entry = pausedCards.get(sessionKey);
