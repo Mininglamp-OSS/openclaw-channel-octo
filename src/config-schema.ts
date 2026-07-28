@@ -85,11 +85,12 @@ export const CARD_PROGRESS_DESCRIPTION =
   "When omitted or true, follow the server card capability gate; false force-disables automatic progress cards. Per-account values override the top-level value.";
 
 export const REASONING_CARD_TEMPLATE_MODE_DESCRIPTION =
-  "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A only when one compatible Bot-catalog template is advertised. Defaults to off; per-account values override the top-level value.";
+  "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A only when one compatible Bot-catalog template is advertised. Defaults to experimental; per-account values override the top-level value.";
 
 const REASONING_CARD_TEMPLATE_MODE_SCHEMA = {
   type: "string" as const,
   enum: ["off", "shadow", "experimental"] as const,
+  default: "experimental" as const,
   description: REASONING_CARD_TEMPLATE_MODE_DESCRIPTION,
 };
 

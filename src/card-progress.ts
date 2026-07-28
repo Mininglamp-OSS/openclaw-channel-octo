@@ -285,7 +285,7 @@ function profileEnabledForContext(ctx: CardContext, manifest: CardProfileManifes
 
 function resolveEntryDeliveryMode(entry: CardEntry): void {
   if (entry.deliveryMode) return;
-  const requested = entry.ctx.reasoningCardTemplateMode ?? "off";
+  const requested = entry.ctx.reasoningCardTemplateMode ?? "experimental";
   const templateRef = selectReasoningProcessTemplate(
     profileCache.get(profileCacheKey(entry.ctx))?.manifest.templating,
   );
