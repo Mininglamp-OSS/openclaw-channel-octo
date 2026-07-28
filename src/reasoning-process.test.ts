@@ -224,8 +224,11 @@ describe("reasoning process template discovery", () => {
     })).toBeNull();
   });
 
+  // Controls are presentation owned by the server-rendered template, not part of the data
+  // contract this producer supplies, so they never decide compatibility either way. Vetoing a
+  // template over a button would trade the whole card for Model B without removing anything.
   it.each(["active", "result", "error"] as const)(
-    "fails closed when the %s view advertises an extra submit action",
+    "stays compatible when the %s view advertises an unhandled submit action",
     (viewName) => {
       const candidate = template("0.2.0");
       expect(selectReasoningProcessTemplate({
@@ -237,9 +240,23 @@ describe("reasoning process template discovery", () => {
             ? { ...view, submit_actions: [...view.submit_actions, "future_action"] }
             : view),
         }],
-      })).toBeNull();
+      })).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
     },
   );
+
+  it("stays compatible when the template advertises no controls at all", () => {
+    // The intended shape once reasoning stop/regenerate is dropped from the template: run
+    // control is not a card action, so the card renders without those buttons.
+    const candidate = template("0.2.0");
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [{
+        ...candidate,
+        views: candidate.views.map((view) => ({ ...view, submit_actions: [] })),
+      }],
+    })).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+  });
 });
 
 describe("reasoning detail sanitization", () => {

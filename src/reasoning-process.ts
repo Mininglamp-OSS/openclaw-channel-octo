@@ -65,10 +65,18 @@ export function buildReasoningProcessId(sessionKey: string, runId?: string): str
   return `octo-reasoning:sha256:${createHash("sha256").update(raw).digest("hex")}`;
 }
 
+/**
+ * Views this producer supplies data for. Compatibility is a **data-contract** check only: the
+ * template must own a view for every state this producer emits, or the server cannot render the
+ * frame. `submit_actions` is deliberately not part of it — the template is a server-side asset
+ * rendered server-side, so which controls it shows is presentation the server owns, not something
+ * this producer either implements or vetoes. Requiring an action would also force a template that
+ * hides its controls to be judged incompatible, silently dropping the whole card to Model B.
+ */
 const REQUIRED_VIEWS = [
-  { name: "active", states: ["reasoning", "answering"], wireProfile: "octo/v2", actions: ["reasoning_stop"] },
-  { name: "error", states: ["error"], wireProfile: "octo/v2", actions: ["reasoning_retry"] },
-  { name: "result", states: ["completed", "stopped"], wireProfile: "octo/v1", actions: [] },
+  { name: "active", states: ["reasoning", "answering"], wireProfile: "octo/v2" },
+  { name: "error", states: ["error"], wireProfile: "octo/v2" },
+  { name: "result", states: ["completed", "stopped"], wireProfile: "octo/v1" },
 ] as const;
 
 /** Select only an unambiguous Bot-catalog entry with the contract shape this producer implements. */
@@ -82,10 +90,7 @@ export function selectReasoningProcessTemplate(
       const view = template.views.find((candidate) => candidate.name === required.name);
       if (!view || view.wire_profile !== required.wireProfile) return false;
       const states = new Set(view.states);
-      const actions = new Set(view.submit_actions);
-      return required.states.every((state) => states.has(state)) &&
-        actions.size === required.actions.length &&
-        required.actions.every((action) => actions.has(action));
+      return required.states.every((state) => states.has(state));
     });
   });
   return compatible.length === 1
