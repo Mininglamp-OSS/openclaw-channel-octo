@@ -990,6 +990,8 @@ function bindPausedContinuation(
 }
 
 export function registerCardProgress(api: OpenClawPluginApi): void {
+  const hasReasoningSubscription = registerCardReasoningSubscription(api);
+
   api.on("before_agent_run", (event: unknown, ctx: unknown) => {
     const { sessionKey, runId } = (ctx ?? {}) as { sessionKey?: string; runId?: string };
     bindCardRun(sessionKey, runId);
@@ -1023,31 +1025,32 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     scheduleFlush(sk!, entry);
   });
 
-  // OpenClaw 2026.6.9 persists provider thinking blocks even on paths where
-  // onReasoningStream is not forwarded to channel dispatchers. This synchronous
-  // hook is the compatibility lane. Never read it unless the user/session has
-  // explicitly enabled reasoning visibility; provider-private thinking remains
-  // hidden when reasoning is off.
-  api.on("before_message_write", (event: unknown, ctx: unknown) => {
-    const root = asRecord(event);
-    const sk = typeof root?.sessionKey === "string"
-      ? root.sessionKey
-      : (ctx as { sessionKey?: string })?.sessionKey;
-    const entry = sk ? cards.get(sk) : undefined;
-    if (!entry || entry.skip ||
-        (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
-      return;
-    }
-    const message = asRecord(root?.message);
-    if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
-    const thought = message.content
-      .map((part) => asRecord(part))
-      .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
-      .map((part) => part!.thinking as string)
-      .join("\n")
-      .trim();
-    if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
-  });
+  // Older hosts have no runId-carrying thinking subscription, so persisted
+  // provider thinking is the only compatibility signal available. Modern hosts
+  // must not register this sessionKey-only lane: a late write from a superseded
+  // run cannot be generation-checked and could contaminate the replacement card.
+  if (!hasReasoningSubscription) {
+    api.on("before_message_write", (event: unknown, ctx: unknown) => {
+      const root = asRecord(event);
+      const sk = typeof root?.sessionKey === "string"
+        ? root.sessionKey
+        : (ctx as { sessionKey?: string })?.sessionKey;
+      const entry = sk ? cards.get(sk) : undefined;
+      if (!entry || entry.skip ||
+          (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
+        return;
+      }
+      const message = asRecord(root?.message);
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+      const thought = message.content
+        .map((part) => asRecord(part))
+        .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
+        .map((part) => part!.thinking as string)
+        .join("\n")
+        .trim();
+      if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
+    });
+  }
 
   api.on("after_tool_call", (event: unknown, ctx: unknown) => {
     const e = (event ?? {}) as {
@@ -1139,7 +1142,6 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     if (entry.messageId) scheduleFlush(sk!, entry);
   });
 
-  registerCardReasoningSubscription(api);
   const hasLifecycleSubscription = registerCardLifecycleSubscription(api);
   if (!hasLifecycleSubscription) {
     api.on("agent_end", (event: unknown, ctx: unknown) => {

@@ -1920,7 +1920,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
   it("captures persisted thinking blocks only when reasoning visibility is enabled", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
-    const { handlers } = makeApi();
+    const { handlers } = makeApi({ lifecycle: false });
     const ctx = { sessionKey: "reasoning-message-write", runId: "run-1" };
 
     setCardContext("reasoning-message-write", {
@@ -1963,7 +1963,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
   it("keeps persisted thinking blocks hidden when reasoning visibility is off", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
-    const { handlers } = makeApi();
+    const { handlers } = makeApi({ lifecycle: false });
     const ctx = { sessionKey: "reasoning-hidden", runId: "run-1" };
 
     setCardContext("reasoning-hidden", {
