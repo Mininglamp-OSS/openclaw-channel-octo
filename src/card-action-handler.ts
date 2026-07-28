@@ -88,9 +88,15 @@ export async function handleCardAction(params: Params): Promise<CardActionHandle
     action.data?.owner === "ai" &&
     action.data?.action_type === "reasoning.control";
   if (isReasoningControl) {
-    // TODO: Before these controls gain side effects, move handling below
-    // lookupCardSession + identity verification and authorize the card owner.
-    // The event poller will persist and ACK this normally. ACK means queue
+    // TODO: These controls are still an unauthorized no-op ACK, and the fix is *not* to simply
+    // move this branch below the identity check: reasoning cards are progress cards, and progress
+    // cards never call registerCardSession (only `card-tool.ts` does), so `lookupCardSession`
+    // below can never resolve one — relocating the branch as-is would silently route every
+    // reasoning control into the generic unknown/expired path instead. Giving stop/retry real
+    // side effects therefore requires a progress-card owner registry keyed by messageId
+    // (accountId + channelId + channelType + sessionKey, in `card-progress.ts`); the branch must
+    // then move below that lookup and verify the clicking account/channel owns the card.
+    // Until then: the event poller will persist and ACK this normally. ACK means queue
     // consumption only; no cancellation/retry side effect is performed here.
     params.log?.warn?.(
       `octo: reasoning control is not supported action=${action.actionId} event=${action.eventId}`,

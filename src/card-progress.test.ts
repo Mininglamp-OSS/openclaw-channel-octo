@@ -9,6 +9,7 @@ import {
   registerCardProgress,
   bindCardRun,
   markCardAnswering,
+  createCardReasoningRecorder,
   recordCardReasoning,
   _resetCardProgressForTests,
 } from "./card-progress.js";
@@ -606,6 +607,40 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((call) => call.url.includes("/message/edit"))?.body;
     expect(edit).toMatchObject({ state: "error", card_seq: 1 });
     expect(edit).not.toHaveProperty("transient");
+  });
+
+  it("Model A paused 帧是持久帧(可能挂 1h,不能进 transient)", async () => {
+    // contractState 把 paused 映射成 reasoning,但 markCardPaused 明确不要 transient:
+    // yielded 卡最长可挂 PAUSED_CARD_TTL_MS(1h),必须进修订历史,与 Model B 语义一致。
+    const { fn, calls } = mockFetch({ profile: registryProfile(), sendId: "paused-card" });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "registry-paused", runId: "run-1" };
+    setCardContext("registry-paused", {
+      apiUrl: "https://registry-paused.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.model_call_started({ callId: "call-1" }, hookCtx);
+    recordCardReasoning("registry-paused", "先派一个子任务。", { snapshot: true });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", result: {} }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    calls.length = 0;
+
+    handlers.before_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    handlers.after_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1", result: {} }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    // dispatch 收尾:卡片移入 pausedCards 等 continuation,这一帧就是可能挂 1h 的那帧。
+    await finalizeCard("registry-paused", { success: true });
+
+    const paused = calls.filter((call) => call.url.includes("/message/edit")).at(-1)?.body;
+    expect(paused).toMatchObject({ state: "reasoning" });
+    expect(paused).not.toHaveProperty("transient");
   });
 
   it("manifest 短 TTL 到期后新消息可发现刚部署的 Registry 能力", async () => {
@@ -1892,6 +1927,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
       data: { text: "STALE PRIVATE REASONING" },
     });
     handlers.model_call_ended({ callId: "call-current", outcome: "completed" }, currentCtx);
+    // 两个 run 同时挂着 token 时,无 runId 的 before_message_write 无法归属 → fail closed。
+    // 当前 run 的推理由带 runId 的车道(thinking 订阅 / llm_output)负责,不依赖这条兼容车道。
     handlers.before_message_write({
       sessionKey: "reasoning-stale-message-write",
       message: {
@@ -1899,6 +1936,12 @@ describe("card-progress 状态机 + hook + 节流", () => {
         content: [{ type: "thinking", thinking: "CURRENT VISIBLE REASONING" }],
       },
     }, {});
+    await emitAgentEvent({
+      runId: "run-current",
+      sessionKey: "reasoning-stale-message-write",
+      stream: "thinking",
+      data: { text: "CURRENT VISIBLE REASONING" },
+    });
     handlers.before_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
     handlers.after_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
     await vi.advanceTimersByTimeAsync(900);
@@ -1908,6 +1951,165 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     expect(progressCardText(card)).not.toContain("STALE PRIVATE REASONING");
     expect(progressCardText(card)).toContain("CURRENT VISIBLE REASONING");
+  });
+
+  it("model_call_ended 逆序到达时,被取代 run 的 reasoning-off 思考不得写入替换后的卡", async () => {
+    // P1-1:host 用 fire-and-forget 有界队列派发 model_call_ended(可丢弃),而
+    // before_message_write 在 appendMessage 里同步执行 —— 被取代的慢 run 的 token 完全
+    // 可能后到。此时 FIFO 队首属于**替换后**的 run,取队首会把 reasoning 关闭那轮的
+    // 私有思考按新一轮的可见性发到频道,并顶掉当前轮自己的写入。
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = "reasoning-reversed-model-end";
+    const base = {
+      apiUrl: "https://reasoning-reversed.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    };
+
+    setCardContext(sessionKey, { ...base, reasoningVisibility: "off" });
+    const oldCtx = { sessionKey, runId: "run-old" };
+    handlers.before_agent_run({}, oldCtx);
+    handlers.model_call_started({ callId: "call-old" }, oldCtx);
+
+    setCardContext(sessionKey, { ...base, reasoningVisibility: "stream" });
+    const currentCtx = { sessionKey, runId: "run-current" };
+    handlers.before_agent_run({}, currentCtx);
+    handlers.model_call_started({ callId: "call-current" }, currentCtx);
+
+    // 逆序:替换后 run 的 model_call_ended 先落,被取代 run 的后落。
+    handlers.model_call_ended({ callId: "call-current", outcome: "completed" }, currentCtx);
+    handlers.model_call_ended({ callId: "call-old", outcome: "completed" }, oldCtx);
+
+    handlers.before_message_write({
+      sessionKey,
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "STALE PRIVATE REASONING" }] },
+    }, {});
+    handlers.before_message_write({
+      sessionKey,
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "ALSO UNATTRIBUTABLE" }] },
+    }, {});
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-current", durationMs: 20 }, currentCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    const text = progressCardText(card);
+    expect(text).not.toContain("STALE PRIVATE REASONING");
+    expect(text).not.toContain("ALSO UNATTRIBUTABLE");
+    expect(text).toContain("读取文件 · 20ms");
+  });
+
+  it("单 run 的多次 model_call_ended 仍可按 token 归属捕获中间思考", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = "reasoning-owned-model-write";
+    const ctx = { sessionKey, runId: "run-1" };
+
+    setCardContext(sessionKey, {
+      apiUrl: "https://reasoning-owned.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
+    });
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    handlers.model_call_ended({ callId: "call-1", outcome: "completed" }, ctx);
+    handlers.before_message_write({
+      sessionKey,
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "FIRST INTERMEDIATE BLOCK" }] },
+    }, {});
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, ctx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", durationMs: 20 }, ctx);
+    handlers.model_call_started({ callId: "call-2" }, ctx);
+    handlers.model_call_ended({ callId: "call-2", outcome: "completed" }, ctx);
+    handlers.before_message_write({
+      sessionKey,
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "SECOND INTERMEDIATE BLOCK" }] },
+    }, {});
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    const text = progressCardText(card);
+    expect(text).toContain("FIRST INTERMEDIATE BLOCK");
+    expect(text).toContain("SECOND INTERMEDIATE BLOCK");
+  });
+
+  it("createCardReasoningRecorder 丢弃 entry 被替换后的迟到回调", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = "reasoning-recorder-generation";
+    const cardCtx = {
+      apiUrl: "https://reasoning-recorder.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "stream" as const,
+    };
+
+    setCardContext(sessionKey, cardCtx);
+    // dispatch 侧在 setCardContext 之后立刻取 recorder,绑定的是当时那个 generation。
+    const staleRecorder = createCardReasoningRecorder(sessionKey);
+    const oldCtx = { sessionKey, runId: "run-old" };
+    handlers.before_agent_run({}, oldCtx);
+    handlers.model_call_started({ callId: "call-old" }, oldCtx);
+
+    // 同 sessionKey 的下一 run 替换 entry(cards.set 换对象 = generation fence)。
+    setCardContext(sessionKey, cardCtx);
+    const currentRecorder = createCardReasoningRecorder(sessionKey);
+    const currentCtx = { sessionKey, runId: "run-current" };
+    handlers.before_agent_run({}, currentCtx);
+    handlers.model_call_started({ callId: "call-current" }, currentCtx);
+
+    staleRecorder("STALE GENERATION REASONING", { snapshot: true });
+    currentRecorder("CURRENT GENERATION REASONING", { snapshot: true });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-current", durationMs: 20 }, currentCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).not.toContain("STALE GENERATION REASONING");
+    expect(progressCardText(card)).toContain("CURRENT GENERATION REASONING");
+  });
+
+  it("createCardReasoningRecorder 在 reasoning 关闭的 generation 上不记录任何文本", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = "reasoning-recorder-off";
+    const ctx = { sessionKey, runId: "run-1" };
+
+    setCardContext(sessionKey, {
+      apiUrl: "https://reasoning-recorder-off.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "off",
+    });
+    const recorder = createCardReasoningRecorder(sessionKey);
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    recorder("MUST STAY HIDDEN FROM RECORDER", { snapshot: true });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, ctx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", durationMs: 20 }, ctx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN FROM RECORDER");
+    expect(progressCardText(card)).toContain("读取文件 · 20ms");
   });
 
   it("keeps host thinking agent events hidden when reasoning visibility is off", async () => {

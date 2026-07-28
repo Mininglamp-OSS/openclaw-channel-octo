@@ -116,17 +116,35 @@ function queuePendingModelWrite(sessionKey: string, runId: string): void {
   pendingModelWrites.set(sessionKey, queue.slice(-MAX_PENDING_MODEL_WRITES));
 }
 
-function takePendingModelWrite(sessionKey: string): string | undefined {
+/**
+ * Resolve the owning run for a runId-less assistant persistence hook.
+ *
+ * An id-less write is attributable only while **one** run on this sessionKey is awaiting
+ * persistence. Two overlapping runs (a superseded turn plus its replacement) carry nothing in the
+ * hook body that ties the text to either, and FIFO order does not follow write order: the host
+ * dispatches `model_call_ended` through a bounded fire-and-forget queue (droppable) while this
+ * hook runs synchronously inside appendMessage, so the superseded run's token can arrive last.
+ * Shifting the head there published a reasoning-off turn's private thinking into the replacement
+ * turn's card *and* starved the real write. Cross-run ambiguity therefore fails closed: consume
+ * nothing, capture nothing, and let the TTL / agent_end reclaim the tokens. Several tokens from
+ * the *same* run are unambiguous (same entry, same visibility) so the head is consumed normally.
+ */
+function takeOwnedModelWrite(sessionKey: string, entry: CardEntry): string | undefined {
   const cutoff = Date.now() - PENDING_MODEL_WRITE_TTL_MS;
-  const queue = pendingModelWrites.get(sessionKey);
-  if (!queue) return undefined;
-  while (queue.length > 0) {
-    const item = queue.shift()!;
-    if (queue.length === 0) pendingModelWrites.delete(sessionKey);
-    if (item.endedAt >= cutoff) return item.runId;
+  const live = (pendingModelWrites.get(sessionKey) ?? []).filter((item) => item.endedAt >= cutoff);
+  const head = live[0];
+  if (!head) {
+    pendingModelWrites.delete(sessionKey);
+    return undefined;
   }
-  pendingModelWrites.delete(sessionKey);
-  return undefined;
+  if (live.some((item) => item.runId !== head.runId) || !claimRun(entry, { runId: head.runId })) {
+    pendingModelWrites.set(sessionKey, live);
+    return undefined;
+  }
+  live.shift();
+  if (live.length === 0) pendingModelWrites.delete(sessionKey);
+  else pendingModelWrites.set(sessionKey, live);
+  return head.runId;
 }
 
 function clearPendingModelRun(sessionKey: string, runId: string): void {
@@ -160,6 +178,8 @@ const FLUSH_DEBOUNCE_MS = 800;
 const EDIT_TIMEOUT_MS = 10_000;
 const PROFILE_CACHE_TTL_MS = 60_000;
 const REGISTRY_EDIT_RETRY_DELAYS_MS = [100, 250] as const;
+/** Registry 契约里必须进修订历史的终态帧。 */
+const TERMINAL_TEMPLATE_STATES = new Set(["completed", "stopped", "error"]);
 const PAUSED_CARD_TTL_MS = 60 * 60 * 1000;
 const INTERNAL_CONTEXT_BEGIN = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
 const INTERNAL_CONTEXT_END = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
@@ -347,6 +367,10 @@ function renderEntryProgress(
 function isRetryableRegistryEditError(error: unknown): boolean {
   const transportStatus = httpStatusFromApiFetchError(error);
   const message = error instanceof Error ? error.message : String(error);
+  // 本地契约校验(validateTemplateFrame / 必填字段)在 fetch 之前抛,前缀 `octo: ` 且无 HTTP 状态。
+  // 重试只会用完全相同的非法 body 再打一次,所以不可重试;状态缺失的 **传输** 失败
+  // (网络/超时,消息形如 `Octo API ... failed`)仍按可重试处理。
+  if (transportStatus === undefined && /^octo: /.test(message)) return false;
   const semanticStatus = Number(message.match(/"http_status"\s*:\s*(\d{3})/)?.[1]);
   return transportStatus === undefined || transportStatus === 429 || transportStatus >= 500 ||
     (Number.isFinite(semanticStatus) && semanticStatus >= 500);
@@ -405,7 +429,10 @@ async function editEntryProgress(params: {
       state: data.state,
       data,
       cardSeq,
-      ...((data.state === "reasoning" || data.state === "answering")
+      // 调用方意图 **与** 非终态双重约束。只看 state 会把 markCardPaused 的持久 paused 帧
+      // (contractState 映射成 reasoning,却可能挂上 PAUSED_CARD_TTL_MS=1h)误标 transient;
+      // 只看调用方意图又会漏掉从 debounce flush 路径(恒 transient:true)到达的 stopped 终态。
+      ...(params.transient && !TERMINAL_TEMPLATE_STATES.has(data.state)
         ? { transient: true }
         : {}),
       signal: params.signal,
@@ -1087,9 +1114,10 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
 
   // 2026.6.9 persists every intermediate provider thinking block here, after
   // model_call_ended, while llm_output is emitted only once for the complete run.
-  // The hook itself has no runId, so consume the FIFO token left by the matching
-  // model_call_ended and require that run to own the current card entry. A stale
-  // run's late write consumes its own token but cannot contaminate a replacement.
+  // The hook itself has no runId, so ownership comes from the token left by the matching
+  // model_call_ended — and only while that attribution is unambiguous (see
+  // takeOwnedModelWrite). Visibility is read off the entry that owns the matched run, so a
+  // reasoning-off turn's thinking can never ride the next turn's visibility.
   api.on("before_message_write", (event: unknown, ctx: unknown) => {
     const root = asRecord(event);
     const sk = typeof root?.sessionKey === "string"
@@ -1097,12 +1125,12 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       : (ctx as { sessionKey?: string })?.sessionKey;
     const message = asRecord(root?.message);
     if (!sk || message?.role !== "assistant" || !Array.isArray(message.content)) return;
-    const runId = takePendingModelWrite(sk);
-    const entry = sk ? cards.get(sk) : undefined;
-    if (!entry || entry.skip || !runId || !claimRun(entry, { runId }) ||
+    const entry = cards.get(sk);
+    if (!entry || entry.skip ||
         (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
       return;
     }
+    if (!takeOwnedModelWrite(sk, entry)) return;
     const thought = message.content
       .map((part) => asRecord(part))
       .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
@@ -1193,7 +1221,9 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       runId?: string;
     };
     const runId = e.runId ?? contextRunId;
-    if (sk && runId) queuePendingModelWrite(sk, runId);
+    // Only sessions with a live card entry can ever consume a token; queueing for every
+    // OpenClaw session in the process would grow the map beyond the tracked cards.
+    if (sk && runId && cards.has(sk)) queuePendingModelWrite(sk, runId);
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip || !claimRun(entry, ctx)) return;
     const target = e.callId

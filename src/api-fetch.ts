@@ -523,7 +523,13 @@ function validateTemplateFrame(params: {
   }
 }
 
-/** Send one Registry-authored type-17 card without any Model B render-owned fields. */
+/**
+ * Send one Registry-authored type-17 card without any Model B render-owned fields.
+ *
+ * `onBehalfOf` is intentionally absent (unlike {@link sendCardMessage}): Registry template cards
+ * are bot-authored by design, and OBO + type-17 is rejected by P1 Decision 2b — persona-clone
+ * turns skip progress cards entirely in `card-progress.ts`.
+ */
 export async function sendTemplateCardMessage(params: {
   apiUrl: string;
   botToken: string;
