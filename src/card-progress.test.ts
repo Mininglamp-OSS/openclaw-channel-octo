@@ -412,6 +412,35 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(payload).not.toHaveProperty("card");
   });
 
+  it("未配置 reasoningCardTemplateMode 时默认选择兼容的 Registry 模板", async () => {
+    const { fn, calls } = mockFetch({
+      profile: registryProfile(),
+      sendId: "registry-default-experimental",
+    });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    setCardContext("registry-default-experimental", {
+      apiUrl: "https://registry-default-experimental.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    handlers.model_call_started(
+      { callId: "call-1" },
+      { sessionKey: "registry-default-experimental" },
+    );
+    handlers.before_tool_call(
+      { toolName: "read", toolCallId: "tool-1" },
+      { sessionKey: "registry-default-experimental" },
+    );
+    await vi.advanceTimersByTimeAsync(900);
+
+    const payload = calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as
+      Record<string, unknown> | undefined;
+    expect(payload).toHaveProperty("template_ref.version", "0.2.0");
+    expect(payload).not.toHaveProperty("card");
+  });
+
   it("shadow 模式只验证 manifest，仍发送 Model B 完整卡", async () => {
     const { fn, calls } = mockFetch({
       profile: {

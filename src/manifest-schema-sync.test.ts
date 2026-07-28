@@ -60,6 +60,7 @@ describe("openclaw.plugin.json channelConfigs", () => {
     const tsAccountProps = (tsProps.accounts as any).additionalProperties.properties;
 
     expect(tsProps.reasoningCardTemplateMode.enum).toEqual(["off", "shadow", "experimental"]);
+    expect(tsProps.reasoningCardTemplateMode.default).toBe("experimental");
     expect(tsAccountProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
     expect(manifestProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
     expect(manifestAccountProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
