@@ -103,6 +103,44 @@ interface CardEntry {
 /** key = sessionKey(H1 实证:全 hook 一致)。跨账号碰撞由 entry.identity + fail-closed 兜底。 */
 const cards = new Map<string, CardEntry>();
 
+/** Active provider calls by session/run/call; used to run-own hooks that omit runId. */
+const activeModelCalls = new Map<string, Map<string, Set<string>>>();
+
+function beginActiveModelCall(sessionKey: string, runId: string, callId: string): void {
+  let runs = activeModelCalls.get(sessionKey);
+  if (!runs) {
+    runs = new Map();
+    activeModelCalls.set(sessionKey, runs);
+  }
+  let calls = runs.get(runId);
+  if (!calls) {
+    calls = new Set();
+    runs.set(runId, calls);
+  }
+  calls.add(callId);
+}
+
+function endActiveModelCall(sessionKey: string, runId: string, callId: string): void {
+  const runs = activeModelCalls.get(sessionKey);
+  const calls = runs?.get(runId);
+  if (!runs || !calls) return;
+  calls.delete(callId);
+  if (calls.size === 0) runs.delete(runId);
+  if (runs.size === 0) activeModelCalls.delete(sessionKey);
+}
+
+function clearActiveModelRun(sessionKey: string, runId: string): void {
+  const runs = activeModelCalls.get(sessionKey);
+  if (!runs) return;
+  runs.delete(runId);
+  if (runs.size === 0) activeModelCalls.delete(sessionKey);
+}
+
+function soleActiveModelRun(sessionKey: string): string | undefined {
+  const runs = activeModelCalls.get(sessionKey);
+  return runs?.size === 1 ? runs.keys().next().value : undefined;
+}
+
 /**
  * 已经结束当前 dispatch、但仍等待 continuation 的卡片。与 cards 分开保存，避免下一条
  * inbound 的 setCardContext 覆盖 messageId，导致后台任务回来后无法更新原卡。
@@ -808,6 +846,7 @@ export function _resetCardProgressForTests(): void {
   }
   cards.clear();
   pausedCards.clear();
+  activeModelCalls.clear();
   profileCache.clear();
   capsCache.clear();
 }
@@ -1052,6 +1091,33 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
   });
 
+  // 2026.6.9 persists every intermediate provider thinking block here, while
+  // llm_output is emitted only once for the complete agent run. The hook itself
+  // has no runId, so accept it only when exactly one provider run is active for
+  // this session and that run owns the current card entry. Overlapping stale and
+  // replacement runs are ambiguous and fail closed.
+  api.on("before_message_write", (event: unknown, ctx: unknown) => {
+    const root = asRecord(event);
+    const sk = typeof root?.sessionKey === "string"
+      ? root.sessionKey
+      : (ctx as { sessionKey?: string })?.sessionKey;
+    const entry = sk ? cards.get(sk) : undefined;
+    const runId = sk ? soleActiveModelRun(sk) : undefined;
+    if (!entry || entry.skip || !runId || !claimRun(entry, { runId }) ||
+        (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
+      return;
+    }
+    const message = asRecord(root?.message);
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+    const thought = message.content
+      .map((part) => asRecord(part))
+      .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
+      .map((part) => part!.thinking as string)
+      .join("\n")
+      .trim();
+    if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
+  });
+
   api.on("after_tool_call", (event: unknown, ctx: unknown) => {
     const e = (event ?? {}) as {
       toolName?: string;
@@ -1095,11 +1161,16 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
   });
 
   api.on("model_call_started", (event: unknown, ctx: unknown) => {
-    const e = (event ?? {}) as { callId?: string };
-    const sk = (ctx as { sessionKey?: string })?.sessionKey;
+    const e = (event ?? {}) as { callId?: string; runId?: string };
+    const { sessionKey: sk, runId: contextRunId } = (ctx ?? {}) as {
+      sessionKey?: string;
+      runId?: string;
+    };
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip) return;
     if (!claimRun(entry, ctx)) return; // 外来 run 的迟到 model_call → 丢弃
+    const runId = e.runId ?? contextRunId;
+    if (sk && runId) beginActiveModelCall(sk, runId, e.callId ?? "__unknown__");
     // P1-g:每次 model_call 产一步"思考"。若上一步就是 running thinking(model_call_started
     // 被连续投递),忽略(去重)。
     const last = entry.steps[entry.steps.length - 1];
@@ -1122,12 +1193,18 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
   api.on("model_call_ended", (event: unknown, ctx: unknown) => {
     const e = (event ?? {}) as {
       callId?: string;
+      runId?: string;
       durationMs?: number;
       outcome?: "completed" | "error";
       failureKind?: string;
       errorCategory?: string;
     };
-    const sk = (ctx as { sessionKey?: string })?.sessionKey;
+    const { sessionKey: sk, runId: contextRunId } = (ctx ?? {}) as {
+      sessionKey?: string;
+      runId?: string;
+    };
+    const runId = e.runId ?? contextRunId;
+    if (sk && runId) endActiveModelCall(sk, runId, e.callId ?? "__unknown__");
     const entry = sk ? cards.get(sk) : undefined;
     if (!entry || entry.skip || !claimRun(entry, ctx)) return;
     const target = e.callId
@@ -1143,17 +1220,17 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
   });
 
   const hasLifecycleSubscription = registerCardLifecycleSubscription(api);
-  if (!hasLifecycleSubscription) {
-    api.on("agent_end", (event: unknown, ctx: unknown) => {
-      const e = (event ?? {}) as { runId?: string; success?: boolean; error?: string };
-      const { sessionKey, runId: contextRunId } = (ctx ?? {}) as { sessionKey?: string; runId?: string };
-      const runId = e.runId ?? contextRunId;
-      if (!sessionKey || !runId) return;
-      const entry = pausedCards.get(sessionKey);
-      if (!entry || entry.continuationRunId !== runId) return;
-      return finishPausedCard(sessionKey, entry, e.success === true ? "done" : "error", e.error);
-    });
-  }
+  api.on("agent_end", (event: unknown, ctx: unknown) => {
+    const e = (event ?? {}) as { runId?: string; success?: boolean; error?: string };
+    const { sessionKey, runId: contextRunId } = (ctx ?? {}) as { sessionKey?: string; runId?: string };
+    const runId = e.runId ?? contextRunId;
+    if (!sessionKey || !runId) return;
+    clearActiveModelRun(sessionKey, runId);
+    if (hasLifecycleSubscription) return;
+    const entry = pausedCards.get(sessionKey);
+    if (!entry || entry.continuationRunId !== runId) return;
+    return finishPausedCard(sessionKey, entry, e.success === true ? "done" : "error", e.error);
+  });
 }
 
 type CardLifecycleEvent = {
