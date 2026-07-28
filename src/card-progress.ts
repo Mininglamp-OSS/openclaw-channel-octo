@@ -115,13 +115,13 @@ type CardProgressSharedState = {
 
 /**
  * OpenClaw 分别加载 bundled channel 与 embedded agent runtime；两个加载实例必须共享
- * dispatch 登记的 entry 与 hook 更新状态。版本放进 key，未来若状态结构不兼容可换 key，
- * 避免复用旧结构。与 runtime.ts 一样，Symbol.for 跨模块记录仍指向同一进程级槽位。
+ * dispatch 登记的 entry 与 hook 更新状态。agent runtime 可拥有独立 global realm，因此
+ * 状态挂在 Node process 对象而非 globalThis。版本放进 key，未来若结构不兼容可换 key。
  */
 const CARD_PROGRESS_STATE_KEY = Symbol.for("openclaw.octo.card-progress-state.v1");
 
 function getCardProgressSharedState(): CardProgressSharedState {
-  const root = globalThis as unknown as Record<PropertyKey, unknown>;
+  const root = process as unknown as Record<PropertyKey, unknown>;
   const existing = root[CARD_PROGRESS_STATE_KEY] as CardProgressSharedState | undefined;
   if (existing) return existing;
   const created: CardProgressSharedState = {
