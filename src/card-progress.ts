@@ -100,11 +100,48 @@ interface CardEntry {
   reasoningId?: string;
 }
 
+type CachedCardProfile = {
+  manifest: CardProfileManifest;
+  expiresAt: number;
+};
+
+type CardProgressSharedState = {
+  cards: Map<string, CardEntry>;
+  pendingModelWrites: Map<string, Array<{ runId: string; endedAt: number }>>;
+  pausedCards: Map<string, CardEntry>;
+  profileCache: Map<string, CachedCardProfile>;
+  capsCache: Map<string, CardCaps>;
+};
+
+/**
+ * OpenClaw 分别加载 bundled channel 与 embedded agent runtime；两个加载实例必须共享
+ * dispatch 登记的 entry 与 hook 更新状态。版本放进 key，未来若状态结构不兼容可换 key，
+ * 避免复用旧结构。与 runtime.ts 一样，Symbol.for 跨模块记录仍指向同一进程级槽位。
+ */
+const CARD_PROGRESS_STATE_KEY = Symbol.for("openclaw.octo.card-progress-state.v1");
+
+function getCardProgressSharedState(): CardProgressSharedState {
+  const root = globalThis as unknown as Record<PropertyKey, unknown>;
+  const existing = root[CARD_PROGRESS_STATE_KEY] as CardProgressSharedState | undefined;
+  if (existing) return existing;
+  const created: CardProgressSharedState = {
+    cards: new Map(),
+    pendingModelWrites: new Map(),
+    pausedCards: new Map(),
+    profileCache: new Map(),
+    capsCache: new Map(),
+  };
+  root[CARD_PROGRESS_STATE_KEY] = created;
+  return created;
+}
+
+const sharedState = getCardProgressSharedState();
+
 /** key = sessionKey(H1 实证:全 hook 一致)。跨账号碰撞由 entry.identity + fail-closed 兜底。 */
-const cards = new Map<string, CardEntry>();
+const cards = sharedState.cards;
 
 /** Run tokens awaiting their matching runId-less assistant persistence hook. */
-const pendingModelWrites = new Map<string, Array<{ runId: string; endedAt: number }>>();
+const pendingModelWrites = sharedState.pendingModelWrites;
 const PENDING_MODEL_WRITE_TTL_MS = 30_000;
 const MAX_PENDING_MODEL_WRITES = 16;
 
@@ -157,22 +194,17 @@ function clearPendingModelRun(sessionKey: string, runId: string): void {
  * 已经结束当前 dispatch、但仍等待 continuation 的卡片。与 cards 分开保存，避免下一条
  * inbound 的 setCardContext 覆盖 messageId，导致后台任务回来后无法更新原卡。
  */
-const pausedCards = new Map<string, CardEntry>();
-
-type CachedCardProfile = {
-  manifest: CardProfileManifest;
-  expiresAt: number;
-};
+const pausedCards = sharedState.pausedCards;
 
 /** Short-lived bot-scoped profile cache; expiry lets new messages observe catalog rollouts. */
-const profileCache = new Map<string, CachedCardProfile>();
+const profileCache = sharedState.profileCache;
 
 /**
  * D12 能力(elements/limits 派生的渲染 caps)缓存,key = apiUrl(部署级,同 gate)。gateEnabled
  * 探测 manifest 时一并填充;渲染时按元素以及节点/深度/字节上限裁剪。旧部署无这些字段 → caps 为空 → 渲染
  * 走保守默认(等同今天行为)。
  */
-const capsCache = new Map<string, CardCaps>();
+const capsCache = sharedState.capsCache;
 
 const FLUSH_DEBOUNCE_MS = 800;
 const EDIT_TIMEOUT_MS = 10_000;
