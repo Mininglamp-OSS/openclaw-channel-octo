@@ -223,7 +223,9 @@ async function runLifecycleFlow({
     expect(checkpoint.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
     expect(checkpoint.cards[0]?.plainSource).toBe("accepted-edit");
     expect(cardText(checkpoint.cards[0])).toContain("Waiting for subtask...");
-    expect(checkpoint.cards[0]?.transient).toBe(true);
+    // Paused cards may remain visible for up to the one-hour retention window, so the
+    // waiting frame must be durable and available to late-joining clients.
+    expect(checkpoint.cards[0]?.transient).toBe(false);
   }
 
   const completed = await waitForEvidence(
