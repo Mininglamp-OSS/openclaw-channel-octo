@@ -990,7 +990,7 @@ function bindPausedContinuation(
 }
 
 export function registerCardProgress(api: OpenClawPluginApi): void {
-  const hasReasoningSubscription = registerCardReasoningSubscription(api);
+  registerCardReasoningSubscription(api);
 
   api.on("before_agent_run", (event: unknown, ctx: unknown) => {
     const { sessionKey, runId } = (ctx ?? {}) as { sessionKey?: string; runId?: string };
@@ -1025,32 +1025,32 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     scheduleFlush(sk!, entry);
   });
 
-  // Older hosts have no runId-carrying thinking subscription, so persisted
-  // provider thinking is the only compatibility signal available. Modern hosts
-  // must not register this sessionKey-only lane: a late write from a superseded
-  // run cannot be generation-checked and could contaminate the replacement card.
-  if (!hasReasoningSubscription) {
-    api.on("before_message_write", (event: unknown, ctx: unknown) => {
-      const root = asRecord(event);
-      const sk = typeof root?.sessionKey === "string"
-        ? root.sessionKey
-        : (ctx as { sessionKey?: string })?.sessionKey;
-      const entry = sk ? cards.get(sk) : undefined;
-      if (!entry || entry.skip ||
-          (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
-        return;
-      }
-      const message = asRecord(root?.message);
-      if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
-      const thought = message.content
-        .map((part) => asRecord(part))
-        .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
-        .map((part) => part!.thinking as string)
-        .join("\n")
-        .trim();
-      if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
-    });
-  }
+  // OpenClaw 2026.6.9 persists provider thinking even when the streaming agent
+  // event lane emits nothing for a provider. llm_output exposes that persisted
+  // assistant message together with runId, unlike before_message_write; using it
+  // keeps the compatibility capture without letting a superseded run write into
+  // the current sessionKey generation.
+  api.on("llm_output", (event: unknown, ctx: unknown) => {
+    const root = asRecord(event);
+    const sk = (ctx as { sessionKey?: string })?.sessionKey;
+    const runId = typeof root?.runId === "string"
+      ? root.runId
+      : (ctx as { runId?: string })?.runId;
+    const entry = sk ? cards.get(sk) : undefined;
+    if (!entry || entry.skip || !runId || !claimRun(entry, { runId }) ||
+        (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
+      return;
+    }
+    const message = asRecord(root?.lastAssistant);
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+    const thought = message.content
+      .map((part) => asRecord(part))
+      .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
+      .map((part) => part!.thinking as string)
+      .join("\n")
+      .trim();
+    if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
+  });
 
   api.on("after_tool_call", (event: unknown, ctx: unknown) => {
     const e = (event ?? {}) as {
