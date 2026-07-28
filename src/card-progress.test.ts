@@ -2079,6 +2079,115 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(text).toContain("读取文件 · 20ms");
   });
 
+  it("yielded reasoning-off run 无 token 的迟到写入不得借用新 run token 公开私有思考", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = "reasoning-yielded-tokenless-write";
+    const base = {
+      apiUrl: "https://reasoning-yielded-tokenless.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    };
+
+    setCardContext(sessionKey, { ...base, reasoningVisibility: "off" });
+    const oldCtx = { sessionKey, runId: "run-old" };
+    handlers.before_agent_run({}, oldCtx);
+    handlers.model_call_started({ callId: "call-old-1" }, oldCtx);
+    handlers.before_tool_call({ toolName: "read", toolCallId: "old-read" }, oldCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "old-read", durationMs: 10 }, oldCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(calls.some((call) => call.url.includes("/sendMessage"))).toBe(true);
+
+    handlers.before_tool_call({ toolName: "sessions_yield", toolCallId: "old-yield" }, oldCtx);
+    handlers.after_tool_call({
+      toolName: "sessions_yield",
+      toolCallId: "old-yield",
+      result: {},
+    }, oldCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    await finalizeCard(sessionKey, { success: true });
+    calls.length = 0;
+
+    // Yield 后旧 generation 仍可继续跑 model call，但 cards 中已无它，因此
+    // model_call_ended 不会留下 token。
+    handlers.model_call_started({ callId: "call-old-2" }, oldCtx);
+    handlers.model_call_ended({ callId: "call-old-2", outcome: "completed" }, oldCtx);
+
+    setCardContext(sessionKey, { ...base, reasoningVisibility: "stream" });
+    const currentCtx = { sessionKey, runId: "run-current" };
+    handlers.before_agent_run({}, currentCtx);
+    handlers.model_call_started({ callId: "call-current" }, currentCtx);
+    handlers.model_call_ended({ callId: "call-current", outcome: "completed" }, currentCtx);
+
+    // 无 runId 的旧写入此时只看到新 run 的 token，绝不能将它当作归属依据。
+    handlers.before_message_write?.({
+      sessionKey,
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "YIELDED PRIVATE REASONING" }],
+      },
+    }, {});
+    handlers.before_tool_call({ toolName: "read", toolCallId: "current-read" }, currentCtx);
+    handlers.after_tool_call({
+      toolName: "read",
+      toolCallId: "current-read",
+      durationMs: 20,
+    }, currentCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).not.toContain("YIELDED PRIVATE REASONING");
+  });
+
+  it("旧 run 丢失 model_call_ended 时的迟到写入不得借用新 run token 公开私有思考", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = "reasoning-dropped-token-write";
+    const base = {
+      apiUrl: "https://reasoning-dropped-token.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    };
+
+    setCardContext(sessionKey, { ...base, reasoningVisibility: "off" });
+    const oldCtx = { sessionKey, runId: "run-old" };
+    handlers.before_agent_run({}, oldCtx);
+    handlers.model_call_started({ callId: "call-old" }, oldCtx);
+    // 旧 run 的 model_call_ended 被 host 有界队列丢弃，所以它没有 token。
+
+    setCardContext(sessionKey, { ...base, reasoningVisibility: "stream" });
+    const currentCtx = { sessionKey, runId: "run-current" };
+    handlers.before_agent_run({}, currentCtx);
+    handlers.model_call_started({ callId: "call-current" }, currentCtx);
+    handlers.model_call_ended({ callId: "call-current", outcome: "completed" }, currentCtx);
+
+    handlers.before_message_write?.({
+      sessionKey,
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "DROPPED TOKEN PRIVATE REASONING" }],
+      },
+    }, {});
+    handlers.before_tool_call({ toolName: "read", toolCallId: "current-read" }, currentCtx);
+    handlers.after_tool_call({
+      toolName: "read",
+      toolCallId: "current-read",
+      durationMs: 20,
+    }, currentCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).not.toContain("DROPPED TOKEN PRIVATE REASONING");
+  });
+
   it("单 run 的多次 model_call_ended 仍可按 token 归属捕获中间思考", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
