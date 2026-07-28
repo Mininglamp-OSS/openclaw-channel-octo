@@ -1840,6 +1840,49 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(progressCardText(card)).toContain("exit 0");
   });
 
+  it("does not expose stale before_message_write capture when a run-aware thinking subscription exists", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers, emitAgentEvent } = makeApi();
+
+    expect(handlers.before_message_write).toBeUndefined();
+
+    setCardContext("reasoning-stale-message-write", {
+      apiUrl: "https://reasoning-stale-write.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
+    });
+    handlers.before_agent_run({}, { sessionKey: "reasoning-stale-message-write", runId: "run-old" });
+
+    setCardContext("reasoning-stale-message-write", {
+      apiUrl: "https://reasoning-stale-write.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
+    });
+    const currentCtx = { sessionKey: "reasoning-stale-message-write", runId: "run-current" };
+    handlers.before_agent_run({}, currentCtx);
+    handlers.model_call_started({ callId: "call-current" }, currentCtx);
+
+    await emitAgentEvent({
+      runId: "run-old",
+      sessionKey: "reasoning-stale-message-write",
+      stream: "thinking",
+      data: { text: "STALE PRIVATE REASONING" },
+    });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-current" }, currentCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
+    expect(progressCardText(card)).not.toContain("STALE PRIVATE REASONING");
+  });
+
   it("keeps host thinking agent events hidden when reasoning visibility is off", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
