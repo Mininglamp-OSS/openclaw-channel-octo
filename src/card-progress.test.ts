@@ -22,7 +22,10 @@ type AgentEvent = {
 };
 
 /** 收集 registerCardProgress 注册的 hook 与 lifecycle handler。 */
-function makeApi(opts: { lifecycle?: boolean } = {}): {
+function makeApi(opts: {
+  lifecycle?: boolean;
+  register?: typeof registerCardProgress;
+} = {}): {
   handlers: Record<string, (e: unknown, c: unknown) => unknown>;
   emitLifecycle: (event: AgentEvent) => Promise<void>;
   emitAgentEvent: (event: AgentEvent) => Promise<void>;
@@ -47,7 +50,7 @@ function makeApi(opts: { lifecycle?: boolean } = {}): {
       },
     };
   }
-  registerCardProgress(api as never);
+  (opts.register ?? registerCardProgress)(api as never);
   return {
     handlers,
     emitLifecycle: async (event) => {
@@ -159,6 +162,36 @@ describe("card-progress 状态机 + hook + 节流", () => {
     vi.useRealTimers();
     global.fetch = originalFetch;
     vi.restoreAllMocks();
+  });
+
+  it("bundled channel 与 agent runtime 分别加载模块时共享进度状态", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const channelInstance = await import("./card-progress.js");
+    channelInstance.setCardContext("dual-loader", {
+      apiUrl: "https://dual-loader.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+
+    // OpenClaw 会分别加载 bundled channel 与 embedded agent runtime。重置模块缓存模拟
+    // 第二份 card-progress 模块记录；两边仍处于同一 Node 进程、共享 globalThis。
+    vi.resetModules();
+    const agentRuntimeInstance = await import("./card-progress.js");
+    const { handlers } = makeApi({ register: agentRuntimeInstance.registerCardProgress });
+
+    try {
+      const hookCtx = { sessionKey: "dual-loader", runId: "run-1" };
+      handlers.before_agent_run({}, hookCtx);
+      handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+      await vi.advanceTimersByTimeAsync(900);
+
+      expect(calls.some((call) => call.url.includes("/sendMessage"))).toBe(true);
+    } finally {
+      channelInstance._resetCardProgressForTests();
+      agentRuntimeInstance._resetCardProgressForTests();
+    }
   });
 
   it("首个 tool 事件懒发占位卡(gate+send),after_tool_call 触发 edit", async () => {
