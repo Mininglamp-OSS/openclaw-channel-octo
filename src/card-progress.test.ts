@@ -579,11 +579,14 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edits[0]?.body?.card_seq).toBe(1);
   });
 
-  it("并发 Model A 编辑在请求前预留不同的 card_seq", async () => {
+  it("并发 Model A 编辑按 card_seq 顺序提交且不会触发 stale CAS", async () => {
     const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
+    const appliedSeqs: number[] = [];
+    const staleSeqs: number[] = [];
     const firstEditReached = makeDeferred();
     const releaseFirstEdit = makeDeferred();
     let editCount = 0;
+    let highestApplied = 0;
     global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
       const body = init?.body ? JSON.parse(init.body) as Record<string, unknown> : undefined;
       calls.push({ url: String(url), body });
@@ -599,6 +602,13 @@ describe("card-progress 状态机 + hook + 节流", () => {
           firstEditReached.resolve();
           await releaseFirstEdit.promise;
         }
+        const cardSeq = Number(body?.card_seq);
+        if (cardSeq <= highestApplied) {
+          staleSeqs.push(cardSeq);
+          return { ok: false, status: 409, statusText: "Conflict", text: async () => "stale card_seq" };
+        }
+        highestApplied = cardSeq;
+        appliedSeqs.push(cardSeq);
       }
       return { ok: true, status: 200, text: async () => "" };
     }) as unknown as typeof fetch;
@@ -629,11 +639,15 @@ describe("card-progress 状态机 + hook + 节流", () => {
     handlers.model_call_started({ callId: "late-call" }, hookCtx);
     await vi.advanceTimersByTimeAsync(900);
 
-    const edits = calls.filter((call) => call.url.includes("/message/edit"));
+    const editsBeforeRelease = calls.filter((call) => call.url.includes("/message/edit"));
     releaseFirstEdit.resolve();
     await terminalEdit;
-    expect(edits).toHaveLength(2);
-    expect(edits.map((call) => call.body?.card_seq)).toEqual([1, 2]);
+    await vi.runAllTicks();
+
+    expect(editsBeforeRelease).toHaveLength(1);
+    expect(staleSeqs).toEqual([]);
+    expect(appliedSeqs[0]).toBe(1);
+    expect(appliedSeqs).toEqual([...appliedSeqs].sort((a, b) => a - b));
   });
 
   it.each([429, 503])("Model A 首帧 %i 后下个事件仍可重试", async (failureStatus) => {

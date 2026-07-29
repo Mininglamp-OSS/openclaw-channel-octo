@@ -282,6 +282,24 @@ describe("reasoning detail sanitization", () => {
     )).toBe("Thinking through...");
     expect(sanitizeReasoningThought("x".repeat(600)).length).toBeLessThanOrEqual(281);
   });
+
+  it("reduces scheme-less credentials and host paths before rendering reasoning text", () => {
+    expect(sanitizeReasoningThought("Connecting with alice:hunter2@db.example.com/private now"))
+      .toBe("Connecting with https://example.com now");
+    expect(sanitizeReasoningThought("Fetching internal-admin.corp.example.com/reset?u=1"))
+      .toBe("Fetching https://example.com");
+  });
+
+  it("reduces scheme-less credentials before rendering tool names", () => {
+    const data = buildReasoningProcessData(state({
+      steps: [
+        { tool: "__thinking__", status: "done", thought: "检查连接。" },
+        { tool: "alice:hunter2@db.example.com/private", status: "done" },
+      ],
+    }));
+
+    expect(data.phases[0]?.actions[0]?.tool).toBe("https://example.com");
+  });
 });
 
 describe("reasoning process Adaptive Card", () => {
