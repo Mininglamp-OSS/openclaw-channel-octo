@@ -175,6 +175,23 @@ export function sanitizeReasoningThought(text: string | undefined): string {
   return normalized.length > THOUGHT_MAX ? normalized.slice(0, THOUGHT_MAX) + "…" : normalized;
 }
 
+/**
+ * Sanitizing one thought costs several regex passes over up to MAX_REASONING_CAPTURE chars, and
+ * every debounce flush re-derives phases from the whole run. Steps are append-only and a thought
+ * only mutates while its model call streams, so cache per step and re-sanitize on change. Keyed by
+ * the step object, so entries die with the card entry.
+ */
+const sanitizedThoughts = new WeakMap<CardStep, { raw: string; clean: string }>();
+
+function cachedThought(step: CardStep): string {
+  const raw = step.thought ?? "";
+  const cached = sanitizedThoughts.get(step);
+  if (cached && cached.raw === raw) return cached.clean;
+  const clean = sanitizeReasoningThought(step.thought);
+  sanitizedThoughts.set(step, { raw, clean });
+  return clean;
+}
+
 function safeToolName(tool: string): string {
   if (tool === "__thinking__") return "think";
   if (tool === SUBAGENT_WAIT_STEP_TOOL) return "wait";
@@ -216,7 +233,7 @@ function phasesFromSteps(
   for (const step of steps) {
     if (step.tool === "__thinking__") {
       current = {
-        thought: sanitizeReasoningThought(step.thought),
+        thought: cachedThought(step),
         actions: [],
       };
       phases.push(current);
@@ -230,10 +247,11 @@ function phasesFromSteps(
   }
   if (phases.length === 0) phases.push({ thought: FALLBACK_THOUGHT, actions: [] });
   if (opts.synthesizeEmptyActions === false) return phases;
+  const thinkingSteps = steps.filter((step) => step.tool === "__thinking__");
   for (let index = 0; index < phases.length; index++) {
     const phase = phases[index]!;
     if (phase.actions.length > 0) continue;
-    const thinking = steps.filter((step) => step.tool === "__thinking__")[index];
+    const thinking = thinkingSteps[index];
     const duration = fmtDuration(thinking?.durationMs);
     const detail = thinking?.status === "running" ? "Planning next step..."
       : thinking?.status === "error" ? "Phase stopped"

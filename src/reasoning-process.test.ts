@@ -300,6 +300,25 @@ describe("reasoning detail sanitization", () => {
 
     expect(data.phases[0]?.actions[0]?.tool).toBe("https://example.com");
   });
+
+  it("re-sanitizes a thought that keeps streaming into the same step", () => {
+    // Sanitized thoughts are cached per step to keep re-rendering off the O(run length) path.
+    // A streaming model call mutates the same step object, so a stale clean value must never
+    // survive the text turning sensitive.
+    const step = { tool: "__thinking__", status: "done" as const, thought: "Checking the reducer." };
+    const steps = [step, { tool: "read", status: "done" as const, summary: "…/src/a.ts" }];
+
+    expect(buildReasoningProcessData(state({ steps })).phases[0]?.thought)
+      .toBe("Checking the reducer.");
+
+    step.thought = "Checking the reducer. Authorization: Bearer abcdefghijklmnop";
+    expect(buildReasoningProcessData(state({ steps })).phases[0]?.thought)
+      .toBe("Thinking through...");
+
+    step.thought = "Checking the reducer again.";
+    expect(buildReasoningProcessData(state({ steps })).phases[0]?.thought)
+      .toBe("Checking the reducer again.");
+  });
 });
 
 describe("reasoning process Adaptive Card", () => {
