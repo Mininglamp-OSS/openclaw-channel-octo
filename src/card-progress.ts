@@ -45,7 +45,7 @@ export interface CardContext {
   channelType: ChannelType;
   /** false force-disables automatic progress cards for this account/session. */
   cardProgress?: boolean;
-  /** Explicit Registry migration gate. Defaults to off (local Model B). */
+  /** Explicit Registry migration gate. Defaults to experimental with Model B fallback. */
   reasoningCardTemplateMode?: ReasoningCardTemplateMode;
   /** persona-clone 身份;存在则跳过卡片(服务端拒 type-17 OBO)。 */
   onBehalfOf?: string;
@@ -262,7 +262,7 @@ function profileEnabledForContext(ctx: CardContext, manifest: CardProfileManifes
   let enabled = manifest.available
     ? manifest.enabled
     : process.env.OCTO_CARD_MESSAGE_ENABLED === "1";
-  const registryCompatible = ctx.reasoningCardTemplateMode === "experimental" &&
+  const registryCompatible = (ctx.reasoningCardTemplateMode ?? "experimental") === "experimental" &&
     !!selectReasoningProcessTemplate(manifest.templating);
   // Model A 由 Registry 模板自己的 wire/views 契约协商，不依赖 Model B 的 Adaptive Card
   // profile/card_version/elements。仅在实际走 Model B 时应用下面的渲染兼容 gate。
@@ -398,7 +398,10 @@ async function editEntryProgress(params: {
   if (entry.deliveryMode === "model-a") {
     const data = buildReasoningProcessWireData(state);
     if (!data || !entry.templateRef) return false;
-    const cardSeq = entry.nextCardSeq;
+    // Reserve before the network await. State transitions and debounced flushes use separate
+    // serializers and can overlap on the same tracked entry; reserving first preserves the
+    // strictly increasing CAS contract even when two edits are concurrently in flight.
+    const cardSeq = entry.nextCardSeq++;
     await editTemplateCardWithRetry({
       apiUrl: entry.ctx.apiUrl,
       botToken: entry.ctx.botToken,
@@ -417,7 +420,6 @@ async function editEntryProgress(params: {
         : {}),
       signal: params.signal,
     });
-    entry.nextCardSeq = cardSeq + 1;
     return true;
   }
 
@@ -875,7 +877,10 @@ export function recordCardReasoning(
   opts: { snapshot?: boolean } = {},
 ): void {
   const entry = cards.get(sessionKey);
-  if (!entry || entry.skip || !text) return;
+  if (!entry || entry.skip || !text ||
+      (entry.ctx.reasoningVisibility !== "on" && entry.ctx.reasoningVisibility !== "stream")) {
+    return;
+  }
   let thinking: CardStep | undefined;
   for (let index = entry.steps.length - 1; index >= 0; index--) {
     if (entry.steps[index]?.tool === "__thinking__") {

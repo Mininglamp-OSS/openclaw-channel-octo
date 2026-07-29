@@ -2647,29 +2647,31 @@ export async function handleInboundMessage(params: {
   const apiUrl = account.config.apiUrl;
   const botToken = account.config.botToken ?? "";
 
-  // Mirror OpenClaw's user-visible reasoning gate for the transcript-hook
-  // compatibility path. An inline directive wins, followed by persisted
-  // session state and then the per-agent/global default. Unauthorized turns
-  // stay off so provider-private thinking is never surfaced accidentally.
+  // Mirror OpenClaw's persisted user-visible reasoning state for the transcript-hook
+  // compatibility path. Command parsing belongs to OpenClaw: this adapter must never
+  // interpret raw user text as a `/reasoning` directive. Unauthorized turns and session-store
+  // failures stay off so provider-private thinking is never surfaced accidentally.
   let reasoningVisibility: "off" | "on" | "stream" = "off";
   if (commandAuthorized) {
-    const directiveLevel = commandBody.match(/(?:^|\s)\/reasoning\s+(on|off|stream)(?=\s|$)/i)?.[1]
-      ?.toLowerCase();
-    if (directiveLevel === "on" || directiveLevel === "off" || directiveLevel === "stream") {
-      reasoningVisibility = directiveLevel;
-    } else {
-      let persistedLevel: string | undefined;
-      try {
-        const storePath = core.channel.session.resolveStorePath(config.session?.store, {
-          agentId: route.agentId,
-        });
-        persistedLevel = getSessionEntry({
-          storePath,
-          sessionKey: route.sessionKey,
-        })?.reasoningLevel;
-      } catch {
-        // Session reads are best-effort; configured defaults remain available.
-      }
+    let persistedLevel: string | undefined;
+    let sessionReadFailed = false;
+    try {
+      const storePath = core.channel.session.resolveStorePath(config.session?.store, {
+        agentId: route.agentId,
+      });
+      persistedLevel = getSessionEntry({
+        storePath,
+        sessionKey: route.sessionKey,
+      })?.reasoningLevel;
+    } catch (error: unknown) {
+      sessionReadFailed = true;
+      log?.warn?.(
+        `octo: failed reading session reasoning visibility; defaulting to off: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (!sessionReadFailed) {
       const agentDefault = config.agents?.list?.find((entry) =>
         entry.id?.toLowerCase() === route.agentId?.toLowerCase())?.reasoningDefault;
       const resolved = persistedLevel ?? agentDefault ?? config.agents?.defaults?.reasoningDefault;
