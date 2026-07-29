@@ -229,6 +229,38 @@ describe("reasoning process template discovery", () => {
     })).toBeNull();
   });
 
+  it("treats a duplicated version as ambiguous even when only one side has compatible views", () => {
+    // template_ref carries only {id, version}, so it cannot say which of the two entries was
+    // meant — the server may resolve the one this producer rejected. Judging ambiguity after the
+    // view filter would hide exactly that case.
+    const incompatible = { ...template("0.2.0"), views: template("0.2.0").views.slice(0, 2) };
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [template("0.2.0"), incompatible],
+    })).toBeNull();
+  });
+
+  it("falls through to an older unambiguous version when the newest one is ambiguous", () => {
+    // The only catalog where skipping an ambiguous version still keeps Model A engaged, and the
+    // case the schema description promises operators.
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [template("0.2.0"), template("0.2.0"), template("0.1.0")],
+    })).toEqual({ id: "ai.reasoning-process", version: "0.1.0" });
+  });
+
+  it("ignores ambiguity in a version it would not have selected", () => {
+    // 0.1.0 is duplicated and unusable, but 0.2.0 is unique, compatible and newer — vetoing it
+    // over an older entry nobody would send costs the feature for no safety gain.
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [template("0.1.0"), template("0.1.0"), template("0.2.0")],
+    })).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+  });
+
   it("fails closed for incompatible view/state shapes", () => {
     expect(selectReasoningProcessTemplate({
       supported: true,

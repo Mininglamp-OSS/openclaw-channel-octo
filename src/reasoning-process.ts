@@ -85,16 +85,21 @@ const REQUIRED_VIEWS = [
  * Select the newest Bot-catalog entry with the contract shape this producer implements.
  *
  * A catalog advertising the successor alongside its predecessor is the normal state for the whole
- * rollout window, so preferring the newest is what keeps the feature engaged there. Genuine
- * ambiguity — one version claimed by two entries — still fails closed to Model B, because nothing
- * here can tell which of them the server would render.
+ * rollout window, so preferring the newest is what keeps the feature engaged there.
+ *
+ * Ambiguity is judged per version and over every entry claiming this template id, not over the
+ * view-compatible subset: `template_ref` carries only `{id, version}`, so two entries claiming one
+ * version cannot be told apart on the wire and the server may resolve the one rejected here. A
+ * version in that state is skipped rather than selected; an older unambiguous version is still
+ * usable, and ambiguity in a version that would not have been selected costs nothing.
  */
 export function selectReasoningProcessTemplate(
   templating: CardTemplatingCapability | undefined,
 ): CardTemplateRef | null {
   if (!templating?.supported || templating.wire !== TEMPLATE_WIRE) return null;
-  const compatible = templating.templates.filter((template) => {
-    if (template.id !== REASONING_TEMPLATE_ID || !SUPPORTED_TEMPLATE_VERSIONS.includes(template.version)) return false;
+  const claimed = templating.templates.filter((template) => template.id === REASONING_TEMPLATE_ID);
+  const compatible = claimed.filter((template) => {
+    if (!SUPPORTED_TEMPLATE_VERSIONS.includes(template.version)) return false;
     return REQUIRED_VIEWS.every((required) => {
       const view = template.views.find((candidate) => candidate.name === required.name);
       if (!view || view.wire_profile !== required.wireProfile) return false;
@@ -102,11 +107,11 @@ export function selectReasoningProcessTemplate(
       return required.states.every((state) => states.has(state));
     });
   });
-  const versions = compatible.map((template) => template.version);
-  if (new Set(versions).size !== versions.length) return null;
   for (const version of SUPPORTED_TEMPLATE_VERSIONS) {
     const match = compatible.find((template) => template.version === version);
-    if (match) return { id: match.id, version: match.version };
+    if (!match) continue;
+    if (claimed.filter((template) => template.version === version).length > 1) continue;
+    return { id: match.id, version: match.version };
   }
   return null;
 }

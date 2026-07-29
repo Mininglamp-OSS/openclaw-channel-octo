@@ -723,6 +723,174 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edit).not.toHaveProperty("transient");
   });
 
+  it("Model A 状态转换遇 5xx 后卡片仍可更新(瞬时抖动不终结)", async () => {
+    // markCardPaused 在 entry 仍是活动卡时走 flush;editTrackedCardState 的失败路径要经
+    // finalizeCard 的 retainForContinuation 分支才可达。让那一次 paused 编辑吃 503,再放行
+    // registry,断言 TTL 过期帧仍然发得出去 —— 若失败被当成终态,pausedCards 里的 entry 会被
+    // skip 挡住每一条回收路径,卡片永久停在中途帧。
+    const states: string[] = [];
+    let failStatus: number | undefined;
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      const target = String(url);
+      if (target.includes("/card/profile")) return { ok: true, status: 200, json: async () => registryProfile() };
+      if (target.includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "transient-card" }) };
+      }
+      if (target.includes("/message/edit")) {
+        states.push(String((JSON.parse(init?.body ?? "{}") as { state?: string }).state));
+        if (failStatus !== undefined) {
+          return { ok: false, status: failStatus, statusText: "unavailable", text: async () => "unavailable" };
+        }
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "registry-transient", runId: "run-1" };
+    setCardContext(hookCtx.sessionKey, {
+      apiUrl: "https://registry-transient.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    handlers.before_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    handlers.after_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    failStatus = 503;
+    // 不能直接 await:重试延迟是 fake timer,await 住就没人推进它们,最后落地的会是
+    // AbortSignal.timeout(EDIT_TIMEOUT_MS) 的真实超时而不是这里要测的 5xx。
+    const finalized = finalizeCard(hookCtx.sessionKey, { success: true });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await finalized;
+    expect(states).toContain("reasoning");
+    failStatus = undefined;
+
+    // PAUSED_CARD_TTL_MS = 1h;expired 经 contractState 映射成 error。
+    await vi.advanceTimersByTimeAsync(3_700_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(states).toContain("error");
+  });
+
+  it("Model A 状态转换遇确定性 4xx 仍然终结卡片(收窄的另一半)", async () => {
+    // 与上一条对称:4xx 会重复必然失败的请求,所以仍按终态处理 —— 过期帧不再发出。
+    const states: string[] = [];
+    let failStatus: number | undefined;
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      const target = String(url);
+      if (target.includes("/card/profile")) return { ok: true, status: 200, json: async () => registryProfile() };
+      if (target.includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "deterministic-card" }) };
+      }
+      if (target.includes("/message/edit")) {
+        states.push(String((JSON.parse(init?.body ?? "{}") as { state?: string }).state));
+        if (failStatus !== undefined) {
+          return { ok: false, status: failStatus, statusText: "bad frame", text: async () => "bad frame" };
+        }
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "registry-deterministic", runId: "run-1" };
+    setCardContext(hookCtx.sessionKey, {
+      apiUrl: "https://registry-deterministic.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    handlers.before_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    handlers.after_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    failStatus = 400;
+    const finalized = finalizeCard(hookCtx.sessionKey, { success: true });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await finalized;
+    failStatus = undefined;
+    const afterTransition = states.length;
+
+    await vi.advanceTimersByTimeAsync(3_700_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(states).toHaveLength(afterTransition);
+  });
+
+  it("Model A 队列前序失败不吞掉排在其后的终态帧", async () => {
+    // 可达条件:findPausedFlowEntry 也看 cards,所以 sessions_yield 之后 entry 仍是活动卡时
+    // lifecycle error 会对它跑 finishPausedCard 的状态编辑。finalizeCard 只 await flushPromise、
+    // 不 await stateEditPromise,于是它的直接 editEntryProgress 排在那次状态编辑后面 —— 前序被
+    // 拒绝时,终态帧必须照发,而不是连带失败。
+    const states: string[] = [];
+    const stateEditReached = makeDeferred();
+    const releaseStateEdit = makeDeferred();
+    let stateEditSeen = 0;
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      const target = String(url);
+      if (target.includes("/card/profile")) return { ok: true, status: 200, json: async () => registryProfile() };
+      if (target.includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "queue-card" }) };
+      }
+      if (target.includes("/message/edit")) {
+        const body = JSON.parse(init?.body ?? "{}") as { state?: string };
+        states.push(String(body.state));
+        // finishPausedCard 发的那一帧,按 state 而不是 card_seq 认 —— 序号会随中间帧漂移。
+        if (body.state === "error") {
+          if (++stateEditSeen === 1) {
+            stateEditReached.resolve();
+            await releaseStateEdit.promise;
+          }
+          return { ok: false, status: 503, statusText: "unavailable", text: async () => "unavailable" };
+        }
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+
+    const { handlers, emitLifecycle } = makeApi();
+    const hookCtx = { sessionKey: "registry-queue", runId: "run-1" };
+    setCardContext(hookCtx.sessionKey, {
+      apiUrl: "https://registry-queue.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    handlers.before_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    handlers.after_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const terminal = emitLifecycle({
+      runId: hookCtx.runId,
+      sessionKey: hookCtx.sessionKey,
+      stream: "lifecycle",
+      data: { phase: "error", error: "boom" },
+    });
+    await stateEditReached.promise;
+    const finalize = finalizeCard(hookCtx.sessionKey, { success: true });
+    releaseStateEdit.resolve();
+    // 同上:重试延迟是 fake timer,直接 await 会让真实的 EDIT_TIMEOUT_MS 抢先落地。
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.allSettled([terminal, finalize]);
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    // 终态帧必须发出,且排在失败的状态编辑之后。
+    expect(states).toContain("error");
+    expect(states).toContain("completed");
+    expect(states.indexOf("completed")).toBeGreaterThan(states.indexOf("error"));
+  });
+
   it("Model A error 状态始终是非 transient 终态", async () => {
     const { fn, calls } = mockFetch({ profile: registryProfile(), sendId: "error-card" });
     global.fetch = fn as unknown as typeof fetch;
