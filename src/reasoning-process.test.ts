@@ -206,12 +206,30 @@ describe("reasoning process template discovery", () => {
     },
   );
 
-  it("fails closed for multiple compatible versions or incompatible view/state shapes", () => {
+  it("picks the newest supported contract when a rollout advertises both versions", () => {
+    // The catalog carries the successor alongside its predecessor for the whole rollout, which
+    // is exactly the deployment this producer targets. Demanding a singleton match would leave
+    // the feature dormant for that entire window.
+    for (const templates of [
+      [template("0.1.0"), template("0.2.0")],
+      [template("0.2.0"), template("0.1.0")],
+    ]) {
+      expect(selectReasoningProcessTemplate({ supported: true, wire: "template-ref/v1", templates }))
+        .toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+    }
+  });
+
+  it("still fails closed when one version is advertised twice", () => {
+    // Two catalog entries claiming the same contract are genuinely ambiguous: nothing here can
+    // tell which one the server would render.
     expect(selectReasoningProcessTemplate({
       supported: true,
       wire: "template-ref/v1",
-      templates: [template("0.1.0"), template("0.2.0")],
+      templates: [template("0.2.0"), template("0.2.0")],
     })).toBeNull();
+  });
+
+  it("fails closed for incompatible view/state shapes", () => {
     expect(selectReasoningProcessTemplate({
       supported: true,
       wire: "template-ref/v1",

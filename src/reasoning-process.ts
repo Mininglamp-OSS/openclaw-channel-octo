@@ -56,7 +56,8 @@ const MAX_RENDERED_PHASES = 6;
 const MAX_RENDERED_ACTIONS = 12;
 const REASONING_TEMPLATE_ID = "ai.reasoning-process";
 const TEMPLATE_WIRE = "template-ref/v1";
-const SUPPORTED_TEMPLATE_VERSIONS = new Set(["0.1.0", "0.2.0"]);
+/** Supported producer contracts in preference order, newest first. */
+const SUPPORTED_TEMPLATE_VERSIONS: readonly string[] = ["0.2.0", "0.1.0"];
 export const REASONING_ID_MAX_LENGTH = 512;
 
 /** Preserve short IDs; use a stable collision-resistant digest instead of unsafe truncation. */
@@ -80,13 +81,20 @@ const REQUIRED_VIEWS = [
   { name: "result", states: ["completed", "stopped"], wireProfile: "octo/v1" },
 ] as const;
 
-/** Select only an unambiguous Bot-catalog entry with the contract shape this producer implements. */
+/**
+ * Select the newest Bot-catalog entry with the contract shape this producer implements.
+ *
+ * A catalog advertising the successor alongside its predecessor is the normal state for the whole
+ * rollout window, so preferring the newest is what keeps the feature engaged there. Genuine
+ * ambiguity — one version claimed by two entries — still fails closed to Model B, because nothing
+ * here can tell which of them the server would render.
+ */
 export function selectReasoningProcessTemplate(
   templating: CardTemplatingCapability | undefined,
 ): CardTemplateRef | null {
   if (!templating?.supported || templating.wire !== TEMPLATE_WIRE) return null;
   const compatible = templating.templates.filter((template) => {
-    if (template.id !== REASONING_TEMPLATE_ID || !SUPPORTED_TEMPLATE_VERSIONS.has(template.version)) return false;
+    if (template.id !== REASONING_TEMPLATE_ID || !SUPPORTED_TEMPLATE_VERSIONS.includes(template.version)) return false;
     return REQUIRED_VIEWS.every((required) => {
       const view = template.views.find((candidate) => candidate.name === required.name);
       if (!view || view.wire_profile !== required.wireProfile) return false;
@@ -94,9 +102,13 @@ export function selectReasoningProcessTemplate(
       return required.states.every((state) => states.has(state));
     });
   });
-  return compatible.length === 1
-    ? { id: compatible[0]!.id, version: compatible[0]!.version }
-    : null;
+  const versions = compatible.map((template) => template.version);
+  if (new Set(versions).size !== versions.length) return null;
+  for (const version of SUPPORTED_TEMPLATE_VERSIONS) {
+    const match = compatible.find((template) => template.version === version);
+    if (match) return { id: match.id, version: match.version };
+  }
+  return null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

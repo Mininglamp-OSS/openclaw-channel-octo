@@ -404,7 +404,12 @@ async function editEntryProgress(params: {
     if (!data || !templateRef) return false;
     const previous = entry.modelAEditPromise;
     const work = (async (): Promise<boolean> => {
-      if (previous) await previous;
+      // Match the two sibling serialisation tails in this file (`:641` state transitions,
+      // `:735` finalize): a queue is for ordering, so a predecessor's failure must not take
+      // the edit behind it down with it before that edit has even reserved a card_seq.
+      if (previous) {
+        try { await previous; } catch { /* the predecessor's own caller already warned */ }
+      }
       if (entry.skip) return false;
       if (params.signal.aborted) throw params.signal.reason;
       // Reserve inside the single Model A queue: reservation order now equals request order, so
@@ -667,7 +672,15 @@ async function editTrackedCardState(
       });
       dbg(`transitioned session=${sessionKey} phase=${phase}`);
     } catch (err: unknown) {
-      if (entry.deliveryMode === "model-a") entry.skip = true;
+      // Same policy as runFlush (`:569`): only a deterministic 4xx is worth giving up on. A 5xx
+      // or timeout that merely outlasted REGISTRY_EDIT_RETRY_DELAYS_MS must not be terminal —
+      // the next edit takes a fresh nextCardSeq, still strictly greater than the server's last
+      // commit, so retrying stays CAS-safe. Model B never set skip here and recovers on the next
+      // transition; Model A giving up made it the only mode a transient blip could freeze.
+      if (entry.deliveryMode === "model-a") {
+        const status = httpStatusFromApiFetchError(err);
+        if (status !== undefined && status >= 400 && status < 500 && status !== 429) entry.skip = true;
+      }
       if (!abort.signal.aborted) {
         warn(`state transition failed: ${err instanceof Error ? err.message : String(err)}`);
       }
