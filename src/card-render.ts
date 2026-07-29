@@ -8,7 +8,7 @@
  * 视觉属性仅用端到端验证过的(weight/spacing/size/wrap),不用未验证的 color 以规避白名单。
  */
 import { CARD_PLACEHOLDER, CARD_VERSION } from "./types.js";
-import { buildDisplayCard, type DisplayBlock, type RichSegment } from "./card-blocks.js";
+import { buildDisplayCard, EN_DROP_MARKER, type DisplayBlock, type RichSegment } from "./card-blocks.js";
 import { cardFitsLimits, type CardLimits } from "./card-limits.js";
 
 export const OCTO_CARD_LAYOUTS = {
@@ -325,6 +325,8 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
 /** ms → 友好耗时(<1s 用 ms,否则 x.xs)。 */
 export function fmtDuration(ms?: number): string {
   if (typeof ms !== "number") return "";
+  // NaN/Infinity(时钟回拨、未初始化的起点)会一路穿过下面的取整,渲出 `Infinityh NaNm NaNs`。
+  if (!Number.isFinite(ms) || ms < 0) return "";
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   const totalSeconds = Math.round(ms / 1000);
@@ -637,6 +639,9 @@ function progressSummary(steps: CardStep[], total: number): string {
   if (thinking > 0) parts.push(`Reasoning ${thinking}`);
   if (tools > 0) parts.push(`Tools ${tools}`);
   if (waiting > 0) parts.push(`Waiting ${waiting}`);
+  // 今天 total === steps.length,三类必占其一;兜底是防 total 日后改成「累计步数」而 steps
+  // 只保留窗口时,摘要行静默变空串。
+  if (parts.length === 0) parts.push(`${total} ${total === 1 ? "step" : "steps"}`);
   return parts.join(" · ");
 }
 
@@ -795,7 +800,13 @@ export function renderProgressCard(
     if (total > 0) flatBlocks.push({ type: "text", text: progressSummaryText(state.steps, total) });
     if (hidden > 0) flatBlocks.push({ type: "text", text: `… ${hidden} earlier steps hidden` });
     flatBlocks.push(...renderProgressDetailBlocks(visibleSteps, flatCaps));
-    const flat = buildDisplayCard({ title: header, blocks: flatBlocks, caps: flatCaps, trusted: true });
+    const flat = buildDisplayCard({
+      title: header,
+      blocks: flatBlocks,
+      caps: flatCaps,
+      trusted: true,
+      dropMarker: EN_DROP_MARKER,
+    });
     return { card: flat.card, plain: flat.plain || CARD_PLACEHOLDER };
   };
 
@@ -810,7 +821,7 @@ export function renderProgressCard(
   // trusted:进度卡的每行文案已在上游逐 sink 脱敏(summarizeToolParams/sanitizeErrorText/safeLabel:
   // URL 已降级、path/shell 按 generic=false 保留 git SHA/digest)。buildDisplayCard 默认 generic=true
   // 会二次套用长 hex/高熵检测,误删含哈希的正常行、甚至把错误终态帧整卡清空 —— 故此路径关掉严格 generic。
-  const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true });
+  const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true, dropMarker: EN_DROP_MARKER });
   const headerItems = progressHeaderItems(state, header, state.steps, total, canRichText);
   const canToggle = supportsTerminalCollapse(caps);
   const isTerminal = state.phase === "done" || state.phase === "error" || state.phase === "expired";

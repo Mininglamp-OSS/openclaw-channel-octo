@@ -246,6 +246,11 @@ describe("fmtDuration", () => {
   it(">=60s 使用紧凑分钟格式", () => expect(fmtDuration(1_750_300)).toBe("29m 10s"));
   it(">=1h 使用紧凑小时格式", () => expect(fmtDuration(3_723_000)).toBe("1h 2m 3s"));
   it("undefined → 空", () => expect(fmtDuration(undefined)).toBe(""));
+  it("非有限值 → 空(不渲出 Infinityh NaNm NaNs)", () => {
+    expect(fmtDuration(Number.NaN)).toBe("");
+    expect(fmtDuration(Number.POSITIVE_INFINITY)).toBe("");
+  });
+  it("负数 → 空(时钟回拨不渲出 -5000ms)", () => expect(fmtDuration(-5000)).toBe(""));
 });
 
 describe("sanitizeErrorText adversarial boundaries", () => {
@@ -548,6 +553,20 @@ describe("renderProgressCard", () => {
 
   it("plain never empty", () => {
     expect(renderProgressCard({ phase: "tool", steps: [] }).plain.length).toBeGreaterThan(0);
+  });
+
+  it("超服务端限制的截断提示与整卡同为英文(不中英混排)", () => {
+    // maxPayloadBytes 收紧到只装得下首行 —— 走 buildDisplayCard 的丢块路径,而不是进度卡
+    // 自己的 maxVisibleSteps 裁剪(那条已经是英文的 `… N earlier steps hidden`)。
+    const steps = Array.from({ length: 12 }, (_, i) => ({
+      tool: `tool_number_${i}`,
+      status: "done" as const,
+      durationMs: 1000 + i,
+      summary: "y".repeat(100),
+    }));
+    const { plain } = renderProgressCard({ phase: "done", steps, elapsedMs: 120_000 }, { maxPayloadBytes: 900 });
+    expect(plain).toContain("items dropped");
+    expect(plain).not.toContain("省略");
   });
 
   it("步骤超上限 → 只渲染最近 N 步 + 折叠计数(防卡片膨胀)", () => {
