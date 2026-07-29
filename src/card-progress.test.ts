@@ -414,7 +414,11 @@ describe("card-progress 状态机 + hook + 节流", () => {
 
   it("未配置 reasoningCardTemplateMode 时默认选择兼容的 Registry 模板", async () => {
     const { fn, calls } = mockFetch({
-      profile: registryProfile(),
+      profile: {
+        ...registryProfile(),
+        card_version: "9.9",
+        elements: [],
+      },
       sendId: "registry-default-experimental",
     });
     global.fetch = fn as unknown as typeof fetch;
@@ -573,6 +577,63 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edits).toHaveLength(2);
     expect(edits[0]?.body).toEqual(edits[1]?.body);
     expect(edits[0]?.body?.card_seq).toBe(1);
+  });
+
+  it("并发 Model A 编辑在请求前预留不同的 card_seq", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
+    const firstEditReached = makeDeferred();
+    const releaseFirstEdit = makeDeferred();
+    let editCount = 0;
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      const body = init?.body ? JSON.parse(init.body) as Record<string, unknown> : undefined;
+      calls.push({ url: String(url), body });
+      if (String(url).includes("/card/profile")) {
+        return { ok: true, status: 200, json: async () => registryProfile() };
+      }
+      if (String(url).includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "seq-card" }) };
+      }
+      if (String(url).includes("/message/edit")) {
+        editCount += 1;
+        if (editCount === 1) {
+          firstEditReached.resolve();
+          await releaseFirstEdit.promise;
+        }
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+
+    const { handlers, emitLifecycle } = makeApi();
+    const hookCtx = { sessionKey: "registry-seq-race", runId: "run-1" };
+    setCardContext(hookCtx.sessionKey, {
+      apiUrl: "https://registry-seq-race.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.before_tool_call({ toolName: "read", toolCallId: "read-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    handlers.before_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    handlers.after_tool_call({ toolName: "sessions_yield", toolCallId: "yield-1" }, hookCtx);
+    const terminalEdit = emitLifecycle({
+      runId: hookCtx.runId,
+      sessionKey: hookCtx.sessionKey,
+      stream: "lifecycle",
+      data: { phase: "error", error: "continuation failed" },
+    });
+    await firstEditReached.promise;
+
+    handlers.model_call_started({ callId: "late-call" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const edits = calls.filter((call) => call.url.includes("/message/edit"));
+    releaseFirstEdit.resolve();
+    await terminalEdit;
+    expect(edits).toHaveLength(2);
+    expect(edits.map((call) => call.body?.card_seq)).toEqual([1, 2]);
   });
 
   it.each([429, 503])("Model A 首帧 %i 后下个事件仍可重试", async (failureStatus) => {
@@ -2329,6 +2390,33 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN FROM RECORDER");
     expect(progressCardText(card)).toContain("读取文件 · 20ms");
+  });
+
+  it("recordCardReasoning sink 在 reasoning 关闭时拒绝直接写入", async () => {
+    const { fn, calls } = mockFetch({ profile: registryProfile() });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const sessionKey = "reasoning-sink-off";
+    const ctx = { sessionKey, runId: "run-1" };
+
+    setCardContext(sessionKey, {
+      apiUrl: "https://reasoning-sink-off.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "off",
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_agent_run({}, ctx);
+    handlers.model_call_started({ callId: "call-1" }, ctx);
+    recordCardReasoning(sessionKey, "DIRECT SINK WRITE MUST STAY HIDDEN", { snapshot: true });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, ctx);
+    handlers.after_tool_call({ toolName: "read", toolCallId: "tool-1", durationMs: 20 }, ctx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const send = calls.find((call) => call.url.includes("/sendMessage"));
+    expect(send).toBeTruthy();
+    expect(JSON.stringify(send!.body!.payload)).not.toContain("DIRECT SINK WRITE MUST STAY HIDDEN");
   });
 
   it("keeps host thinking agent events hidden when reasoning visibility is off", async () => {

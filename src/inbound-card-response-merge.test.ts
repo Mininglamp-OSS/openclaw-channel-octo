@@ -11,6 +11,12 @@ import { _clearOwnerRegistry, registerOwnerUid } from "./owner-registry.js";
 import { ChannelType, MessageType } from "./types.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 
+const sessionStoreMocks = vi.hoisted(() => ({
+  getSessionEntry: vi.fn(),
+}));
+
+vi.mock("openclaw/plugin-sdk/session-store-runtime", () => sessionStoreMocks);
+
 const API = "http://octo.test";
 const BOT_UID = "bot_self_0000000000000000000000000000";
 const HUMAN_UID = "human_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -33,7 +39,7 @@ function makeAccount(): ResolvedOctoAccount {
   };
 }
 
-function makeMessage() {
+function makeMessage(content = "分析渠道 B") {
   return {
     message_id: "m1",
     message_seq: 100,
@@ -43,7 +49,7 @@ function makeMessage() {
     timestamp: Math.floor(Date.now() / 1000),
     payload: {
       type: MessageType.Text,
-      content: "分析渠道 B",
+      content,
       mention: { uids: [BOT_UID] },
     },
   };
@@ -175,21 +181,27 @@ function installRuntime(
   } as any);
 }
 
-async function runInbound() {
+async function runInbound(opts: {
+  log?: { warn?: (message: string) => void };
+  messageContent?: string;
+} = {}) {
   await handleInboundMessage({
     account: makeAccount(),
-    message: makeMessage() as any,
+    message: makeMessage(opts.messageContent) as any,
     botUid: BOT_UID,
     groupHistories: new Map(),
     lastBotReplySeqMap: new Map(),
     memberMap: new Map(),
     uidToNameMap: new Map(),
     groupCacheTimestamps: new Map(),
+    log: opts.log,
   });
 }
 
 describe("inbound final response progress-card merge", () => {
   beforeEach(() => {
+    sessionStoreMocks.getSessionEntry.mockReset();
+    sessionStoreMocks.getSessionEntry.mockReturnValue(undefined);
     _clearKnownBots();
     _clearOwnerRegistry();
     registerOwnerUid("acct1", HUMAN_UID);
@@ -265,6 +277,46 @@ describe("inbound final response progress-card merge", () => {
       expect(textSends).toHaveLength(0);
     },
   );
+
+  it.each([
+    "/reasoning on",
+    "请解释 /reasoning on 会发生什么",
+  ])("does not interpret user text as a reasoning directive: %s", async (messageContent) => {
+    const { sends } = installFetchStub();
+    const hooks = collectCardHooks();
+    installRuntime(hooks, "最终结论", {
+      reasoningText: "USER TEXT MUST NOT ENABLE REASONING CAPTURE",
+      reasoningVisibility: "off",
+    });
+
+    await runInbound({ messageContent });
+
+    const cardSend = sends.find((body) =>
+      (body.payload as { type?: number } | undefined)?.type === 17);
+    expect(cardSend).toBeTruthy();
+    expect(JSON.stringify(cardSend?.payload)).not.toContain("USER TEXT MUST NOT ENABLE REASONING CAPTURE");
+  });
+
+  it("fails closed when session reasoning visibility cannot be read", async () => {
+    const { sends } = installFetchStub();
+    const hooks = collectCardHooks();
+    const warn = vi.fn();
+    sessionStoreMocks.getSessionEntry.mockImplementation(() => {
+      throw new Error("session store unavailable");
+    });
+    installRuntime(hooks, "最终结论", {
+      reasoningText: "SESSION STORE FAILURE MUST NOT LEAK",
+      reasoningVisibility: "stream",
+    });
+
+    await runInbound({ log: { warn } });
+
+    const cardSend = sends.find((body) =>
+      (body.payload as { type?: number } | undefined)?.type === 17);
+    expect(cardSend).toBeTruthy();
+    expect(JSON.stringify(cardSend?.payload)).not.toContain("SESSION STORE FAILURE MUST NOT LEAK");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("reasoning visibility"));
+  });
 
   it("drops a late reasoning callback after the session entry generation is replaced", async () => {
     const { sends } = installFetchStub();
