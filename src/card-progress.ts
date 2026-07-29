@@ -86,6 +86,8 @@ interface CardEntry {
   /** paused/resuming/done 跨-run edit 的串行尾指针。 */
   stateEditPromise?: Promise<void>;
   stateEditAbort?: AbortController;
+  /** All Model A edits share this tail so card_seq reservation order equals wire order. */
+  modelAEditPromise?: Promise<boolean>;
   /** paused 卡的有界回收定时器。 */
   pausedExpiryTimer?: ReturnType<typeof setTimeout>;
   /** replacement/clear 时主动取消 profile/send/edit,缩小 stale side-effect 窗口。 */
@@ -394,33 +396,46 @@ async function editEntryProgress(params: {
   signal: AbortSignal;
 }): Promise<boolean> {
   const { entry, state } = params;
-  if (!entry.messageId) return false;
+  const messageId = entry.messageId;
+  if (!messageId) return false;
   if (entry.deliveryMode === "model-a") {
     const data = buildReasoningProcessWireData(state);
-    if (!data || !entry.templateRef) return false;
-    // Reserve before the network await. State transitions and debounced flushes use separate
-    // serializers and can overlap on the same tracked entry; reserving first preserves the
-    // strictly increasing CAS contract even when two edits are concurrently in flight.
-    const cardSeq = entry.nextCardSeq++;
-    await editTemplateCardWithRetry({
-      apiUrl: entry.ctx.apiUrl,
-      botToken: entry.ctx.botToken,
-      messageId: entry.messageId,
-      channelId: entry.ctx.channelId,
-      channelType: entry.ctx.channelType,
-      templateRef: entry.templateRef,
-      state: data.state,
-      data,
-      cardSeq,
-      // 调用方意图 **与** 非终态双重约束。只看 state 会把 markCardPaused 的持久 paused 帧
-      // (contractState 映射成 reasoning,却可能挂上 PAUSED_CARD_TTL_MS=1h)误标 transient;
-      // 只看调用方意图又会漏掉从 debounce flush 路径(恒 transient:true)到达的 stopped 终态。
-      ...(params.transient && !TERMINAL_TEMPLATE_STATES.has(data.state)
-        ? { transient: true }
-        : {}),
-      signal: params.signal,
-    });
-    return true;
+    const templateRef = entry.templateRef;
+    if (!data || !templateRef) return false;
+    const previous = entry.modelAEditPromise;
+    const work = (async (): Promise<boolean> => {
+      if (previous) await previous;
+      if (entry.skip) return false;
+      if (params.signal.aborted) throw params.signal.reason;
+      // Reserve inside the single Model A queue: reservation order now equals request order, so
+      // a later CAS value cannot commit before an earlier one and make it stale on arrival.
+      const cardSeq = entry.nextCardSeq++;
+      await editTemplateCardWithRetry({
+        apiUrl: entry.ctx.apiUrl,
+        botToken: entry.ctx.botToken,
+        messageId,
+        channelId: entry.ctx.channelId,
+        channelType: entry.ctx.channelType,
+        templateRef,
+        state: data.state,
+        data,
+        cardSeq,
+        // 调用方意图 **与** 非终态双重约束。只看 state 会把 markCardPaused 的持久 paused 帧
+        // (contractState 映射成 reasoning,却可能挂上 PAUSED_CARD_TTL_MS=1h)误标 transient;
+        // 只看调用方意图又会漏掉从 debounce flush 路径(恒 transient:true)到达的 stopped 终态。
+        ...(params.transient && !TERMINAL_TEMPLATE_STATES.has(data.state)
+          ? { transient: true }
+          : {}),
+        signal: params.signal,
+      });
+      return true;
+    })();
+    entry.modelAEditPromise = work;
+    try {
+      return await work;
+    } finally {
+      if (entry.modelAEditPromise === work) entry.modelAEditPromise = undefined;
+    }
   }
 
   const { card, plain } = renderEntryProgress(params.sessionKey, entry, state);
@@ -428,7 +443,7 @@ async function editEntryProgress(params: {
   await editCardMessage({
     apiUrl: entry.ctx.apiUrl,
     botToken: entry.ctx.botToken,
-    messageId: entry.messageId,
+    messageId,
     channelId: entry.ctx.channelId,
     channelType: entry.ctx.channelType,
     card,

@@ -8,6 +8,7 @@ import {
   cardSupports,
   fmtDuration,
   isSensitive,
+  reduceUrlsInText,
   renderProgressCard,
   sanitizeErrorText,
   type CardCaps,
@@ -161,24 +162,25 @@ export function summarizeToolResult(toolName: string | undefined, result: unknow
 /** Reasoning lane text is visible to channel members, so fail closed on protected/secret shapes. */
 export function sanitizeReasoningThought(text: string | undefined): string {
   if (!text) return FALLBACK_THOUGHT;
-  const normalized = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+  let normalized = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   if (!normalized ||
       normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
-      normalized.includes("<<<END_OPENCLAW_INTERNAL_CONTEXT>>>") ||
-      /(?:https?:\/\/|wss?:\/\/|\b(?:postgres|mysql|redis|ssh):\/\/)/i.test(normalized) ||
-      isSensitive(normalized, true)) {
+      normalized.includes("<<<END_OPENCLAW_INTERNAL_CONTEXT>>>")) {
     return FALLBACK_THOUGHT;
   }
+  normalized = reduceUrlsInText(normalized).replace(/\s+/g, " ").trim();
+  if (!normalized || isSensitive(normalized, true)) return FALLBACK_THOUGHT;
   return normalized.length > THOUGHT_MAX ? normalized.slice(0, THOUGHT_MAX) + "…" : normalized;
 }
 
 function safeToolName(tool: string): string {
   if (tool === "__thinking__") return "think";
   if (tool === SUBAGENT_WAIT_STEP_TOOL) return "wait";
-  if (!tool || isSensitive(tool, true)) return "tool";
-  return tool.length > TOOL_NAME_MAX ? tool.slice(0, TOOL_NAME_MAX) + "…" : tool;
+  const reduced = reduceUrlsInText(tool).replace(/\s+/g, " ").trim();
+  if (!reduced || isSensitive(reduced, true)) return "tool";
+  return reduced.length > TOOL_NAME_MAX ? reduced.slice(0, TOOL_NAME_MAX) + "…" : reduced;
 }
 
 function actionDetail(step: CardStep): string {
