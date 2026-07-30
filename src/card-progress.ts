@@ -729,6 +729,49 @@ function markCardPaused(sessionKey: string, runId?: string, expectedEntry?: Card
 }
 
 /**
+ * 收尾兜底:把滞留在 pausedCards 里、由**本次收尾 run 拥有**的孤儿卡直接收到终态。
+ *
+ * 背景:一段 run 走过 sessions_yield 后收尾时把可见卡移入 pausedCards;它 resume 后是新的
+ * dispatch,`setCardContext` 为其新建一张空 entry(无 messageId)。若该 continuation 只产出
+ * final text、没有新工具调用,这张空 entry 永远拿不到 messageId,`finalizeCard` 正常分支因
+ * `!messageId` 早退,真正可见的 paused 卡永不推进终态 → 冻结在「正在处理/等待任务结果」,
+ * 直到 1h TTL 才误标为「等待超时」——即便任务其实成功。
+ *
+ * **归属校验(fail-closed)**:paused 卡可能在等待期间与无关消息交错,绝不能被任意后续
+ * dispatch 收尾。只有能证明本次收尾 run **就是**该 paused 流程的 run 才接管:
+ *   - `owner.runId === paused.pausedFromRunId`:同一 run resume 后收尾(bare yield 主场景;
+ *     resumed run 保留原 runId,与 handleCardLifecycleEvent 的 error/finish 归属判定一致)。
+ * 其余守卫:同 identity(防跨账号)、有 messageId、未 skip,且**不属于**仍在等子任务
+ * (`childSessionKeys` 非空)或已被 continuation 认领(`continuationRunId` 已设)的 subagent-yield
+ * 流程——后者仍由 lifecycle / agent_end 的 finishPausedCard 收尾,不能在这里抢先关闭。
+ * 缺 `owner.runId`(旧 host 不提供 runId)时同样 fail-closed,不接管。
+ */
+async function finalizeOrphanedPausedCard(
+  sessionKey: string,
+  opts: { success: boolean; errorText?: string },
+  owner: { identity: string; runId?: string },
+): Promise<void> {
+  const paused = pausedCards.get(sessionKey);
+  if (!paused || paused.skip || !paused.messageId) return;
+  // subagent-yield 流程:仍在等子任务或已被 continuation 认领 → 交给 lifecycle/agent_end,不抢占。
+  if (paused.continuationRunId || paused.childSessionKeys.size > 0) return;
+  // 跨账号 fail-closed:身份必须一致。
+  if (paused.identity !== owner.identity) return;
+  // run 归属 fail-closed:只有本 paused 流程的 run(同 run resume)可收尾;缺 runId 或与
+  // pausedFromRunId 不符(等待期间的无关 dispatch)→ 不接管,留给真正的 continuation / TTL。
+  if (!owner.runId || paused.pausedFromRunId !== owner.runId) return;
+  const phase = opts.success ? "done" : "error";
+  await editTrackedCardState(
+    sessionKey,
+    paused,
+    phase,
+    opts.errorText ? { errorText: opts.errorText } : {},
+  );
+  releasePausedCard(sessionKey, paused, `finalized orphaned paused card phase=${phase}`);
+  dbg(`finalized orphaned paused card session=${sessionKey} phase=${phase} run=${owner.runId}`);
+}
+
+/**
  * dispatch `finally` 收尾:完成/失败时清理；yield 时保留原卡供 continuation 更新。
  * 幂等:未登记或没发过占位卡则仅清理。
  */
@@ -737,6 +780,8 @@ export async function finalizeCard(
   opts: { success: boolean; errorText?: string } = { success: true },
 ): Promise<void> {
   const entry = cards.get(sessionKey);
+  // 没登记 entry → 无 identity/runId 可校验,fail-closed:不碰 pausedCards(sessionKey 碰撞时
+  // 可能是另一身份的卡)。正常 continuation dispatch 都会先 setCardContext,entry 必存在。
   if (!entry) return;
   // 等待 in-flight flush 落定后再接管。否则:首帧 send 尚未 return 时 messageId 未就绪,
   // 直接删 entry 会跳过终态帧,占位卡「🤖 Working…」永久冻结;若有 in-flight 中间帧
@@ -763,7 +808,15 @@ export async function finalizeCard(
   }
 
   // 从没发过卡(skip / 无工具调用)→ 无需收尾帧。
-  if (entry.skip || !entry.messageId) return;
+  if (entry.skip || !entry.messageId) {
+    // 常见于 yield 后同一 run resume 的 continuation:setCardContext 为其新建空 entry(无
+    // messageId),真正可见的卡还在 pausedCards。若本 run 已收尾(非 paused/resuming)且**归属**
+    // 该 paused 流程,把孤儿卡收到终态;否则(如等待期间的无关消息)不碰,留给真正的 continuation / TTL。
+    if (!retainForContinuation) {
+      await finalizeOrphanedPausedCard(sessionKey, opts, { identity: entry.identity, runId: entry.runId });
+    }
+    return;
+  }
 
   if (retainForContinuation) {
     await editTrackedCardState(sessionKey, entry, entry.phase);
