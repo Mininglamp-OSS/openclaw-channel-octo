@@ -7,9 +7,17 @@
  * 帧内容:工具名友好化 + 参数摘要 + 耗时,让用户看清 agent 在做什么。
  * 视觉属性仅用端到端验证过的(weight/spacing/size/wrap),不用未验证的 color 以规避白名单。
  */
-import { CARD_PLACEHOLDER, CARD_VERSION } from "./types.js";
+import { CARD_VERSION } from "./types.js";
 import { buildDisplayCard, EN_DROP_MARKER, type DisplayBlock, type RichSegment } from "./card-blocks.js";
 import { cardFitsLimits, type CardLimits } from "./card-limits.js";
+
+/**
+ * Plain-text fallback for the progress / reasoning card. Deliberately not `CARD_PLACEHOLDER`:
+ * that constant is the **inbound** derivation for a received card and feeds the model in a
+ * Chinese-copy context, whereas these two renderers are English end to end. Reachable here when a
+ * tight negotiated payload budget drops every group and the body degrades to empty.
+ */
+export const PROGRESS_CARD_PLACEHOLDER = "[card]";
 
 export const OCTO_CARD_LAYOUTS = {
   agentProgressV1: "agent_progress_v1",
@@ -336,8 +344,10 @@ export function fmtDuration(ms?: number): string {
   // NaN/Infinity(时钟回拨、未初始化的起点)会一路穿过下面的取整,渲出 `Infinityh NaNm NaNs`。
   if (!Number.isFinite(ms) || ms < 0) return "";
   if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  // Pick the unit from the rounded value, not the raw one: `toFixed(1)` rounds up, so branching on
+  // `ms < 60_000` let 59_999 render as `60.0s` — the very output the minute branch exists to avoid.
   const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${(ms / 1000).toFixed(1)}s`;
   const seconds = totalSeconds % 60;
   const totalMinutes = Math.floor(totalSeconds / 60);
   const minutes = totalMinutes % 60;
@@ -389,9 +399,17 @@ const LABEL_MAX = 40;
  */
 function safeLabel(label: string): string {
   const s = reduceUrlsInText(label);
-  // Raw MCP names contain `__` separators, which look high-entropy when the whole label is
-  // scanned as one token. Scan each semantic segment so ordinary long MCP names are truncated
-  // rather than hidden, while secrets inside any server/tool segment still fail closed.
+  // Raw MCP names are scanned per `__` segment rather than whole, because hasGenericSecretShape
+  // counts a lone `_` as a base64url signal — so every snake_case MCP name of 32+ chars reads as
+  // high-entropy and would render as `Tool`.
+  //
+  // Be precise about what this gives up: the keyword and known-prefix detectors (AKIA, ghp_, sk-,
+  // JWT, token/api_key/…) still fail closed on any single segment, but whole-string entropy
+  // detection does not survive the split — a high-entropy value that a `__` breaks into sub-32-char
+  // pieces is no longer caught, and renders up to LABEL_MAX. Tool names come from operator-owned
+  // registry/MCP config rather than model or user input, so that residue is defence-in-depth
+  // against misconfiguration, not an attacker-reachable path. The real fix is one layer down in
+  // hasGenericSecretShape; until then this carve-out is the narrower evil.
   const sensitive = s.startsWith(MCP_TOOL_PREFIX)
     ? s.split("__").some((segment) => isSensitive(segment, true))
     : isSensitive(s, true);
@@ -422,7 +440,7 @@ function headerText(state: CardProgressState): string {
     case "paused":
       return "⏸️ Waiting for results";
     case "resuming":
-      return "🤖 Preparing result";
+      return "🤖 Preparing results";
     case "answering":
       return "🤖 Answering";
     case "expired":
@@ -781,7 +799,7 @@ function progressToggleColumn(startVisible: boolean): Record<string, unknown> | 
  * 可见步数受服务端 max_nodes 权威约束(缺省用本地上限)。
  *
  * 返回 `{ card, plain }`:card = AC 1.5 JSON;plain = 纯文本兜底(与布局无关;服务端 Finalize 会
- * 权威重算)。plain 空则回退 CARD_PLACEHOLDER。
+ * 权威重算)。plain 空则回退 PROGRESS_CARD_PLACEHOLDER。
  */
 export function renderProgressCard(
   state: CardProgressState,
@@ -819,7 +837,7 @@ export function renderProgressCard(
       trusted: true,
       dropMarker: EN_DROP_MARKER,
     });
-    return { card: flat.card, plain: flat.plain || CARD_PLACEHOLDER };
+    return { card: flat.card, plain: flat.plain || PROGRESS_CARD_PLACEHOLDER };
   };
 
   if (!cardSupports(caps, "ColumnSet") || !cardSupports(caps, "Container")) {
@@ -870,10 +888,10 @@ export function renderProgressCard(
   card.metadata = { octo_layout: OCTO_CARD_LAYOUTS.agentProgressV1 };
   const summaryPlain = total > 0 ? progressSummaryText(state.steps, total) : "";
   const plain = [header, summaryPlain, detail.plain].filter(Boolean).join("\n");
-  if (!cardFitsLimits(card, plain || CARD_PLACEHOLDER, caps)) {
+  if (!cardFitsLimits(card, plain || PROGRESS_CARD_PLACEHOLDER, caps)) {
     return renderFlatFallback();
   }
-  return { card, plain: plain || CARD_PLACEHOLDER };
+  return { card, plain: plain || PROGRESS_CARD_PLACEHOLDER };
 }
 
 /**

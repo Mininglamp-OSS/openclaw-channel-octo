@@ -93,6 +93,10 @@ describe("ai.reasoning-process successor-compatible contract", () => {
       statusTone: "Warning",
       traceExpanded: false,
       traceCollapsed: true,
+      // `stopped at phase N` is an ordinal position, matching the copy it replaced — the count
+      // reading ("stopped at N phases") happens to share the number and must not creep back in.
+      timerText: "6.0s · stopped at phase 1",
+      collapsedSummary: "Kept 1 phase from before the stop",
     });
     expect(buildReasoningProcessData(state({ phase: "error", errorText: "provider timeout" }))).toMatchObject({
       state: "error",

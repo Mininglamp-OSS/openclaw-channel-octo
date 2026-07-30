@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CARD_PLACEHOLDER, CARD_VERSION } from "./types.js";
+import { CARD_VERSION } from "./types.js";
 import type { CardTemplateRef, CardTemplatingCapability } from "./api-fetch.js";
 import { cardFitsLimits } from "./card-limits.js";
 import {
@@ -9,6 +9,7 @@ import {
   fmtDuration,
   isSensitive,
   reduceUrlsInText,
+  PROGRESS_CARD_PLACEHOLDER,
   renderProgressCard,
   sanitizeErrorText,
   type CardCaps,
@@ -333,7 +334,7 @@ function buildReasoningProcessDataWithPhases(
           : "Attention",
     timerText: mapped === "reasoning" ? "Reasoning…"
       : mapped === "answering" ? "Writing the answer…"
-        : mapped === "stopped" ? `${elapsed} · stopped at ${phaseCount(phases.length)}`
+        : mapped === "stopped" ? `${elapsed} · stopped at phase ${phases.length}`
           : mapped === "error" ? "Interrupted"
             : `${elapsed} · ${phaseCount(phases.length)} · ${toolCallCount(toolCount)}`,
     traceExpanded: active || mapped === "error",
@@ -419,7 +420,7 @@ function plainText(data: ReasoningProcessData): string {
   }
   if (data.progressText) lines.push(data.progressText);
   if (data.errorMessage) lines.push(data.errorMessage);
-  return lines.join("\n") || CARD_PLACEHOLDER;
+  return lines.join("\n") || PROGRESS_CARD_PLACEHOLDER;
 }
 
 /** Render the local toggle-only variant of the shared 0.1.0/0.2.0 data contract. */

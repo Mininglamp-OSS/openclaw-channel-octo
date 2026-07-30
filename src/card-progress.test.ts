@@ -1327,7 +1327,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const resumingEdit = calls.find((call) => {
       if (!call.url.includes("/message/edit")) return false;
       const env = JSON.parse(call.body!.content_edit as string);
-      return progressHeaderText(env.card).includes("🤖 Preparing result");
+      return progressHeaderText(env.card).includes("🤖 Preparing results");
     });
     expect(resumingEdit).toBeTruthy();
     expect(progressCardText(JSON.parse(resumingEdit!.body!.content_edit as string).card))
@@ -1417,7 +1417,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(calls.some((call) => {
       if (!call.url.includes("/message/edit")) return false;
       const env = JSON.parse(call.body!.content_edit as string);
-      return progressHeaderText(env.card).includes("🤖 Preparing result");
+      return progressHeaderText(env.card).includes("🤖 Preparing results");
     })).toBe(true);
 
     calls.length = 0;
@@ -2861,7 +2861,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
 
   it("懒发契约:model_call_started 单独不发卡 —— 纯 display-card turn(含思考步)无占位卡、无中断终态", async () => {
     // 回归:P1-g 的 model_call_started 曾无条件 scheduleFlush,击穿 P1-h 抑制 ——
-    // 纯 display-card turn 仍发占位卡并 finalize 成「⚠️ 已中断」。
+    // 纯 display-card turn 仍发占位卡并 finalize 成「⚠️ Interrupted」。
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
     const { handlers } = makeApi();

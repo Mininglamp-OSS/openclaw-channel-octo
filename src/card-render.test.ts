@@ -251,6 +251,12 @@ describe("fmtDuration", () => {
     expect(fmtDuration(Number.POSITIVE_INFINITY)).toBe("");
   });
   it("负数 → 空(时钟回拨不渲出 -5000ms)", () => expect(fmtDuration(-5000)).toBe(""));
+  it("秒/分边界按取整后的值选单位(不渲出 60.0s)", () => {
+    expect(fmtDuration(59_499)).toBe("59.5s");
+    expect(fmtDuration(59_950)).toBe("1m 0s");
+    expect(fmtDuration(59_999)).toBe("1m 0s");
+    expect(fmtDuration(60_000)).toBe("1m 0s");
+  });
 });
 
 describe("sanitizeErrorText adversarial boundaries", () => {
@@ -313,6 +319,12 @@ describe("stepLine", () => {
     expect(out.endsWith("…")).toBe(true);
     // 未知工具名命中敏感关键词 → 回退通用「工具」(不把疑似密钥的标识符渲进群卡片)。
     expect(stepLine({ tool: "fetch_api_key_helper", status: "running" })).toBe("⏳ Tool");
+    // 按段扫描放宽了整串熵检测,所以必须锁住「什么仍然被抓住」:已知前缀落在任一段里 → 仍打码。
+    expect(stepLine({ tool: "mcp__github__ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", status: "running" }))
+      .toBe("⏳ Tool");
+    expect(stepLine({ tool: "mcp__aws__AKIAIOSFODNN7EXAMPLE", status: "running" })).toBe("⏳ Tool");
+    // 关键词同理(段内命中即整个 label 回退)。
+    expect(stepLine({ tool: "mcp__vault__read_secret", status: "running" })).toBe("⏳ Tool");
     // label 也过 URL 降级(与 params/error sink 一致):工具名里嵌 webhook/DSN → 只留注册域。
     const urlName = stepLine({ tool: "https://hooks.slack.com/services/T00/B00/SeCrEtXyZ", status: "running" });
     expect(urlName).toContain("https://slack.com");
@@ -521,7 +533,7 @@ describe("renderProgressCard", () => {
     const expired = renderProgressCard({ phase: "expired", steps: [] });
 
     expect(progressHeaderText(paused.card)).toBe("⏸️ Waiting for results");
-    expect(progressHeaderText(resuming.card)).toBe("🤖 Preparing result");
+    expect(progressHeaderText(resuming.card)).toBe("🤖 Preparing results");
     expect(progressHeaderText(expired.card)).toBe("⏱️ Wait timed out");
   });
 
@@ -585,7 +597,9 @@ describe("renderProgressCard", () => {
     // 最后一步是最新的 /f19
     expect(elementText(detail[detail.length - 1])).toContain("/f19");
     // 已折叠掉最早的 /f0
-    expect(detail.every((b) => !elementText(b).includes("/f0:"))).toBe(true);
+    // 锚到实际渲染形态 `📖 read: /f0 · 200ms`;旧写法用 "/f0:" —— 冒号在路径前面,
+    // 这个子串永不出现,即使被折叠的步骤仍在渲染也会通过。
+    expect(detail.every((b) => !elementText(b).includes(": /f0 "))).toBe(true);
   });
 
   it("窄屏 fallback 去掉重复标题/可见步数,并压缩长耗时", () => {

@@ -275,7 +275,7 @@ async function runLifecycleFlow({
     const waitDuration = text.match(
       /(?:Subtask returned|Waiting for subtask) · (?:(\d+)h )?(?:(\d+)m )?(?:(\d+(?:\.\d+)?)s)/,
     );
-    expect(waitDuration, text).toBeDefined();
+    expect(waitDuration, text).not.toBeNull();
     const waitSeconds = Number(waitDuration?.[1] ?? 0) * 3600 +
       Number(waitDuration?.[2] ?? 0) * 60 + Number(waitDuration?.[3] ?? 0);
     expect(waitSeconds).toBeGreaterThanOrEqual(pausedCheckpointDelayMs / 1_000);
