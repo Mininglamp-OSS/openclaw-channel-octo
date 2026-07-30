@@ -52,12 +52,20 @@ export interface CardStep {
    * continuation 收尾，duration = now - startedAt。渲染层只看 durationMs。
    */
   startedAt?: number;
+  /** OpenClaw model_call_started.callId; used to close the matching reasoning phase. */
+  modelCallId?: string;
+  /** User-visible reasoning lane text associated with this model call. */
+  thought?: string;
+  /** Bounded structural summary derived from after_tool_call.result. */
+  resultSummary?: string;
 }
 
 /** 进度卡的渲染状态。 */
 export interface CardProgressState {
-  phase: "thinking" | "tool" | "paused" | "resuming" | "expired" | "done" | "error";
+  phase: "thinking" | "tool" | "paused" | "resuming" | "answering" | "expired" | "done" | "stopped" | "error";
   steps: CardStep[];
+  /** Stable contract identifier: sessionKey + runId when the host provides runId. */
+  reasoningId?: string;
   elapsedMs?: number;
   errorText?: string;
 }
@@ -415,6 +423,8 @@ function headerText(state: CardProgressState): string {
       return "⏸️ Waiting for results";
     case "resuming":
       return "🤖 Preparing result";
+    case "answering":
+      return "🤖 Answering";
     case "expired":
       return "⏱️ Wait timed out";
     case "error": {
@@ -429,6 +439,8 @@ function headerText(state: CardProgressState): string {
       if (secs) parts.push(secs);
       return parts.join(" · ");
     }
+    case "stopped":
+      return "⚠️ Stopped";
   }
 }
 
@@ -824,7 +836,7 @@ export function renderProgressCard(
   const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true, dropMarker: EN_DROP_MARKER });
   const headerItems = progressHeaderItems(state, header, state.steps, total, canRichText);
   const canToggle = supportsTerminalCollapse(caps);
-  const isTerminal = state.phase === "done" || state.phase === "error" || state.phase === "expired";
+  const isTerminal = state.phase === "done" || state.phase === "stopped" || state.phase === "error" || state.phase === "expired";
   const detailVisible = !(canToggle && isTerminal);
   const columns: Record<string, unknown>[] = [
     {

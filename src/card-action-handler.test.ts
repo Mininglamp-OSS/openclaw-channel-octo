@@ -109,6 +109,35 @@ describe("handleCardAction", () => {
     expect(dispatch).not.toHaveBeenCalled();
   });
 
+  it.each(["reasoning_stop", "reasoning_retry"])(
+    "%s 只记录 unsupported 并消费，不派发 agent 或伪造成功状态",
+    async (actionId) => {
+      const dispatch = vi.fn();
+      const warnings: string[] = [];
+      expect(await handleCardAction({
+        action: action({
+          messageId: "registry-reasoning-card",
+          actionId,
+          data: {
+            action: actionId,
+            effect: actionId === "reasoning_stop" ? "stop_reasoning" : "retry_reasoning",
+            reasoning_id: "run-1",
+            owner: "ai",
+            action_type: "reasoning.control",
+          },
+        }),
+        accountId: "a1",
+        apiUrl: "x",
+        botToken: "t",
+        dispatch,
+        log: { warn: (message) => warnings.push(message) },
+      })).toBe("ignored");
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(editCardMessage).not.toHaveBeenCalled();
+      expect(warnings).toContainEqual(expect.stringContaining(`reasoning control is not supported action=${actionId}`));
+    },
+  );
+
   it("inputs 超限时不 dispatch，并把原卡更新为失败", async () => {
     const dispatch = vi.fn();
     expect(await handleCardAction({

@@ -46,7 +46,10 @@ function findParentTranscript() {
     const file = path.join(dir, name);
     const rows = readJsonLines(file);
     const serialized = JSON.stringify(rows);
-    if (serialized.includes(marker) && serialized.includes("sessions_yield")) return { file, rows };
+    if (serialized.includes(marker) &&
+        (serialized.includes("sessions_yield") || serialized.includes("FILES_E2E_WORKFLOW"))) {
+      return { file, rows };
+    }
   }
   return { file: undefined, rows: [] };
 }
@@ -85,12 +88,24 @@ function readGatewayLogs() {
   }).join("\n");
 }
 
-function latestAcceptedEdit(messageId) {
-  const edits = readJsonLines("/tmp/octo-host-e2e/card-edits.jsonl")
+function readSessionSettings() {
+  try {
+    const store = JSON.parse(fs.readFileSync("/root/.openclaw-dev/agents/main/sessions/sessions.json", "utf8"));
+    const entry = store[sessionKey] ?? {};
+    return {
+      thinkingLevel: entry.thinkingLevel,
+      reasoningLevel: entry.reasoningLevel,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function acceptedEdits(messageId) {
+  return readJsonLines("/tmp/octo-host-e2e/card-edits.jsonl")
     .filter((row) => row?.ok === true && row?.messageId === messageId &&
       Number(row?.timestampMs ?? 0) >= startedAtMs - 5_000)
     .sort((a, b) => Number(a.timestampMs ?? 0) - Number(b.timestampMs ?? 0));
-  return edits.at(-1);
 }
 
 async function recentCards() {
@@ -120,7 +135,8 @@ async function recentCards() {
       const timestampMs = Number(message.timestamp ?? 0) * 1000;
       if (payload.type !== 17 || timestampMs < startedAtMs - 5_000) return [];
       const messageId = String(message.message_idstr ?? message.message_id ?? "");
-      const edit = latestAcceptedEdit(messageId);
+      const edits = acceptedEdits(messageId);
+      const edit = edits.at(-1);
       return [{
         messageId,
         timestampMs,
@@ -128,6 +144,18 @@ async function recentCards() {
           ? edit.plain
           : typeof payload.plain === "string" ? payload.plain : "",
         plainSource: edit ? "accepted-edit" : "original-message",
+        ...(edit?.templateRef || payload.template_ref
+          ? { templateRef: edit?.templateRef ?? payload.template_ref }
+          : {}),
+        ...(typeof edit?.state === "string" || typeof payload.state === "string"
+          ? { state: edit?.state ?? payload.state }
+          : {}),
+        ...(edit?.data || payload.data ? { data: edit?.data ?? payload.data } : {}),
+        ...(Number.isSafeInteger(edit?.cardSeq) ? { cardSeq: edit.cardSeq } : {}),
+        ...(edit ? { transient: edit.transient === true } : {}),
+        editCardSeqs: edits
+          .map((row) => row?.cardSeq)
+          .filter((value) => Number.isSafeInteger(value)),
       }];
     } catch {
       return [];
@@ -149,6 +177,7 @@ const texts = rows.map((row) => ({ role: row.message?.role, text: messageText(ro
 const trajectoryText = JSON.stringify(trajectoryRows);
 const gatewayLogs = readGatewayLogs();
 const cards = await recentCards();
+const sessionSettings = readSessionSettings();
 
 const phaseEvidence = {
   paused: gatewayLogs.includes(`finalized session=${sessionKey} phase=paused`) ||
@@ -168,5 +197,6 @@ console.log(JSON.stringify({
   followupReply: texts.some(({ role, text }) => role === "assistant" && text.includes(`FOLLOWUP_E2E_OK:${marker}`)),
   parentReply: texts.some(({ role, text }) => role === "assistant" && text.includes(`PARENT_E2E_OK:${marker}`)),
   phases: ["paused", "resuming", "done"].filter((phase) => phaseEvidence[phase]),
+  sessionSettings,
   cards,
 }));

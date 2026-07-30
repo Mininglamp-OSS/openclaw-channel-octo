@@ -9,7 +9,7 @@ import { describe, it, expect, vi } from "vitest";
  * - "final" (tool warning) → defer to pendingToolWarningFinal
  * - "block" / other → buffer text (overwrite), send once in finally
  *
- * - isReasoning payloads are skipped entirely
+ * - isReasoning payloads are captured for the progress card but never sent as normal text
  * - Media payloads are always sent immediately with dedup
  * - The finally block sends the last buffered text after dispatcher finishes
  * - onError clears the buffer to prevent stale text
@@ -53,6 +53,7 @@ function makeDeliver(
   sendMediaFn: (url: string) => Promise<void>,
   sendTextFn: (text: string, signal?: AbortSignal) => Promise<void>,
   isToolWarningFn: (payload: any) => boolean,
+  recordReasoningFn: (text: string, snapshot: boolean) => void = () => {},
 ) {
   return async (
     payload: {
@@ -60,12 +61,16 @@ function makeDeliver(
       mediaUrls?: string[];
       mediaUrl?: string;
       isReasoning?: boolean;
+      isReasoningSnapshot?: boolean;
       isError?: boolean;
     },
     info: { kind: string },
   ) => {
-    // Skip reasoning blocks
-    if (payload.isReasoning) return;
+    // Capture reasoning for the progress card, but never leak it as a normal reply.
+    if (payload.isReasoning) {
+      recordReasoningFn(payload.text ?? "", payload.isReasoningSnapshot === true);
+      return;
+    }
 
     const kind = info.kind;
 
@@ -281,17 +286,32 @@ describe("deliver buffer pattern", () => {
     expect(sendText).toHaveBeenCalledTimes(2);
   });
 
-  it("isReasoning: skips entirely", async () => {
+  it("isReasoning: records snapshot semantics without sending normal text", async () => {
     const deliverBuffer = createDeliverBuffer();
     const state = createDeliverState();
     const sentMediaUrls = new Set<string>();
     const sendMedia = vi.fn().mockResolvedValue(undefined);
     const sendText = vi.fn().mockResolvedValue(undefined);
-    const deliver = makeDeliver(deliverBuffer, state, sentMediaUrls, sendMedia, sendText, defaultIsToolWarning);
+    const recordReasoning = vi.fn();
+    const deliver = makeDeliver(
+      deliverBuffer,
+      state,
+      sentMediaUrls,
+      sendMedia,
+      sendText,
+      defaultIsToolWarning,
+      recordReasoning,
+    );
 
     await deliver({ text: "Internal reasoning...", isReasoning: true }, { kind: "block" });
-    await deliver({ text: "More reasoning", isReasoning: true }, { kind: "final" });
+    await deliver({
+      text: "Complete reasoning snapshot",
+      isReasoning: true,
+      isReasoningSnapshot: true,
+    }, { kind: "final" });
 
+    expect(recordReasoning).toHaveBeenNthCalledWith(1, "Internal reasoning...", false);
+    expect(recordReasoning).toHaveBeenNthCalledWith(2, "Complete reasoning snapshot", true);
     expect(sendText).not.toHaveBeenCalled();
     expect(deliverBuffer.lastText).toBeNull();
 

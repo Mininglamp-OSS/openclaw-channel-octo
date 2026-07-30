@@ -74,6 +74,12 @@
             "type": "boolean",
             "description": "When omitted or true, follow the server card capability gate; false force-disables automatic progress cards. Per-account values override the top-level value."
           },
+          "reasoningCardTemplateMode": {
+            "type": "string",
+            "enum": ["off", "shadow", "experimental"],
+            "default": "experimental",
+            "description": "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A when a compatible Bot-catalog template is advertised, preferring the newest supported version; a version claimed by two catalog entries is ambiguous and is skipped in favour of an older unambiguous one, falling back to Model B only when none remains. Defaults to experimental; per-account values override the top-level value."
+          },
           "cardDisplay": {
             "type": "boolean",
             "description": "When omitted or true, follow the server card capability gate; false force-disables the octo_send_display_card tool. Per-account values override the top-level value."
@@ -135,6 +141,12 @@
                 "cardProgress": {
                   "type": "boolean",
                   "description": "When omitted or true, follow the server card capability gate; false force-disables automatic progress cards. Per-account values override the top-level value."
+                },
+                "reasoningCardTemplateMode": {
+                  "type": "string",
+                  "enum": ["off", "shadow", "experimental"],
+                  "default": "experimental",
+                  "description": "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A when a compatible Bot-catalog template is advertised, preferring the newest supported version; a version claimed by two catalog entries is ambiguous and is skipped in favour of an older unambiguous one, falling back to Model B only when none remains. Defaults to experimental; per-account values override the top-level value."
                 },
                 "cardDisplay": {
                   "type": "boolean",
