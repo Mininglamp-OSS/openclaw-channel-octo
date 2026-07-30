@@ -202,6 +202,17 @@ describe("reasoning process template discovery", () => {
     },
   );
 
+  it.each(["", "   ", " 0.3.0", "0.3.0 "])(
+    "fails closed for an empty or whitespace-padded manifest version %j",
+    (version) => {
+      expect(selectReasoningProcessTemplate({
+        supported: true,
+        wire: "template-ref/v1",
+        templates: [template(version)],
+      })).toBeNull();
+    },
+  );
+
   it("fails closed when multiple compatible versions are advertised without a preference signal", () => {
     // The manifest is a capability set, not a preference-ordered list. The consumer must not
     // guess which version the server intended when more than one compatible ref is available.
@@ -259,11 +270,10 @@ describe("reasoning process template discovery", () => {
     })).toBeNull();
   });
 
-  // Controls are presentation owned by the server-rendered template, not part of the data
-  // contract this producer supplies, so they never decide compatibility either way. Vetoing a
-  // template over a button would trade the whole card for Model B without removing anything.
+  // Controls are rendered by the server but must still be understood by this consumer. A future
+  // action cannot be allowed to produce a clickable control that this plugin only ignores.
   it.each(["active", "result", "error"] as const)(
-    "stays compatible when the %s view advertises an unhandled submit action",
+    "fails closed when the %s view advertises an unhandled submit action",
     (viewName) => {
       const candidate = template("0.2.0");
       expect(selectReasoningProcessTemplate({
@@ -275,7 +285,7 @@ describe("reasoning process template discovery", () => {
             ? { ...view, submit_actions: [...view.submit_actions, "future_action"] }
             : view),
         }],
-      })).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+      })).toBeNull();
     },
   );
 

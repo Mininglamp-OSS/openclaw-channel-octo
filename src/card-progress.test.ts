@@ -412,6 +412,29 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(payload).not.toHaveProperty("card");
   });
 
+  it("空白 Registry 版本不固定 Model A，而是安全回退 Model B", async () => {
+    const { fn, calls } = mockFetch({ profile: registryProfile("   ") });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    setCardContext("blank-registry-version", {
+      apiUrl: "https://blank-registry-version.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_tool_call(
+      { toolName: "read", toolCallId: "tool-1" },
+      { sessionKey: "blank-registry-version" },
+    );
+    await vi.advanceTimersByTimeAsync(900);
+
+    const payload = calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as
+      Record<string, unknown> | undefined;
+    expect(payload).toHaveProperty("card");
+    expect(payload).not.toHaveProperty("template_ref");
+  });
+
   it("未配置 reasoningCardTemplateMode 时默认选择兼容的 Registry 模板", async () => {
     const { fn, calls } = mockFetch({
       profile: {
