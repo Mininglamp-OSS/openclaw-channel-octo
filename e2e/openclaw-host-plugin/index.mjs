@@ -41,7 +41,10 @@ function ensureEditObserver(api) {
     if (url.endsWith("/v1/bot/message/edit") && typeof init?.body === "string") {
       try {
         const request = JSON.parse(init.body);
-        const envelope = JSON.parse(request.content_edit);
+        const envelope = typeof request.content_edit === "string"
+          ? JSON.parse(request.content_edit)
+          : request.template_ref ? request : undefined;
+        if (!envelope) return response;
         fs.mkdirSync(REQUEST_DIR, { recursive: true });
         fs.appendFileSync(EDIT_LOG, JSON.stringify({
           timestampMs: Date.now(),
@@ -50,6 +53,10 @@ function ensureEditObserver(api) {
           ok: response.ok,
           transient: envelope.transient === true,
           plain: typeof envelope.plain === "string" ? envelope.plain : "",
+          ...(envelope.template_ref ? { templateRef: envelope.template_ref } : {}),
+          ...(typeof envelope.state === "string" ? { state: envelope.state } : {}),
+          ...(envelope.data && typeof envelope.data === "object" ? { data: envelope.data } : {}),
+          ...(Number.isSafeInteger(envelope.card_seq) ? { cardSeq: envelope.card_seq } : {}),
         }) + "\n");
       } catch (error) {
         api.logger.warn(`octo-host-e2e edit observer: ${error}`);
@@ -70,22 +77,65 @@ function scriptedReply(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const allText = messages.map((message) => contentText(message?.content)).join("\n");
   const marker = allText.match(/(?:CHILD|PARENT)_E2E_OK:([0-9a-f-]{36})/i)?.[1] ??
+    allText.match(/FILES_E2E_WORKFLOW:([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/OpenClaw host E2E marker: ([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/Ordinary user follow-up for ([0-9a-f-]{36})/i)?.[1];
   if (!marker) return { text: "E2E_SCRIPT_ERROR: missing marker" };
 
+  const toolMessages = messages.filter((message) => message?.role === "tool");
+
+  if (allText.includes(`FILES_E2E_WORKFLOW:${marker}`)) {
+    const workDir = `/tmp/octo-realistic-e2e/${marker}`;
+    const inputPath = `${workDir}/input.txt`;
+    const reportPath = `${workDir}/report.txt`;
+    if (toolMessages.length === 0) {
+      return {
+        tool: "read",
+        arguments: { path: inputPath },
+        reasoning: "I’ll inspect the source file before making changes.",
+      };
+    }
+    if (toolMessages.length === 1) {
+      return {
+        tool: "write",
+        arguments: { path: reportPath, content: "Processed: alpha=7\n" },
+        reasoning: "The input is valid; I’ll write the derived report.",
+        // Keep this realistic multi-step task above the progress-card debounce
+        // threshold so the test exercises a visible send followed by edits.
+        delayMs: 1_200,
+      };
+    }
+    if (toolMessages.length === 2) {
+      return {
+        tool: "exec",
+        arguments: {
+          command: `wc -c ${reportPath}`,
+          yieldMs: 1_000,
+          timeout: 10,
+          background: false,
+        },
+        reasoning: "The report is written; I’ll verify its size with a command.",
+      };
+    }
+    return {
+      text: `FILES_E2E_OK:${marker}`,
+      reasoning: "The read, write, and command checks are complete.",
+    };
+  }
+
   if (allText.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") &&
       allText.includes(`CHILD_E2E_OK:${marker}`)) {
-    return { text: `PARENT_E2E_OK:${marker}` };
+    return { text: `PARENT_E2E_OK:${marker}`, reasoning: "Visible reasoning checkpoint." };
   }
   if (allText.includes(`Ordinary user follow-up for ${marker}`)) {
-    return { text: `FOLLOWUP_E2E_OK:${marker}` };
+    return { text: `FOLLOWUP_E2E_OK:${marker}`, reasoning: "Visible reasoning checkpoint." };
   }
 
   const isChild = allText.includes("[Subagent Task]");
-  const toolMessages = messages.filter((message) => message?.role === "tool");
   if (isChild) {
-    if (toolMessages.length > 0) return { text: `CHILD_E2E_OK:${marker}` };
+    if (toolMessages.length > 0) {
+      return { text: `CHILD_E2E_OK:${marker}`, reasoning: "Visible reasoning checkpoint." };
+    }
     const delay = Number(allText.match(/sleep (\d+)/)?.[1] ?? 10);
     return {
       tool: "exec",
@@ -95,6 +145,7 @@ function scriptedReply(body) {
         timeout: delay + 15,
         background: false,
       },
+      reasoning: "Visible reasoning checkpoint.",
     };
   }
 
@@ -105,6 +156,21 @@ function scriptedReply(body) {
       tool: "sessions_yield",
       arguments: { message: "Waiting for protected child completion event." },
       delayMs: 2_000,
+      reasoning: "Visible reasoning checkpoint.",
+    };
+  }
+  const preflightFinished = toolMessages.some((message) =>
+    message?.name === "exec" || contentText(message?.content).includes("OCTO_TOOL_E2E_OK"));
+  if (!preflightFinished) {
+    return {
+      tool: "exec",
+      arguments: {
+        command: "printf OCTO_TOOL_E2E_OK",
+        yieldMs: 1_000,
+        timeout: 10,
+        background: false,
+      },
+      reasoning: "Visible reasoning checkpoint. Verify the tool input and result before delegation.",
     };
   }
   const delay = Number(allText.match(/sleep (\d+)/)?.[1] ?? 10);
@@ -120,6 +186,7 @@ function scriptedReply(body) {
       model: MODEL_REF,
       cleanup: "delete",
     },
+    reasoning: "Visible reasoning checkpoint.",
   };
 }
 
@@ -142,6 +209,15 @@ function sendScriptedResponse(res, body, reply) {
     });
     const emit = (chunk) => res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     emit({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+    if (reply.reasoning) {
+      emit({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{ index: 0, delta: { reasoning_content: reply.reasoning }, finish_reason: null }],
+      });
+    }
     emit({
       id,
       object: "chat.completion.chunk",
@@ -174,6 +250,7 @@ function sendScriptedResponse(res, body, reply) {
       message: {
         role: "assistant",
         content: toolCall ? null : reply.text ?? "",
+        ...(reply.reasoning ? { reasoning_content: reply.reasoning } : {}),
         ...(toolCall ? { tool_calls: [toolCall] } : {}),
       },
       finish_reason: finishReason,
@@ -231,8 +308,19 @@ function resolveAccountId(config, requested) {
 }
 
 function buildPrompt(kind, marker, childDelaySeconds) {
+  if (kind === "configure-reasoning") return "/reasoning stream";
   if (kind === "followup") {
     return `Ordinary user follow-up for ${marker}. Do not call tools. Reply exactly FOLLOWUP_E2E_OK:${marker}`;
+  }
+  if (kind === "file-tools") {
+    const workDir = `/tmp/octo-realistic-e2e/${marker}`;
+    return [
+      `FILES_E2E_WORKFLOW:${marker}`,
+      `Read ${workDir}/input.txt.`,
+      `Write the processed value to ${workDir}/report.txt.`,
+      "Run wc -c against the report to verify the write.",
+      `After all three tools succeed, reply exactly FILES_E2E_OK:${marker}`,
+    ].join(" ");
   }
   const childResult = `CHILD_E2E_OK:${marker}`;
   const childTask = [
@@ -243,8 +331,9 @@ function buildPrompt(kind, marker, childDelaySeconds) {
   ].join(" ");
   return [
     `OpenClaw host E2E marker: ${marker}.`,
-    `You MUST call sessions_spawn exactly once with runtime=\"subagent\", mode=\"run\", context=\"isolated\", model=\"${MODEL_REF}\".`,
-    "Call sessions_spawn as your first tool. Do not call agents_list; omit agentId.",
+    "First call exec exactly once with command=\"printf OCTO_TOOL_E2E_OK\", yieldMs=1000, timeout=10, background=false.",
+    `After exec succeeds, call sessions_spawn exactly once with runtime=\"subagent\", mode=\"run\", context=\"isolated\", model=\"${MODEL_REF}\".`,
+    "Do not call agents_list; omit agentId.",
     `Set the child task exactly to ${JSON.stringify(childTask)}.`,
     "After spawn succeeds, do not poll with sessions_list, sessions_history, exec sleep, or any other tool.",
     "Call sessions_yield and end this turn while waiting for the protected completion event.",
@@ -271,7 +360,10 @@ export default {
 
     const runRequest = async (params) => {
       try {
-        const kind = params.kind === "followup" ? "followup" : "spawn";
+        const kind = params.kind === "followup" || params.kind === "configure-reasoning" ||
+          params.kind === "file-tools"
+          ? params.kind
+          : "spawn";
         const marker = requiredString(params, "marker");
         const targetUid = requiredString(params, "targetUid");
         const sessionKey = requiredString(params, "sessionKey");
@@ -292,7 +384,6 @@ export default {
         if (!account.configured || !account.config.botToken) {
           throw new Error(`Octo account ${accountId} is not configured`);
         }
-
         const now = Date.now();
         await handleInboundMessage({
           account,

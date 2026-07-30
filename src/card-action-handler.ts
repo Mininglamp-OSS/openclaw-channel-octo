@@ -82,6 +82,31 @@ async function updateStatus(params: {
 
 export async function handleCardAction(params: Params): Promise<CardActionHandleResult> {
   const { action } = params;
+  const isReasoningControl =
+    (action.actionId === "reasoning_stop" || action.actionId === "reasoning_retry") &&
+    action.data?.action === action.actionId &&
+    action.data?.owner === "ai" &&
+    action.data?.action_type === "reasoning.control";
+  if (isReasoningControl) {
+    // Stopping or regenerating a reasoning run is run control, not a card action: there is no
+    // session to claim, no operator input to validate and no status frame to write back, so it
+    // is intentionally unimplemented and the reasoning template is expected to render without
+    // these controls (see REQUIRED_VIEWS in reasoning-process.ts). This branch remains as a
+    // defensive no-op ACK for cards already sitting in channels and for catalogs that still
+    // advertise the controls. ACK means queue consumption only.
+    //
+    // TODO: If these ever gain real semantics, the branch cannot simply move below the identity
+    // check: reasoning cards are progress cards, and progress cards never call
+    // registerCardSession (only `card-tool.ts` does), so `lookupCardSession` below can never
+    // resolve one and every control would fall into the generic unknown/expired path. Real
+    // stop/retry needs a progress-card owner registry keyed by messageId (accountId +
+    // channelId + channelType + sessionKey, in `card-progress.ts`), and the branch must then
+    // move below that lookup and verify the clicking account/channel owns the card.
+    params.log?.warn?.(
+      `octo: reasoning control is not supported action=${action.actionId} event=${action.eventId}`,
+    );
+    return "ignored";
+  }
   const pendingSession = lookupCardSession(action.messageId);
   if (!pendingSession) {
     params.log?.warn?.(`octo: ignoring card_action for unknown/expired message=${action.messageId}`);

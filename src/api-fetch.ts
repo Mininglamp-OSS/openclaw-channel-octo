@@ -466,6 +466,98 @@ export async function sendCardMessage(params: {
   }, params.signal);
 }
 
+export interface CardTemplateRef {
+  id: string;
+  version: string;
+}
+
+export interface CardTemplateViewCapability {
+  name: string;
+  states: string[];
+  wire_profile: string;
+  submit_actions: string[];
+}
+
+export interface CardTemplateCapability {
+  id: string;
+  version: string;
+  views: CardTemplateViewCapability[];
+}
+
+export interface CardTemplatingCapability {
+  supported: boolean;
+  wire: string;
+  templates: CardTemplateCapability[];
+}
+
+function validateTemplateFrame(params: {
+  templateRef: CardTemplateRef;
+  state: string;
+  data: object;
+}): void {
+  const templateRef = params.templateRef as unknown;
+  if (templateRef === null || typeof templateRef !== "object" || Array.isArray(templateRef)) {
+    throw new Error("octo: templateRef must contain exactly id and version");
+  }
+  const templateRefKeys = Object.keys(templateRef);
+  if (templateRefKeys.length !== 2 ||
+      !templateRefKeys.includes("id") ||
+      !templateRefKeys.includes("version")) {
+    throw new Error("octo: templateRef must contain exactly id and version");
+  }
+  const { id, version } = templateRef as Record<string, unknown>;
+  if (typeof id !== "string" || typeof version !== "string" || !id.trim() || !version.trim()) {
+    throw new Error("octo: templateRef id/version are required");
+  }
+  if (typeof params.state !== "string" || !params.state.trim()) {
+    throw new Error("octo: template state is required");
+  }
+  const data = params.data as unknown;
+  if (data === null || typeof data !== "object" || Array.isArray(data) ||
+      (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null) ||
+      !Object.hasOwn(data, "state")) {
+    throw new Error("octo: data must be a plain object with own state");
+  }
+  if ((data as { state: unknown }).state !== params.state) {
+    throw new Error("octo: data.state must match state");
+  }
+}
+
+/**
+ * Send one Registry-authored type-17 card without any Model B render-owned fields.
+ *
+ * `onBehalfOf` is intentionally absent (unlike {@link sendCardMessage}): Registry template cards
+ * are bot-authored by design, and OBO + type-17 is rejected by P1 Decision 2b — persona-clone
+ * turns skip progress cards entirely in `card-progress.ts`.
+ */
+export async function sendTemplateCardMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  templateRef: CardTemplateRef;
+  state: string;
+  data: object;
+  clientMsgNo?: string;
+  signal?: AbortSignal;
+}): Promise<SendMessageResult | undefined> {
+  if (!params.channelId.trim()) {
+    throw new Error("octo: channelId is required to send a message");
+  }
+  validateTemplateFrame(params);
+  return await postJson<SendMessageResult>(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload: {
+      type: MessageType.InteractiveCard,
+      template_ref: params.templateRef,
+      state: params.state,
+      data: params.data,
+    },
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+  }, params.signal);
+}
+
 /**
  * 就地编辑一条 InteractiveCard(=17) 消息（D6 帧 rewrite，octo-server PR#548）。
  *
@@ -512,8 +604,8 @@ export async function editCardMessage(params: {
     envelope.plain = params.plain;
   }
   if (params.cardSeq !== undefined) {
-    if (!Number.isSafeInteger(params.cardSeq) || params.cardSeq < 0) {
-      throw new Error("octo: cardSeq must be a non-negative safe integer");
+    if (!Number.isSafeInteger(params.cardSeq) || params.cardSeq <= 0) {
+      throw new Error("octo: cardSeq must be a positive safe integer");
     }
     envelope.card_seq = params.cardSeq;
   }
@@ -527,6 +619,38 @@ export async function editCardMessage(params: {
     channel_type: params.channelType,
     content_edit: JSON.stringify(envelope),
     ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
+  }, params.signal);
+}
+
+/** Replace one Registry-authored card frame; raw content_edit is intentionally unavailable. */
+export async function editTemplateCardMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  messageId: string;
+  channelId: string;
+  channelType: ChannelType;
+  templateRef: CardTemplateRef;
+  state: string;
+  data: object;
+  cardSeq: number;
+  transient?: boolean;
+  signal?: AbortSignal;
+}): Promise<void> {
+  if (!params.messageId) throw new Error("octo: messageId is required to edit a card");
+  if (!params.channelId.trim()) throw new Error("octo: channelId is required to edit a card");
+  if (!Number.isSafeInteger(params.cardSeq) || params.cardSeq <= 0) {
+    throw new Error("octo: cardSeq must be a positive safe integer");
+  }
+  validateTemplateFrame(params);
+  await postJson(params.apiUrl, params.botToken, "/v1/bot/message/edit", {
+    message_id: params.messageId,
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    template_ref: params.templateRef,
+    state: params.state,
+    data: params.data,
+    card_seq: params.cardSeq,
+    ...(params.transient ? { transient: true } : {}),
   }, params.signal);
 }
 
@@ -561,6 +685,41 @@ export interface CardProfileManifest {
   actions?: string[];
   /** 尺寸/结构上限（node/depth/body caps 等）。 */
   limits?: Record<string, unknown>;
+  /** Optional Registry template-ref/v1 capability and explicit Bot catalog. */
+  templating?: CardTemplatingCapability;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function parseTemplatingCapability(value: unknown): CardTemplatingCapability | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const root = value as Record<string, unknown>;
+  const templates: CardTemplateCapability[] = [];
+  for (const candidate of Array.isArray(root.templates) ? root.templates : []) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const template = candidate as Record<string, unknown>;
+    if (typeof template.id !== "string" || typeof template.version !== "string") continue;
+    const views: CardTemplateViewCapability[] = [];
+    for (const candidateView of Array.isArray(template.views) ? template.views : []) {
+      if (!candidateView || typeof candidateView !== "object" || Array.isArray(candidateView)) continue;
+      const view = candidateView as Record<string, unknown>;
+      if (typeof view.name !== "string" || typeof view.wire_profile !== "string") continue;
+      views.push({
+        name: view.name,
+        wire_profile: view.wire_profile,
+        states: stringArray(view.states),
+        submit_actions: stringArray(view.submit_actions),
+      });
+    }
+    templates.push({ id: template.id, version: template.version, views });
+  }
+  return {
+    supported: root.supported === true,
+    wire: typeof root.wire === "string" ? root.wire : "",
+    templates,
+  };
 }
 
 /**
@@ -594,6 +753,7 @@ export async function getCardProfile(params: {
   // 端点已部署（available:true）；manifest 内容异常时保守视作 enabled:false。
   const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
   if (!raw || typeof raw !== "object") return { available: true, enabled: false };
+  const templating = parseTemplatingCapability(raw.templating);
   return {
     available: true,
     // 兼容布尔与 1/0 序列化(与本仓 GroupMember.robot / getMentionPref 的 flag 惯例一致)。
@@ -604,6 +764,7 @@ export async function getCardProfile(params: {
     ...(Array.isArray(raw.inputs) ? { inputs: (raw.inputs as unknown[]).filter((e): e is string => typeof e === "string") } : {}),
     ...(Array.isArray(raw.actions) ? { actions: (raw.actions as unknown[]).filter((e): e is string => typeof e === "string") } : {}),
     ...(raw.limits && typeof raw.limits === "object" ? { limits: raw.limits as Record<string, unknown> } : {}),
+    ...(templating ? { templating } : {}),
   };
 }
 

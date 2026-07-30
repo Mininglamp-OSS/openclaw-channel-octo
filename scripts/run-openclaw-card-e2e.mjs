@@ -47,6 +47,10 @@ if (mode === "setup") {
     provider: config.models.providers[providerId],
     hadAgentModel: Object.prototype.hasOwnProperty.call(config.agents.defaults.models, modelRef),
     agentModel: config.agents.defaults.models[modelRef],
+    hadThinkingDefault: Object.prototype.hasOwnProperty.call(config.agents.defaults, "thinkingDefault"),
+    thinkingDefault: config.agents.defaults.thinkingDefault,
+    hadReasoningDefault: Object.prototype.hasOwnProperty.call(config.agents.defaults, "reasoningDefault"),
+    reasoningDefault: config.agents.defaults.reasoningDefault,
   };
   fs.writeFileSync(statePath, JSON.stringify(state));
   config.plugins.entries[pluginId] = {
@@ -59,9 +63,11 @@ if (mode === "setup") {
     baseUrl: "http://127.0.0.1:19123/v1",
     apiKey: "octo-host-e2e",
     request: { allowPrivateNetwork: true },
-    models: [{ id: "scripted", name: "Octo Host E2E Scripted", api: "openai-completions" }],
+    models: [{ id: "scripted", name: "Octo Host E2E Scripted", api: "openai-completions", reasoning: true }],
   };
   config.agents.defaults.models[modelRef] = {};
+  config.agents.defaults.thinkingDefault = "low";
+  config.agents.defaults.reasoningDefault = "stream";
 } else {
   let state;
   try { state = JSON.parse(fs.readFileSync(statePath, "utf8")); } catch { state = {}; }
@@ -73,6 +79,10 @@ if (mode === "setup") {
   else delete config.models.providers[providerId];
   if (state.hadAgentModel) config.agents.defaults.models[modelRef] = state.agentModel;
   else delete config.agents.defaults.models[modelRef];
+  if (state.hadThinkingDefault) config.agents.defaults.thinkingDefault = state.thinkingDefault;
+  else delete config.agents.defaults.thinkingDefault;
+  if (state.hadReasoningDefault) config.agents.defaults.reasoningDefault = state.reasoningDefault;
+  else delete config.agents.defaults.reasoningDefault;
   try { fs.unlinkSync(statePath); } catch {}
 }
 const tmp = configPath + ".octo-host-e2e-" + process.pid;
@@ -265,9 +275,12 @@ async function main() {
     info("restarting real OpenClaw gateway with card lifecycle diagnostics");
     await startGateway(true);
     info("running Octo inbound -> spawn -> yield -> follow-up -> completion E2E");
-    await runStreaming("npx", [
+    const testArgs = [
       "vitest", "run", "src/card-openclaw-e2e.test.ts", "--reporter=verbose",
-    ], {
+    ];
+    const testName = process.env.OCTO_E2E_TEST_NAME?.trim();
+    if (testName) testArgs.push("-t", testName);
+    await runStreaming("npx", testArgs, {
       env: {
         ...process.env,
         OCTO_OPENCLAW_E2E: "1",

@@ -26,7 +26,13 @@ import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.
 import { normalizeAccountId } from "./account-id.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
-import { setCardContext, finalizeCard, finalizeCardWithResponse } from "./card-progress.js";
+import {
+  setCardContext,
+  finalizeCard,
+  finalizeCardWithResponse,
+  markCardAnswering,
+  createCardReasoningRecorder,
+} from "./card-progress.js";
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER, CARD_PLACEHOLDER } from "./types.js";
 import type { RichTextBlock } from "./types.js";
 import { getOctoRuntime } from "./runtime.js";
@@ -2641,6 +2647,38 @@ export async function handleInboundMessage(params: {
   const apiUrl = account.config.apiUrl;
   const botToken = account.config.botToken ?? "";
 
+  // Mirror OpenClaw's persisted user-visible reasoning state for the transcript-hook
+  // compatibility path. Command parsing belongs to OpenClaw: this adapter must never
+  // interpret raw user text as a `/reasoning` directive. Unauthorized turns and session-store
+  // failures stay off so provider-private thinking is never surfaced accidentally.
+  let reasoningVisibility: "off" | "on" | "stream" = "off";
+  if (commandAuthorized) {
+    let persistedLevel: string | undefined;
+    let sessionReadFailed = false;
+    try {
+      const storePath = core.channel.session.resolveStorePath(config.session?.store, {
+        agentId: route.agentId,
+      });
+      persistedLevel = getSessionEntry({
+        storePath,
+        sessionKey: route.sessionKey,
+      })?.reasoningLevel;
+    } catch (error: unknown) {
+      sessionReadFailed = true;
+      log?.warn?.(
+        `octo: failed reading session reasoning visibility; defaulting to off: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (!sessionReadFailed) {
+      const agentDefault = config.agents?.list?.find((entry) =>
+        entry.id?.toLowerCase() === route.agentId?.toLowerCase())?.reasoningDefault;
+      const resolved = persistedLevel ?? agentDefault ?? config.agents?.defaults?.reasoningDefault;
+      if (resolved === "on" || resolved === "stream") reasoningVisibility = resolved;
+    }
+  }
+
   // 波 B:登记进度卡发送上下文(hook 侧懒发/更新时用)。route.sessionKey 桥接
   // dispatch↔hook(H1 实证一致)。OBO(persona-clone)场景由 setCardContext 内部标记跳过。
   setCardContext(route.sessionKey, {
@@ -2649,8 +2687,11 @@ export async function handleInboundMessage(params: {
     channelId: replyChannelId,
     channelType: replyChannelType,
     cardProgress: account.config.cardProgress,
+    reasoningCardTemplateMode: account.config.reasoningCardTemplateMode,
+    reasoningVisibility,
     ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
   });
+  const recordReasoningForGeneration = createCardReasoningRecorder(route.sessionKey);
 
   // 已读回执 + 正在输入 — fire-and-forget
   if (isOBOv2) {
@@ -2827,6 +2868,18 @@ export async function handleInboundMessage(params: {
   };
 
   let replySucceeded = false;
+  const captureReasoning = (payload: {
+    text?: string;
+    isReasoningSnapshot?: boolean;
+  }): void => {
+    // Defense in depth: hosts normally suppress these callbacks while reasoning
+    // is off, but provider-private text must never reach a channel-visible card
+    // even if a host integration emits it unexpectedly.
+    if (reasoningVisibility !== "on" && reasoningVisibility !== "stream") return;
+    recordReasoningForGeneration(payload.text ?? "", {
+      snapshot: payload.isReasoningSnapshot === true,
+    });
+  };
 
   // Timeout guard: see resolveDispatchTimeoutMs at top of file. Without this,
   // an upstream dispatch hang would leave the per-group queue's Promise chain
@@ -2868,16 +2921,24 @@ export async function handleInboundMessage(params: {
       // group behaviour and override operator intent.
       replyOptions:
         !isGroup && config.messages?.visibleReplies === undefined
-          ? { sourceReplyDeliveryMode: "automatic" as const }
-          : {},
+          ? {
+              sourceReplyDeliveryMode: "automatic" as const,
+              onReasoningStream: captureReasoning,
+            }
+          : { onReasoningStream: captureReasoning },
       // onFreshSettledDelivery is only present on newer SDK dispatcher options.
       // On older SDK the property is ignored (and never invoked, since
       // pendingToolWarningFinal is only set when the tool-warning classifier
       // exists), so the cast keeps both versions type-correct.
       dispatcherOptions: ({
         deliver: async (payload: ReplyPayload, info: { kind: ReplyDispatchKind }) => {
-          // Skip reasoning blocks
-          if (payload.isReasoning) return;
+          // Reasoning is not a normal chat reply. Capture its user-visible lane for the
+          // progress card as a compatibility fallback for hosts that deliver reasoning
+          // payloads through the dispatcher instead of onReasoningStream.
+          if (payload.isReasoning) {
+            captureReasoning(payload);
+            return;
+          }
 
           const kind = info.kind;
 
@@ -2909,6 +2970,10 @@ export async function handleInboundMessage(params: {
             return;
           }
           if (!content) return;
+
+          // OpenClaw has no exact "answer generation started" hook. The first
+          // non-reasoning, non-tool text is the documented best-effort boundary.
+          if (kind !== "tool") markCardAnswering(route.sessionKey);
 
           if (kind === "tool") {
             // Verbose tool call output: send immediately

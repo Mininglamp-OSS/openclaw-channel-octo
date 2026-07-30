@@ -7,6 +7,7 @@
  * not fail validation today.
  */
 export type ForkCommandScope = "owner-mentioned" | "any-mentioned" | "owner-only" | "any";
+export type ReasoningCardTemplateMode = "off" | "shadow" | "experimental";
 
 /** Per-command configuration (top-level only; not per-account in v1). */
 export interface OctoCommandsConfig {
@@ -29,6 +30,7 @@ export interface OctoAccountConfig {
   historyLimit?: number;  // 群聊历史消息条数限制（默认20）
   historyPromptTemplate?: string;  // Template for group history context injection
   cardProgress?: boolean;  // false force-disables automatic progress cards; true/unset follows server capabilities
+  reasoningCardTemplateMode?: ReasoningCardTemplateMode;  // off=Model B, shadow=discover only, experimental=Model A when compatible
   cardDisplay?: boolean;  // false force-disables the display-card tool; true/unset follows server capabilities
   cardInteraction?: boolean;  // false force-disables interactive cards; true/unset follows server capabilities
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
@@ -50,6 +52,7 @@ export interface OctoConfig {
   historyLimit?: number;  // 群聊历史消息条数限制（默认20）
   historyPromptTemplate?: string;  // Template for group history context injection
   cardProgress?: boolean;  // Top-level default for automatic progress cards
+  reasoningCardTemplateMode?: ReasoningCardTemplateMode;  // Top-level Registry migration mode for reasoning cards
   cardDisplay?: boolean;  // Top-level default for the display-card tool
   cardInteraction?: boolean;  // Top-level default for interactive cards
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
@@ -80,6 +83,16 @@ export const DISPATCH_TIMEOUT_MS_DESCRIPTION =
 
 export const CARD_PROGRESS_DESCRIPTION =
   "When omitted or true, follow the server card capability gate; false force-disables automatic progress cards. Per-account values override the top-level value.";
+
+export const REASONING_CARD_TEMPLATE_MODE_DESCRIPTION =
+  "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A when a compatible Bot-catalog template is advertised, preferring the newest supported version; a version claimed by two catalog entries is ambiguous and is skipped in favour of an older unambiguous one, falling back to Model B only when none remains. Defaults to experimental; per-account values override the top-level value.";
+
+const REASONING_CARD_TEMPLATE_MODE_SCHEMA = {
+  type: "string" as const,
+  enum: ["off", "shadow", "experimental"] as const,
+  default: "experimental" as const,
+  description: REASONING_CARD_TEMPLATE_MODE_DESCRIPTION,
+};
 
 export const CARD_DISPLAY_DESCRIPTION =
   "When omitted or true, follow the server card capability gate; false force-disables the octo_send_display_card tool. Per-account values override the top-level value.";
@@ -128,6 +141,7 @@ export const OctoConfigJsonSchema = {
       historyLimit: { type: "number", minimum: 1, maximum: 100 },
       historyPromptTemplate: { type: "string" },
       cardProgress: { type: "boolean", description: CARD_PROGRESS_DESCRIPTION },
+      reasoningCardTemplateMode: REASONING_CARD_TEMPLATE_MODE_SCHEMA,
       cardDisplay: { type: "boolean", description: CARD_DISPLAY_DESCRIPTION },
       cardInteraction: { type: "boolean", description: CARD_INTERACTION_DESCRIPTION },
       onBehalfOf: { type: "string" },
@@ -152,6 +166,7 @@ export const OctoConfigJsonSchema = {
             historyLimit: { type: "number", minimum: 1, maximum: 100 },
             historyPromptTemplate: { type: "string" },
             cardProgress: { type: "boolean", description: CARD_PROGRESS_DESCRIPTION },
+            reasoningCardTemplateMode: REASONING_CARD_TEMPLATE_MODE_SCHEMA,
             cardDisplay: { type: "boolean", description: CARD_DISPLAY_DESCRIPTION },
             cardInteraction: { type: "boolean", description: CARD_INTERACTION_DESCRIPTION },
             onBehalfOf: { type: "string" },
