@@ -67,17 +67,24 @@ export function buildReasoningProcessId(sessionKey: string, runId?: string): str
 }
 
 /**
- * Views this producer supplies data for. Compatibility is a **data-contract** check only: the
- * template must own a view for every state this producer emits, or the server cannot render the
- * frame. `submit_actions` is deliberately not part of it — the template is a server-side asset
- * rendered server-side, so which controls it shows is presentation the server owns, not something
- * this producer either implements or vetoes. Requiring an action would also force a template that
- * hides its controls to be judged incompatible, silently dropping the whole card to Model B.
+ * Views this producer supplies data for. A template may omit controls, but every advertised
+ * `submit_action` must be understood by this consumer; otherwise the server could render a button
+ * that only gets ignored when clicked.
  */
 const REQUIRED_VIEWS = [
-  { name: "active", states: ["reasoning", "answering"], wireProfile: "octo/v2" },
-  { name: "error", states: ["error"], wireProfile: "octo/v2" },
-  { name: "result", states: ["completed", "stopped"], wireProfile: "octo/v1" },
+  {
+    name: "active",
+    states: ["reasoning", "answering"],
+    wireProfile: "octo/v2",
+    submitActions: ["reasoning_stop"],
+  },
+  {
+    name: "error",
+    states: ["error"],
+    wireProfile: "octo/v2",
+    submitActions: ["reasoning_retry"],
+  },
+  { name: "result", states: ["completed", "stopped"], wireProfile: "octo/v1", submitActions: [] },
 ] as const;
 
 /**
@@ -97,11 +104,14 @@ export function selectReasoningProcessTemplate(
   if (!templating?.supported || templating.wire !== TEMPLATE_WIRE) return null;
   const claimed = templating.templates.filter((template) => template.id === REASONING_TEMPLATE_ID);
   const compatible = claimed.filter((template) => {
+    if (!template.version || template.version.trim() !== template.version) return false;
     return REQUIRED_VIEWS.every((required) => {
       const view = template.views.find((candidate) => candidate.name === required.name);
       if (!view || view.wire_profile !== required.wireProfile) return false;
       const states = new Set(view.states);
-      return required.states.every((state) => states.has(state));
+      if (!required.states.every((state) => states.has(state))) return false;
+      const allowedActions = new Set<string>(required.submitActions);
+      return view.submit_actions.every((action) => allowedActions.has(action));
     });
   });
   if (compatible.length !== 1) return null;
