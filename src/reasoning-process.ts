@@ -92,9 +92,13 @@ const REQUIRED_VIEWS = [
  *
  * The server manifest is authoritative for the template version. Keeping a local version allowlist
  * would turn every compatible server rollout into a plugin release dependency, so a sole compatible
- * entry is returned with its advertised version unchanged.
+ * entry is returned with its advertised version unchanged. The template id plus wire/view/action
+ * shape is the producer contract boundary; a breaking data contract must use a new id or negotiated
+ * wire capability rather than relying on an unadvertised client-side version range.
  *
- * Manifest order is not a preference signal, so multiple compatible entries fail closed to Model B.
+ * The deployed E1c catalog advertises one new-send version. Manifest order is not a preference
+ * signal, so multiple compatible entries without an explicit preference capability fail closed to
+ * Model B rather than reintroducing a local semver policy.
  * A duplicated id/version also remains ambiguous even if only one copy has compatible views:
  * `template_ref` cannot identify which copy the server would resolve.
  */
@@ -106,8 +110,10 @@ export function selectReasoningProcessTemplate(
   const compatible = claimed.filter((template) => {
     if (!template.version || template.version.trim() !== template.version) return false;
     return REQUIRED_VIEWS.every((required) => {
-      const view = template.views.find((candidate) => candidate.name === required.name);
-      if (!view || view.wire_profile !== required.wireProfile) return false;
+      const matchingViews = template.views.filter((candidate) => candidate.name === required.name);
+      if (matchingViews.length !== 1) return false;
+      const view = matchingViews[0]!;
+      if (view.wire_profile !== required.wireProfile) return false;
       const states = new Set(view.states);
       if (!required.states.every((state) => states.has(state))) return false;
       const allowedActions = new Set<string>(required.submitActions);

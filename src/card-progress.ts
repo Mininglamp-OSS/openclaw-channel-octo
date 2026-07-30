@@ -260,29 +260,53 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
   }
 }
 
-function profileEnabledForContext(ctx: CardContext, manifest: CardProfileManifest): boolean {
-  let enabled = manifest.available
+function baseProfileEnabled(manifest: CardProfileManifest): boolean {
+  return manifest.available
     ? manifest.enabled
     : process.env.OCTO_CARD_MESSAGE_ENABLED === "1";
+}
+
+function modelBProfileCompatible(manifest: CardProfileManifest): boolean {
+  if (!manifest.available) return true;
+  if (Array.isArray(manifest.profiles) && manifest.profiles.length > 0 &&
+      !manifest.profiles.includes(CARD_PROFILE)) {
+    dbg(`gate: profile ${CARD_PROFILE} not advertised (${manifest.profiles.join(",")}) → disabled`);
+    return false;
+  }
+  if (typeof manifest.card_version === "string" && manifest.card_version !== CARD_VERSION) {
+    dbg(`gate: card_version ${manifest.card_version} != ${CARD_VERSION} → disabled`);
+    return false;
+  }
+  if (Array.isArray(manifest.elements) && !manifest.elements.includes("TextBlock")) {
+    // Model B 的所有安全降级最终都依赖 TextBlock。显式空数组或缺 TextBlock 是权威不支持。
+    dbg("gate: TextBlock not advertised → disabled");
+    return false;
+  }
+  return true;
+}
+
+function modelBEnabledForContext(manifest: CardProfileManifest): boolean {
+  return baseProfileEnabled(manifest) && modelBProfileCompatible(manifest);
+}
+
+function profileEnabledForContext(ctx: CardContext, manifest: CardProfileManifest): boolean {
+  const enabled = baseProfileEnabled(manifest);
+  if (!enabled) return false;
   const registryCompatible = (ctx.reasoningCardTemplateMode ?? "experimental") === "experimental" &&
     !!selectReasoningProcessTemplate(manifest.templating);
   // Model A 由 Registry 模板自己的 wire/views 契约协商，不依赖 Model B 的 Adaptive Card
   // profile/card_version/elements。仅在实际走 Model B 时应用下面的渲染兼容 gate。
-  if (enabled && manifest.available && !registryCompatible) {
-    if (Array.isArray(manifest.profiles) && manifest.profiles.length > 0 &&
-        !manifest.profiles.includes(CARD_PROFILE)) {
-      dbg(`gate: profile ${CARD_PROFILE} not advertised (${manifest.profiles.join(",")}) → disabled`);
-      enabled = false;
-    } else if (typeof manifest.card_version === "string" && manifest.card_version !== CARD_VERSION) {
-      dbg(`gate: card_version ${manifest.card_version} != ${CARD_VERSION} → disabled`);
-      enabled = false;
-    } else if (Array.isArray(manifest.elements) && !manifest.elements.includes("TextBlock")) {
-      // Model B 的所有安全降级最终都依赖 TextBlock。显式空数组或缺 TextBlock 是权威不支持。
-      dbg("gate: TextBlock not advertised → disabled");
-      enabled = false;
-    }
-  }
-  return enabled;
+  return registryCompatible || modelBProfileCompatible(manifest);
+}
+
+function canFallbackFirstFrameToModelB(entry: CardEntry, error: unknown): boolean {
+  const status = httpStatusFromApiFetchError(error);
+  // 401/403 是身份问题,409 可能代表已提交后的冲突,429 是瞬时限流;这些都不应触发第二次 send。
+  const deterministicTemplateRejection = status !== undefined && status >= 400 && status < 500 &&
+    status !== 401 && status !== 403 && status !== 409 && status !== 429;
+  if (!deterministicTemplateRejection) return false;
+  const manifest = profileCache.get(profileCacheKey(entry.ctx))?.manifest;
+  return !!manifest && modelBEnabledForContext(manifest);
 }
 
 function resolveEntryDeliveryMode(entry: CardEntry): void {
@@ -511,24 +535,40 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     if (!entry.messageId) {
       if (!isCurrentEntry(sessionKey, entry)) return;
       let res;
-      if (entry.deliveryMode === "model-a") {
-        const data = buildReasoningProcessWireData(state);
-        if (!data) {
-          dbg("model-a first frame deferred: no phases with actions yet");
-          return;
+      while (true) {
+        if (entry.deliveryMode === "model-a") {
+          const data = buildReasoningProcessWireData(state);
+          if (!data) {
+            dbg("model-a first frame deferred: no phases with actions yet");
+            return;
+          }
+          if (!entry.templateRef) return;
+          try {
+            res = await sendTemplateCardMessage({
+              apiUrl: entry.ctx.apiUrl,
+              botToken: entry.ctx.botToken,
+              channelId: entry.ctx.channelId,
+              channelType: entry.ctx.channelType,
+              templateRef: entry.templateRef,
+              state: data.state,
+              data,
+              signal,
+            });
+            break;
+          } catch (error) {
+            if (!canFallbackFirstFrameToModelB(entry, error) || !isCurrentEntry(sessionKey, entry)) {
+              throw error;
+            }
+            warn(
+              `model-a first frame rejected; retrying once with model-b: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            entry.deliveryMode = "model-b";
+            entry.templateRef = undefined;
+          }
         }
-        if (!entry.templateRef) return;
-        res = await sendTemplateCardMessage({
-          apiUrl: entry.ctx.apiUrl,
-          botToken: entry.ctx.botToken,
-          channelId: entry.ctx.channelId,
-          channelType: entry.ctx.channelType,
-          templateRef: entry.templateRef,
-          state: data.state,
-          data,
-          signal,
-        });
-      } else {
+
         const { card, plain } = renderEntryProgress(sessionKey, entry, state);
         if (!Array.isArray(card.body) || card.body.length === 0) {
           warn("rendered card cannot fit negotiated capabilities/limits; disabling for session");
@@ -545,6 +585,7 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
           ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
           signal,
         });
+        break;
       }
       entry.messageId = res?.message_id;
       if (!isCurrentEntry(sessionKey, entry)) return;
