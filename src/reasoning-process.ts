@@ -33,7 +33,7 @@ export interface ReasoningProcessPhase {
   actions: ReasoningProcessAction[];
 }
 
-/** Shared producer contract for ai.reasoning-process@0.1.0 and bounded successor 0.2.0. */
+/** Producer data shape for server-advertised ai.reasoning-process templates. */
 export interface ReasoningProcessData {
   reasoningId: string;
   state: ReasoningProcessState;
@@ -57,8 +57,6 @@ const MAX_RENDERED_PHASES = 6;
 const MAX_RENDERED_ACTIONS = 12;
 const REASONING_TEMPLATE_ID = "ai.reasoning-process";
 const TEMPLATE_WIRE = "template-ref/v1";
-/** Supported producer contracts in preference order, newest first. */
-const SUPPORTED_TEMPLATE_VERSIONS: readonly string[] = ["0.2.0", "0.1.0"];
 export const REASONING_ID_MAX_LENGTH = 512;
 
 /** Preserve short IDs; use a stable collision-resistant digest instead of unsafe truncation. */
@@ -69,30 +67,42 @@ export function buildReasoningProcessId(sessionKey: string, runId?: string): str
 }
 
 /**
- * Views this producer supplies data for. Compatibility is a **data-contract** check only: the
- * template must own a view for every state this producer emits, or the server cannot render the
- * frame. `submit_actions` is deliberately not part of it — the template is a server-side asset
- * rendered server-side, so which controls it shows is presentation the server owns, not something
- * this producer either implements or vetoes. Requiring an action would also force a template that
- * hides its controls to be judged incompatible, silently dropping the whole card to Model B.
+ * Views this producer supplies data for. A template may omit controls, but every advertised
+ * `submit_action` must be understood by this consumer; otherwise the server could render a button
+ * that only gets ignored when clicked.
  */
 const REQUIRED_VIEWS = [
-  { name: "active", states: ["reasoning", "answering"], wireProfile: "octo/v2" },
-  { name: "error", states: ["error"], wireProfile: "octo/v2" },
-  { name: "result", states: ["completed", "stopped"], wireProfile: "octo/v1" },
+  {
+    name: "active",
+    states: ["reasoning", "answering"],
+    wireProfile: "octo/v2",
+    submitActions: ["reasoning_stop"],
+  },
+  {
+    name: "error",
+    states: ["error"],
+    wireProfile: "octo/v2",
+    submitActions: ["reasoning_retry"],
+  },
+  { name: "result", states: ["completed", "stopped"], wireProfile: "octo/v1", submitActions: [] },
 ] as const;
 
 /**
- * Select the newest Bot-catalog entry with the contract shape this producer implements.
+ * Select the sole Bot-catalog entry with the contract shape this producer implements.
  *
- * A catalog advertising the successor alongside its predecessor is the normal state for the whole
- * rollout window, so preferring the newest is what keeps the feature engaged there.
+ * The server manifest is authoritative for the template version. Keeping a local version allowlist
+ * would turn every compatible server rollout into a plugin release dependency, so a sole compatible
+ * entry is returned with its advertised version unchanged. The template id plus wire/view/action
+ * shape is the producer contract boundary; a breaking data contract must use a new id or negotiated
+ * wire capability rather than relying on an unadvertised client-side version range.
  *
- * Ambiguity is judged per version and over every entry claiming this template id, not over the
- * view-compatible subset: `template_ref` carries only `{id, version}`, so two entries claiming one
- * version cannot be told apart on the wire and the server may resolve the one rejected here. A
- * version in that state is skipped rather than selected; an older unambiguous version is still
- * usable, and ambiguity in a version that would not have been selected costs nothing.
+ * The authoritative cross-repo clauses are octo-server
+ * `.octospec/tasks/cardtmpl-runtime-catalog-overlay/brief.md` D13/E1d and
+ * `.octospec/tasks/cardtmpl-reasoning-schema-successor/brief.md` D5: the catalog advertises one
+ * new-send version, and multiple compatible entries without an explicit preference capability
+ * fail closed to Model B rather than reintroducing a local semver policy.
+ * A duplicated id/version also remains ambiguous even if only one copy has compatible views:
+ * `template_ref` cannot identify which copy the server would resolve.
  */
 export function selectReasoningProcessTemplate(
   templating: CardTemplatingCapability | undefined,
@@ -100,21 +110,22 @@ export function selectReasoningProcessTemplate(
   if (!templating?.supported || templating.wire !== TEMPLATE_WIRE) return null;
   const claimed = templating.templates.filter((template) => template.id === REASONING_TEMPLATE_ID);
   const compatible = claimed.filter((template) => {
-    if (!SUPPORTED_TEMPLATE_VERSIONS.includes(template.version)) return false;
+    if (!template.version || template.version.trim() !== template.version) return false;
     return REQUIRED_VIEWS.every((required) => {
-      const view = template.views.find((candidate) => candidate.name === required.name);
-      if (!view || view.wire_profile !== required.wireProfile) return false;
+      const matchingViews = template.views.filter((candidate) => candidate.name === required.name);
+      if (matchingViews.length !== 1) return false;
+      const view = matchingViews[0]!;
+      if (view.wire_profile !== required.wireProfile) return false;
       const states = new Set(view.states);
-      return required.states.every((state) => states.has(state));
+      if (!required.states.every((state) => states.has(state))) return false;
+      const allowedActions = new Set<string>(required.submitActions);
+      return view.submit_actions.every((action) => allowedActions.has(action));
     });
   });
-  for (const version of SUPPORTED_TEMPLATE_VERSIONS) {
-    const match = compatible.find((template) => template.version === version);
-    if (!match) continue;
-    if (claimed.filter((template) => template.version === version).length > 1) continue;
-    return { id: match.id, version: match.version };
-  }
-  return null;
+  if (compatible.length !== 1) return null;
+  const match = compatible[0]!;
+  if (claimed.filter((template) => template.version === match.version).length > 1) return null;
+  return { id: match.id, version: match.version };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -423,7 +434,7 @@ function plainText(data: ReasoningProcessData): string {
   return lines.join("\n") || PROGRESS_CARD_PLACEHOLDER;
 }
 
-/** Render the local toggle-only variant of the shared 0.1.0/0.2.0 data contract. */
+/** Render the local toggle-only variant of the shared Registry data shape. */
 export function renderReasoningProcessCard(
   state: CardProgressState,
   caps?: CardCaps,

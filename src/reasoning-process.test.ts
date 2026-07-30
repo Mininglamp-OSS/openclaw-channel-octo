@@ -191,16 +191,19 @@ describe("reasoning process template discovery", () => {
     ],
   });
 
-  it.each(["0.1.0", "0.2.0"])("selects the supported %s contract", (version) => {
-    expect(selectReasoningProcessTemplate({
-      supported: true,
-      wire: "template-ref/v1",
-      templates: [template(version)],
-    })).toEqual({ id: "ai.reasoning-process", version });
-  });
+  it.each(["0.1.0", "0.2.0", "0.3.0", "1.0.0", "9.8.7"])(
+    "selects the sole compatible manifest version %s without a local allowlist",
+    (version) => {
+      expect(selectReasoningProcessTemplate({
+        supported: true,
+        wire: "template-ref/v1",
+        templates: [template(version)],
+      })).toEqual({ id: "ai.reasoning-process", version });
+    },
+  );
 
-  it.each(["0.3.0", "1.0.0", "9.8.7"])(
-    "fails closed for unknown contract version %s even when views match",
+  it.each(["", "   ", " 0.3.0", "0.3.0 "])(
+    "fails closed for an empty or whitespace-padded manifest version %j",
     (version) => {
       expect(selectReasoningProcessTemplate({
         supported: true,
@@ -210,17 +213,26 @@ describe("reasoning process template discovery", () => {
     },
   );
 
-  it("picks the newest supported contract when a rollout advertises both versions", () => {
-    // The catalog carries the successor alongside its predecessor for the whole rollout, which
-    // is exactly the deployment this producer targets. Demanding a singleton match would leave
-    // the feature dormant for that entire window.
+  it("fails closed when multiple compatible versions are advertised without a preference signal", () => {
+    // The manifest is a capability set, not a preference-ordered list. The consumer must not
+    // guess which version the server intended when more than one compatible ref is available.
     for (const templates of [
       [template("0.1.0"), template("0.2.0")],
+      [template("0.3.0"), template("0.2.0")],
       [template("0.2.0"), template("0.1.0")],
     ]) {
       expect(selectReasoningProcessTemplate({ supported: true, wire: "template-ref/v1", templates }))
-        .toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+        .toBeNull();
     }
+  });
+
+  it("selects the sole compatible version when another advertised version has incompatible views", () => {
+    const incompatible = { ...template("0.2.0"), views: template("0.2.0").views.slice(0, 2) };
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [incompatible, template("0.3.0")],
+    })).toEqual({ id: "ai.reasoning-process", version: "0.3.0" });
   });
 
   it("still fails closed when one version is advertised twice", () => {
@@ -245,26 +257,6 @@ describe("reasoning process template discovery", () => {
     })).toBeNull();
   });
 
-  it("falls through to an older unambiguous version when the newest one is ambiguous", () => {
-    // The only catalog where skipping an ambiguous version still keeps Model A engaged, and the
-    // case the schema description promises operators.
-    expect(selectReasoningProcessTemplate({
-      supported: true,
-      wire: "template-ref/v1",
-      templates: [template("0.2.0"), template("0.2.0"), template("0.1.0")],
-    })).toEqual({ id: "ai.reasoning-process", version: "0.1.0" });
-  });
-
-  it("ignores ambiguity in a version it would not have selected", () => {
-    // 0.1.0 is duplicated and unusable, but 0.2.0 is unique, compatible and newer — vetoing it
-    // over an older entry nobody would send costs the feature for no safety gain.
-    expect(selectReasoningProcessTemplate({
-      supported: true,
-      wire: "template-ref/v1",
-      templates: [template("0.1.0"), template("0.1.0"), template("0.2.0")],
-    })).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
-  });
-
   it("fails closed for incompatible view/state shapes", () => {
     expect(selectReasoningProcessTemplate({
       supported: true,
@@ -278,11 +270,38 @@ describe("reasoning process template discovery", () => {
     })).toBeNull();
   });
 
-  // Controls are presentation owned by the server-rendered template, not part of the data
-  // contract this producer supplies, so they never decide compatibility either way. Vetoing a
-  // template over a button would trade the whole card for Model B without removing anything.
+  it.each([
+    {
+      name: "unknown submit action",
+      duplicate: {
+        name: "active",
+        states: ["reasoning", "answering"],
+        wire_profile: "octo/v2",
+        submit_actions: ["future_action"],
+      },
+    },
+    {
+      name: "incompatible wire profile",
+      duplicate: {
+        name: "active",
+        states: ["reasoning", "answering"],
+        wire_profile: "octo/v1",
+        submit_actions: ["reasoning_stop"],
+      },
+    },
+  ])("fails closed when a duplicate required view hides an $name", ({ duplicate }) => {
+    const candidate = template("0.3.0");
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [{ ...candidate, views: [...candidate.views, duplicate] }],
+    })).toBeNull();
+  });
+
+  // Controls are rendered by the server but must still be understood by this consumer. A future
+  // action cannot be allowed to produce a clickable control that this plugin only ignores.
   it.each(["active", "result", "error"] as const)(
-    "stays compatible when the %s view advertises an unhandled submit action",
+    "fails closed when the %s view advertises an unhandled submit action",
     (viewName) => {
       const candidate = template("0.2.0");
       expect(selectReasoningProcessTemplate({
@@ -294,7 +313,7 @@ describe("reasoning process template discovery", () => {
             ? { ...view, submit_actions: [...view.submit_actions, "future_action"] }
             : view),
         }],
-      })).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+      })).toBeNull();
     },
   );
 
@@ -310,6 +329,20 @@ describe("reasoning process template discovery", () => {
         views: candidate.views.map((view) => ({ ...view, submit_actions: [] })),
       }],
     })).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+  });
+
+  it("keeps known controls scoped to the views that define their presentation contract", () => {
+    const candidate = template("0.3.0");
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [{
+        ...candidate,
+        views: candidate.views.map((view) => view.name === "result"
+          ? { ...view, submit_actions: ["reasoning_retry"] }
+          : view),
+      }],
+    })).toBeNull();
   });
 });
 
