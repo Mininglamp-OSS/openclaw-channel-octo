@@ -96,9 +96,11 @@ const REQUIRED_VIEWS = [
  * shape is the producer contract boundary; a breaking data contract must use a new id or negotiated
  * wire capability rather than relying on an unadvertised client-side version range.
  *
- * The deployed E1c catalog advertises one new-send version. Manifest order is not a preference
- * signal, so multiple compatible entries without an explicit preference capability fail closed to
- * Model B rather than reintroducing a local semver policy.
+ * The authoritative cross-repo clauses are octo-server
+ * `.octospec/tasks/cardtmpl-runtime-catalog-overlay/brief.md` D13/E1d and
+ * `.octospec/tasks/cardtmpl-reasoning-schema-successor/brief.md` D5: the catalog advertises one
+ * new-send version, and multiple compatible entries without an explicit preference capability
+ * fail closed to Model B rather than reintroducing a local semver policy.
  * A duplicated id/version also remains ambiguous even if only one copy has compatible views:
  * `template_ref` cannot identify which copy the server would resolve.
  */
