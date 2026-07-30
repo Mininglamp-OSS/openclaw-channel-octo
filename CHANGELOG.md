@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.1.2...v1.2.0) (2026-07-30)
+
+
+### Added
+
+* **cards:** consume Registry reasoning templates ([#186](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/186)) ([58f52ca](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/58f52cac1edaa4e3bdeb61b0c6df2014fd49764e))
+
+
+### Fixed
+
+* **cards:** finalize orphaned paused card for correlated continuation ([#189](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/189)) ([63540d6](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/63540d6d0825afab39d52d04e56bb56e5ceafb1a)), closes [#180](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/180)
+* **cards:** polish progress card fallback ([#182](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/182)) ([2616e11](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/2616e11ed4df7f3587f77c03247943c3d0792ec3))
+* **cards:** trust advertised reasoning template versions ([#188](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/188)) ([cd0538a](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/cd0538a8aff7005dac60d14a2158677411c044c6))
+* **outbound:** accept bare absolute file paths in sendMedia ([#184](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/184)) ([83fa67a](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/83fa67a2f7b480b415cd80799fd3f158e2af3376)), closes [#183](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/183)
+
 ## [1.1.2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.1.0...v1.1.2) (2026-07-23)
 
 > 版本号从 1.1.0 直接跳到 1.1.2：1.1.1 此前因 ClawHub 发布重试被占用（内容等同 1.1.0），本次跳过以避免版本号语义歧义。
