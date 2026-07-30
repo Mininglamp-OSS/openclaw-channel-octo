@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.1.2...v1.2.0) (2026-07-30)
+
+### Added
+- **消费 Registry 下发的 reasoning-process 模板渲染推理进度卡（Model A）**（#186）：进度卡从「只能由插件本地渲染（Model B）」升级为「优先消费服务端 Bot card profile 广告的 `ai.reasoning-process` 模板」，把模型的推理文本与工具调用轨迹以结构化模板帧（`template_ref` + `state` + `data`）呈现在群里，而非只有一个粗略的本地卡。
+  - 工作方式：从 Bot card profile 发现兼容的 `ai.reasoning-process` 模板，捕获用户可见的推理文本 + 安全的工具输入/输出摘要，以稳定 reasoning ID、单调递增的 `card_seq` 编辑、瞬态进度帧与终态发送 Model A 卡；通用卡与 agent 自撰的 display 卡仍走 Model B。
+  - 新增配置 `reasoningCardTemplateMode`（顶层默认 + `accounts.<id>` 覆盖，与 `requireMention` 同款分层），三态：`experimental`（**默认**，服务端广告兼容模板则发 Model A，否则回退 Model B）、`shadow`（只做发现验证仍发 Model B）、`off`（纯本地 Model B）。
+  - 安全与隐私：推理文本**仅当** OpenClaw reasoning visibility 为 `on` / `stream` 时才捕获，经与其他可见输出同一套 URL / 凭证脱敏管道处理、疑似 secret 形态 fail-closed、并有长度上限。**注意**：在群里开启 reasoning 可见性等于把模型思考过程公开给该 channel 全体成员。不影响 `octo_send_display_card` / `octo_send_card`。
+
+### Fixed
+- **`sessions_yield` 后 continuation 只产出终稿文本时，进度卡永久冻结在「正在处理」**（#180, PR #189）：多工具 + final text 的任务经 `sessions_yield` 让出后，若恢复的 continuation 只回最终战报、不再调任何新工具，进度卡最后一步图标永远停在 ⏳，直到 1 小时 TTL 才被误标为「⏱️ 等待超时」——即便任务其实成功。
+  - 根因：yielding run 收尾时把带 `messageId` 的可见卡移入 `pausedCards`；它 resume 后是一次新 dispatch，`setCardContext` 为其新建一张空 entry（无 `messageId`）。continuation 只产 final text 时这张空 entry 拿不到 `messageId`，`finalizeCard` 命中 `!messageId` 早退，躺在 `pausedCards` 里的真卡从未被推进到终态；非 subagent 的 bare yield 又没有 completion event 去认领 `continuationRunId`，lifecycle / `agent_end` 的兜底也不触发。
+  - 修复：给 `finalizeCard` 加收尾兜底——当本 run 无法承载终态帧（`!messageId`）、本 run 已收尾（非 paused/resuming），且能证明本次收尾 run 归属该 paused 流程时，把孤儿卡直接收到 ✅ 已完成 / ⚠️ 已中断。
+  - 归属校验 fail-closed：run 归属（`owner.runId === pausedFromRunId`，同一 yielded run resume 后收尾）、同身份（防跨账号）、不抢占仍在等子任务或已被 `continuationRunId` 认领的 subagent-yield 流程（那些仍由 lifecycle 收尾）、无 entry 可校验时直接返回不碰 `pausedCards`。
+- **进度卡 / reasoning 卡的 fallback 文案与格式打磨**（#182）：进度卡文案改为紧凑英文并**保留原始工具名**（如 `read` / `write`），让客户端按稳定标识本地化，而非渲染翻译后的标签；长耗时按分钟 / 小时格式化，`fmtDuration` 对非有限值 / 负值返回空串并按四舍五入后的秒选单位，消除 `59_999ms → 60.0s` 这类落到分钟分支想避免的输出。
+  - 截断标记改为可注入选项（默认仍中文，只有进度卡传英文 marker，agent 自撰的 display 卡不受影响）；进度卡与 reasoning 卡各有独立英文 placeholder，`inbound.ts` 仍用中文 placeholder。
+  - 放宽一处脱敏守卫：`safeLabel` 改为按 `__` 分段扫描 MCP 标签，避免把 32+ 字符的 snake_case MCP 工具名误判成 secret 而渲染成「Tool」；关键字 / 已知前缀检测仍按段 fail-closed。
+- **reasoning 模板版本改为信任服务端广告值，不再用本地版本白名单**（#188）：#186 的选择器带本地 `0.1.0` / `0.2.0` 白名单 + 「多版本选最新」推断，与 octo-server 的权威跨仓契约冲突（契约要求从 manifest 动态取版本、不设本地 allowlist、多版本无 semver 策略时 fail-closed）。
+  - 修复：移除本地 allowlist，直接使用 catalog 中**唯一**的兼容版本；出现 0 个或多个兼容条目、无效版本、未知 Submit action、重复必需 view 时一律 fail-closed 回退 Model B。
+  - 新增首帧重试：**仅当**初次 Model A 发送收到确定性的 `card_invalid` 响应、且已广告兼容的 Model B profile 时，首帧作为 Model B 重试**恰好一次**；超时 / 冲突 / 卡片禁用 / 瞬态 / 服务端错误均不触发；已存在的 Model A 消息永不切换 wire 模式。
+- **`sendMedia` 发送裸绝对路径媒体时抛 `Invalid URL`**（#183, PR #184）：图片生成等工具产出的裸绝对路径（如 `/home/.../image.jpg`）经 `sendMedia` 发送时抛 `TypeError: Invalid URL`，媒体从未送达。
+  - 根因：`sendMedia` 只识别 `data:` 与 `file://`，其他一律落到 HTTP 分支的 `new URL(mediaUrl)`，裸绝对路径无 scheme 直接抛错。
+  - 修复：对 `path.isAbsolute()` 的 `mediaUrl` 按 `file://` 同等处理，从磁盘读取并走预签名上传路径，不再交给 URL 解析器。纯新增分支，不影响既有 `data:` / `file://` / http(s) 行为。
+
 ## [1.1.2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.1.0...v1.1.2) (2026-07-23)
 
 > 版本号从 1.1.0 直接跳到 1.1.2：1.1.1 此前因 ClawHub 发布重试被占用（内容等同 1.1.0），本次跳过以避免版本号语义歧义。
