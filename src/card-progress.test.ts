@@ -384,7 +384,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
   it("兼容 Registry 模板不受 Model B card_version/elements gate 限制", async () => {
     const { fn, calls } = mockFetch({
       profile: {
-        ...registryProfile(),
+        ...registryProfile("0.3.0"),
         card_version: "9.9",
         elements: [],
       },
@@ -408,7 +408,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
 
     const payload = calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as
       Record<string, unknown> | undefined;
-    expect(payload).toHaveProperty("template_ref.version", "0.2.0");
+    expect(payload).toHaveProperty("template_ref.version", "0.3.0");
     expect(payload).not.toHaveProperty("card");
   });
 
