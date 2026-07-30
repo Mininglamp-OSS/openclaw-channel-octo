@@ -673,6 +673,94 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(appliedSeqs).toEqual([...appliedSeqs].sort((a, b) => a - b));
   });
 
+  it("Model A 首帧被确定性拒绝时，在同一 flush 内仅回退一次兼容的 Model B", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      const target = String(url);
+      const body = init?.body ? JSON.parse(init.body) as Record<string, unknown> : undefined;
+      calls.push({ url: target, body });
+      if (target.includes("/card/profile")) {
+        return { ok: true, status: 200, json: async () => registryProfile("0.3.0") };
+      }
+      if (target.includes("/sendMessage")) {
+        const payload = body?.payload as Record<string, unknown> | undefined;
+        if (payload?.template_ref) {
+          return {
+            ok: false,
+            status: 400,
+            statusText: "Bad Request",
+            text: async () => '{"code":"card_invalid"}',
+          };
+        }
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "fallback-card" }) };
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+
+    const { handlers } = makeApi();
+    const sessionKey = "registry-first-send-fallback";
+    setCardContext(sessionKey, {
+      apiUrl: "https://registry-first-send-fallback.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, { sessionKey });
+    await vi.advanceTimersByTimeAsync(900);
+
+    const sends = calls.filter((call) => call.url.includes("/sendMessage"));
+    expect(sends).toHaveLength(2);
+    expect(sends[0]?.body?.payload).toHaveProperty("template_ref.version", "0.3.0");
+    expect(sends[1]?.body?.payload).toHaveProperty("card");
+    expect(sends[1]?.body?.payload).not.toHaveProperty("template_ref");
+
+    markCardAnswering(sessionKey);
+    await vi.advanceTimersByTimeAsync(900);
+    const edit = calls.find((call) => call.url.includes("/message/edit"))?.body;
+    expect(edit).toHaveProperty("content_edit");
+    expect(edit).not.toHaveProperty("template_ref");
+  });
+
+  it("Model A 首帧被拒绝但 Model B capability 不兼容时不盲目回退", async () => {
+    const sends: Record<string, unknown>[] = [];
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
+      const target = String(url);
+      if (target.includes("/card/profile")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ...registryProfile("0.3.0"),
+            profiles: ["octo/v2"],
+            card_version: "9.9",
+            elements: [],
+          }),
+        };
+      }
+      if (target.includes("/sendMessage")) {
+        sends.push(JSON.parse(init?.body ?? "{}") as Record<string, unknown>);
+        return { ok: false, status: 400, statusText: "Bad Request", text: async () => "card_invalid" };
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    }) as unknown as typeof fetch;
+
+    const { handlers } = makeApi();
+    const sessionKey = "registry-no-model-b-fallback";
+    setCardContext(sessionKey, {
+      apiUrl: "https://registry-no-model-b-fallback.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningCardTemplateMode: "experimental",
+    });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, { sessionKey });
+    await vi.advanceTimersByTimeAsync(900);
+
+    expect(sends).toHaveLength(1);
+    expect(sends[0]?.payload).toHaveProperty("template_ref.version", "0.3.0");
+  });
+
   it.each([429, 503])("Model A 首帧 %i 后下个事件仍可重试", async (failureStatus) => {
     const calls: string[] = [];
     let sendAttempts = 0;

@@ -270,6 +270,34 @@ describe("reasoning process template discovery", () => {
     })).toBeNull();
   });
 
+  it.each([
+    {
+      name: "unknown submit action",
+      duplicate: {
+        name: "active",
+        states: ["reasoning", "answering"],
+        wire_profile: "octo/v2",
+        submit_actions: ["future_action"],
+      },
+    },
+    {
+      name: "incompatible wire profile",
+      duplicate: {
+        name: "active",
+        states: ["reasoning", "answering"],
+        wire_profile: "octo/v1",
+        submit_actions: ["reasoning_stop"],
+      },
+    },
+  ])("fails closed when a duplicate required view hides an $name", ({ duplicate }) => {
+    const candidate = template("0.3.0");
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [{ ...candidate, views: [...candidate.views, duplicate] }],
+    })).toBeNull();
+  });
+
   // Controls are rendered by the server but must still be understood by this consumer. A future
   // action cannot be allowed to produce a clickable control that this plugin only ignores.
   it.each(["active", "result", "error"] as const)(
@@ -301,6 +329,20 @@ describe("reasoning process template discovery", () => {
         views: candidate.views.map((view) => ({ ...view, submit_actions: [] })),
       }],
     })).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+  });
+
+  it("keeps known controls scoped to the views that define their presentation contract", () => {
+    const candidate = template("0.3.0");
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [{
+        ...candidate,
+        views: candidate.views.map((view) => view.name === "result"
+          ? { ...view, submit_actions: ["reasoning_retry"] }
+          : view),
+      }],
+    })).toBeNull();
   });
 });
 
