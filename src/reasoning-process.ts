@@ -33,7 +33,7 @@ export interface ReasoningProcessPhase {
   actions: ReasoningProcessAction[];
 }
 
-/** Shared producer contract for ai.reasoning-process@0.1.0 and bounded successor 0.2.0. */
+/** Producer data shape for server-advertised ai.reasoning-process templates. */
 export interface ReasoningProcessData {
   reasoningId: string;
   state: ReasoningProcessState;
@@ -57,8 +57,6 @@ const MAX_RENDERED_PHASES = 6;
 const MAX_RENDERED_ACTIONS = 12;
 const REASONING_TEMPLATE_ID = "ai.reasoning-process";
 const TEMPLATE_WIRE = "template-ref/v1";
-/** Supported producer contracts in preference order, newest first. */
-const SUPPORTED_TEMPLATE_VERSIONS: readonly string[] = ["0.2.0", "0.1.0"];
 export const REASONING_ID_MAX_LENGTH = 512;
 
 /** Preserve short IDs; use a stable collision-resistant digest instead of unsafe truncation. */
@@ -83,16 +81,15 @@ const REQUIRED_VIEWS = [
 ] as const;
 
 /**
- * Select the newest Bot-catalog entry with the contract shape this producer implements.
+ * Select the sole Bot-catalog entry with the contract shape this producer implements.
  *
- * A catalog advertising the successor alongside its predecessor is the normal state for the whole
- * rollout window, so preferring the newest is what keeps the feature engaged there.
+ * The server manifest is authoritative for the template version. Keeping a local version allowlist
+ * would turn every compatible server rollout into a plugin release dependency, so a sole compatible
+ * entry is returned with its advertised version unchanged.
  *
- * Ambiguity is judged per version and over every entry claiming this template id, not over the
- * view-compatible subset: `template_ref` carries only `{id, version}`, so two entries claiming one
- * version cannot be told apart on the wire and the server may resolve the one rejected here. A
- * version in that state is skipped rather than selected; an older unambiguous version is still
- * usable, and ambiguity in a version that would not have been selected costs nothing.
+ * Manifest order is not a preference signal, so multiple compatible entries fail closed to Model B.
+ * A duplicated id/version also remains ambiguous even if only one copy has compatible views:
+ * `template_ref` cannot identify which copy the server would resolve.
  */
 export function selectReasoningProcessTemplate(
   templating: CardTemplatingCapability | undefined,
@@ -100,7 +97,6 @@ export function selectReasoningProcessTemplate(
   if (!templating?.supported || templating.wire !== TEMPLATE_WIRE) return null;
   const claimed = templating.templates.filter((template) => template.id === REASONING_TEMPLATE_ID);
   const compatible = claimed.filter((template) => {
-    if (!SUPPORTED_TEMPLATE_VERSIONS.includes(template.version)) return false;
     return REQUIRED_VIEWS.every((required) => {
       const view = template.views.find((candidate) => candidate.name === required.name);
       if (!view || view.wire_profile !== required.wireProfile) return false;
@@ -108,13 +104,10 @@ export function selectReasoningProcessTemplate(
       return required.states.every((state) => states.has(state));
     });
   });
-  for (const version of SUPPORTED_TEMPLATE_VERSIONS) {
-    const match = compatible.find((template) => template.version === version);
-    if (!match) continue;
-    if (claimed.filter((template) => template.version === version).length > 1) continue;
-    return { id: match.id, version: match.version };
-  }
-  return null;
+  if (compatible.length !== 1) return null;
+  const match = compatible[0]!;
+  if (claimed.filter((template) => template.version === match.version).length > 1) return null;
+  return { id: match.id, version: match.version };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -423,7 +416,7 @@ function plainText(data: ReasoningProcessData): string {
   return lines.join("\n") || PROGRESS_CARD_PLACEHOLDER;
 }
 
-/** Render the local toggle-only variant of the shared 0.1.0/0.2.0 data contract. */
+/** Render the local toggle-only variant of the shared Registry data shape. */
 export function renderReasoningProcessCard(
   state: CardProgressState,
   caps?: CardCaps,
