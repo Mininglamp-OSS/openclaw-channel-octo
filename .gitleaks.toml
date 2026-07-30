@@ -1,0 +1,27 @@
+# gitleaks configuration for openclaw-channel-octo.
+#
+# Extends the upstream default ruleset (useDefault = true) and only allowlists
+# paths that hold deliberately fake credentials — unit-test fixtures and API
+# documentation examples. These are placeholders, never real secrets, and
+# production source (src/*.ts, non-test) stays fully scanned.
+#
+# The org reusable secret-scan workflow auto-detects this file
+# (`if [ -f .gitleaks.toml ]; then --config .gitleaks.toml`).
+title = "openclaw-channel-octo gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures and documentation examples use fake credentials, not real secrets."
+paths = [
+  # Unit tests seed bots/accounts with fabricated tokens
+  # (e.g. "tok-…_bot", "bf_secret", "app_EXAMPLE_dummy_app_bot_token").
+  '''.*\.test\.ts''',
+  # API skill docs demonstrate curl calls with placeholder Authorization headers.
+  '''skills/.*\.md''',
+]
+regexes = [
+  # Fake bot-token convention, in case it appears outside the paths above.
+  '''tok-[A-Za-z0-9_-]{6,}''',
+]
