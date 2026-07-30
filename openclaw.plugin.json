@@ -78,7 +78,7 @@
             "type": "string",
             "enum": ["off", "shadow", "experimental"],
             "default": "experimental",
-            "description": "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A when exactly one compatible Bot-catalog template is advertised, using its manifest version unchanged; zero or multiple compatible entries fall back to Model B because catalog order is not a preference signal. Defaults to experimental; per-account values override the top-level value."
+            "description": "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A when exactly one compatible Bot-catalog template is advertised, using its manifest version unchanged; zero or multiple compatible entries fall back to Model B because catalog order is not a preference signal. A rejected experimental first frame retries once as Model B only for a deterministic card-invalid response; timeouts, conflicts, and transient/server errors do not trigger that fallback. Defaults to experimental; per-account values override the top-level value."
           },
           "cardDisplay": {
             "type": "boolean",
@@ -146,7 +146,7 @@
                   "type": "string",
                   "enum": ["off", "shadow", "experimental"],
                   "default": "experimental",
-                  "description": "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A when exactly one compatible Bot-catalog template is advertised, using its manifest version unchanged; zero or multiple compatible entries fall back to Model B because catalog order is not a preference signal. Defaults to experimental; per-account values override the top-level value."
+                  "description": "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A when exactly one compatible Bot-catalog template is advertised, using its manifest version unchanged; zero or multiple compatible entries fall back to Model B because catalog order is not a preference signal. A rejected experimental first frame retries once as Model B only for a deterministic card-invalid response; timeouts, conflicts, and transient/server errors do not trigger that fallback. Defaults to experimental; per-account values override the top-level value."
                 },
                 "cardDisplay": {
                   "type": "boolean",

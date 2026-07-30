@@ -299,12 +299,34 @@ function profileEnabledForContext(ctx: CardContext, manifest: CardProfileManifes
   return registryCompatible || modelBProfileCompatible(manifest);
 }
 
+const TEMPLATE_FRAME_REJECTION_STATUSES = new Set([400, 404, 422]);
+const CARD_INVALID_ERROR_CODES = new Set([
+  "card_invalid",
+  "err.server.bot_api.card_invalid",
+]);
+
+function apiErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function semanticHttpStatusFromApiError(error: unknown): number | undefined {
+  const match = apiErrorMessage(error).match(/"http_status"\s*:\s*(\d{3})/);
+  return match ? Number(match[1]) : undefined;
+}
+
+function errorCodeFromApiError(error: unknown): string | undefined {
+  return apiErrorMessage(error).match(/"code"\s*:\s*"([^"]+)"/)?.[1];
+}
+
 function canFallbackFirstFrameToModelB(entry: CardEntry, error: unknown): boolean {
-  const status = httpStatusFromApiFetchError(error);
-  // 401/403 是身份问题,409 可能代表已提交后的冲突,429 是瞬时限流;这些都不应触发第二次 send。
-  const deterministicTemplateRejection = status !== undefined && status >= 400 && status < 500 &&
-    status !== 401 && status !== 403 && status !== 409 && status !== 429;
-  if (!deterministicTemplateRejection) return false;
+  const transportStatus = httpStatusFromApiFetchError(error);
+  const semanticStatus = semanticHttpStatusFromApiError(error);
+  const errorCode = errorCodeFromApiError(error);
+  // 第二次 send 只能发生在服务端明确拒绝模板帧时。408/冲突/限流/5xx 都可能是
+  // 已提交或瞬时失败，不能因为外层 transport 400 就切到 Model B 造成孤儿卡。
+  if (transportStatus === undefined || !TEMPLATE_FRAME_REJECTION_STATUSES.has(transportStatus)) return false;
+  if (semanticStatus !== undefined && !TEMPLATE_FRAME_REJECTION_STATUSES.has(semanticStatus)) return false;
+  if (errorCode !== undefined && !CARD_INVALID_ERROR_CODES.has(errorCode)) return false;
   const manifest = profileCache.get(profileCacheKey(entry.ctx))?.manifest;
   return !!manifest && modelBEnabledForContext(manifest);
 }
@@ -372,14 +394,15 @@ function renderEntryProgress(
 
 function isRetryableRegistryEditError(error: unknown): boolean {
   const transportStatus = httpStatusFromApiFetchError(error);
-  const message = error instanceof Error ? error.message : String(error);
+  const message = apiErrorMessage(error);
   // 本地契约校验(validateTemplateFrame / 必填字段)在 fetch 之前抛,前缀 `octo: ` 且无 HTTP 状态。
   // 重试只会用完全相同的非法 body 再打一次,所以不可重试;状态缺失的 **传输** 失败
   // (网络/超时,消息形如 `Octo API ... failed`)仍按可重试处理。
   if (transportStatus === undefined && /^octo: /.test(message)) return false;
-  const semanticStatus = Number(message.match(/"http_status"\s*:\s*(\d{3})/)?.[1]);
+  const semanticStatus = semanticHttpStatusFromApiError(error);
+  const errorCode = errorCodeFromApiError(error);
   return transportStatus === undefined || transportStatus === 429 || transportStatus >= 500 ||
-    (Number.isFinite(semanticStatus) && semanticStatus >= 500);
+    (semanticStatus !== undefined && semanticStatus >= 500) || errorCode === "err.shared.internal";
 }
 
 async function waitForRegistryRetry(ms: number, signal: AbortSignal): Promise<void> {
@@ -535,40 +558,35 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     if (!entry.messageId) {
       if (!isCurrentEntry(sessionKey, entry)) return;
       let res;
-      while (true) {
-        if (entry.deliveryMode === "model-a") {
-          const data = buildReasoningProcessWireData(state);
-          if (!data) {
-            dbg("model-a first frame deferred: no phases with actions yet");
-            return;
-          }
-          if (!entry.templateRef) return;
-          try {
-            res = await sendTemplateCardMessage({
-              apiUrl: entry.ctx.apiUrl,
-              botToken: entry.ctx.botToken,
-              channelId: entry.ctx.channelId,
-              channelType: entry.ctx.channelType,
-              templateRef: entry.templateRef,
-              state: data.state,
-              data,
-              signal,
-            });
-            break;
-          } catch (error) {
-            if (!canFallbackFirstFrameToModelB(entry, error) || !isCurrentEntry(sessionKey, entry)) {
-              throw error;
-            }
-            warn(
-              `model-a first frame rejected; retrying once with model-b: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
-            entry.deliveryMode = "model-b";
-            entry.templateRef = undefined;
-          }
+      if (entry.deliveryMode === "model-a") {
+        const data = buildReasoningProcessWireData(state);
+        if (!data) {
+          dbg("model-a first frame deferred: no phases with actions yet");
+          return;
         }
+        if (!entry.templateRef) return;
+        try {
+          res = await sendTemplateCardMessage({
+            apiUrl: entry.ctx.apiUrl,
+            botToken: entry.ctx.botToken,
+            channelId: entry.ctx.channelId,
+            channelType: entry.ctx.channelType,
+            templateRef: entry.templateRef,
+            state: data.state,
+            data,
+            signal,
+          });
+        } catch (error) {
+          if (!canFallbackFirstFrameToModelB(entry, error) || !isCurrentEntry(sessionKey, entry)) {
+            throw error;
+          }
+          warn(`model-a first frame rejected; retrying once with model-b: ${apiErrorMessage(error)}`);
+          entry.deliveryMode = "model-b";
+          entry.templateRef = undefined;
+        }
+      }
 
+      if (entry.deliveryMode === "model-b") {
         const { card, plain } = renderEntryProgress(sessionKey, entry, state);
         if (!Array.isArray(card.body) || card.body.length === 0) {
           warn("rendered card cannot fit negotiated capabilities/limits; disabling for session");
@@ -585,7 +603,6 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
           ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
           signal,
         });
-        break;
       }
       entry.messageId = res?.message_id;
       if (!isCurrentEntry(sessionKey, entry)) return;
@@ -611,8 +628,9 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     warn(`flush failed: ${err instanceof Error ? err.message : String(err)}`);
     // 确定性拒绝(4xx,除可重试的 429)→ fail-closed,别对着必然失败的 server 逐事件重试。
     // 5xx / 网络 / 429 保持可重试(与 gate 的瞬时失败处理一致)。
-    const status = httpStatusFromApiFetchError(err);
-    if (status !== undefined && status >= 400 && status < 500 && status !== 429) {
+    const status = semanticHttpStatusFromApiError(err) ?? httpStatusFromApiFetchError(err);
+    if (status !== undefined && status >= 400 && status < 500 && status !== 429 &&
+        errorCodeFromApiError(err) !== "err.shared.internal") {
       entry.skip = true;
     }
   } finally {
