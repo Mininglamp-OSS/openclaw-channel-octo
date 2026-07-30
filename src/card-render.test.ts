@@ -74,31 +74,31 @@ const ERROR_REDACTION_CASES = [
 ] as const;
 
 describe("resolveToolMeta", () => {
-  it("已知工具 → 图标 + 中文标签", () => {
-    expect(resolveToolMeta("read")).toEqual({ icon: "📖", label: "读取文件" });
-    expect(resolveToolMeta("exec")).toEqual({ icon: "⌨️", label: "执行命令" });
-    expect(resolveToolMeta("process")).toEqual({ icon: "⚙️", label: "运行进程" });
+  it("已知工具 → 专属图标 + 原始 toolName", () => {
+    expect(resolveToolMeta("read")).toEqual({ icon: "📖", label: "read" });
+    expect(resolveToolMeta("exec")).toEqual({ icon: "⌨️", label: "exec" });
+    expect(resolveToolMeta("process")).toEqual({ icon: "⚙️", label: "process" });
   });
-  it("OpenClaw update_plan → 专属地图图标 + 中文标签", () => {
-    expect(resolveToolMeta("update_plan")).toEqual({ icon: "🗺️", label: "更新计划" });
+  it("OpenClaw update_plan → 专属地图图标 + 原始 toolName", () => {
+    expect(resolveToolMeta("update_plan")).toEqual({ icon: "🗺️", label: "update_plan" });
     const { card } = renderProgressCard({
       phase: "tool",
       steps: [{ tool: "update_plan", status: "done", durationMs: 29 }],
     });
-    expect(progressDetailText(card)).toContain("🗺️ 更新计划");
+    expect(progressDetailText(card)).toContain("🗺️ update_plan");
     expect(progressDetailText(card)).not.toContain("🔧 update_plan");
   });
-  it("MCP 工具解析 server / tool", () => {
+  it("MCP 工具保留原始 toolName", () => {
     expect(resolveToolMeta("mcp__github__create_issue")).toEqual({
       icon: "🔌",
-      label: "MCP github / create_issue",
+      label: "mcp__github__create_issue",
     });
   });
   it("未知工具 → 通用图标 + 原名", () => {
     expect(resolveToolMeta("weirdtool")).toEqual({ icon: "🔧", label: "weirdtool" });
   });
-  it("host 内建工具名 find(SDK ToolName)→ 查找文件,且走 path 摘要策略(不再裸名)", () => {
-    expect(resolveToolMeta("find")).toEqual({ icon: "🔍", label: "查找文件" });
+  it("host 内建工具名 find 保留原名,且仍走 path 摘要策略", () => {
+    expect(resolveToolMeta("find")).toEqual({ icon: "🔍", label: "find" });
     expect(summarizeToolParams("find", { path: "/work/src/card-render.ts" })).toBe("/work/src/card-render.ts");
   });
 });
@@ -242,8 +242,21 @@ describe("summarizeToolParams", () => {
 
 describe("fmtDuration", () => {
   it("<1s 用 ms", () => expect(fmtDuration(200)).toBe("200ms"));
-  it(">=1s 用 x.xs", () => expect(fmtDuration(10165)).toBe("10.2s"));
+  it("1s..60s 用 x.xs", () => expect(fmtDuration(10165)).toBe("10.2s"));
+  it(">=60s 使用紧凑分钟格式", () => expect(fmtDuration(1_750_300)).toBe("29m 10s"));
+  it(">=1h 使用紧凑小时格式", () => expect(fmtDuration(3_723_000)).toBe("1h 2m 3s"));
   it("undefined → 空", () => expect(fmtDuration(undefined)).toBe(""));
+  it("非有限值 → 空(不渲出 Infinityh NaNm NaNs)", () => {
+    expect(fmtDuration(Number.NaN)).toBe("");
+    expect(fmtDuration(Number.POSITIVE_INFINITY)).toBe("");
+  });
+  it("负数 → 空(时钟回拨不渲出 -5000ms)", () => expect(fmtDuration(-5000)).toBe(""));
+  it("秒/分边界按取整后的值选单位(不渲出 60.0s)", () => {
+    expect(fmtDuration(59_499)).toBe("59.5s");
+    expect(fmtDuration(59_950)).toBe("1m 0s");
+    expect(fmtDuration(59_999)).toBe("1m 0s");
+    expect(fmtDuration(60_000)).toBe("1m 0s");
+  });
 });
 
 describe("sanitizeErrorText adversarial boundaries", () => {
@@ -264,39 +277,39 @@ describe("sanitizeErrorText adversarial boundaries", () => {
 
 describe("stepLine", () => {
   it("running:⏳ + 标签 + 摘要", () =>
-    expect(stepLine({ tool: "exec", status: "running", summary: "ls -la" })).toBe("⏳ 执行命令：ls -la"));
+    expect(stepLine({ tool: "exec", status: "running", summary: "ls -la" })).toBe("⏳ exec: ls -la"));
   it("done:图标 + 标签 + 摘要 + 耗时", () =>
     expect(stepLine({ tool: "exec", status: "done", summary: "ls -la", durationMs: 10165 })).toBe(
-      "⌨️ 执行命令：ls -la · 10.2s",
+      "⌨️ exec: ls -la · 10.2s",
     ));
   it("done 无摘要", () =>
-    expect(stepLine({ tool: "read", status: "done", durationMs: 200 })).toBe("📖 读取文件 · 200ms"));
+    expect(stepLine({ tool: "read", status: "done", durationMs: 200 })).toBe("📖 read · 200ms"));
   it("error", () =>
     expect(stepLine({ tool: "bash", status: "error", summary: "rm x", error: "boom" })).toBe(
-      "❌ 执行命令：rm x — boom",
+      "❌ bash: rm x — boom",
     ));
   it("error 详情脱敏:命中敏感串则只留状态、不渲染原始错误", () => {
     // 含 token 关键词
-    expect(stepLine({ tool: "bash", status: "error", error: "auth failed: Bearer sk-live-abc" })).toBe("❌ 执行命令");
+    expect(stepLine({ tool: "bash", status: "error", error: "auth failed: Bearer sk-live-abc" })).toBe("❌ bash");
     // 裸 sk- 前缀长 token(不在 URL 里)→ 整行隐藏
-    expect(stepLine({ tool: "bash", status: "error", error: "token sk-live-ABC123XYZ456def789ghi rejected" })).toBe("❌ 执行命令");
+    expect(stepLine({ tool: "bash", status: "error", error: "token sk-live-ABC123XYZ456def789ghi rejected" })).toBe("❌ bash");
     // AKIA 出现在错误里
-    expect(stepLine({ tool: "exec", status: "error", error: "invalid key AKIAIOSFODNN7EXAMPLE" })).toBe("❌ 执行命令");
+    expect(stepLine({ tool: "exec", status: "error", error: "invalid key AKIAIOSFODNN7EXAMPLE" })).toBe("❌ exec");
   });
   it("error 详情超长截断,折叠空白", () => {
     const long = "line1\n" + "z".repeat(200); // 非 hex、无数字 → 不算密钥,仅超长
     const out = stepLine({ tool: "read", status: "error", error: long });
-    expect(out.startsWith("❌ 读取文件 — line1 ")).toBe(true);
+    expect(out.startsWith("❌ read — line1 ")).toBe(true);
     expect(out.endsWith("…")).toBe(true);
     expect(out.length).toBeLessThan(140); // 图标+标签 + 120 上限 + 省略号
   });
   it("error 含 git SHA / digest / UUID 不被整段吞掉(不套用长 hex/高熵)", () => {
     // webhook 由 URL 降级兜住,故错误文本不套用长 hex/高熵形状 → 普通运维错误不被 blank。
     expect(stepLine({ tool: "read", status: "error", error: "build failed at commit 5f2a1c9d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b" })).toBe(
-      "❌ 读取文件 — build failed at commit 5f2a1c9d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b",
+      "❌ read — build failed at commit 5f2a1c9d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b",
     );
     // 但明确关键词/前缀仍拦。
-    expect(stepLine({ tool: "read", status: "error", error: "AKIAIOSFODNN7EXAMPLE rejected" })).toBe("❌ 读取文件");
+    expect(stepLine({ tool: "read", status: "error", error: "AKIAIOSFODNN7EXAMPLE rejected" })).toBe("❌ read");
   });
   it("P2-1: 工具名 label 过长截断 / 敏感形状回退通用标签", () => {
     // 超长 MCP 工具名 → 截断,防卡片被 label 撑爆。
@@ -305,7 +318,13 @@ describe("stepLine", () => {
     expect(out.length).toBeLessThan(60);
     expect(out.endsWith("…")).toBe(true);
     // 未知工具名命中敏感关键词 → 回退通用「工具」(不把疑似密钥的标识符渲进群卡片)。
-    expect(stepLine({ tool: "fetch_api_key_helper", status: "running" })).toBe("⏳ 工具");
+    expect(stepLine({ tool: "fetch_api_key_helper", status: "running" })).toBe("⏳ Tool");
+    // 按段扫描放宽了整串熵检测,所以必须锁住「什么仍然被抓住」:已知前缀落在任一段里 → 仍打码。
+    expect(stepLine({ tool: "mcp__github__ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", status: "running" }))
+      .toBe("⏳ Tool");
+    expect(stepLine({ tool: "mcp__aws__AKIAIOSFODNN7EXAMPLE", status: "running" })).toBe("⏳ Tool");
+    // 关键词同理(段内命中即整个 label 回退)。
+    expect(stepLine({ tool: "mcp__vault__read_secret", status: "running" })).toBe("⏳ Tool");
     // label 也过 URL 降级(与 params/error sink 一致):工具名里嵌 webhook/DSN → 只留注册域。
     const urlName = stepLine({ tool: "https://hooks.slack.com/services/T00/B00/SeCrEtXyZ", status: "running" });
     expect(urlName).toContain("https://slack.com");
@@ -362,7 +381,7 @@ describe("renderProgressCard", () => {
     expect(result!.card).not.toHaveProperty("metadata");
     const body = result!.card.body as Array<Record<string, unknown>>;
     expect(body[0]).toMatchObject({ type: "Container", style: "emphasis" });
-    expect(elementText(body[0])).toContain("✅ 已完成");
+    expect(elementText(body[0])).toContain("✅ Done");
     expect(elementText(body[1])).toContain("渠道 B 的下降主要来自权益认知不足");
     expect(result!.plain).toBe("结论\n\n渠道 B 的下降主要来自权益认知不足。");
   });
@@ -419,9 +438,9 @@ describe("renderProgressCard", () => {
     const { card, plain } = renderProgressCard({ phase: "thinking", steps: [] });
     expect(card.type).toBe("AdaptiveCard");
     expect(card.version).toBe("1.5");
-    expect(progressHeaderText(card)).toBe("🤖 思考中…");
+    expect(progressHeaderText(card)).toBe("🤖 Thinking…");
     expect(progressDetailItems(card)).toHaveLength(0);
-    expect(plain).toBe("🤖 思考中…");
+    expect(plain).toBe("🤖 Thinking…");
   });
 
   it("tool 阶段带摘要步骤", () => {
@@ -429,8 +448,8 @@ describe("renderProgressCard", () => {
       phase: "tool",
       steps: [{ tool: "read", status: "done", summary: "/work/README.md", durationMs: 200 }],
     });
-    expect(progressHeaderText(card)).toContain("🤖 正在处理…");
-    expect(progressDetailText(card)).toBe("📖 读取文件：/work/README.md · 200ms");
+    expect(progressHeaderText(card)).toContain("🤖 Working…");
+    expect(progressDetailText(card)).toBe("📖 read: /work/README.md · 200ms");
   });
 
   it("同类合并:连续 3 个 read done → 1 行 「读取文件 × 3」,含总耗时和最近文件名", () => {
@@ -444,10 +463,10 @@ describe("renderProgressCard", () => {
     });
     const detail = progressDetailItems(card);
     expect(detail.length).toBe(1);
-    expect(elementText(detail[0])).toContain("读取文件 × 3");
+    expect(elementText(detail[0])).toContain("read × 3");
     expect(elementText(detail[0])).toContain("450ms"); // 累加耗时
     expect(elementText(detail[0])).toContain("/e/f.md"); // 最近 = 最后一个
-    expect(plain).toContain("读取文件 × 3");
+    expect(plain).toContain("read × 3");
   });
 
   it("同类合并:running/error 不合并 —— 当前重点不能糊掉", () => {
@@ -464,7 +483,7 @@ describe("renderProgressCard", () => {
     const detail = progressDetailItems(card);
     // 期望:合并组[a,b done] + error 单独 + done 单独 + running 单独 = 4 行
     expect(detail.length).toBe(4);
-    expect(elementText(detail[0])).toContain("读取文件 × 2"); // 前两个合并
+    expect(elementText(detail[0])).toContain("read × 2"); // 前两个合并
     expect(elementText(detail[1])).toContain("❌"); // error 保留
     expect(elementText(detail[2])).toContain("/d.md"); // 单个 done 不合并
     expect(elementText(detail[3])).toContain("⏳"); // running 保留
@@ -484,9 +503,9 @@ describe("renderProgressCard", () => {
     const detail = progressDetailItems(card);
     // [read×2] + [exec 单个] + [read×2] = 3 行
     expect(detail.length).toBe(3);
-    expect(elementText(detail[0])).toContain("读取文件 × 2");
-    expect(elementText(detail[1])).toContain("执行命令");
-    expect(elementText(detail[2])).toContain("读取文件 × 2");
+    expect(elementText(detail[0])).toContain("read × 2");
+    expect(elementText(detail[1])).toContain("exec");
+    expect(elementText(detail[2])).toContain("read × 2");
   });
 
   it("同类合并:done 收尾 header 计数仍用原始步数(合并不影响 N 步展示)", () => {
@@ -496,7 +515,7 @@ describe("renderProgressCard", () => {
       { tool: "read" as const, status: "done" as const, durationMs: 30 },
     ];
     const { card } = renderProgressCard({ phase: "done", steps, elapsedMs: 100 });
-    expect(progressHeaderText(card)).toContain("✅ 已完成 · 3 步 · 100ms"); // 用户看到"3 步",不是"1 组"
+    expect(progressHeaderText(card)).toContain("✅ Done · 3 steps · 100ms"); // 用户看到"3 steps",不是"1 group"
   });
 
   it("done 收尾:步数 + 耗时", () => {
@@ -505,7 +524,7 @@ describe("renderProgressCard", () => {
       steps: [{ tool: "read", status: "done" }],
       elapsedMs: 2500,
     });
-    expect(progressHeaderText(card)).toContain("✅ 已完成 · 1 步 · 2.5s");
+    expect(progressHeaderText(card)).toContain("✅ Done · 1 step · 2.5s");
   });
 
   it("yield 暂停与恢复使用短状态文案", () => {
@@ -513,14 +532,14 @@ describe("renderProgressCard", () => {
     const resuming = renderProgressCard({ phase: "resuming", steps: [] });
     const expired = renderProgressCard({ phase: "expired", steps: [] });
 
-    expect(progressHeaderText(paused.card)).toBe("⏸️ 等待任务结果");
-    expect(progressHeaderText(resuming.card)).toBe("🤖 正在整理结果");
-    expect(progressHeaderText(expired.card)).toBe("⏱️ 等待超时");
+    expect(progressHeaderText(paused.card)).toBe("⏸️ Waiting for results");
+    expect(progressHeaderText(resuming.card)).toBe("🤖 Preparing results");
+    expect(progressHeaderText(expired.card)).toBe("⏱️ Wait timed out");
   });
 
   it("error 收尾", () => {
     const { card } = renderProgressCard({ phase: "error", steps: [], errorText: "超时" });
-    expect(progressHeaderText(card)).toContain("⚠️ 已中断");
+    expect(progressHeaderText(card)).toContain("⚠️ Interrupted");
   });
 
   it("R2: 含 git SHA 的步骤行不被 buildDisplayCard 二次误删(进度卡内容视为可信)", () => {
@@ -539,13 +558,27 @@ describe("renderProgressCard", () => {
       steps: [],
       errorText: "build failed at commit 5f2a1c9d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b",
     });
-    expect(progressHeaderText(card)).toContain("⚠️ 已中断");
+    expect(progressHeaderText(card)).toContain("⚠️ Interrupted");
     expect(plain).not.toBe("[卡片]");
     expect(plain).toContain("5f2a1c9d");
   });
 
   it("plain never empty", () => {
     expect(renderProgressCard({ phase: "tool", steps: [] }).plain.length).toBeGreaterThan(0);
+  });
+
+  it("超服务端限制的截断提示与整卡同为英文(不中英混排)", () => {
+    // maxPayloadBytes 收紧到只装得下首行 —— 走 buildDisplayCard 的丢块路径,而不是进度卡
+    // 自己的 maxVisibleSteps 裁剪(那条已经是英文的 `… N earlier steps hidden`)。
+    const steps = Array.from({ length: 12 }, (_, i) => ({
+      tool: `tool_number_${i}`,
+      status: "done" as const,
+      durationMs: 1000 + i,
+      summary: "y".repeat(100),
+    }));
+    const { plain } = renderProgressCard({ phase: "done", steps, elapsedMs: 120_000 }, { maxPayloadBytes: 900 });
+    expect(plain).toContain("items dropped");
+    expect(plain).not.toContain("省略");
   });
 
   it("步骤超上限 → 只渲染最近 N 步 + 折叠计数(防卡片膨胀)", () => {
@@ -560,17 +593,33 @@ describe("renderProgressCard", () => {
     const detail = progressDetailItems(card);
     // 20 个 read/exec 交替 → 无合并;折叠行(1) + 最近 12 步 = 13 个 detail block
     expect(detail.length).toBe(13);
-    expect(elementText(detail[0])).toBe("… 省略前 8 步");
+    expect(elementText(detail[0])).toBe("… 8 earlier steps hidden");
     // 最后一步是最新的 /f19
     expect(elementText(detail[detail.length - 1])).toContain("/f19");
     // 已折叠掉最早的 /f0
-    expect(detail.every((b) => !elementText(b).includes("/f0："))).toBe(true);
+    // 锚到实际渲染形态 `📖 read: /f0 · 200ms`;旧写法用 "/f0:" —— 冒号在路径前面,
+    // 这个子串永不出现,即使被折叠的步骤仍在渲染也会通过。
+    expect(detail.every((b) => !elementText(b).includes(": /f0 "))).toBe(true);
+  });
+
+  it("窄屏 fallback 去掉重复标题/可见步数,并压缩长耗时", () => {
+    const steps = [
+      ...Array.from({ length: 67 }, () => ({ tool: "__thinking__", status: "done" as const, durationMs: 100 })),
+      ...Array.from({ length: 84 }, () => ({ tool: "process", status: "done" as const, durationMs: 100 })),
+    ];
+    const { card, plain } = renderProgressCard({ phase: "done", steps, elapsedMs: 1_750_300 });
+
+    expect(progressHeaderText(card)).toContain("✅ Done · 151 steps · 29m 10s");
+    expect(plain).toContain("Reasoning 67 · Tools 84");
+    expect(plain).toContain("… 139 earlier steps hidden");
+    expect(plain).not.toContain("Reasoning and tool calls");
+    expect(plain).not.toContain("12/151 steps");
   });
 
   it("done 收尾 header 计数用全量步数(不受裁剪影响)", () => {
     const steps = Array.from({ length: 20 }, () => ({ tool: "read", status: "done" as const }));
     const { card } = renderProgressCard({ phase: "done", steps, elapsedMs: 1000 });
-    expect(progressHeaderText(card)).toContain("✅ 已完成 · 20 步 · 1.0s");
+    expect(progressHeaderText(card)).toContain("✅ Done · 20 steps · 1.0s");
   });
 });
 
@@ -592,7 +641,7 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     expect(progressDetailItems(card)[0].type).toBe("TextBlock");
   });
 
-  it("advertise RichTextBlock → 步骤渲成 RichTextBlock(一行内多样式;label bold、状态/耗时着色),plain 一行完整不分行", () => {
+  it("advertise RichTextBlock → 单步 label 使用灰色常规字重,plain 一行完整不分行", () => {
     // 优于 ColumnSet 列的原因:服务端 Finalize 权威重算 plain 时,ColumnSet 会把图标列/文本列
     // 各当一行,输出成"⌨️\n执行命令:ls · 200ms"两行(降级客户端视觉退化)。RichTextBlock 是单元素,
     // 内联多段样式,plain 输出干净一行。
@@ -607,12 +656,35 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
       : detailItem;
     expect(row.type).toBe("RichTextBlock");
     const inlines = row.inlines as Array<Record<string, unknown>>;
-    // 至少有:图标段、label(bold)段、summary/duration 段
+    // 至少有:图标段、label(subtle)段、summary/duration 段
     expect(inlines.length).toBeGreaterThanOrEqual(2);
-    const bolded = inlines.find((i) => i.weight === "Bolder");
-    expect(bolded?.text).toBe("执行命令");
-    expect(plain).toContain("⌨️ 执行命令：ls · 200ms"); // plain 一行完整
-    expect(plain).not.toContain("⌨️\n执行命令"); // 关键:不分行
+    const label = inlines.find((i) => i.text === "exec");
+    expect(label).toMatchObject({ text: "exec", isSubtle: true });
+    expect(label).not.toHaveProperty("weight");
+    expect(plain).toContain("⌨️ exec: ls · 200ms"); // plain 一行完整
+    expect(plain).not.toContain("⌨️\nexec"); // 关键:不分行
+  });
+
+  it("advertise RichTextBlock → 合并步骤 label 使用灰色常规字重", () => {
+    const caps = { elements: new Set(["TextBlock", "RichTextBlock", "Container", "ColumnSet"]) };
+    const { card } = renderProgressCard(
+      {
+        phase: "tool",
+        steps: [
+          { tool: "exec", status: "done", durationMs: 100 },
+          { tool: "exec", status: "done", durationMs: 200 },
+        ],
+      },
+      caps,
+    );
+    const detailItem = progressDetailItems(card)[0];
+    const row = detailItem.type === "Container"
+      ? (detailItem.items as Array<Record<string, unknown>>)[0]
+      : detailItem;
+    const inlines = row.inlines as Array<Record<string, unknown>>;
+    const label = inlines.find((inline) => inline.text === "exec");
+    expect(label).toMatchObject({ text: "exec", isSubtle: true });
+    expect(label).not.toHaveProperty("weight");
   });
 
   it("advertise Container+RichTextBlock → 进度步骤按 thinking 阶段收进 timeline 容器", () => {
@@ -636,8 +708,8 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     expect(containers[0].items?.map((e) => e.type)).toEqual(["RichTextBlock", "RichTextBlock"]);
     expect(containers[1].style).toBe("warning");
     expect(containers[1].items?.[0]?.type).toBe("RichTextBlock");
-    expect(plain).toContain("💭 思考 · 3.0s");
-    expect(plain).toContain("⌨️ 执行命令：find · 100ms");
+    expect(plain).toContain("💭 Reasoning · 3.0s");
+    expect(plain).toContain("⌨️ exec: find · 100ms");
   });
 
   it("advertise ToggleVisibility → terminal card defaults collapsed and buttons target timeline_detail", () => {
@@ -665,21 +737,20 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     const headerBlock = summaryHeader.columns[0].items[0] as { type: string; inlines: Array<Record<string, unknown>> };
     expect(headerBlock.type).toBe("RichTextBlock");
     expect(headerBlock.inlines).toMatchObject([
-      { text: "✅ 已完成", weight: "Bolder" },
-      { text: " · 2 步 · 3.2s", isSubtle: true },
+      { text: "✅ Done", weight: "Bolder" },
+      { text: " · 2 steps · 3.2s", isSubtle: true },
     ]);
     const summaryBlock = summaryHeader.columns[0].items[1] as { type: string; inlines: Array<Record<string, unknown>> };
     expect(summaryBlock.inlines).toMatchObject([
-      { text: "推理与工具调用", weight: "Bolder" },
-      { text: " · 思考 1 · 工具 1 · 2 步", isSubtle: true },
+      { text: "Reasoning 1 · Tools 1", isSubtle: true },
     ]);
 
     const collapseBtn = summaryHeader.columns[1].items[0] as { id: string; isVisible: boolean; actions: Array<Record<string, unknown>> };
     const expandBtn = summaryHeader.columns[1].items[1] as { id: string; isVisible: boolean; actions: Array<Record<string, unknown>> };
     expect(collapseBtn.isVisible).toBe(false);
     expect(expandBtn.isVisible).toBe(true);
-    expect(collapseBtn.actions[0]).toMatchObject({ type: "Action.ToggleVisibility", title: "收起推理" });
-    expect(expandBtn.actions[0]).toMatchObject({ type: "Action.ToggleVisibility", title: "展开推理" });
+    expect(collapseBtn.actions[0]).toMatchObject({ type: "Action.ToggleVisibility", title: "Hide details" });
+    expect(expandBtn.actions[0]).toMatchObject({ type: "Action.ToggleVisibility", title: "Show details" });
 
     const detail = body[1] as { type: string; id: string; isVisible: boolean; items: Array<Record<string, unknown>> };
     expect(detail.type).toBe("Container");
@@ -697,9 +768,10 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     ]);
     expect(detail.items[0].type).toBe("Container");
     expect(JSON.stringify(detail.items)).toContain("💭");
-    expect(JSON.stringify(detail.items)).toContain("执行命令");
-    expect(plain).toContain("推理与工具调用 · 思考 1 · 工具 1 · 2 步");
-    expect(plain).toContain("⌨️ 执行命令：find · 100ms");
+    expect(JSON.stringify(detail.items)).toContain("exec");
+    expect(plain).toContain("Reasoning 1 · Tools 1");
+    expect(plain).not.toContain("2/2 steps");
+    expect(plain).toContain("⌨️ exec: find · 100ms");
   });
 
   it("advertise ToggleVisibility → running card keeps timeline_detail visible", () => {
@@ -762,20 +834,20 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     expect(card.metadata).toBeUndefined(); // enhanced root 超预算后降级普通平面卡
   });
 
-  it("P1-g: __thinking__ 特殊 tool 名 → icon 💭, label '思考'(done 时用 icon, running 时仍用 ⏳)", () => {
+  it("P1-g: __thinking__ 特殊 tool 名 → icon 💭, label 'Reasoning'(done 时用 icon, running 时仍用 ⏳)", () => {
     // done 状态:显示 💭 思考
     const done = renderProgressCard({
       phase: "tool",
       steps: [{ tool: "__thinking__", status: "done", durationMs: 200 }],
     });
-    expect(progressDetailText(done.card)).toContain("💭 思考");
+    expect(progressDetailText(done.card)).toContain("💭 Reasoning");
     expect(progressDetailText(done.card)).toContain("200ms");
     // running 状态:仍用 ⏳(running 图标),label 是"思考"
     const running = renderProgressCard({
       phase: "thinking",
       steps: [{ tool: "__thinking__", status: "running" }],
     });
-    expect(progressDetailText(running.card)).toContain("⏳ 思考");
+    expect(progressDetailText(running.card)).toContain("⏳ Reasoning");
   });
 
   it("子任务等待作为独立明细展示,不能误算成工具耗时", () => {
@@ -790,9 +862,9 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
       ],
     });
 
-    expect(progressDetailText(card)).toContain("⏸️ 等待子任务 · 65.0s");
-    expect(plain).toContain("任务过程 · 思考 1 · 工具 2 · 等待 1 · 4 步");
-    expect(plain).not.toContain("工具 3");
+    expect(progressDetailText(card)).toContain("⏸️ Waiting for subtask · 1m 5s");
+    expect(plain).toContain("Reasoning 1 · Tools 2 · Waiting 1");
+    expect(plain).not.toContain("Tools 3");
   });
 
   it("P1-g: 连续 thinking done 触发同类合并 → 💭 思考 × N", () => {
@@ -806,8 +878,8 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     });
     const t = progressDetailText(card);
     expect(t).toContain("💭");
-    expect(t).toContain("思考 × 3");
-    expect(t).toContain("共 600ms");
+    expect(t).toContain("Reasoning × 3");
+    expect(t).toContain("total 600ms");
   });
 
   it("cardSupports 支持 input/action 查询(与 element 同接口):advertise 以其为准", () => {

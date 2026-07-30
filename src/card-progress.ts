@@ -739,8 +739,8 @@ export async function finalizeCard(
   const entry = cards.get(sessionKey);
   if (!entry) return;
   // 等待 in-flight flush 落定后再接管。否则:首帧 send 尚未 return 时 messageId 未就绪,
-  // 直接删 entry 会跳过终态帧,占位卡「正在处理…」永久冻结;若有 in-flight 中间帧
-  // (transient)edit,还可能后于终态帧落库、把「✅ 已完成」覆盖回「正在处理」。await 后
+  // 直接删 entry 会跳过终态帧,占位卡「🤖 Working…」永久冻结;若有 in-flight 中间帧
+  // (transient)edit,还可能后于终态帧落库、把「✅ Done」覆盖回「Working…」。await 后
   // messageId 必已就绪、edit 顺序也串好。flush 内部已 catch+告警,这里吞掉即可。
   if (entry.flushPromise) {
     try { await entry.flushPromise; } catch { /* flush 内部已告警 */ }
@@ -1179,7 +1179,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     // 被连续投递),忽略(去重)。
     const last = entry.steps[entry.steps.length - 1];
     if (last && last.tool === "__thinking__" && last.status === "running") return;
-    // 首段思考(尚无真实工具步)→ header 显示"🤖 思考中…";真实工具跑过后保持"正在处理…"。
+    // 首段思考(尚无真实工具步)→ header 显示 "🤖 Thinking…";真实工具跑过后保持 "🤖 Working…"。
     const hadRealStep = entry.steps.some((s) => s.tool !== "__thinking__");
     if (!hadRealStep) entry.phase = "thinking";
     entry.steps.push({
@@ -1190,7 +1190,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     });
     // 懒发契约(模块头:"首个工具事件懒发占位卡"):**纯思考不发首帧卡**。仅当卡已存在(messageId)
     // 或已有真实工具步时才刷新 —— 否则纯文本 / 纯 display-card turn 的思考步会误发一张占位卡,
-    // 并在收尾时 finalize 成误导性的"⚠️ 已中断",正是 P1-h 想消除的噪音。
+    // 并在收尾时 finalize 成误导性的 "⚠️ Interrupted",正是 P1-h 想消除的噪音。
     if (entry.messageId || hadRealStep) scheduleFlush(sk!, entry);
   });
 

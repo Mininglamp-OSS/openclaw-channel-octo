@@ -93,7 +93,26 @@ export interface BuildDisplayCardOptions {
    * 进度卡文案上游已逐 sink 脱敏 → 传 true(sanitize 用 generic=false,不再二次误删 git SHA 等)。
    */
   trusted?: boolean;
+  /**
+   * 超服务端限制丢块时的截断提示。默认中文,与其余卡面文案一致;进度卡等**整卡已英文化**的
+   * 调用方覆盖它,避免同一张卡里中英混排。
+   */
+  dropMarker?: DropMarker;
 }
+
+/** dropped → 卡面文案 + plain 兜底文案(plain 略去括号里的原因,与正文行宽对齐)。 */
+export type DropMarker = (dropped: number) => { text: string; plain: string };
+
+const DEFAULT_DROP_MARKER: DropMarker = (dropped) => ({
+  text: `… 省略 ${dropped} 项(超出服务端限制)`,
+  plain: `… 省略 ${dropped} 项`,
+});
+
+/** 英文卡面用的截断提示(进度卡)。 */
+export const EN_DROP_MARKER: DropMarker = (dropped) => ({
+  text: `… ${dropped} more items dropped (server limit)`,
+  plain: `… ${dropped} more items dropped`,
+});
 
 export interface BuildDisplayCardResult {
   card: Record<string, unknown>;
@@ -142,6 +161,7 @@ function adaptiveCard(body: Record<string, unknown>[]): Record<string, unknown> 
 function fitRenderedGroups(
   groups: Rendered[],
   caps: CardCaps | undefined,
+  dropMarker: DropMarker,
 ): { body: Record<string, unknown>[]; plainLines: string[] } {
   if (!caps?.maxNodes && !caps?.maxDepth && !caps?.maxPayloadBytes) {
     return {
@@ -170,8 +190,7 @@ function fitRenderedGroups(
 
   if (dropped > 0 && cardSupports(caps, "TextBlock")) {
     while (true) {
-      const markerText = `… 省略 ${dropped} 项(超出服务端限制)`;
-      const markerPlain = `… 省略 ${dropped} 项`;
+      const { text: markerText, plain: markerPlain } = dropMarker(dropped);
       const marker = textBlock(markerText);
       if (cardFitsLimits(adaptiveCard([...body, marker]), [...plainLines, markerPlain].join("\n"), caps)) {
         body.push(marker);
@@ -674,7 +693,7 @@ function renderBlocks(blocks: DisplayBlock[], ctx: RenderCtx): Rendered {
  * plain = 纯文本兜底(与布局无关,服务端 Finalize 会权威重算)。
  */
 export function buildDisplayCard(opts: BuildDisplayCardOptions): BuildDisplayCardResult {
-  const { title, blocks, caps, trusted } = opts;
+  const { title, blocks, caps, trusted, dropMarker = DEFAULT_DROP_MARKER } = opts;
   // Every currently supported block either is TextBlock or degrades through TextBlock.
   // An explicitly advertised capability set without TextBlock has no safe output shape.
   if (caps?.elements !== undefined && !cardSupports(caps, "TextBlock")) {
@@ -704,7 +723,7 @@ export function buildDisplayCard(opts: BuildDisplayCardOptions): BuildDisplayCar
     firstRendered.plainLines.shift();
   }
   groups.push(...renderedGroups.filter((group) => group.elements.length > 0 || group.plainLines.length > 0));
-  const { body, plainLines } = fitRenderedGroups(groups, caps);
+  const { body, plainLines } = fitRenderedGroups(groups, caps, dropMarker);
   const card = adaptiveCard(body);
   return { card, plain: plainLines.join("\n") };
 }

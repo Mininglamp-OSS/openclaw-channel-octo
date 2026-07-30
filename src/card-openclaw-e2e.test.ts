@@ -222,7 +222,9 @@ async function runLifecycleFlow({
     expect(checkpoint.cards).toHaveLength(1);
     expect(checkpoint.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
     expect(checkpoint.cards[0]?.plainSource).toBe("accepted-edit");
-    expect(cardText(checkpoint.cards[0])).toContain("Waiting for subtask...");
+    // Model B prefixes the running step with ⏳ and Model A appends an ellipsis, so assert the
+    // shared substring rather than either renderer's decoration.
+    expect(cardText(checkpoint.cards[0])).toContain("Waiting for subtask");
     // Paused cards may remain visible for up to the one-hour retention window, so the
     // waiting frame must be durable and available to late-joining clients.
     expect(checkpoint.cards[0]?.transient).toBe(false);
@@ -266,10 +268,17 @@ async function runLifecycleFlow({
   expect(cardText(completed.cards[0])).toContain("exec · printf · exit 0");
   if (pausedCheckpointDelayMs !== undefined) {
     expect(completed.cards[0]?.plainSource).toBe("accepted-edit");
+    // A settled wait reads "Subtask returned" on Model A and keeps the step label on Model B;
+    // either way the duration may now be m/h formatted, so a bare `([\d.]+)s` would miss a
+    // wait longer than a minute — which is exactly what this checkpoint produces.
     const text = cardText(completed.cards[0]);
-    const waitDuration = text.match(/Subtask returned · ([\d.]+)s/)?.[1];
-    expect(waitDuration, text).toBeDefined();
-    expect(Number(waitDuration)).toBeGreaterThanOrEqual(pausedCheckpointDelayMs / 1_000);
+    const waitDuration = text.match(
+      /(?:Subtask returned|Waiting for subtask) · (?:(\d+)h )?(?:(\d+)m )?(?:(\d+(?:\.\d+)?)s)/,
+    );
+    expect(waitDuration, text).not.toBeNull();
+    const waitSeconds = Number(waitDuration?.[1] ?? 0) * 3600 +
+      Number(waitDuration?.[2] ?? 0) * 60 + Number(waitDuration?.[3] ?? 0);
+    expect(waitSeconds).toBeGreaterThanOrEqual(pausedCheckpointDelayMs / 1_000);
   }
   expect(completed.phases).toEqual(["paused", "resuming", "done"]);
   expect(completed.childExec).toBe(true);

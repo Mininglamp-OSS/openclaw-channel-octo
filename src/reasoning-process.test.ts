@@ -42,13 +42,13 @@ describe("ai.reasoning-process successor-compatible contract", () => {
     expect(data).toMatchObject({
       reasoningId: "agent:main:octo:room:run-1",
       state: "completed",
-      title: "已深度思考",
-      statusLabel: "已完成",
+      title: "Reasoning",
+      statusLabel: "Done",
       statusTone: "Good",
-      timerText: "用时 12.0s · 1 段推理 · 1 次工具调用",
+      timerText: "12.0s · 1 phase · 1 tool call",
       traceExpanded: false,
       traceCollapsed: true,
-      collapsedSummary: "已思考 12.0s · 推理过程已收起",
+      collapsedSummary: "12.0s · trace collapsed",
     });
     expect(data.phases).toEqual([
       {
@@ -68,39 +68,43 @@ describe("ai.reasoning-process successor-compatible contract", () => {
   it("maps active, answering, stopped, and error phases to contract states", () => {
     expect(buildReasoningProcessData(state({ phase: "tool", elapsedMs: 2_000 }))).toMatchObject({
       state: "reasoning",
-      statusLabel: "思考中",
+      statusLabel: "Thinking",
       statusTone: "Accent",
       traceExpanded: true,
       traceCollapsed: false,
-      progressText: "Working through...",
+      progressText: "Working through…",
     });
     expect(buildReasoningProcessData(state({ phase: "paused" }))).toMatchObject({
       state: "reasoning",
-      progressText: "Waiting for subtask...",
+      progressText: "Waiting for subtask…",
     });
     expect(buildReasoningProcessData(state({ phase: "resuming" }))).toMatchObject({
       state: "reasoning",
-      progressText: "Subtask returned. Wrapping up...",
+      progressText: "Subtask returned. Wrapping up…",
     });
     expect(buildReasoningProcessData(state({ phase: "answering" }))).toMatchObject({
       state: "answering",
-      statusLabel: "回答中",
-      progressText: "推理已完成，正在生成回答…",
+      statusLabel: "Answering",
+      progressText: "Reasoning complete. Writing the answer…",
     });
     expect(buildReasoningProcessData(state({ phase: "stopped", elapsedMs: 6_000 }))).toMatchObject({
       state: "stopped",
-      statusLabel: "已停止",
+      statusLabel: "Stopped",
       statusTone: "Warning",
       traceExpanded: false,
       traceCollapsed: true,
+      // `stopped at phase N` is an ordinal position, matching the copy it replaced — the count
+      // reading ("stopped at N phases") happens to share the number and must not creep back in.
+      timerText: "6.0s · stopped at phase 1",
+      collapsedSummary: "Kept 1 phase from before the stop",
     });
     expect(buildReasoningProcessData(state({ phase: "error", errorText: "provider timeout" }))).toMatchObject({
       state: "error",
-      statusLabel: "生成失败",
+      statusLabel: "Failed",
       statusTone: "Attention",
       traceExpanded: true,
       traceCollapsed: false,
-      errorTitle: "生成失败",
+      errorTitle: "Generation failed",
       errorMessage: "provider timeout",
     });
   });
@@ -128,21 +132,21 @@ describe("ai.reasoning-process successor-compatible contract", () => {
       ],
     }));
 
-    expect(data.phases[0]?.actions[0]?.detail).toBe("Subtask returned · 75.0s");
+    expect(data.phases[0]?.actions[0]?.detail).toBe("Subtask returned · 1m 15s");
   });
 
   it("uses English fallback copy when phase and action details are unavailable", () => {
     const detailFor = (step: CardProgressState["steps"][number]): string | undefined =>
       buildReasoningProcessData(state({ steps: [step] })).phases[0]?.actions[0]?.detail;
 
-    expect(detailFor({ tool: "__thinking__", status: "running" })).toBe("Planning next step...");
+    expect(detailFor({ tool: "__thinking__", status: "running" })).toBe("Planning next step…");
     expect(detailFor({ tool: "__thinking__", status: "error" })).toBe("Phase stopped");
     expect(detailFor({ tool: "__thinking__", status: "done" })).toBe("Phase complete");
-    expect(detailFor({ tool: "read", status: "running" })).toBe("Running...");
+    expect(detailFor({ tool: "read", status: "running" })).toBe("Running…");
     expect(detailFor({ tool: "read", status: "error" })).toBe("Call failed");
     expect(detailFor({ tool: "read", status: "done" })).toBe("Completed");
     expect(detailFor({ tool: SUBAGENT_WAIT_STEP_TOOL, status: "running" }))
-      .toBe("Waiting for subtask...");
+      .toBe("Waiting for subtask…");
 
     expect(buildReasoningProcessData(state({ phase: "expired" })).errorMessage)
       .toBe("Timed out waiting for the background task.");
@@ -326,10 +330,10 @@ describe("reasoning detail sanitization", () => {
 
   it("redacts secret-shaped or protected internal reasoning and bounds visible text", () => {
     expect(sanitizeReasoningThought("Authorization: Bearer abcdefghijklmnop"))
-      .toBe("Thinking through...");
+      .toBe("Thinking through…");
     expect(sanitizeReasoningThought(
       "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>> private completion event",
-    )).toBe("Thinking through...");
+    )).toBe("Thinking through…");
     expect(sanitizeReasoningThought("x".repeat(600)).length).toBeLessThanOrEqual(281);
   });
 
@@ -363,7 +367,7 @@ describe("reasoning detail sanitization", () => {
 
     step.thought = "Checking the reducer. Authorization: Bearer abcdefghijklmnop";
     expect(buildReasoningProcessData(state({ steps })).phases[0]?.thought)
-      .toBe("Thinking through...");
+      .toBe("Thinking through…");
 
     step.thought = "Checking the reducer again.";
     expect(buildReasoningProcessData(state({ steps })).phases[0]?.thought)

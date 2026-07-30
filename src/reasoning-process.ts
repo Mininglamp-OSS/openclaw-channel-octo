@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CARD_PLACEHOLDER, CARD_VERSION } from "./types.js";
+import { CARD_VERSION } from "./types.js";
 import type { CardTemplateRef, CardTemplatingCapability } from "./api-fetch.js";
 import { cardFitsLimits } from "./card-limits.js";
 import {
@@ -9,6 +9,7 @@ import {
   fmtDuration,
   isSensitive,
   reduceUrlsInText,
+  PROGRESS_CARD_PLACEHOLDER,
   renderProgressCard,
   sanitizeErrorText,
   type CardCaps,
@@ -49,7 +50,7 @@ export interface ReasoningProcessData {
   errorMessage?: string;
 }
 
-const FALLBACK_THOUGHT = "Thinking through...";
+const FALLBACK_THOUGHT = "Thinking through…";
 const THOUGHT_MAX = 280;
 const TOOL_NAME_MAX = 80;
 const MAX_RENDERED_PHASES = 6;
@@ -219,7 +220,7 @@ function safeToolName(tool: string): string {
 
 function actionDetail(step: CardStep): string {
   if (step.tool === SUBAGENT_WAIT_STEP_TOOL) {
-    const label = step.status === "running" ? "Waiting for subtask..." : "Subtask returned";
+    const label = step.status === "running" ? "Waiting for subtask…" : "Subtask returned";
     const duration = fmtDuration(step.durationMs);
     return duration ? `${label} · ${duration}` : label;
   }
@@ -227,7 +228,7 @@ function actionDetail(step: CardStep): string {
   const parts = [step.summary, step.status === "error" ? error : step.resultSummary]
     .filter((value): value is string => !!value);
   if (parts.length > 0) return parts.join(" · ");
-  if (step.status === "running") return "Running...";
+  if (step.status === "running") return "Running…";
   if (step.status === "error") return "Call failed";
   return "Completed";
 }
@@ -270,7 +271,7 @@ function phasesFromSteps(
     if (phase.actions.length > 0) continue;
     const thinking = thinkingSteps[index];
     const duration = fmtDuration(thinking?.durationMs);
-    const detail = thinking?.status === "running" ? "Planning next step..."
+    const detail = thinking?.status === "running" ? "Planning next step…"
       : thinking?.status === "error" ? "Phase stopped"
         : "Phase complete";
     phase.actions.push({
@@ -283,6 +284,14 @@ function phasesFromSteps(
     });
   }
   return phases;
+}
+
+function phaseCount(n: number): string {
+  return `${n} ${n === 1 ? "phase" : "phases"}`;
+}
+
+function toolCallCount(n: number): string {
+  return `${n} ${n === 1 ? "tool call" : "tool calls"}`;
 }
 
 function contractState(phase: CardProgressState["phase"]): ReasoningProcessState {
@@ -313,38 +322,38 @@ function buildReasoningProcessDataWithPhases(
   const base: ReasoningProcessData = {
     reasoningId: state.reasoningId?.trim() || "octo-progress",
     state: mapped,
-    title: "已深度思考",
-    statusLabel: mapped === "reasoning" ? "思考中"
-      : mapped === "answering" ? "回答中"
-        : mapped === "completed" ? "已完成"
-          : mapped === "stopped" ? "已停止"
-            : "生成失败",
+    title: "Reasoning",
+    statusLabel: mapped === "reasoning" ? "Thinking"
+      : mapped === "answering" ? "Answering"
+        : mapped === "completed" ? "Done"
+          : mapped === "stopped" ? "Stopped"
+            : "Failed",
     statusTone: mapped === "reasoning" || mapped === "answering" ? "Accent"
       : mapped === "completed" ? "Good"
         : mapped === "stopped" ? "Warning"
           : "Attention",
-    timerText: mapped === "reasoning" ? "正在深度思考…"
-      : mapped === "answering" ? "正在生成回答…"
-        : mapped === "stopped" ? `已思考 ${elapsed} · 已停止于第 ${phases.length} 段`
-          : mapped === "error" ? "已中断"
-            : `用时 ${elapsed} · ${phases.length} 段推理 · ${toolCount} 次工具调用`,
+    timerText: mapped === "reasoning" ? "Reasoning…"
+      : mapped === "answering" ? "Writing the answer…"
+        : mapped === "stopped" ? `${elapsed} · stopped at phase ${phases.length}`
+          : mapped === "error" ? "Interrupted"
+            : `${elapsed} · ${phaseCount(phases.length)} · ${toolCallCount(toolCount)}`,
     traceExpanded: active || mapped === "error",
     traceCollapsed: !active && mapped !== "error",
-    collapsedSummary: mapped === "answering" ? "推理已完成 · 回答正在生成"
-      : mapped === "stopped" ? `已保留停止前的 ${phases.length} 段推理过程`
-        : mapped === "error" ? "生成已中断 · 点击可查看停止前的过程"
-          : mapped === "completed" ? `已思考 ${elapsed} · 推理过程已收起`
-            : "推理仍在进行 · 点击可查看当前过程",
+    collapsedSummary: mapped === "answering" ? "Reasoning complete · answer in progress"
+      : mapped === "stopped" ? `Kept ${phaseCount(phases.length)} from before the stop`
+        : mapped === "error" ? "Interrupted · open to see the steps so far"
+          : mapped === "completed" ? `${elapsed} · trace collapsed`
+            : "Reasoning in progress · open to follow along",
     phases,
   };
   if (mapped === "reasoning") {
-    base.progressText = state.phase === "paused" ? "Waiting for subtask..."
-      : state.phase === "resuming" ? "Subtask returned. Wrapping up..."
-        : "Working through...";
+    base.progressText = state.phase === "paused" ? "Waiting for subtask…"
+      : state.phase === "resuming" ? "Subtask returned. Wrapping up…"
+        : "Working through…";
   } else if (mapped === "answering") {
-    base.progressText = "推理已完成，正在生成回答…";
+    base.progressText = "Reasoning complete. Writing the answer…";
   } else if (mapped === "error") {
-    base.errorTitle = "生成失败";
+    base.errorTitle = "Generation failed";
     base.errorMessage = errorMessage;
   }
   return base;
@@ -411,7 +420,7 @@ function plainText(data: ReasoningProcessData): string {
   }
   if (data.progressText) lines.push(data.progressText);
   if (data.errorMessage) lines.push(data.errorMessage);
-  return lines.join("\n") || CARD_PLACEHOLDER;
+  return lines.join("\n") || PROGRESS_CARD_PLACEHOLDER;
 }
 
 /** Render the local toggle-only variant of the shared 0.1.0/0.2.0 data contract. */
@@ -470,7 +479,7 @@ export function renderReasoningProcessCard(
           style: "attention",
           spacing: "Large",
           items: [
-            textBlock(data.errorTitle ?? "生成失败", { weight: "Bolder", color: "Attention", spacing: "None" }),
+            textBlock(data.errorTitle ?? "Generation failed", { weight: "Bolder", color: "Attention", spacing: "None" }),
             textBlock(data.errorMessage, { size: "Small", spacing: "Small" }),
           ],
         }] : []),
@@ -497,7 +506,7 @@ export function renderReasoningProcessCard(
         actions: [{
           type: "Action.ToggleVisibility",
           id: "reasoning_toggle",
-          title: "显示 / 隐藏推理",
+          title: "Show / hide reasoning",
           targetElements: ["trace_panel", "collapsed_panel"],
         }],
       }],

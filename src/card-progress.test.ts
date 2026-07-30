@@ -951,7 +951,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(payload?.template_ref).toMatchObject({ id: "ai.reasoning-process" });
     const phases = payload?.data?.phases ?? [];
     expect(phases.length).toBeGreaterThan(0);
-    expect(phases.every((phase) => phase.thought === "Thinking through...")).toBe(true);
+    expect(phases.every((phase) => phase.thought === "Thinking through…")).toBe(true);
     expect(phases.some((phase) => phase.actions.length > 0)).toBe(true);
     expect(JSON.stringify(payload?.data)).not.toContain("MUST STAY HIDDEN");
   });
@@ -1230,7 +1230,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((c) => c.url.includes("/message/edit"));
     expect(edit).toBeTruthy();
     const env = JSON.parse(edit!.body!.content_edit as string);
-    expect(progressHeaderText(env.card)).toContain("✅ 已完成");
+    expect(progressHeaderText(env.card)).toContain("✅ Done");
     expect(env.transient).toBeUndefined(); // 终态帧进修订历史(不带 transient)
   });
 
@@ -1261,8 +1261,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((call) => call.url.includes("/message/edit"));
     expect(edit).toBeTruthy();
     const env = JSON.parse(edit!.body!.content_edit as string);
-    expect(progressHeaderText(env.card)).toContain("⏸️ 等待任务结果");
-    expect(progressHeaderText(env.card)).not.toContain("已中断");
+    expect(progressHeaderText(env.card)).toContain("⏸️ Waiting for results");
+    expect(progressHeaderText(env.card)).not.toContain("Interrupted");
   });
 
   it("yielded lifecycle 后保留原卡,后续 run 开始时整理、结束时完成", async () => {
@@ -1304,11 +1304,11 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const pausedEdit = calls.find((call) => {
       if (!call.url.includes("/message/edit")) return false;
       const env = JSON.parse(call.body!.content_edit as string);
-      return progressHeaderText(env.card).includes("⏸️ 等待任务结果");
+      return progressHeaderText(env.card).includes("⏸️ Waiting for results");
     });
     expect(pausedEdit).toBeTruthy();
     expect(progressCardText(JSON.parse(pausedEdit!.body!.content_edit as string).card))
-      .toContain("⏳ 等待子任务");
+      .toContain("⏳ Waiting for subtask");
 
     await vi.advanceTimersByTimeAsync(65_000);
 
@@ -1327,11 +1327,11 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const resumingEdit = calls.find((call) => {
       if (!call.url.includes("/message/edit")) return false;
       const env = JSON.parse(call.body!.content_edit as string);
-      return progressHeaderText(env.card).includes("🤖 正在整理结果");
+      return progressHeaderText(env.card).includes("🤖 Preparing results");
     });
     expect(resumingEdit).toBeTruthy();
     expect(progressCardText(JSON.parse(resumingEdit!.body!.content_edit as string).card))
-      .toContain("⏸️ 等待子任务 · 65.0s");
+      .toContain("⏸️ Waiting for subtask · 1m 5s");
 
     calls.length = 0;
     await emitLifecycle({
@@ -1343,7 +1343,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const completed = calls.find((call) => call.url.includes("/message/edit"));
     expect(completed).toBeTruthy();
     const completedEnv = JSON.parse(completed!.body!.content_edit as string);
-    expect(progressHeaderText(completedEnv.card)).toContain("✅ 已完成");
+    expect(progressHeaderText(completedEnv.card)).toContain("✅ Done");
   });
 
   it("无关用户 run 不得劫持 paused 卡,真正 completion run 仍可继续更新", async () => {
@@ -1417,7 +1417,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(calls.some((call) => {
       if (!call.url.includes("/message/edit")) return false;
       const env = JSON.parse(call.body!.content_edit as string);
-      return progressHeaderText(env.card).includes("🤖 正在整理结果");
+      return progressHeaderText(env.card).includes("🤖 Preparing results");
     })).toBe(true);
 
     calls.length = 0;
@@ -1429,7 +1429,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     });
     const finalEdit = calls.find((call) => call.url.includes("/message/edit"));
     expect(finalEdit).toBeTruthy();
-    expect(progressHeaderText(JSON.parse(finalEdit!.body!.content_edit as string).card)).toContain("✅ 已完成");
+    expect(progressHeaderText(JSON.parse(finalEdit!.body!.content_edit as string).card)).toContain("✅ Done");
   });
 
   it("乱序 start/end 编辑必须串行,最终不能被迟到的 resuming 覆盖", async () => {
@@ -1449,7 +1449,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
       if (String(url).includes("/message/edit")) {
         const env = JSON.parse(body.content_edit as string);
         const header = progressHeaderText(env.card);
-        if (header.includes("正在整理结果")) {
+        if (header.includes("Preparing result")) {
           resumingReached.resolve();
           await releaseResuming.promise;
         }
@@ -1500,7 +1500,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     await Promise.all([startEvent, endEvent]);
 
     expect(appliedHeaders.length).toBeGreaterThanOrEqual(2);
-    expect(appliedHeaders.at(-1)).toContain("✅ 已完成");
+    expect(appliedHeaders.at(-1)).toContain("✅ Done");
   });
 
   it("旧 host 无 lifecycle API 时仍可由受信 completion prompt + agent_end 完成卡片", async () => {
@@ -1538,7 +1538,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
 
     const edits = calls.filter((call) => call.url.includes("/message/edit"));
     const lastEnv = JSON.parse(edits.at(-1)!.body!.content_edit as string);
-    expect(progressHeaderText(lastEnv.card)).toContain("✅ 已完成");
+    expect(progressHeaderText(lastEnv.card)).toContain("✅ Done");
   });
 
   it("无 continuation 的 paused 卡到期后显示等待超时并释放追踪", async () => {
@@ -1563,7 +1563,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((call) => call.url.includes("/message/edit"));
     expect(edit).toBeTruthy();
     const env = JSON.parse(edit!.body!.content_edit as string);
-    expect(progressHeaderText(env.card)).toContain("⏱️ 等待超时");
+    expect(progressHeaderText(env.card)).toContain("⏱️ Wait timed out");
   });
 
   it("paused 窗口的跨身份同 sessionKey 碰撞必须 fail-closed", async () => {
@@ -1642,8 +1642,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((call) => call.url.includes("/message/edit"));
     expect(edit).toBeTruthy();
     const env = JSON.parse(edit!.body!.content_edit as string);
-    expect(progressHeaderText(env.card)).toContain("已中断");
-    expect(progressHeaderText(env.card)).not.toContain("等待任务结果");
+    expect(progressHeaderText(env.card)).toContain("Interrupted");
+    expect(progressHeaderText(env.card)).not.toContain("Waiting for results");
   });
 
   it("finalizeCard 未发过占位卡 → 仅清理不发", async () => {
@@ -1731,7 +1731,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((c) => c.url.includes("/message/edit"));
     expect(edit).toBeTruthy();
     const env = JSON.parse(edit!.body!.content_edit as string);
-    expect(progressHeaderText(env.card)).toContain("✅ 已完成");
+    expect(progressHeaderText(env.card)).toContain("✅ Done");
     expect(env.transient).toBeUndefined(); // 终态帧进修订历史
   });
 
@@ -1773,7 +1773,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((c) => c.url.includes("/message/edit"));
     expect(edit).toBeTruthy(); // 终态帧未丢
     const env = JSON.parse(edit!.body!.content_edit as string);
-    expect(progressHeaderText(env.card)).toContain("✅ 已完成");
+    expect(progressHeaderText(env.card)).toContain("✅ Done");
   });
 
   it("P2-a: gate 5xx 不缓存,下次 flush 重探成功仍能发卡", async () => {
@@ -1823,8 +1823,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edit).toBeTruthy();
     const env = JSON.parse(edit!.body!.content_edit as string);
     const texts = progressDetailItems(env.card).map(elementText);
-    expect(texts[0]).toBe("⌨️ 执行命令：sleep · 50ms"); // A 已完成
-    expect(texts[1]).toBe("⏳ 执行命令：sleep");          // B 仍 running
+    expect(texts[0]).toBe("⌨️ exec: sleep · 50ms"); // A 已完成
+    expect(texts[1]).toBe("⏳ exec: sleep");          // B 仍 running
   });
 
   it("P2-b(重复投递): toolCallId 命中失败不回退按名匹配,不误标并发步骤", async () => {
@@ -1844,8 +1844,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.filter((c) => c.url.includes("/message/edit")).pop();
     const env = JSON.parse(edit!.body!.content_edit as string);
     const texts = progressDetailItems(env.card).map(elementText);
-    expect(texts[0]).toBe("⌨️ 执行命令：sleep · 50ms"); // A done(只被标一次)
-    expect(texts[1]).toBe("⏳ 执行命令：sleep");          // B 仍 running,未被重复事件误标
+    expect(texts[0]).toBe("⌨️ exec: sleep · 50ms"); // A done(只被标一次)
+    expect(texts[1]).toBe("⏳ exec: sleep");          // B 仍 running,未被重复事件误标
   });
 
   it("J1: finalize await 期间下一 run setCardContext,不误删新 run 的 entry", async () => {
@@ -2070,16 +2070,15 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const summaryHeader = body[0] as { columns: Array<{ width: string; items: Array<Record<string, unknown>> }> };
     const headerBlock = summaryHeader.columns[0].items[0] as { type: string; inlines: Array<Record<string, unknown>> };
     expect(headerBlock.type).toBe("RichTextBlock");
-    expect(headerBlock.inlines[0]).toMatchObject({ text: "✅ 已完成", weight: "Bolder" });
+    expect(headerBlock.inlines[0]).toMatchObject({ text: "✅ Done", weight: "Bolder" });
     const summaryBlock = summaryHeader.columns[0].items[1] as { type: string; inlines: Array<Record<string, unknown>> };
-    expect(summaryBlock.inlines[0]).toMatchObject({ text: "推理与工具调用", weight: "Bolder" });
-    expect(summaryBlock.inlines[1]).toMatchObject({ isSubtle: true });
+    expect(summaryBlock.inlines[0]).toMatchObject({ text: "Reasoning 1 · Tools 1", isSubtle: true });
     const collapseBtn = summaryHeader.columns[1].items[0] as { id: string; isVisible: boolean; actions: Array<Record<string, unknown>> };
     const expandBtn = summaryHeader.columns[1].items[1] as { id: string; isVisible: boolean; actions: Array<Record<string, unknown>> };
     expect(collapseBtn.isVisible).toBe(false);
     expect(expandBtn.isVisible).toBe(true);
-    expect(collapseBtn.actions[0]).toMatchObject({ type: "Action.ToggleVisibility", title: "收起推理" });
-    expect(expandBtn.actions[0]).toMatchObject({ type: "Action.ToggleVisibility", title: "展开推理" });
+    expect(collapseBtn.actions[0]).toMatchObject({ type: "Action.ToggleVisibility", title: "Hide details" });
+    expect(expandBtn.actions[0]).toMatchObject({ type: "Action.ToggleVisibility", title: "Show details" });
     expect((body[1] as { type: string; id: string; isVisible: boolean }).type).toBe("Container");
     expect((body[1] as { id: string }).id).toBe("timeline_detail");
     expect((body[1] as { isVisible: boolean }).isVisible).toBe(false);
@@ -2088,7 +2087,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
       { elementId: collapseBtn.id, isVisible: false },
       { elementId: expandBtn.id, isVisible: true },
     ]);
-    expect(JSON.stringify(body[1])).toContain("执行命令");
+    expect(JSON.stringify(body[1])).toContain("exec");
   });
 
   it("P1-g: model_call_started 产 running thinking step,before_tool_call 结束它(标 done + durationMs)", async () => {
@@ -2110,8 +2109,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     // 首帧应含:header + thinking(done) + read(running/done)
     const joined = progressCardText(card);
-    expect(joined).toContain("💭 思考"); // thinking step 出现
-    expect(joined).toContain("读取文件");  // 后续 tool step 也在
+    expect(joined).toContain("💭 Reasoning"); // thinking step 出现
+    expect(joined).toContain("read");  // 后续 tool step 也在
   });
 
   it("captures reasoning snapshots and tool output summaries into the contract card", async () => {
@@ -2350,7 +2349,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const text = progressCardText(card);
     expect(text).not.toContain("STALE PRIVATE REASONING");
     expect(text).not.toContain("ALSO UNATTRIBUTABLE");
-    expect(text).toContain("读取文件 · 20ms");
+    expect(text).toContain("📖 read · 20ms");
   });
 
   it("yielded reasoning-off run 无 token 的迟到写入不得借用新 run token 公开私有思考", async () => {
@@ -2571,7 +2570,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(send).toBeTruthy();
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN FROM RECORDER");
-    expect(progressCardText(card)).toContain("读取文件 · 20ms");
+    expect(progressCardText(card)).toContain("📖 read · 20ms");
   });
 
   it("recordCardReasoning sink 在 reasoning 关闭时拒绝直接写入", async () => {
@@ -2630,9 +2629,9 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(send).toBeTruthy();
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN");
-    expect(progressCardText(card)).not.toContain("Thinking through...");
-    expect(progressCardText(card)).toContain("推理与工具调用");
-    expect(progressCardText(card)).toContain("读取文件 · 20ms");
+    expect(progressCardText(card)).not.toContain("Thinking through…");
+    expect(progressCardText(card)).toContain("Reasoning 1 · Tools 1");
+    expect(progressCardText(card)).toContain("📖 read · 20ms");
   });
 
   it("captures persisted thinking blocks only when reasoning visibility is enabled", async () => {
@@ -2707,8 +2706,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(send).toBeTruthy();
     const card = (send!.body!.payload as { card: { body: Array<Record<string, unknown>> } }).card;
     expect(progressCardText(card)).not.toContain("MUST STAY HIDDEN");
-    expect(progressCardText(card)).not.toContain("Thinking through...");
-    expect(progressCardText(card)).toContain("推理与工具调用");
+    expect(progressCardText(card)).not.toContain("Thinking through…");
+    expect(progressCardText(card)).toContain("Reasoning 1 · Tools 1");
   });
 
   it("uses model_call_ended duration and preserves aborted as stopped at finalize", async () => {
@@ -2742,7 +2741,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.filter((call) => call.url.includes("/message/edit")).pop();
     expect(edit).toBeTruthy();
     const envelope = JSON.parse(edit!.body!.content_edit as string);
-    expect(progressCardText(envelope.card)).toContain("已停止");
+    expect(progressCardText(envelope.card)).toContain("Stopped");
     expect(progressCardText(envelope.card)).not.toContain("生成失败");
     expect(JSON.stringify(envelope.card)).toContain("1.2s");
   });
@@ -2778,8 +2777,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.find((call) => call.url.includes("/message/edit"));
     expect(edit).toBeTruthy();
     const envelope = JSON.parse(edit!.body!.content_edit as string);
-    expect(progressCardText(envelope.card)).toContain("回答中");
-    expect(progressCardText(envelope.card)).toContain("正在生成回答");
+    expect(progressCardText(envelope.card)).toContain("Answering");
+    expect(progressCardText(envelope.card)).toContain("Writing the answer…");
   });
 
   it("P1-g: 多次 model_call_started 累积多步 thinking(同类合并压缩)", async () => {
@@ -2856,13 +2855,13 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const card = (send!.body!.payload as { card: { metadata?: unknown; body: Array<Record<string, unknown>> } }).card;
     expect(card.metadata).toEqual({ octo_layout: OCTO_CARD_LAYOUTS.agentProgressV1 });
     const joined = progressCardText(card);
-    expect(joined).toContain("读取文件");
+    expect(joined).toContain("read");
     expect(joined).not.toContain("octo_send_display_card");
   });
 
   it("懒发契约:model_call_started 单独不发卡 —— 纯 display-card turn(含思考步)无占位卡、无中断终态", async () => {
     // 回归:P1-g 的 model_call_started 曾无条件 scheduleFlush,击穿 P1-h 抑制 ——
-    // 纯 display-card turn 仍发占位卡并 finalize 成「⚠️ 已中断」。
+    // 纯 display-card turn 仍发占位卡并 finalize 成「⚠️ Interrupted」。
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
     const { handlers } = makeApi();
@@ -2955,8 +2954,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
         return progressCardText(card);
       })
       .join(" || ");
-    expect(allText).toContain("写入文件"); // B 自己的步骤渲染出来了
-    expect(allText).not.toContain("执行命令"); // A 迟到的 exec 步骤从未进入任何帧
+    expect(allText).toContain("write"); // B 自己的步骤渲染出来了
+    expect(allText).not.toContain("exec"); // A 迟到的 exec 步骤从未进入任何帧
   });
 
   it("bindCardRun 缺标识/无 entry/skip 时 no-op,且既有 owner 不可被覆盖", async () => {
@@ -2993,8 +2992,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const rendered = progressCardText((send!.body!.payload as {
       card: { body: Array<Record<string, unknown>> };
     }).card);
-    expect(rendered).toContain("读取文件");
-    expect(rendered).not.toContain("执行命令");
+    expect(rendered).toContain("read");
+    expect(rendered).not.toContain("exec");
   });
 
   it("entry 等待 profile 时被新身份替换,恢复后不得向旧频道发送占位卡", async () => {

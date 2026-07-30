@@ -7,9 +7,17 @@
  * 帧内容:工具名友好化 + 参数摘要 + 耗时,让用户看清 agent 在做什么。
  * 视觉属性仅用端到端验证过的(weight/spacing/size/wrap),不用未验证的 color 以规避白名单。
  */
-import { CARD_PLACEHOLDER, CARD_VERSION } from "./types.js";
-import { buildDisplayCard, type DisplayBlock, type RichSegment } from "./card-blocks.js";
+import { CARD_VERSION } from "./types.js";
+import { buildDisplayCard, EN_DROP_MARKER, type DisplayBlock, type RichSegment } from "./card-blocks.js";
 import { cardFitsLimits, type CardLimits } from "./card-limits.js";
+
+/**
+ * Plain-text fallback for the progress / reasoning card. Deliberately not `CARD_PLACEHOLDER`:
+ * that constant is the **inbound** derivation for a received card and feeds the model in a
+ * Chinese-copy context, whereas these two renderers are English end to end. Reachable here when a
+ * tight negotiated payload budget drops every group and the body degrades to empty.
+ */
+export const PROGRESS_CARD_PLACEHOLDER = "[card]";
 
 export const OCTO_CARD_LAYOUTS = {
   agentProgressV1: "agent_progress_v1",
@@ -73,37 +81,34 @@ export interface CardProgressState {
 const MCP_TOOL_PREFIX = "mcp__";
 export const SUBAGENT_WAIT_STEP_TOOL = "__subagent_wait__";
 
-/** 常见工具 → 图标 + 中文标签;未知工具用通用图标 + 原名。 */
-const TOOL_META: Record<string, { icon: string; label: string }> = {
-  read: { icon: "📖", label: "读取文件" },
-  write: { icon: "✏️", label: "写入文件" },
-  edit: { icon: "✏️", label: "编辑文件" },
-  apply_patch: { icon: "✏️", label: "修改代码" },
-  exec: { icon: "⌨️", label: "执行命令" },
-  bash: { icon: "⌨️", label: "执行命令" },
-  shell: { icon: "⌨️", label: "执行命令" },
-  process: { icon: "⚙️", label: "运行进程" },
-  search: { icon: "🔍", label: "搜索" },
-  grep: { icon: "🔍", label: "搜索内容" },
-  find: { icon: "🔍", label: "查找文件" },
-  glob: { icon: "🔍", label: "查找文件" }, // 别名兜底;host 内建工具名是 find(见 SDK ToolName)
-  ls: { icon: "📂", label: "浏览目录" },
-  fetch: { icon: "🌐", label: "抓取网页" },
-  web_search: { icon: "🌐", label: "联网搜索" },
-  update_plan: { icon: "🗺️", label: "更新计划" },
-  octo_management: { icon: "💬", label: "Octo 操作" },
+/** 常见工具只映射图标；fallback 标签始终保留原始 toolName，供客户端按稳定名称做 i18n。 */
+const TOOL_ICONS: Record<string, string> = {
+  read: "📖",
+  write: "✏️",
+  edit: "✏️",
+  apply_patch: "✏️",
+  exec: "⌨️",
+  bash: "⌨️",
+  shell: "⌨️",
+  process: "⚙️",
+  search: "🔍",
+  grep: "🔍",
+  find: "🔍",
+  glob: "🔍",
+  ls: "📂",
+  fetch: "🌐",
+  web_search: "🌐",
+  update_plan: "🗺️",
+  octo_management: "💬",
 };
 
-/** 工具名 → 图标 + 标签。MCP 工具(`mcp__server__tool`)解析 server/tool。 */
+/** 工具名 → 图标 + 原始名称；内部合成步骤使用可读的英文 fallback。 */
 export function resolveToolMeta(tool: string): { icon: string; label: string } {
   // 特殊内部 tool 名:agent 一轮 model_call = 一步"思考"(P1-g)。以 __ 前缀,agent 侧无冲突可能。
-  if (tool === "__thinking__") return { icon: "💭", label: "思考" };
-  if (tool === SUBAGENT_WAIT_STEP_TOOL) return { icon: "⏸️", label: "等待子任务" };
-  if (tool.startsWith(MCP_TOOL_PREFIX)) {
-    const rest = tool.slice(MCP_TOOL_PREFIX.length).replace(/__/g, " / ");
-    return { icon: "🔌", label: `MCP ${rest}` };
-  }
-  return TOOL_META[tool] ?? { icon: "🔧", label: tool };
+  if (tool === "__thinking__") return { icon: "💭", label: "Reasoning" };
+  if (tool === SUBAGENT_WAIT_STEP_TOOL) return { icon: "⏸️", label: "Waiting for subtask" };
+  if (tool.startsWith(MCP_TOOL_PREFIX)) return { icon: "🔌", label: tool };
+  return { icon: TOOL_ICONS[tool] ?? "🔧", label: tool };
 }
 
 const SUMMARY_MAX = 64;
@@ -336,7 +341,20 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
 /** ms → 友好耗时(<1s 用 ms,否则 x.xs)。 */
 export function fmtDuration(ms?: number): string {
   if (typeof ms !== "number") return "";
-  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+  // NaN/Infinity(时钟回拨、未初始化的起点)会一路穿过下面的取整,渲出 `Infinityh NaNm NaNs`。
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return `${ms}ms`;
+  // Pick the unit from the rounded value, not the raw one: `toFixed(1)` rounds up, so branching on
+  // `ms < 60_000` let 59_999 render as `60.0s` — the very output the minute branch exists to avoid.
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${(ms / 1000).toFixed(1)}s`;
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  return hours > 0
+    ? `${hours}h ${minutes}m ${seconds}s`
+    : `${totalMinutes}m ${seconds}s`;
 }
 
 /** 错误文本展示上限(比参数摘要略宽,但仍防多 KB 堆栈撑爆卡片)。 */
@@ -376,12 +394,26 @@ const LABEL_MAX = 40;
 /**
  * 工具名 label 也是群可见 sink(与 params/error 一致):tool 名来自 registry/MCP 配置,长名会
  * 撑卡片,疑似密钥形状的标识符不应渲出。清洗与其它 sink 对齐:先 URL 降级(注册域),再命中
- * 敏感 → 回退通用「工具」,否则截断。(label 通常无 URL,reduceUrlsInText 为 no-op;统一以防
+ * 敏感 → 回退通用 `Tool`,否则截断。(label 通常无 URL,reduceUrlsInText 为 no-op;统一以防
  * MCP/动态工具名里嵌了 webhook/DSN 形状。)
  */
 function safeLabel(label: string): string {
   const s = reduceUrlsInText(label);
-  if (isSensitive(s, true)) return "工具";
+  // Raw MCP names are scanned per `__` segment rather than whole, because hasGenericSecretShape
+  // counts a lone `_` as a base64url signal — so every snake_case MCP name of 32+ chars reads as
+  // high-entropy and would render as `Tool`.
+  //
+  // Be precise about what this gives up: the keyword and known-prefix detectors (AKIA, ghp_, sk-,
+  // JWT, token/api_key/…) still fail closed on any single segment, but whole-string entropy
+  // detection does not survive the split — a high-entropy value that a `__` breaks into sub-32-char
+  // pieces is no longer caught, and renders up to LABEL_MAX. Tool names come from operator-owned
+  // registry/MCP config rather than model or user input, so that residue is defence-in-depth
+  // against misconfiguration, not an attacker-reachable path. The real fix is one layer down in
+  // hasGenericSecretShape; until then this carve-out is the narrower evil.
+  const sensitive = s.startsWith(MCP_TOOL_PREFIX)
+    ? s.split("__").some((segment) => isSensitive(segment, true))
+    : isSensitive(s, true);
+  if (sensitive) return "Tool";
   return s.length > LABEL_MAX ? s.slice(0, LABEL_MAX) + "…" : s;
 }
 
@@ -389,7 +421,7 @@ function safeLabel(label: string): string {
 export function stepLine(step: CardStep): string {
   const { icon, label: rawLabel } = resolveToolMeta(step.tool);
   const label = safeLabel(rawLabel);
-  const sum = step.summary ? `：${step.summary}` : "";
+  const sum = step.summary ? `: ${step.summary}` : "";
   if (step.status === "running") return `⏳ ${label}${sum}`;
   if (step.status === "error") {
     const detail = sanitizeErrorText(step.error);
@@ -402,31 +434,31 @@ export function stepLine(step: CardStep): string {
 function headerText(state: CardProgressState): string {
   switch (state.phase) {
     case "thinking":
-      return "🤖 思考中…";
+      return "🤖 Thinking…";
     case "tool":
-      return "🤖 正在处理…";
+      return "🤖 Working…";
     case "paused":
-      return "⏸️ 等待任务结果";
+      return "⏸️ Waiting for results";
     case "resuming":
-      return "🤖 正在整理结果";
+      return "🤖 Preparing results";
     case "answering":
-      return "🤖 正在生成回答";
+      return "🤖 Answering";
     case "expired":
-      return "⏱️ 等待超时";
+      return "⏱️ Wait timed out";
     case "error": {
       const detail = sanitizeErrorText(state.errorText);
-      return `⚠️ 已中断${detail ? `：${detail}` : ""}`;
+      return `⚠️ Interrupted${detail ? `: ${detail}` : ""}`;
     }
     case "done": {
       const n = state.steps.length;
       const secs = fmtDuration(state.elapsedMs);
-      const parts = ["✅ 已完成"];
-      if (n > 0) parts.push(`${n} 步`);
+      const parts = ["✅ Done"];
+      if (n > 0) parts.push(`${n} ${n === 1 ? "step" : "steps"}`);
       if (secs) parts.push(secs);
       return parts.join(" · ");
     }
     case "stopped":
-      return "⚠️ 已停止";
+      return "⚠️ Stopped";
   }
 }
 
@@ -490,7 +522,7 @@ function maxVisibleSteps(caps: CardCaps | undefined): number {
 
 /**
  * 单步 → RichTextBlock 的多段 inlines(供 buildDisplayCard 的 rich block 使用):
- *   状态图标 | label(Bolder) | :摘要 | · 耗时/— 错误详情(good/attention 着色)
+ *   状态图标 | label(subtle) | :摘要 | · 耗时/— 错误详情(good/attention 着色)
  * 段拼接后与 `stepLine(step)` 输出完全一致 —— 保证 plain 兜底不变,且降级到 TextBlock 时视觉等价。
  */
 function stepSegments(step: CardStep): RichSegment[] {
@@ -500,16 +532,16 @@ function stepSegments(step: CardStep): RichSegment[] {
   if (step.status === "running") {
     return [
       { text: "⏳ " },
-      { text: label, bold: true },
-      ...(sum ? [{ text: "：" }, { text: sum, fontType: "Monospace" as const }] : []),
+      { text: label, subtle: true },
+      ...(sum ? [{ text: ": " }, { text: sum, fontType: "Monospace" as const }] : []),
     ];
   }
   if (step.status === "error") {
     const detail = sanitizeErrorText(step.error);
     const segs: RichSegment[] = [
       { text: "❌ " },
-      { text: label, bold: true },
-      ...(sum ? [{ text: "：" }, { text: sum, fontType: "Monospace" as const }] : []),
+      { text: label, subtle: true },
+      ...(sum ? [{ text: ": " }, { text: sum, fontType: "Monospace" as const }] : []),
     ];
     if (detail) segs.push({ text: ` — ${detail}`, color: "attention" });
     return segs;
@@ -517,8 +549,8 @@ function stepSegments(step: CardStep): RichSegment[] {
   const dur = fmtDuration(step.durationMs);
   const segs: RichSegment[] = [
     { text: `${icon} ` },
-    { text: label, bold: true },
-    ...(sum ? [{ text: "：" }, { text: sum, fontType: "Monospace" as const }] : []),
+    { text: label, subtle: true },
+    ...(sum ? [{ text: ": " }, { text: sum, fontType: "Monospace" as const }] : []),
   ];
   if (dur) segs.push({ text: ` · ${dur}`, color: "good" });
   return segs;
@@ -526,7 +558,7 @@ function stepSegments(step: CardStep): RichSegment[] {
 
 /**
  * 同类合并的一"组":≥2 个连续同 tool 且全 done 的步骤压成一行,大幅缩视觉噪音。
- * 显示:`<icon> <label> × N · 共 <总耗时> — 最近: <最后一个 summary>`
+ * 显示:`<icon> <label> × N · total <duration> — latest: <last summary>`
  * running/error 步骤不参与合并(单独调 stepSegments),避免糊掉当前重点。
  */
 function groupSegments(group: CardStep[]): RichSegment[] {
@@ -541,11 +573,11 @@ function groupSegments(group: CardStep[]): RichSegment[] {
   const lastSum = last.summary ? last.summary : "";
   const segs: RichSegment[] = [
     { text: `${icon} ` },
-    { text: label, bold: true },
+    { text: label, subtle: true },
     { text: ` × ${group.length}` },
   ];
-  if (dur) segs.push({ text: ` · 共 ${dur}`, color: "good" });
-  if (lastSum) segs.push({ text: " — 最近: " }, { text: lastSum, fontType: "Monospace" });
+  if (dur) segs.push({ text: ` · total ${dur}`, color: "good" });
+  if (lastSum) segs.push({ text: " — latest: " }, { text: lastSum, fontType: "Monospace" });
   return segs;
 }
 
@@ -633,11 +665,13 @@ function progressSummary(steps: CardStep[], total: number): string {
   const thinking = steps.filter((s) => s.tool === "__thinking__").length;
   const waiting = steps.filter((s) => s.tool === SUBAGENT_WAIT_STEP_TOOL).length;
   const tools = total - thinking - waiting;
-  const parts = [waiting > 0 ? "任务过程" : "推理与工具调用"];
-  if (thinking > 0) parts.push(`思考 ${thinking}`);
-  if (tools > 0) parts.push(`工具 ${tools}`);
-  if (waiting > 0) parts.push(`等待 ${waiting}`);
-  if (thinking === 0 && tools === 0 && waiting === 0) parts.push(`${total} 步`);
+  const parts: string[] = [];
+  if (thinking > 0) parts.push(`Reasoning ${thinking}`);
+  if (tools > 0) parts.push(`Tools ${tools}`);
+  if (waiting > 0) parts.push(`Waiting ${waiting}`);
+  // 今天 total === steps.length,三类必占其一;兜底是防 total 日后改成「累计步数」而 steps
+  // 只保留窗口时,摘要行静默变空串。
+  if (parts.length === 0) parts.push(`${total} ${total === 1 ? "step" : "steps"}`);
   return parts.join(" · ");
 }
 
@@ -645,35 +679,24 @@ function terminalHeaderSegments(state: CardProgressState): RichSegment[] | null 
   if (state.phase === "done") {
     const n = state.steps.length;
     const secs = fmtDuration(state.elapsedMs);
-    const stats = [n > 0 ? `${n} 步` : "", secs].filter(Boolean).join(" · ");
+    const stats = [n > 0 ? `${n} ${n === 1 ? "step" : "steps"}` : "", secs].filter(Boolean).join(" · ");
     return [
-      { text: "✅ 已完成", bold: true },
+      { text: "✅ Done", bold: true },
       ...(stats ? [{ text: ` · ${stats}`, subtle: true } satisfies RichSegment] : []),
     ];
   }
   if (state.phase === "error") {
     const detail = sanitizeErrorText(state.errorText);
     return [
-      { text: "⚠️ 已中断", bold: true },
-      ...(detail ? [{ text: `：${detail}`, color: "attention" } satisfies RichSegment] : []),
+      { text: "⚠️ Interrupted", bold: true },
+      ...(detail ? [{ text: `: ${detail}`, color: "attention" } satisfies RichSegment] : []),
     ];
   }
   return null;
 }
 
-function progressSummarySegments(steps: CardStep[], total: number, visible: string): RichSegment[] {
-  const thinking = steps.filter((s) => s.tool === "__thinking__").length;
-  const waiting = steps.filter((s) => s.tool === SUBAGENT_WAIT_STEP_TOOL).length;
-  const tools = total - thinking - waiting;
-  const stats: string[] = [];
-  if (thinking > 0) stats.push(`思考 ${thinking}`);
-  if (tools > 0) stats.push(`工具 ${tools}`);
-  if (waiting > 0) stats.push(`等待 ${waiting}`);
-  stats.push(`${visible} 步`);
-  return [
-    { text: waiting > 0 ? "任务过程" : "推理与工具调用", bold: true },
-    { text: ` · ${stats.join(" · ")}`, subtle: true },
-  ];
+function progressSummarySegments(steps: CardStep[], total: number): RichSegment[] {
+  return [{ text: progressSummary(steps, total), subtle: true }];
 }
 
 function richTextBlock(segments: RichSegment[]): Record<string, unknown> {
@@ -705,8 +728,8 @@ function progressHeaderSegments(state: CardProgressState, fallbackHeader: string
   return terminalHeaderSegments(state) ?? [{ text: fallbackHeader, bold: true }];
 }
 
-function progressSummaryText(steps: CardStep[], total: number, visible: string): string {
-  return `${progressSummary(steps, total)} · ${visible} 步`;
+function progressSummaryText(steps: CardStep[], total: number): string {
+  return progressSummary(steps, total);
 }
 
 function progressHeaderItems(
@@ -714,17 +737,16 @@ function progressHeaderItems(
   header: string,
   steps: CardStep[],
   total: number,
-  visible: string,
   canRichText: boolean,
 ): Record<string, unknown>[] {
   const items: Record<string, unknown>[] = [];
   if (canRichText) {
     items.push(richTextBlock(progressHeaderSegments(state, header)));
-    if (total > 0) items.push(richTextBlock(progressSummarySegments(steps, total, visible)));
+    if (total > 0) items.push(richTextBlock(progressSummarySegments(steps, total)));
     return items;
   }
   items.push(textBlock(header, { bold: true, size: "Medium" }));
-  if (total > 0) items.push(textBlock(progressSummaryText(steps, total, visible), { subtle: true }));
+  if (total > 0) items.push(textBlock(progressSummaryText(steps, total), { subtle: true }));
   return items;
 }
 
@@ -740,7 +762,7 @@ function progressToggleColumn(startVisible: boolean): Record<string, unknown> | 
         actions: [
           {
             type: "Action.ToggleVisibility",
-            title: "收起推理",
+            title: "Hide details",
             targetElements: [
               { elementId: AGENT_PROGRESS_DETAIL_ID, isVisible: false },
               { elementId: AGENT_PROGRESS_COLLAPSE_ID, isVisible: false },
@@ -756,7 +778,7 @@ function progressToggleColumn(startVisible: boolean): Record<string, unknown> | 
         actions: [
           {
             type: "Action.ToggleVisibility",
-            title: "展开推理",
+            title: "Show details",
             targetElements: [
               { elementId: AGENT_PROGRESS_DETAIL_ID, isVisible: true },
               { elementId: AGENT_PROGRESS_COLLAPSE_ID, isVisible: true },
@@ -777,7 +799,7 @@ function progressToggleColumn(startVisible: boolean): Record<string, unknown> | 
  * 可见步数受服务端 max_nodes 权威约束(缺省用本地上限)。
  *
  * 返回 `{ card, plain }`:card = AC 1.5 JSON;plain = 纯文本兜底(与布局无关;服务端 Finalize 会
- * 权威重算)。plain 空则回退 CARD_PLACEHOLDER。
+ * 权威重算)。plain 空则回退 PROGRESS_CARD_PLACEHOLDER。
  */
 export function renderProgressCard(
   state: CardProgressState,
@@ -793,7 +815,6 @@ export function renderProgressCard(
   const hidden = Math.max(0, total - cap);
   const visibleSteps = hidden > 0 ? state.steps.slice(-cap) : state.steps;
   const canRichText = cardSupports(caps, "RichTextBlock");
-  const visible = hidden > 0 ? `${visibleSteps.length}/${total}` : `${total}`;
 
   const renderFlatFallback = (): { card: Record<string, unknown>; plain: string } => {
     // The specialized layout is all-or-nothing. Once either root element is unavailable or
@@ -806,11 +827,17 @@ export function renderProgressCard(
       actions: new Set(),
     };
     const flatBlocks: DisplayBlock[] = [];
-    if (total > 0) flatBlocks.push({ type: "text", text: progressSummaryText(state.steps, total, visible) });
-    if (hidden > 0) flatBlocks.push({ type: "text", text: `… 省略前 ${hidden} 步` });
+    if (total > 0) flatBlocks.push({ type: "text", text: progressSummaryText(state.steps, total) });
+    if (hidden > 0) flatBlocks.push({ type: "text", text: `… ${hidden} earlier steps hidden` });
     flatBlocks.push(...renderProgressDetailBlocks(visibleSteps, flatCaps));
-    const flat = buildDisplayCard({ title: header, blocks: flatBlocks, caps: flatCaps, trusted: true });
-    return { card: flat.card, plain: flat.plain || CARD_PLACEHOLDER };
+    const flat = buildDisplayCard({
+      title: header,
+      blocks: flatBlocks,
+      caps: flatCaps,
+      trusted: true,
+      dropMarker: EN_DROP_MARKER,
+    });
+    return { card: flat.card, plain: flat.plain || PROGRESS_CARD_PLACEHOLDER };
   };
 
   if (!cardSupports(caps, "ColumnSet") || !cardSupports(caps, "Container")) {
@@ -818,14 +845,14 @@ export function renderProgressCard(
   }
 
   const detailBlocks: DisplayBlock[] = [];
-  if (hidden > 0) detailBlocks.push({ type: "text", text: `… 省略前 ${hidden} 步` });
+  if (hidden > 0) detailBlocks.push({ type: "text", text: `… ${hidden} earlier steps hidden` });
   detailBlocks.push(...renderProgressDetailBlocks(visibleSteps, caps));
 
   // trusted:进度卡的每行文案已在上游逐 sink 脱敏(summarizeToolParams/sanitizeErrorText/safeLabel:
   // URL 已降级、path/shell 按 generic=false 保留 git SHA/digest)。buildDisplayCard 默认 generic=true
   // 会二次套用长 hex/高熵检测,误删含哈希的正常行、甚至把错误终态帧整卡清空 —— 故此路径关掉严格 generic。
-  const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true });
-  const headerItems = progressHeaderItems(state, header, state.steps, total, visible, canRichText);
+  const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true, dropMarker: EN_DROP_MARKER });
+  const headerItems = progressHeaderItems(state, header, state.steps, total, canRichText);
   const canToggle = supportsTerminalCollapse(caps);
   const isTerminal = state.phase === "done" || state.phase === "stopped" || state.phase === "error" || state.phase === "expired";
   const detailVisible = !(canToggle && isTerminal);
@@ -859,12 +886,12 @@ export function renderProgressCard(
     ],
   };
   card.metadata = { octo_layout: OCTO_CARD_LAYOUTS.agentProgressV1 };
-  const summaryPlain = total > 0 ? progressSummaryText(state.steps, total, visible) : "";
+  const summaryPlain = total > 0 ? progressSummaryText(state.steps, total) : "";
   const plain = [header, summaryPlain, detail.plain].filter(Boolean).join("\n");
-  if (!cardFitsLimits(card, plain || CARD_PLACEHOLDER, caps)) {
+  if (!cardFitsLimits(card, plain || PROGRESS_CARD_PLACEHOLDER, caps)) {
     return renderFlatFallback();
   }
-  return { card, plain: plain || CARD_PLACEHOLDER };
+  return { card, plain: plain || PROGRESS_CARD_PLACEHOLDER };
 }
 
 /**
