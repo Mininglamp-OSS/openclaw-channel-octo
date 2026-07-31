@@ -2768,6 +2768,7 @@ export async function handleInboundMessage(params: {
         await docTask.postComment(content, signal);
         statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
       } catch (err) {
+        statusSink?.({ lastError: String(err) });
         log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
       }
       return undefined;

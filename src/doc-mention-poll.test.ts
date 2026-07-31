@@ -147,6 +147,20 @@ describe("文档任务持久去重", () => {
     expect(results.filter((seen) => seen === false)).toHaveLength(1);
   });
 
+  it("落盘失败不得把 key 记进内存:否则调用方重试会被误判为重复而永久丢任务", async () => {
+    const store = createFileDocMentionDedupeStore({ accountId: "acct1", baseDir: join(dir, "nested") });
+    // 用一个已存在的同名文件占位,让 mkdir/rename 失败
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(dir, "nested"), "not-a-dir", "utf8");
+
+    await expect(store.claim("k1")).rejects.toBeTruthy();
+
+    // 修复占位后重试必须仍能放行(内存未被污染)
+    const { rm: rmOne } = await import("node:fs/promises");
+    await rmOne(join(dir, "nested"), { force: true });
+    expect(await store.claim("k1")).toBe(false);
+  });
+
   it("超出容量时淘汰最旧的键", async () => {
     const store = createMemoryDocMentionDedupeStore(2);
     await store.claim("a");

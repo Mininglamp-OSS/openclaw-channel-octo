@@ -108,7 +108,7 @@ export function formatDocMentionText(mention: DocCommentMention): string {
     `comment_id=${mention.commentId}`,
     `thread_id=${mention.threadId}`,
   ];
-  if (mention.url) lines.push(`url=${mention.url}`);
+  if (mention.url) lines.push(`url=${JSON.stringify(mention.url)}`);
   lines.push(`comment=${JSON.stringify(mention.text)}`);
   lines.push(
     "",

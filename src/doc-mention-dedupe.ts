@@ -35,6 +35,7 @@ export function createFileDocMentionDedupeStore(params: {
   const file = join(dir, "doc-mentions.processed.json");
 
   let loaded: Promise<string[]> | undefined;
+  let cache: string[] | undefined;
   // 串行化写入,避免同账号并发任务互相覆盖(rename 是原子的,但读-改-写不是)。
   let tail: Promise<void> = Promise.resolve();
 
@@ -61,12 +62,14 @@ export function createFileDocMentionDedupeStore(params: {
       if (!idempotencyKey) return false;
       const run = tail.then(async () => {
         loaded ??= load();
-        const keys = await loaded;
-        if (keys.includes(idempotencyKey)) return true;
-        keys.push(idempotencyKey);
-        if (keys.length > capacity) keys.splice(0, keys.length - capacity);
-        // 先落盘再返回:落盘失败必须让调用方看到异常,否则崩溃后会重复执行。
-        await persist(keys);
+        cache ??= await loaded;
+        if (cache.includes(idempotencyKey)) return true;
+        // 先落盘、成功后才更新内存:反过来的话,persist 抛错时内存已记为「已处理」,
+        // 而调用方收到异常会重试 —— 重试时被内存判定为重复,任务被永久静默丢弃。
+        const next = [...cache, idempotencyKey];
+        if (next.length > capacity) next.splice(0, next.length - capacity);
+        await persist(next);
+        cache = next;
         return false;
       });
       tail = run.then(() => undefined, () => undefined);
