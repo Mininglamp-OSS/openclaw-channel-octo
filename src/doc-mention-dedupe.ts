@@ -48,6 +48,8 @@ export function createFileDocMentionDedupeStore(params: {
   let cache: string[] | undefined;
   const inFlight = new Set<string>();
   // 串行化写入,避免同账号并发任务互相覆盖(rename 是原子的,但读-改-写不是)。
+  // 注意:仅限**单进程内**。同账号多进程各持一份内存快照,整表读-改-写后
+  // last-writer-wins 会丢 key;当前部署形态是每进程一个常驻轮询器,故可接受。
   let tail: Promise<void> = Promise.resolve();
 
   const load = async (): Promise<string[]> => {
@@ -92,9 +94,14 @@ export function createFileDocMentionDedupeStore(params: {
         // 而调用方仍会重试 —— 重试时被内存判定为重复,任务被永久静默丢弃。
         const next = [...cache, idempotencyKey];
         if (next.length > capacity) next.splice(0, next.length - capacity);
-        await persist(next);
-        cache = next;
-        inFlight.delete(idempotencyKey);
+        try {
+          await persist(next);
+          cache = next;
+        } finally {
+          // 无论落盘成没成都要清 in-flight:留着会让本进程后续的重投被判重复而
+          // 静默跳过,而此时磁盘上并没有记录 —— 两头落空。
+          inFlight.delete(idempotencyKey);
+        }
       });
       tail = run.then(() => undefined, () => undefined);
       return run;

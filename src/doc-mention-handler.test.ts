@@ -171,4 +171,41 @@ describe("文档任务接线", () => {
     expect(postComment).toHaveBeenCalledTimes(1);
     expect(postComment.mock.calls[0][1]).toBe("已改好");
   });
+
+  // --- 「投递过」不等于「答复送达」 ---
+
+  it("中间消息发成功、最终答复发失败:必须补兜底且不写去重(答复不能悄悄丢)", async () => {
+    // 反例:delivered 只要 >0 就判成功 → 用户只看到「正在读取文档…」,
+    // 永远等不到答复,也等不到失败提示,事件却已 ack + 落盘。
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("正在读取文档…");
+      await extra.docTask.postComment("这是最终答复").catch(() => {});
+      return "completed" as const;
+    });
+    let call = 0;
+    const { handler, dedupe, postComment } = makeHandler(dispatch, async (_m: any, text: string) => {
+      call += 1;
+      if (text === "这是最终答复") throw new Error("docs API 503");
+    });
+
+    await handler(mention());
+
+    const bodies = postComment.mock.calls.map((c: any) => c[1]);
+    expect(bodies.some((b: string) => b.includes("没有完成"))).toBe(true); // 有兜底提示
+    expect(await dedupe.claim("k1")).toBe(false); // 有丢失 → 不写去重
+  });
+
+  it("任务被判 dropped(如会话冲突):即使发过回执也不写去重 —— 活儿没干", async () => {
+    // 回归:回执经同一投递通道会把 delivered 抬到 1,从而把「从未执行的任务」
+    // 记为已完成,吸收掉本该重投的那次。
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("⚠️ 上一轮任务尚未结束，本次请求已跳过。");
+      return "dropped" as const;
+    });
+    const { handler, dedupe } = makeHandler(dispatch);
+
+    await handler(mention());
+
+    expect(await dedupe.claim("k1")).toBe(false);
+  });
 });

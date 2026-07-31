@@ -44,8 +44,10 @@ const POST_RETRY_BASE_MS = 200;
  *      (resolveAgentRoute 抛错、能力门禁)根本不是异常。三者都会写入持久去重
  *      并 ack —— 评论区静默、永不重试。现在由本函数统计真实投递次数来判定。
  *
- *   2. 只有真的投递过才写持久去重(complete);否则 release,让 server 侧重投
- *      仍能重放。兜底评论不计入投递 —— 它只保证有痕迹,不代表任务做成了。
+ *   2. 完成 = 任务跑完(completed) **且** 没有任何一条内容发丢 **且** 确实发出过。
+ *      三者缺一就 release,让 server 侧重投仍能重放。被判 dropped 的任务(如会话
+ *      冲突)哪怕发过回执也不算完成 —— 活儿没干,记为完成会吸收掉该重投的那次。
+ *      兜底评论只保证留痕,不计入投递。
  *
  *   3. 异常不外抛。外抛会让轮询器游标停在原地,重投后再次失败,形成每个轮询周期
  *      一次的死循环。代价要说清楚:ack 即 server 的 confirm,ack 过的事件不会
@@ -65,14 +67,21 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
       return;
     }
 
-    // 只统计**成功**的投递:抛错的那次不计,于是「回帖失败」不会被当成交付。
+    // 「投递过」不等于「答复送达」:一个回合可能先发成功一条进度消息、再把最终
+    // 答复发丢。只看 delivered>0 会把这种情况判成成功 —— 用户只看到「正在读取
+    // 文档…」,永远等不到答复,也等不到失败提示。所以同时记丢失次数。
     let delivered = 0;
-    const postWithRetry = async (text: string, signal?: AbortSignal): Promise<void> => {
+    let lost = 0;
+    const postWithRetry = async (
+      text: string,
+      signal?: AbortSignal,
+      opts?: { count?: boolean },
+    ): Promise<void> => {
       let lastErr: unknown;
       for (let attempt = 1; attempt <= POST_ATTEMPTS; attempt += 1) {
         try {
           await deps.postComment(mention, text, signal);
-          delivered += 1;
+          if (opts?.count !== false) delivered += 1;
           return;
         } catch (err) {
           lastErr = err;
@@ -84,11 +93,13 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           }
         }
       }
+      if (opts?.count !== false) lost += 1;
       throw lastErr;
     };
 
+    let outcome: "completed" | "dropped" = "dropped";
     try {
-      await deps.dispatch(synthesizeDocMentionMessage(mention, deps.botUid), undefined, {
+      outcome = await deps.dispatch(synthesizeDocMentionMessage(mention, deps.botUid), undefined, {
         queueScope: docTaskQueueScope(mention),
         docTask: {
           docId: mention.docId,
@@ -103,17 +114,23 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
       );
     }
 
-    if (delivered === 0) {
-      // 本轮什么都没发到评论区 —— 无论原因是回帖失败、无文本可发,还是 dispatch
-      // 之前就返回了。补一条兜底,保证用户在他看的地方看得到结果。
-      try {
-        await postWithRetry(NOTHING_DELIVERED_NOTICE);
-      } catch (err) {
-        deps.log?.error?.(
-          `octo: doc task fallback notice failed doc=${mention.docId} thread=${mention.threadId}: ${String(err)}`,
-        );
+    // 只有「任务真的跑完 + 一条都没丢 + 确实发出过内容」才算完成。
+    // dropped(如会话冲突回执)哪怕发过回执也不算 —— 活儿根本没干,
+    // 把它记为已完成会吸收掉本该重投的那一次。
+    const fullyDelivered = outcome === "completed" && lost === 0 && delivered > 0;
+    if (!fullyDelivered) {
+      // 什么都没发,或者有内容发丢了 —— 两种情况用户都缺信息,补一条兜底。
+      // dropped 且回执已发出的情况不补:回执本身就是痕迹。
+      if (delivered === 0 || lost > 0) {
+        try {
+          // count:false —— 兜底只保证留痕,不代表任务做成,不计入投递。
+          await postWithRetry(NOTHING_DELIVERED_NOTICE, undefined, { count: false });
+        } catch (err) {
+          deps.log?.error?.(
+            `octo: doc task fallback notice failed doc=${mention.docId} thread=${mention.threadId}: ${String(err)}`,
+          );
+        }
       }
-      // 兜底不算成功交付:不写持久去重,让 server 重投仍可重放。
       deps.dedupe.release(mention.idempotencyKey);
       return;
     }
