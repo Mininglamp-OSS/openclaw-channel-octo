@@ -1542,7 +1542,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           return;
         }
         const message = synthesizeDocMentionMessage(mention, credentials.robot_id);
-        await dispatchInboundMessage(message, undefined, {
+        // 只有任务真正跑完才写入持久去重。若在此之前崩溃/被拒,「进行中」标记随进程
+        // 消失,事件重投时得以重放 —— 否则任务被永久静默丢弃,评论区没有任何反馈。
+        let outcome: "completed" | "dropped" = "dropped";
+        try {
+          outcome = await dispatchInboundMessage(message, undefined, {
           queueScope: docTaskQueueScope(mention),
           docTask: {
             docId: mention.docId,
@@ -1559,7 +1563,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
               });
             },
           },
-        });
+          });
+        } finally {
+          if (outcome === "completed") await docMentionDedupe.complete(mention.idempotencyKey);
+          else docMentionDedupe.release(mention.idempotencyKey);
+        }
       };
 
       let cardEventPoller: EventPoller | undefined;

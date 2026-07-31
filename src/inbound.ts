@@ -2741,10 +2741,50 @@ export async function handleInboundMessage(params: {
   }
 
   // Keep sending typing indicator while AI is processing
-  const typingInterval = setInterval(() => {
-    if (docTask) return;
+  // 文档任务不建这个定时器:评论区没有「正在输入」语义,建了也只是每 5s 空转一次。
+  const typingInterval = docTask ? undefined : setInterval(() => {
     sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) }).catch(() => {});
   }, 5000);
+
+  // --- 文档任务的唯一出站出口 ---
+  // 文档任务的一切用户可见输出(最终答复、错误/超时兜底、media 说明)都必须从这里
+  // 走。分散在各处加 `if (docTask)` 守卫的做法已经漏过一次:onError / 超时 /
+  // dispatch 拒绝 / media 四个出口曾直接 sendMessage 到合成消息的 DM channel,
+  // 也就是发起人的私聊 —— 既污染 IM,评论区又毫无痕迹。收敛成单一出口后,
+  // 新增出站点只要不经过它就会被失败路径测试抓住。
+  //
+  // 失败只记日志,绝不回退 IM:回退等于把污染放回来;文档修改本身已经落盘。
+  const docTaskMediaUrls: string[] = [];
+  const postDocTaskReply = async (content: string, signal?: AbortSignal): Promise<void> => {
+    if (!docTask) return;
+    const attachments = docTaskMediaUrls.splice(0, docTaskMediaUrls.length);
+    const body = attachments.length > 0
+      ? `${content}\n\n${attachments.map((url) => `[附件] ${url}`).join("\n")}`
+      : content;
+    try {
+      await docTask.postComment(body, signal);
+      statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
+    } catch (err) {
+      statusSink?.({ lastError: String(err) });
+      log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
+    }
+  };
+  /** 用户可见的兜底通知(错误/超时/拒绝)。文档任务改投评论区,其余保持原样直发。 */
+  const sendUserFacingFallback = async (content: string, signal?: AbortSignal): Promise<void> => {
+    if (docTask) {
+      await postDocTaskReply(content, signal);
+      return;
+    }
+    await sendMessage({
+      apiUrl,
+      botToken,
+      channelId: replyChannelId,
+      channelType: replyChannelType,
+      content,
+      ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
+      ...(signal ? { signal } : {}),
+    });
+  };
 
   // Buffer text across streaming deliver calls; only send once after dispatcher finishes.
   // Media is sent immediately (no edit problem); text is buffered (each call overwrites).
@@ -2760,17 +2800,7 @@ export async function handleInboundMessage(params: {
   // --- Shared helper: resolve mentions and send text ---
   const resolveAndSendText = async (content: string, signal?: AbortSignal): Promise<SendMessageResult | undefined> => {
     if (docTask) {
-      // 出站重定向:文档任务的一切文本(最终答复、超时道歉、缓冲兜底)都从这里
-      // 收口,改投评论区。不做「直接丢弃」是刻意的 —— 丢弃会让失败/超时的任务在
-      // 评论区毫无反馈。@[uid:name] 结构化提及对评论区不适用,按纯文本发送。
-      // 失败只记日志,绝不回退 IM:回退等于把污染放回来;文档修改本身已经落盘。
-      try {
-        await docTask.postComment(content, signal);
-        statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
-      } catch (err) {
-        statusSink?.({ lastError: String(err) });
-        log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
-      }
+      await postDocTaskReply(content, signal);
       return undefined;
     }
     let replyMentionUids: string[] = [];
@@ -2991,6 +3021,13 @@ export async function handleInboundMessage(params: {
           const outboundMediaUrls = resolveOutboundMediaUrls(payload);
           for (const mediaUrl of outboundMediaUrls) {
             if (sentMediaUrls.has(mediaUrl)) continue;
+            if (docTask) {
+              // 评论 API 不收附件:不上传、不发 IM,URL 附到评论正文里带出去。
+              docTaskMediaUrls.push(mediaUrl);
+              sentMediaUrls.add(mediaUrl);
+              log?.info?.(`octo: doc task media not sent to IM, attached to comment: ${mediaUrl}`);
+              continue;
+            }
             try {
               const mediaResult = await uploadAndSendMedia({
                 mediaUrl,
@@ -3061,19 +3098,9 @@ export async function handleInboundMessage(params: {
           deliverBuffer.textSent = true;
           deliveryErrorOccurred = true;
           try {
-            await sendMessage({
-              apiUrl,
-              botToken,
-              channelId: replyChannelId,
-              channelType: replyChannelType,
-              content: "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
-              ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-              // Same bounded signal as the timeout-path apology: if upstream
-              // signals an error AND the Octo API is also sick, this recovery
-              // sendMessage would otherwise hold the per-group queue until
-              // the outer dispatch timeout kicks in.
-              signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-            });
+            // 经唯一出口:文档任务改投评论区,其余仍直发 IM。同样用受限 signal ——
+            // 上游报错且 Octo API 也病了时,别把队列卡到外层 dispatch 超时。
+            await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
           } catch (sendErr) {
             log?.error?.(`octo: failed to send error message: ${String(sendErr)}`);
           }
@@ -3131,15 +3158,7 @@ export async function handleInboundMessage(params: {
         // The apology call itself MUST be bounded — otherwise a sick Octo API
         // hangs this sendMessage too, defeating the whole timeout fix. See
         // DISPATCH_TIMEOUT_APOLOGY_MS above.
-        await sendMessage({
-          apiUrl,
-          botToken,
-          channelId: replyChannelId,
-          channelType: replyChannelType,
-          content: "⚠️ 处理超时，请稍后重试。",
-          ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-          signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-        });
+        await sendUserFacingFallback("⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
       } catch (sendErr) {
         log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
       }
@@ -3177,15 +3196,7 @@ export async function handleInboundMessage(params: {
         deliverBuffer.lastText = null;
         deliverBuffer.textSent = true;
         try {
-          await sendMessage({
-            apiUrl,
-            botToken,
-            channelId: replyChannelId,
-            channelType: replyChannelType,
-            content: "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
-            ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-            signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-          });
+          await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
         } catch (sendErr) {
           log?.error?.(`octo: failed to send dispatch-error fallback: ${String(sendErr)}`);
         }

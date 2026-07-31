@@ -126,19 +126,37 @@ describe("文档任务持久去重", () => {
   beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "octo-docmention-")); });
   afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 
-  it("同一 idempotency_key 只放行一次", async () => {
+  it("完成后同一 idempotency_key 不再放行", async () => {
     const store = createFileDocMentionDedupeStore({ accountId: "acct1", baseDir: dir });
     expect(await store.claim("k1")).toBe(false);
+    await store.complete("k1");
     expect(await store.claim("k1")).toBe(true);
     expect(await store.claim("k2")).toBe(false);
   });
 
-  it("进程重启后仍能去重(内存态会被重启击穿,故必须落盘)", async () => {
+  it("进程重启后仍对已完成任务去重(内存态会被重启击穿,故必须落盘)", async () => {
     const first = createFileDocMentionDedupeStore({ accountId: "acct1", baseDir: dir });
     expect(await first.claim("k1")).toBe(false);
+    await first.complete("k1");
 
     const afterRestart = createFileDocMentionDedupeStore({ accountId: "acct1", baseDir: dir });
     expect(await afterRestart.claim("k1")).toBe(true);
+  });
+
+  it("崩溃在 claim 之后、complete 之前:重启后必须允许重放,而不是永久丢弃", async () => {
+    const beforeCrash = createFileDocMentionDedupeStore({ accountId: "acct1", baseDir: dir });
+    expect(await beforeCrash.claim("k1")).toBe(false);
+    // 任务执行中进程崩溃 —— 没有 complete。「进行中」只在内存,随进程消失。
+
+    const afterCrash = createFileDocMentionDedupeStore({ accountId: "acct1", baseDir: dir });
+    expect(await afterCrash.claim("k1")).toBe(false);
+  });
+
+  it("release 后允许再次执行(dispatch 未完成时的重投)", async () => {
+    const store = createFileDocMentionDedupeStore({ accountId: "acct1", baseDir: dir });
+    expect(await store.claim("k1")).toBe(false);
+    store.release("k1");
+    expect(await store.claim("k1")).toBe(false);
   });
 
   it("并发 claim 同一 key 只有一个通过", async () => {
@@ -153,20 +171,21 @@ describe("文档任务持久去重", () => {
     const { writeFile } = await import("node:fs/promises");
     await writeFile(join(dir, "nested"), "not-a-dir", "utf8");
 
-    await expect(store.claim("k1")).rejects.toBeTruthy();
+    expect(await store.claim("k1")).toBe(false);
+    await expect(store.complete("k1")).rejects.toBeTruthy();
 
     // 修复占位后重试必须仍能放行(内存未被污染)
     const { rm: rmOne } = await import("node:fs/promises");
     await rmOne(join(dir, "nested"), { force: true });
+    store.release("k1");
     expect(await store.claim("k1")).toBe(false);
   });
 
   it("超出容量时淘汰最旧的键", async () => {
     const store = createMemoryDocMentionDedupeStore(2);
-    await store.claim("a");
-    await store.claim("b");
-    await store.claim("c");
+    for (const key of ["a", "b", "c"]) { await store.claim(key); await store.complete(key); }
     expect(await store.claim("a")).toBe(false); // 已被淘汰,重新放行
+    store.release("a");
     expect(await store.claim("c")).toBe(true);
   });
 });
