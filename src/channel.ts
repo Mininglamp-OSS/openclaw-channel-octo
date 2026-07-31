@@ -42,9 +42,6 @@ import {
 import { synthesizeCardActionMessage } from "./card-action.js";
 import {
   docCommentParentId,
-  docTaskQueueScope,
-  docTaskSessionScope,
-  synthesizeDocMentionMessage,
   type DocCommentMention,
 } from "./doc-mention.js";
 import { createFileDocMentionDedupeStore } from "./doc-mention-dedupe.js";
@@ -1514,16 +1511,16 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
               if (extra?.docTask) {
                 // 第五处 IM 出口:该回执按合成消息解析目标,会发进发起人的私聊。
                 // 文档任务改投评论区 —— 与 inbound 的出站收口同一条原则。
+                // 冲突回执不经 handleInboundMessage(这个回合根本没进去),所以
+                // 结论要在这里自己上报:notice-only —— 留了痕,但活儿一点没干,
+                // 不写去重、也不再补一条通用兜底(否则用户连着看两句废话)。
                 try {
-                  // kind:"notice" —— 回执只是留痕,活儿一点没干。标成产出会把一个
-                  // 从未执行的任务记为完成;而不标记的话,handler 又会在回执之后
-                  // 再补一条通用兜底,用户连着看到两句废话。
                   await extra.docTask.postComment(
                     "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
-                    undefined,
-                    { kind: "notice" },
                   );
+                  extra.docTask.reportOutcome("notice-only");
                 } catch (postErr) {
+                  extra.docTask.reportOutcome("nothing");
                   log?.error?.(`octo: doc task conflict notice failed: ${String(postErr)}`);
                 }
               } else {
@@ -1547,7 +1544,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // enqueue 后 confirm 前崩溃重投,两条路径都靠 idempotency_key 收敛。
       const docTasksEnabled = account.config.docTasks === true;
       const cardInteractionEnabled = account.config.cardInteraction !== false;
-      const docMentionDedupe = createFileDocMentionDedupeStore({ accountId: account.accountId });
+      // log 必须传:去重表读不出来时(EACCES / JSON 截断)会退化成空表,
+      // 已完成的事件全部变回可重放 —— 这是必须能在日志里看见的降级,不是静默的。
+      const docMentionDedupe = createFileDocMentionDedupeStore({ accountId: account.accountId, log });
       const handleDocMention = createDocMentionHandler({
         botUid: credentials.robot_id,
         dedupe: docMentionDedupe,

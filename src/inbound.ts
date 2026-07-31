@@ -20,9 +20,9 @@ const isReplyPayloadNonTerminalToolErrorWarning =
     ? replyPayloadCompat.isReplyPayloadNonTerminalToolErrorWarning
     : undefined;
 const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
-import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
+import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
 import { createImEgressGuard } from "./im-egress.js";
-import type { DocTaskPostKind } from "./doc-mention-handler.js";
+import type { DocTaskOutcome } from "./doc-mention-handler.js";
 import type { GroupMember } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
 import { normalizeAccountId } from "./account-id.js";
@@ -1541,7 +1541,9 @@ export async function handleInboundMessage(params: {
     threadId: string;
     /** 会话作用域片段,如 `doctask:{docId}:{threadId}`(见 doc-mention.ts)。 */
     sessionScope: string;
-    postComment: (text: string, signal?: AbortSignal, opts?: { kind?: DocTaskPostKind }) => Promise<void>;
+    postComment: (text: string, signal?: AbortSignal) => Promise<void>;
+    /** 回合末尾恰好上报一次;没上报按 nothing 处理(见 doc-mention-handler.ts)。 */
+    reportOutcome: (outcome: DocTaskOutcome) => void;
   };
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
@@ -2283,7 +2285,16 @@ export async function handleInboundMessage(params: {
     // 文档任务的会话粒度是「评论串」:同串追问共享上下文,跨串互不可见,且与
     // DM/群会话彻底分开。刻意不落进 `octo:group:` 命名空间 —— group-md.ts 靠
     // 该前缀正则决定是否注入 GROUP.md,文档任务不该继承群聊规则。
-    route = { ...route, sessionKey: `agent:${route.agentId}:${CHANNEL_ID}:${docTask.sessionScope}` };
+    //
+    // accountId 必须在键里:宿主自己的 key 构造器是
+    // `agent:{agentId}:{channel}:{accountId}:direct:{peerId}`,漏掉它会让共用同一
+    // agent 的两个 bot 账号在同一条评论串下塌成一个会话、共享历史。两侧 id 一律
+    // 小写归一,和宿主保持一致。docId/threadId 里的 `:` 已在 docTaskSessionScope
+    // 里转义,否则键的结构会有歧义(`d:1` + `2` 与 `d` + `1:2` 会撞成同一个键)。
+    route = {
+      ...route,
+      sessionKey: `agent:${route.agentId}:${CHANNEL_ID}:${normalizeAccountId(account.accountId)}:${docTask.sessionScope}`,
+    };
   }
 
   // Fire-and-forget: ensure GROUP.md is cached for this group
@@ -2771,11 +2782,17 @@ export async function handleInboundMessage(params: {
   // 新增出站点只要不经过它就会被失败路径测试抓住。
   //
   // 失败只记日志,绝不回退 IM:回退等于把污染放回来;文档修改本身已经落盘。
+  // 本回合的产出记账。**只在这三处赋值**,回合末尾归纳成一个结论上报给 handler。
+  // 判定集中在这里而不是散在各出站点,是因为只有这里同时看得到「答复发出去没有」
+  // 和「中间道歉过没有」—— 散开判定的版本连续三轮有某个点标错。
+  let docTaskWorkDelivered = false; // 至少一条真实产出发成功
+  let docTaskWorkLost = false; // 有真实产出没发出去
+  let docTaskNoticed = false; // 发出过提示(道歉/超时/拒绝)
   const docTaskMediaUrls: string[] = [];
   const postDocTaskReply = async (
     content: string,
     signal?: AbortSignal,
-    opts?: { kind?: DocTaskPostKind },
+    opts?: { notice?: boolean },
   ): Promise<void> => {
     if (!docTask) return;
     // 只读不清空:发失败就把附件留在队列里,交给本回合后续的出站(或兜底)再带出去。
@@ -2788,11 +2805,16 @@ export async function handleInboundMessage(params: {
       .join("\n\n");
     if (!body) return;
     try {
-      await docTask.postComment(body, signal, opts);
+      await docTask.postComment(body, signal);
       // 按「消费掉的条数」出队,而不是清空:await 期间 deliver 可能又推进了新附件。
       docTaskMediaUrls.splice(0, attachments.length);
+      if (opts?.notice) docTaskNoticed = true;
+      else docTaskWorkDelivered = true;
       statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
     } catch (err) {
+      // 提示发失败不记 lost:提示本来就不是产出,发不出去只是没留下痕迹,
+      // 由 handler 的兜底补。产出发失败才是「答复丢了」。
+      if (!opts?.notice) docTaskWorkLost = true;
       statusSink?.({ lastError: String(err) });
       log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
     }
@@ -2800,13 +2822,13 @@ export async function handleInboundMessage(params: {
   /**
    * 用户可见的兜底通知(错误/超时/拒绝)。文档任务改投评论区,其余保持原样直发。
    *
-   * `kind: "notice"` 是关键:一句道歉证明不了任务做成了。不标记的话,只发出道歉的
-   * 一个回合会被 handler 记成「投递成功」→ 写入持久去重 → 文档一个字没改,事件却
-   * 被永久吸收,再也不会重投。
+   * `notice: true` 是关键:一句道歉证明不了任务做成了。**道歉过的回合一律不算完成**
+   * —— 哪怕它先发过一条「正在读取文档…」。这条规则在下面的 reportDocTaskOutcome
+   * 里兑现,这里只负责把「这是提示不是产出」这件事说清楚。
    */
   const sendUserFacingFallback = async (content: string, signal?: AbortSignal): Promise<void> => {
     if (docTask) {
-      await postDocTaskReply(content, signal, { kind: "notice" });
+      await postDocTaskReply(content, signal, { notice: true });
       return;
     }
     await imSendMessage({
@@ -3281,6 +3303,23 @@ export async function handleInboundMessage(params: {
     void finalizeCard(route.sessionKey, { success: replySucceeded });
     // Safety net: clean up pending inbound context in case the hook didn't fire
     pendingInboundContext.delete(route.sessionKey);
+
+    // --- 文档任务:把本回合的结论上报一次 ---
+    // 放在最外层 finally,所以正常结束、dispatch 抛错、超时三条路径都会走到;
+    // dispatch 之前的早返回(能力门禁、路由解析失败)走不到,handler 按「没上报」
+    // 处理 —— 那些回合确实什么都没产出,不写去重、允许重投,方向天然正确。
+    if (docTask) {
+      const docTaskOutcome =
+        docTaskWorkDelivered && !docTaskWorkLost && !docTaskNoticed
+          ? "work-delivered"
+          : docTaskNoticed
+            ? "notice-only"
+            : "nothing";
+      log?.info?.(
+        `octo: doc task turn outcome=${docTaskOutcome} work=${docTaskWorkDelivered} lost=${docTaskWorkLost} noticed=${docTaskNoticed}`,
+      );
+      docTask.reportOutcome(docTaskOutcome);
+    }
 
     // Record last answered inbound message_seq for history segmentation (don't clear history).
     // We use the inbound @mention message's message_seq (from WebSocket frame) rather than

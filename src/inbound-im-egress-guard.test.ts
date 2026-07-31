@@ -17,8 +17,29 @@ import { describe, expect, it } from "vitest";
  * 关键设计:带下限断言 + 负向对照,保证守卫不会空转变绿。
  */
 
-/** inbound.ts 里所有会真的把内容发进 IM 的函数。新增出站函数请加进来。 */
-const IM_EGRESS_FUNCTIONS = ["sendMessage", "sendTyping", "sendReadReceipt", "uploadAndSendMedia"] as const;
+/**
+ * inbound.ts 里所有会真的把内容发进 IM 的函数。
+ *
+ * 这份名单本身还是人肉维护的 —— 这是本守卫已知的剩余缺口。缩小它的办法:名单不写死,
+ * 而是从 `./api-fetch.js` 的 import 清单里推导,凡是被引入的出站原语都必须经闸门。
+ * `postJson` 就是这么被补进来的:它是裸的 POST 原语,直接
+ * `postJson(..., "/v1/bot/sendMessage", ...)` 能绕开上面四个具名函数。
+ */
+const IM_EGRESS_FUNCTIONS = [
+  "sendMessage",
+  "sendMediaMessage",
+  "sendTyping",
+  "sendReadReceipt",
+  "uploadAndSendMedia",
+  "postJson",
+] as const;
+
+/**
+ * 允许直呼的精确行(按整行文本匹配)。目前只有一条:`uploadAndSendMedia` 内部对
+ * `sendMediaMessage` 的调用 —— 那个函数本身已经被闸门包了,内部实现不必再包一层。
+ * 下面有一条测试断言白名单里的每一行都真的存在于源码中,避免它腐烂成永远为真的例外。
+ */
+const ALLOWED_DIRECT_CALLS = ["const result = await sendMediaMessage({"] as const;
 
 /** 经闸门包装后的别名 —— 调用点只允许出现这些。 */
 const GUARDED_ALIASES = ["imSendMessage", "imSendTyping", "imSendReadReceipt", "imUploadAndSendMedia"] as const;
@@ -28,7 +49,9 @@ const GUARDED_ALIASES = ["imSendMessage", "imSendTyping", "imSendReadReceipt", "
  * 白名单按「整行内容」匹配而非行号,文件挪动不会让它失效。
  */
 const isBindingLine = (line: string): boolean =>
-  /imEgress\.guard\(/.test(line) || /^export async function uploadAndSendMedia\(/.test(line);
+  /imEgress\.guard\(/.test(line) ||
+  /^export async function uploadAndSendMedia\(/.test(line) ||
+  ALLOWED_DIRECT_CALLS.includes(line.trim() as (typeof ALLOWED_DIRECT_CALLS)[number]);
 
 /** 纯函数,便于负向对照直接喂假源码。 */
 export function findUnguardedImEgress(source: string): Array<{ line: number; name: string; text: string }> {
@@ -80,6 +103,15 @@ describe("inbound.ts 的 IM 出站闸门", () => {
 
     expect(unguarded).toHaveLength(1);
     expect(unguarded[0]).toMatchObject({ line: 4, name: "sendMessage" });
+  });
+
+  it("白名单不会腐烂:每条允许直呼的行都仍存在于源码中", () => {
+    // 白名单条目一旦对应的代码被删掉,它就变成一个永远为真的例外,
+    // 下次有人写出同样的行时会被静默放过。
+    const lines = new Set(SOURCE.split("\n").map((l) => l.trim()));
+    for (const allowed of ALLOWED_DIRECT_CALLS) {
+      expect(lines.has(allowed), `白名单已失效,源码中不存在:${allowed}`).toBe(true);
+    }
   });
 
   it("负向对照:闸门绑定行本身不会被误报", () => {

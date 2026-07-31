@@ -89,10 +89,19 @@ export function parseDocCommentMention(event: BotEvent): DocCommentMention | nul
  * GROUP.md,文档任务不应继承群聊规则。
  */
 export function docTaskSessionScope(mention: DocCommentMention): string {
-  return `doctask:${mention.docId}:${mention.threadId}`;
+  return `doctask:${escapeScopeSegment(mention.docId)}:${escapeScopeSegment(mention.threadId)}`;
 }
 
-/** 串行队列键:同评论串串行,跨评论串并行,且不占用发起人的 DM 队列。 */
+/**
+ * `:` 是作用域键的分隔符,所以字段里的 `:` 必须转义,否则键的结构有歧义 ——
+ * docId="d:1"/threadId="2" 与 docId="d"/threadId="1:2" 会拼成同一个键,两条不相干
+ * 的评论串就共享了会话和串行队列。
+ */
+function escapeScopeSegment(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+}
+
+/** 串行队列键:同评论串串行,把文档任务挪出发起人的 DM 队列(轮询器串行 await 每个 handler,这里并不带来跨评论串并行),且不占用发起人的 DM 队列。 */
 export function docTaskQueueScope(mention: DocCommentMention): string {
   return docTaskSessionScope(mention);
 }
@@ -143,6 +152,14 @@ export function synthesizeDocMentionMessage(mention: DocCommentMention, botUid: 
 /**
  * docs 评论 API 的 parentId 是整数,而 octo-server 事件里的 id 是字符串。
  * 无法解析成正整数时返回 undefined —— 宁可发一条根评论,也不要把非法值发上去。
+ *
+ * 用 threadId 而不是 mention.parentId:server 那边 `thread_id = parent_id ‖ comment_id`,
+ * threadId 才是评论串的根,回在它下面才和「同串共享会话」的语义一致。mention.parentId
+ * 仍然解析并被契约测试钉住(它是 server 契约的一部分),只是不作为回复目标。
+ *
+ * 已知边界:超过 2^53 的雪花 id 会解析失败并退化成根评论。这是安全的失败方向,
+ * 但接口契约本身尚未对着真实 docs 后端验证过 —— 若 parentId 其实接受字符串,
+ * 应当原样透传 server 给的值,这个精度悬崖就一并消失了。
  */
 export function docCommentParentId(mention: DocCommentMention): number | undefined {
   const parsed = Number(mention.threadId);

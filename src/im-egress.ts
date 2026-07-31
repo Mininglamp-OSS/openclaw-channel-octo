@@ -12,7 +12,7 @@
  *     未经本闸门包装的出站函数,并带下限断言防止空转变绿。
  *
  * 刻意不抛异常:几处出站是 fire-and-forget(`.catch(() => {})`),抛出去会被吞掉,
- * 记账反而抓得住 —— 失败路径测试直接断言 `blockedCount() === 0`。
+ * 日志和计数反而抓得住。
  */
 export interface ImEgressGuardOptions {
   /** true = 本次入站不允许任何 IM 出站(当前仅文档任务)。 */

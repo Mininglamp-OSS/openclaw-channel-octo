@@ -858,16 +858,34 @@ export async function postDocComment(params: {
   parentId?: number;
   signal?: AbortSignal;
 }): Promise<void> {
-  await postJson(
+  const path = `/v1/bot/docs/${encodeURIComponent(params.docId)}/comments`;
+  const result = await postJson<{ status?: unknown; msg?: unknown; message?: unknown }>(
     params.apiUrl,
     params.botToken,
-    `/v1/bot/docs/${encodeURIComponent(params.docId)}/comments`,
+    path,
     {
       body: params.body,
       ...(params.parentId !== undefined ? { parentId: params.parentId } : {}),
     },
-    params.signal,
+    // 必须有界。多处调用点不传 signal(handler 的兜底通知、会话冲突回执、
+    // deliver() 的正常答复),而这条 POST 是在轮询器的单条循环里 await 的:
+    // docs 后端接了连接却不回包,handleDocMention 就永不返回,该账号的文档任务
+    // 和卡片事件一起停到重启为止。hang 不是 try/catch 能接住的。
+    params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
   );
+
+  // 平台返回的是 {status, ...} 信封,业务失败(文档不存在、无评论权限、正文超长)
+  // 一样可能是 HTTP 200。而这条 POST 的成败是整个特性**唯一**的投递凭证 —— 只看
+  // response.ok 会把业务失败记成「已投递」,进而写入持久去重、永不重投。
+  if (result && typeof result === "object" && "status" in result) {
+    const { status } = result;
+    if (typeof status === "number" && status !== 1) {
+      const detail = result.msg ?? result.message;
+      throw new Error(
+        `Octo API ${path} rejected the comment (status=${status})${detail ? `: ${String(detail)}` : ""}`,
+      );
+    }
+  }
 }
 
 

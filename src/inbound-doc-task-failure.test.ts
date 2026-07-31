@@ -109,13 +109,13 @@ function installRuntime(drive: DispatchDriver, openClawConfig: Record<string, un
   return dispatch;
 }
 
-/** 记录每条评论的性质 —— `notice` 不代表任务做成,handler 靠它决定要不要写去重。 */
-type PostedComment = { text: string; kind: string };
+/** 本回合上报的结论 —— handler 靠它决定要不要写去重,不再从副作用推断。 */
+type ReportedOutcome = "work-delivered" | "notice-only" | "nothing";
 
 function runDocTask(
   posted: string[],
   accountOverrides: Record<string, unknown> = {},
-  sinks: { comments?: PostedComment[]; log?: { error?: (m: string) => void } } = {},
+  sinks: { outcomes?: ReportedOutcome[]; log?: { error?: (m: string) => void } } = {},
 ) {
   const mention = makeMention();
   return handleInboundMessage({
@@ -132,10 +132,8 @@ function runDocTask(
       docId: mention.docId,
       threadId: mention.threadId,
       sessionScope: docTaskSessionScope(mention),
-      postComment: async (text, _signal, opts) => {
-        posted.push(text);
-        sinks.comments?.push({ text, kind: opts?.kind ?? "work" });
-      },
+      postComment: async (text) => { posted.push(text); },
+      reportOutcome: (outcome) => { sinks.outcomes?.push(outcome); },
     },
   });
 }
@@ -233,14 +231,15 @@ describe("文档任务:最终答复的投递模式不受 messages.visibleReplies
       { messages: { visibleReplies: "message_tool" } },
     );
     const posted: string[] = [];
-    const comments: PostedComment[] = [];
+    const outcomes: ReportedOutcome[] = [];
 
-    await runDocTask(posted, {}, { comments });
+    await runDocTask(posted, {}, { outcomes });
 
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect((dispatch.mock.calls[0] as any)[0].replyOptions.sourceReplyDeliveryMode).toBe("automatic");
     expect(imOutbound(urls)).toHaveLength(0);
-    expect(comments).toEqual([{ text: "已按要求改好", kind: "work" }]);
+    expect(posted).toEqual(["已按要求改好"]);
+    expect(outcomes).toEqual(["work-delivered"]);
   });
 
   it("非文档任务的 DM 不受影响:显式配置仍然被尊重", async () => {
@@ -265,58 +264,116 @@ describe("文档任务:最终答复的投递模式不受 messages.visibleReplies
   });
 });
 
-describe("文档任务:提示不得被当成产出", () => {
-  // 回归:三处兜底(onError / 超时 / dispatch 拒绝)都经同一投递通道,原先不带任何
-  // 标记 —— handler 于是把「只发出一句道歉」的回合记成投递成功。onError 路径
-  // dispatcher 还会正常 resolve(outcome=completed),三个条件全满足 → 写入持久去重
-  // → 文档一个字没改,事件却被永久吸收,再也不会重投。
-  it("onError 的道歉标记为 notice,不是产出", async () => {
+describe("文档任务:一个回合的结论由它自己上报", () => {
+  // 回归:上一版让 handler 从 delivered/lost/noticed 三个计数器重建结论,每个出站点
+  // 都得记得给自己打对标签 —— 连续三轮有某个点标错。最后一次是 `delivered > 0 &&
+  // noticed`:一条「正在读取文档…」加一句道歉,就被判成完成、写进持久去重,而文档
+  // 一个字没改。现在结论由跑完整个回合的 inbound 说一次,规则是
+  // **道歉过的回合一律不算完成**。
+  it("onError:上报 notice-only", async () => {
     installFetchStub();
     installRuntime(async (args) => { await args.dispatcherOptions.onError(new Error("boom"), { kind: "final" }); });
-    const posted: string[] = [];
-    const comments: PostedComment[] = [];
+    const outcomes: ReportedOutcome[] = [];
 
-    await runDocTask(posted, {}, { comments });
+    await runDocTask([], {}, { outcomes });
 
-    expect(comments).toHaveLength(1);
-    expect(comments[0].kind).toBe("notice");
+    expect(outcomes).toEqual(["notice-only"]);
   });
 
-  it("超时提示标记为 notice,不是产出", async () => {
+  it("超时:上报 notice-only", async () => {
     installFetchStub();
     installRuntime(async () => { await new Promise((resolve) => setTimeout(resolve, 5_000)); });
-    const posted: string[] = [];
-    const comments: PostedComment[] = [];
+    const outcomes: ReportedOutcome[] = [];
 
-    await runDocTask(posted, { dispatchTimeoutMs: 1000 }, { comments }).catch(() => {});
+    await runDocTask([], { dispatchTimeoutMs: 1000 }, { outcomes }).catch(() => {});
 
-    expect(comments).toHaveLength(1);
-    expect(comments[0].kind).toBe("notice");
+    expect(outcomes).toEqual(["notice-only"]);
   }, 20_000);
 
-  it("dispatch 拒绝的兜底标记为 notice,不是产出", async () => {
+  it("dispatch 拒绝:上报 notice-only(抛出前也必须先上报)", async () => {
     installFetchStub();
     installRuntime(async () => { throw new Error("dispatch rejected"); });
-    const posted: string[] = [];
-    const comments: PostedComment[] = [];
+    const outcomes: ReportedOutcome[] = [];
 
-    await expect(runDocTask(posted, {}, { comments })).rejects.toThrow("dispatch rejected");
+    await expect(runDocTask([], {}, { outcomes })).rejects.toThrow("dispatch rejected");
 
-    expect(comments).toHaveLength(1);
-    expect(comments[0].kind).toBe("notice");
+    expect(outcomes).toEqual(["notice-only"]);
   });
 
-  it("正常答复不带标记 → 按产出记账", async () => {
+  it("正常答复:上报 work-delivered", async () => {
     installFetchStub();
     installRuntime(async (args) => {
       await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
     });
+    const outcomes: ReportedOutcome[] = [];
     const posted: string[] = [];
-    const comments: PostedComment[] = [];
 
-    await runDocTask(posted, {}, { comments });
+    await runDocTask(posted, {}, { outcomes });
 
-    expect(comments).toEqual([{ text: "已按要求改好", kind: "work" }]);
+    expect(outcomes).toEqual(["work-delivered"]);
+    expect(posted).toEqual(["已按要求改好"]);
+  });
+
+  it("先发出进度、再道歉:上报 notice-only —— 进度不能把失败的回合顶成完成", async () => {
+    // 这正是 6c47a8f/f54ed93 两版都判错的形状。tool 文本走 resolveAndSendText,
+    // 上一版按「产出」记账,于是 delivered > 0 让整个回合被判完成。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "正在读取文档…" }, { kind: "tool" });
+      await args.dispatcherOptions.onError(new Error("boom"), { kind: "final" });
+    });
+    const outcomes: ReportedOutcome[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { outcomes });
+
+    expect(posted).toHaveLength(2);
+    expect(outcomes).toEqual(["notice-only"]);
+  });
+
+  it("只发出附件、随后出错:同样是 notice-only", async () => {
+    // media-only 分支经 postDocTaskReply("") 出站并置 replySucceeded,上一版把它
+    // 记成产出,于是「附件 + 道歉」也会被判完成。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "final" });
+      await args.dispatcherOptions.onError(new Error("boom"), { kind: "final" });
+    });
+    const outcomes: ReportedOutcome[] = [];
+
+    await runDocTask([], {}, { outcomes });
+
+    expect(outcomes).toEqual(["notice-only"]);
+  });
+
+  it("产出发丢且没来得及提示:上报 nothing —— 由 handler 补兜底", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
+    });
+    const outcomes: ReportedOutcome[] = [];
+    const mention = makeMention();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: synthesizeDocMentionMessage(mention, BOT_UID) as any,
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      log: undefined,
+      docTask: {
+        docId: mention.docId,
+        threadId: mention.threadId,
+        sessionScope: docTaskSessionScope(mention),
+        postComment: async () => { throw new Error("docs API 503"); },
+        reportOutcome: (outcome) => { outcomes.push(outcome); },
+      },
+    });
+
+    expect(outcomes).toEqual(["nothing"]);
   });
 });
 

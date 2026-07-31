@@ -141,6 +141,71 @@ describe("轮询器识别文档任务事件", () => {
     expect(cursor.saved).toEqual([14]);
   });
 
+  it("游标落盘失败:仍然 ack,任务只跑一次 —— 状态目录写不进去不该把任务重跑一遍", async () => {
+    // 回归(reviewer 复现):上一轮只堵了 handler 里的去重落盘,但游标文件
+    // (events.cursor.json)和去重表(doc-mentions.processed.json)在**同一个目录**,
+    // EROFS/ENOSPC/EACCES/EDQUOT 会同时命中两处写。cursorStore.save() 原先裸在
+    // 循环里,一抛就逃出整个 for:不 ack、游标不前进、批次剩余事件也一起不处理
+    // —— 实测 polls=6 taskRuns=6 acked=[] cursorSaved=[],3.2s 跑 6 遍,永不收敛。
+    const acked: number[] = [];
+    let polls = 0;
+    globalThis.fetch = vi.fn(async (input: any) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const json = (data: unknown) =>
+        new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
+      const ackMatch = /\/v1\/bot\/events\/(\d+)\/ack/.exec(url);
+      if (ackMatch) { acked.push(Number(ackMatch[1])); return json({ status: 1 }); }
+      if (url.includes("/v1/bot/events")) {
+        polls += 1;
+        return json({ status: 1, results: acked.includes(15) ? [] : [docEvent(15)] });
+      }
+      return json({});
+    }) as unknown as typeof fetch;
+
+    let taskRuns = 0;
+    const poller = startEventPoller({
+      apiUrl: API,
+      botToken: "tok",
+      intervalMs: 500,
+      cursorStore: {
+        async load() { return 0; },
+        async save() { throw new Error("EROFS: read-only file system"); },
+      },
+      onDocMention: async () => { taskRuns += 1; },
+    });
+    await poller.ready;
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    poller.stop();
+
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(taskRuns).toBe(1);
+    expect(acked).toEqual([15]); // ack 才是真正止住重投的东西
+    expect(poller.cursor()).toBe(15); // 内存游标照常前进
+  });
+
+  it("同一批里前一个事件游标落盘失败,后续事件仍被处理", async () => {
+    // 第二重影响:原先那个抛出会中断整个 for 循环,所以一旦触发,**卡片动作**也
+    // 一起停 —— 是整个轮询器被楔死,不只是文档任务重放。
+    const { acked } = installFetch([docEvent(16), docEvent(17)]);
+    const seen: number[] = [];
+    const poller = startEventPoller({
+      apiUrl: API,
+      botToken: "tok",
+      intervalMs: 500,
+      cursorStore: {
+        async load() { return 0; },
+        async save() { throw new Error("ENOSPC: no space left on device"); },
+      },
+      onDocMention: async (mention) => { seen.push(Number(mention.idempotencyKey.slice(1))); },
+    });
+    await poller.ready;
+    await drain();
+    poller.stop();
+
+    expect(seen).toEqual([16, 17]);
+    expect(acked).toEqual([16, 17]);
+  });
+
   it("未知 event_type 既不派发也不 ack", async () => {
     const { acked } = installFetch([{ event_id: 13, event_type: "brand_new_type", event_data: {} }]);
     const seen: DocCommentMention[] = [];

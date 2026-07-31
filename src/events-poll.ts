@@ -145,9 +145,16 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
           }
         }
 
-        await options.cursorStore.save(event.event_id);
-        cursor = event.event_id;
-
+        // ACK 先于存游标,而且存游标不许抛。
+        //
+        // 两者是不同量级的失败:ack 才是真正止住 server 重投的东西,游标只是本进程
+        // 的重启起点 —— 已 ack 的事件 server 不会再投,所以游标丢了是可恢复的。
+        // 反过来写就不成立:游标存在轮询器状态目录里(events.cursor.json),和文档
+        // 任务的去重表(doc-mentions.processed.json)是**同一个目录**,EROFS /
+        // ENOSPC / EACCES / EDQUOT 会同时命中两处写。原先 save() 裸在这里,一抛就
+        // 逃出整个 for 循环:不 ack、游标不前进(它在 save 之后才赋值)、批次剩下
+        // 的事件也一起不处理 —— 下一 tick 原样重取,把会改文档的任务每周期重跑
+        // 一遍,同时把卡片动作也一并楔死。实测 3.2s 跑 6 遍,永不收敛。
         if (recognized && options.ack !== false) {
           try {
             await ackBotEvent({
@@ -161,6 +168,16 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
             );
           }
         }
+
+        try {
+          await options.cursorStore.save(event.event_id);
+        } catch (error) {
+          options.log?.error?.(
+            `octo: cursor save failed at event ${event.event_id} (in-memory cursor still advances): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        // 内存游标无条件前进:落盘失败只影响重启后的起点,不该让本进程反复重取。
+        cursor = event.event_id;
       }
       if (events.length > 0) {
         options.log?.info?.(

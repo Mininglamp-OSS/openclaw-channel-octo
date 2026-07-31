@@ -48,6 +48,7 @@ describe("文档任务接线", () => {
     // 「成功」以确实发出过评论为准 —— 只是 dispatch 没抛异常不算(见不变量 1)
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好");
+      extra.docTask.reportOutcome("work-delivered");
       return "completed" as const;
     });
     const { handler, dedupe } = makeHandler(dispatch);
@@ -103,6 +104,7 @@ describe("文档任务接线", () => {
   it("docTask.postComment 透传到注入的实现", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好");
+      extra.docTask.reportOutcome("work-delivered");
       return "completed" as const;
     });
     const { handler, postComment } = makeHandler(dispatch);
@@ -120,6 +122,7 @@ describe("文档任务接线", () => {
   it("回帖始终失败:不得写入持久去重(否则一次瞬时 5xx 就永久丢回复)", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好").catch(() => {});
+      extra.docTask.reportOutcome("nothing");
       return "completed" as const;
     });
     const { handler, dedupe } = makeHandler(dispatch, async () => { throw new Error("docs API 503"); });
@@ -134,6 +137,7 @@ describe("文档任务接线", () => {
     let attempts = 0;
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好");
+      extra.docTask.reportOutcome("work-delivered");
       return "completed" as const;
     });
     const { handler, dedupe } = makeHandler(dispatch, async () => {
@@ -162,6 +166,7 @@ describe("文档任务接线", () => {
   it("正常投递过就不再补兜底", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好");
+      extra.docTask.reportOutcome("work-delivered");
       return "completed" as const;
     });
     const { handler, postComment } = makeHandler(dispatch);
@@ -180,6 +185,8 @@ describe("文档任务接线", () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("正在读取文档…");
       await extra.docTask.postComment("这是最终答复").catch(() => {});
+      // inbound 侧:有产出发丢且没提示 → nothing
+      extra.docTask.reportOutcome("nothing");
       return "completed" as const;
     });
     let call = 0;
@@ -195,14 +202,12 @@ describe("文档任务接线", () => {
     expect(await dedupe.claim("k1")).toBe(false); // 有丢失 → 不写去重
   });
 
-  // --- 提示 ≠ 产出 ---
+  // --- 结论由回合上报,不由本文件推断 ---
 
-  it("只发出一句道歉(kind:notice):不写去重,事件仍可重投 —— 一句道歉证明不了活儿干了", async () => {
-    // 回归:inbound 的三处兜底(onError / 超时 / dispatch 拒绝)都经同一投递通道,
-    // 不标 notice 的话会把 delivered 抬到 1;onError 路径 dispatcher 还会正常 resolve
-    // → outcome=completed → 判定完成 → 文档一个字没改,事件却被永久吸收。
+  it("上报 notice-only:不写去重,也不再补一条兜底(评论区已有痕迹)", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
-      await extra.docTask.postComment("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", undefined, { kind: "notice" });
+      await extra.docTask.postComment("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。");
+      extra.docTask.reportOutcome("notice-only");
       return "completed" as const;
     });
     const { handler, dedupe, postComment } = makeHandler(dispatch);
@@ -210,21 +215,31 @@ describe("文档任务接线", () => {
     await handler(mention());
 
     expect(await dedupe.claim("k1")).toBe(false); // 未记为完成 → 可重投
-    // 已经有提示了就不再补通用兜底,否则用户连着看两句废话
-    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1); // 不叠第二条废话
   });
 
-  it("产出送达 + 另发过提示:仍按产出判定为完成", async () => {
+  it("完全没上报(dispatch 之前就早返回):按 nothing 处理 —— 补兜底、不写去重", async () => {
+    // 能力门禁、resolveAgentRoute 抛错这类路径根本走不到上报点。
+    const dispatch = vi.fn(async () => "completed" as const);
+    const { handler, dedupe, postComment } = makeHandler(dispatch);
+
+    await handler(mention());
+
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(await dedupe.claim("k1")).toBe(false);
+  });
+
+  it("上报 work-delivered 但任务被判 dropped:仍不算完成 —— 活儿没干", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
-      await extra.docTask.postComment("进度提示", undefined, { kind: "notice" });
       await extra.docTask.postComment("已改好");
-      return "completed" as const;
+      extra.docTask.reportOutcome("work-delivered");
+      return "dropped" as const;
     });
     const { handler, dedupe } = makeHandler(dispatch);
 
     await handler(mention());
 
-    expect(await dedupe.claim("k1")).toBe(true);
+    expect(await dedupe.claim("k1")).toBe(false);
   });
 
   // --- 去重落盘失败不得逃逸(不变量 3) ---
@@ -234,6 +249,7 @@ describe("文档任务接线", () => {
     // 3.2s 内把同一个任务对着线上文档跑了 6 遍,永不收敛。
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好");
+      extra.docTask.reportOutcome("work-delivered");
       return "completed" as const;
     });
     const postComment = vi.fn(async () => {});
@@ -252,12 +268,10 @@ describe("文档任务接线", () => {
     expect(postComment).toHaveBeenCalledTimes(1); // 答复照常发出,不因落盘失败重发
   });
 
-  it("任务被判 dropped(如会话冲突):即使发过回执也不写去重 —— 活儿没干", async () => {
-    // 回归:回执经同一投递通道会把 delivered 抬到 1,从而把「从未执行的任务」
-    // 记为已完成,吸收掉本该重投的那次。
-    // channel.ts 发这条回执时标的就是 kind:"notice"(见 isSessionInitConflict 分支)。
+  it("会话冲突:channel.ts 上报 notice-only,回执本身就是痕迹,不补兜底也不写去重", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
-      await extra.docTask.postComment("⚠️ 上一轮任务尚未结束，本次请求已跳过。", undefined, { kind: "notice" });
+      await extra.docTask.postComment("⚠️ 上一轮任务尚未结束，本次请求已跳过。");
+      extra.docTask.reportOutcome("notice-only");
       return "dropped" as const;
     });
     const { handler, dedupe, postComment } = makeHandler(dispatch);
@@ -265,6 +279,6 @@ describe("文档任务接线", () => {
     await handler(mention());
 
     expect(await dedupe.claim("k1")).toBe(false);
-    expect(postComment).toHaveBeenCalledTimes(1); // 回执本身就是痕迹,不再补兜底
+    expect(postComment).toHaveBeenCalledTimes(1);
   });
 });

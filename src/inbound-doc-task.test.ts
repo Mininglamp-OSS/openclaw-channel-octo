@@ -111,6 +111,7 @@ function runDocTask(postComment: (text: string) => Promise<void>) {
       threadId: mention.threadId,
       sessionScope: docTaskSessionScope(mention),
       postComment: async (text) => { await postComment(text); },
+      reportOutcome: () => {},
     },
   });
 }
