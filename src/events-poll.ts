@@ -9,6 +9,16 @@ import { parseCardAction, type CardAction } from "./card-action.js";
 
 const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_LIMIT = 50;
+/** Ceiling for the error backoff in long-poll mode. */
+const MAX_ERROR_BACKOFF_MS = 30_000;
+/**
+ * How much of the requested hold a response must have consumed for the server to count as
+ * "actually holding". Well below 1 so ordinary jitter, or a hold ended early by a real event
+ * arriving, is not mistaken for a non-holding server.
+ */
+const HELD_FRACTION = 0.5;
+/** Mirrors the server-side clamp on `wait`, so the two agree by construction rather than convention. */
+const MAX_WAIT_SECONDS = 30;
 
 export interface EventCursorStore {
   load(): Promise<number>;
@@ -91,8 +101,13 @@ export function requestCardEventPolling(accountId: string): void {
 export function startEventPoller(options: EventPollerOptions): EventPoller {
   const intervalMs = Math.max(500, Math.floor(options.intervalMs ?? DEFAULT_INTERVAL_MS));
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? DEFAULT_LIMIT)));
+  // Clamp at runtime, not just in the JSON schema: a host that surfaces the schema advisorily
+  // rather than enforcing it would otherwise let eventWaitSeconds: 3600 through, yielding a
+  // ~3610s client timeout against a server that clamps its own `wait` to 30s.
   const waitSeconds =
-    options.waitSeconds && options.waitSeconds > 0 ? Math.floor(options.waitSeconds) : 0;
+    options.waitSeconds && options.waitSeconds > 0
+      ? Math.min(MAX_WAIT_SECONDS, Math.floor(options.waitSeconds))
+      : 0;
   let cursor = 0;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -100,17 +115,51 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
   // single sequential chain, so a stop during a 25s hold would keep the account busy for the
   // rest of that hold instead of shutting down.
   let inFlight: AbortController | undefined;
+  let consecutiveErrors = 0;
 
-  const schedule = (): void => {
+  const schedule = (delayMs: number): void => {
     if (stopped) return;
-    // When long-polling, the server already paces the loop: it holds an empty queue and answers
-    // early only when there is something to deliver. Sleeping another intervalMs on top would
-    // reintroduce exactly the latency the hold removes.
-    timer = setTimeout(() => void tick(), waitSeconds > 0 ? 0 : intervalMs);
+    timer = setTimeout(() => void tick(), Math.max(0, delayMs));
+  };
+
+  /**
+   * Pace the next tick from what this one actually did.
+   *
+   * Long polling delegates pacing to the server — but only while the server is really holding.
+   * Rescheduling at 0ms unconditionally (the first version of this) turns any fast return into a
+   * hot loop: an older server that ignores `wait`, any 4xx/5xx, a connection refusal, or a proxy
+   * closing the hold early all come back in one RTT, and the loop re-fires immediately, forever.
+   * Measured in review at ~800 req/s against an immediately-erroring server — the opposite of the
+   * traffic reduction this feature exists for, at exactly the moment the server can least absorb
+   * it (PR #194 review: Jerry-Xin, lml2468, yujiawei, mochashanyao).
+   *
+   * So: only a hold that was genuinely honoured earns an immediate re-poll.
+   */
+  const nextDelayMs = (
+    outcome: "batch" | "empty" | "error",
+    requestMs: number,
+  ): number => {
+    if (waitSeconds === 0) return intervalMs; // short poll: unchanged, always paced
+    if (outcome === "error") {
+      // Never hammer an unhealthy server. Exponential, capped, reset on any success.
+      consecutiveErrors += 1;
+      return Math.min(MAX_ERROR_BACKOFF_MS, intervalMs * 2 ** (consecutiveErrors - 1));
+    }
+    consecutiveErrors = 0;
+    // Events in hand: drain immediately, there may be more behind them.
+    if (outcome === "batch") return 0;
+    // Empty, and the server clearly did not hold for anything like the time we asked for — it is
+    // not participating in the long poll (old server, proxy, or an error page). Fall back to
+    // client-side pacing rather than spinning.
+    if (requestMs < waitSeconds * 1000 * HELD_FRACTION) return intervalMs;
+    // Empty after a real hold: the server did its job, go straight back in.
+    return 0;
   };
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
+    const startedAt = Date.now();
+    let outcome: "batch" | "empty" | "error" = "empty";
     try {
       const controller = new AbortController();
       inFlight = controller;
@@ -160,12 +209,14 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
           }
         }
       }
+      outcome = events.length > 0 ? "batch" : "empty";
       if (events.length > 0) {
         options.log?.info?.(
           `octo: event poll batch events=${events.length} card_actions=${cardActions} cursor=${cursor}`,
         );
       }
     } catch (error) {
+      outcome = "error";
       // A stop() mid-hold aborts the request on purpose; reporting that as a poll failure would
       // put a spurious error in the log on every clean shutdown.
       if (!stopped) {
@@ -175,7 +226,7 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       }
     } finally {
       inFlight = undefined;
-      schedule();
+      schedule(nextDelayMs(outcome, Date.now() - startedAt));
     }
   };
 
@@ -183,14 +234,16 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
     .then((loaded) => {
       cursor = Number.isSafeInteger(loaded) && loaded >= 0 ? loaded : 0;
       options.log?.info?.(`octo: card event poller ready at cursor=${cursor}`);
-      schedule();
+      // First tick keeps the pre-existing timing: short polling waits one interval before its
+      // first read, long polling starts immediately.
+      schedule(waitSeconds > 0 ? 0 : intervalMs);
     })
     .catch((error) => {
       options.log?.error?.(
         `octo: event cursor load failed, starting from zero: ${error instanceof Error ? error.message : String(error)}`,
       );
       cursor = 0;
-      schedule();
+      schedule(waitSeconds > 0 ? 0 : intervalMs);
     });
 
   return {

@@ -24,6 +24,8 @@ const EVENTS_POLL_TIMEOUT_MS = 10_000;
 // jitter; the client must never be the side that times out first, because an abort loses the
 // batch the server was about to hand back.
 const EVENTS_POLL_WAIT_MARGIN_MS = 10_000;
+/** Mirrors the server-side clamp on `wait`; keeps the derived client timeout bounded too. */
+const MAX_EVENT_WAIT_SECONDS = 30;
 
 /**
  * Client timeout for one /v1/bot/events request.
@@ -809,7 +811,10 @@ export async function fetchBotEvents(params: {
   waitSeconds?: number;
   signal?: AbortSignal;
 }): Promise<BotEvent[]> {
-  const waitSeconds = params.waitSeconds && params.waitSeconds > 0 ? Math.floor(params.waitSeconds) : 0;
+  const waitSeconds =
+    params.waitSeconds && params.waitSeconds > 0
+      ? Math.min(MAX_EVENT_WAIT_SECONDS, Math.floor(params.waitSeconds))
+      : 0;
   const response = await postJson<{ results?: BotEvent[] }>(
     params.apiUrl,
     params.botToken,

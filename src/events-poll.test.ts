@@ -376,54 +376,101 @@ describe("event poller long-poll", () => {
     poller.stop();
   });
 
-  it("long-poll 模式下不再额外空等 intervalMs", async () => {
-    // The whole point: the server already paces the loop by holding the request. Sleeping
-    // intervalMs on top would give back most of the latency the hold just bought.
+  it("服务端真 hold 时，返回后立即续拉（不再空等 intervalMs）", async () => {
+    // The mock must actually hold. With an instantly-returning mock this test would pass
+    // because of the hot-loop defect rather than because the server took over pacing —
+    // that is exactly how the original version of this test locked the defect in
+    // (PR #194 review, yujiawei).
+    const HOLD_MS = 3_000;
+    const starts: number[] = [];
+    global.fetch = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          starts.push(Date.now());
+          setTimeout(() => resolve(Response.json({ results: [] })), HOLD_MS);
+        }),
+    ) as typeof fetch;
+
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 60_000, // would dominate if the loop still slept between reads
+      waitSeconds: 3,
+      cursorStore: memoryCursor(0),
+      onCardAction: async () => {},
+    });
+    await poller.ready;
+
+    await vi.advanceTimersByTimeAsync(HOLD_MS + 50);
+    await vi.advanceTimersByTimeAsync(HOLD_MS + 50);
+
+    // Two requests within ~2 holds proves the gap between them is the hold, not intervalMs.
+    expect(starts.length).toBeGreaterThanOrEqual(2);
+    expect(starts[1] - starts[0]).toBeLessThan(HOLD_MS + 1_000);
+    poller.stop();
+  });
+
+  it("服务端不 hold 时退回 intervalMs 节流 —— 旧服务端不会被打成请求风暴", async () => {
+    // The compatibility path the PR description promised was "a safe no-op": an older server
+    // ignores `wait` and answers immediately. Without outcome-based pacing this became an
+    // unbounded hot loop (measured at ~800 req/s in review).
     let calls = 0;
     global.fetch = vi.fn().mockImplementation(async () => {
       calls += 1;
-      return Response.json({ results: [] });
+      return Response.json({ results: [] }); // immediate empty: server is not holding
     }) as typeof fetch;
 
-    const drain = async () => {
-      // The reschedule happens in a `finally` after an await chain, so one timer advance is
-      // not enough to observe the next tick; drain a few rounds instead of guessing.
-      // Advance by 1ms per round: a 0ms advance does not move the clock, so a freshly
-      // scheduled setTimeout(...,0) would never come due.
-      for (let i = 0; i < 5; i += 1) await vi.advanceTimersByTimeAsync(1);
-    };
-
-    const longPoll = startEventPoller({
+    const poller = startEventPoller({
       apiUrl: "https://api.test",
       botToken: "bf_x",
-      intervalMs: 60_000,
+      intervalMs: 2_000,
       waitSeconds: 25,
       cursorStore: memoryCursor(0),
       onCardAction: async () => {},
     });
-    await longPoll.ready;
-    await drain();
-    const longPollCalls = calls;
-    longPoll.stop();
+    await poller.ready;
 
-    calls = 0;
-    const shortPoll = startEventPoller({
+    for (let i = 0; i < 10; i += 1) await vi.advanceTimersByTimeAsync(1);
+    // Paced by intervalMs, so ~10ms of wall clock may not fit a second request at all.
+    expect(calls).toBeLessThanOrEqual(1);
+
+    await vi.advanceTimersByTimeAsync(2_100);
+    expect(calls).toBe(2); // exactly one more after one intervalMs — not a storm
+    poller.stop();
+  });
+
+  it("出错时指数退避，且成功后重置 —— 不在服务端最不健康时加压", async () => {
+    let calls = 0;
+    let failing = true;
+    global.fetch = vi.fn().mockImplementation(async () => {
+      calls += 1;
+      if (failing) return new Response("boom", { status: 502 });
+      return Response.json({ results: [] });
+    }) as typeof fetch;
+
+    const poller = startEventPoller({
       apiUrl: "https://api.test",
       botToken: "bf_x",
-      intervalMs: 60_000,
+      intervalMs: 1_000,
+      waitSeconds: 25,
       cursorStore: memoryCursor(0),
+      log: { error: () => {} },
       onCardAction: async () => {},
     });
-    await shortPoll.ready;
-    await drain();
-    const shortPollCalls = calls;
-    shortPoll.stop();
+    await poller.ready;
 
-    // Same wall-clock (5ms advanced), same intervalMs: short polling is gated by the 60s
-    // timer and cannot fire at all, while long polling keeps going back for more as soon as
-    // each request settles.
-    expect(shortPollCalls).toBe(0);
-    expect(longPollCalls).toBeGreaterThan(1);
+    // Before the fix this window produced hundreds of requests.
+    for (let i = 0; i < 20; i += 1) await vi.advanceTimersByTimeAsync(1);
+    expect(calls).toBeLessThanOrEqual(1);
+
+    await vi.advanceTimersByTimeAsync(1_050); // 1st backoff = intervalMs
+    expect(calls).toBe(2);
+    await vi.advanceTimersByTimeAsync(1_050); // 2nd backoff = 2x, not yet due
+    expect(calls).toBe(2);
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(calls).toBe(3);
+
+    poller.stop();
   });
 
   it("stop() 中断在途 hold，且不把中断记成轮询失败", async () => {
