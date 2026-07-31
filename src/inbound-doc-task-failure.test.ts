@@ -190,4 +190,20 @@ describe("文档任务:失败路径同样不得触达 IM", () => {
     expect(imOutbound(urls)).toHaveLength(0);
     expect(posted.length).toBeGreaterThanOrEqual(1);
   });
+
+  it("agent 只产出 media、没有文本:附件必须发进评论区,不能一条都不发", async () => {
+    // 回归:附件原先只在「有文本可发」时才随评论带出去,纯 media 回合会一条评论
+    // 都不产生,任务却被记为成功 —— 评论区静默且永不重试。
+    const urls = installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "final" });
+    });
+    const posted: string[] = [];
+
+    await runDocTask(posted);
+
+    expect(imOutbound(urls)).toHaveLength(0);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain(`[附件] ${API}/f/a.png`);
+  });
 });

@@ -1511,14 +1511,26 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             );
           } catch (err) {
             if (isSessionInitConflict(err)) {
-              await notifyInboundConflictDropped({
-                err,
-                msg,
-                accountId: account.accountId,
-                apiUrl: account.config.apiUrl,
-                botToken: account.config.botToken,
-                log,
-              });
+              if (extra?.docTask) {
+                // 第五处 IM 出口:该回执按合成消息解析目标,会发进发起人的私聊。
+                // 文档任务改投评论区 —— 与 inbound 的出站收口同一条原则。
+                try {
+                  await extra.docTask.postComment(
+                    "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
+                  );
+                } catch (postErr) {
+                  log?.error?.(`octo: doc task conflict notice failed: ${String(postErr)}`);
+                }
+              } else {
+                await notifyInboundConflictDropped({
+                  err,
+                  msg,
+                  accountId: account.accountId,
+                  apiUrl: account.config.apiUrl,
+                  botToken: account.config.botToken,
+                  log,
+                });
+              }
               return "dropped" as const;
             }
             throw err;

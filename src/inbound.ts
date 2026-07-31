@@ -2758,9 +2758,12 @@ export async function handleInboundMessage(params: {
   const postDocTaskReply = async (content: string, signal?: AbortSignal): Promise<void> => {
     if (!docTask) return;
     const attachments = docTaskMediaUrls.splice(0, docTaskMediaUrls.length);
-    const body = attachments.length > 0
-      ? `${content}\n\n${attachments.map((url) => `[附件] ${url}`).join("\n")}`
-      : content;
+    // 允许「只有附件、没有文本」:agent 产出纯 media 的回合原先在这里无文本可发,
+    // 附件就永远卡在队列里 —— 评论区静默,任务却被当成功。
+    const body = [content.trim(), ...attachments.map((url) => `[附件] ${url}`)]
+      .filter(Boolean)
+      .join("\n\n");
+    if (!body) return;
     try {
       await docTask.postComment(body, signal);
       statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
@@ -3047,6 +3050,12 @@ export async function handleInboundMessage(params: {
           // --- Text handling based on kind ---
           const content = payload.text?.trim() ?? "";
           if (!content && sentMediaUrls.size > 0) {
+            // 文档任务:附件此时还排在 docTaskMediaUrls 里,必须经出站收口发出去,
+            // 否则本回合一条评论都不会产生。
+            if (docTask) {
+              await postDocTaskReply("");
+              return;
+            }
             statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
             replySucceeded = true;
             return;

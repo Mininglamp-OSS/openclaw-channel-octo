@@ -30,9 +30,9 @@ function mention(overrides: Record<string, unknown> = {}): DocCommentMention {
   })!;
 }
 
-function makeHandler(dispatch: any) {
+function makeHandler(dispatch: any, postCommentImpl?: any) {
   const dedupe = createMemoryDocMentionDedupeStore();
-  const postComment = vi.fn(async () => {});
+  const postComment = vi.fn(postCommentImpl ?? (async () => {}));
   const handler = createDocMentionHandler({
     botUid: BOT_UID,
     dedupe,
@@ -44,8 +44,12 @@ function makeHandler(dispatch: any) {
 }
 
 describe("文档任务接线", () => {
-  it("成功后写入持久去重,同 key 不再执行", async () => {
-    const dispatch = vi.fn(async () => "completed" as const);
+  it("成功投递后写入持久去重,同 key 不再执行", async () => {
+    // 「成功」以确实发出过评论为准 —— 只是 dispatch 没抛异常不算(见不变量 1)
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("已改好");
+      return "completed" as const;
+    });
     const { handler, dedupe } = makeHandler(dispatch);
 
     await handler(mention());
@@ -66,7 +70,7 @@ describe("文档任务接线", () => {
     expect(await dedupe.claim("k1")).toBe(false); // 未被标记为已完成
   });
 
-  it("dispatch 返回 dropped:同样释放,不写持久去重", async () => {
+  it("dispatch 返回 dropped 且未投递:释放,不写持久去重", async () => {
     const dispatch = vi.fn(async () => "dropped" as const);
     const { handler, dedupe } = makeHandler(dispatch);
 
@@ -106,5 +110,65 @@ describe("文档任务接线", () => {
     await handler(mention());
 
     expect(postComment).toHaveBeenCalledWith(expect.objectContaining({ docId: "d1" }), "已改好", undefined);
+  });
+
+  // --- 投递结果必须可观测 ---
+  // 根因:完成状态原先是靠「handler 没抛异常」推断的,从不校验评论到底发出去没有。
+  // 于是「回帖失败」「media-only 无文本」「dispatch 前早返回」三条路径都会被当成
+  // 成功 —— 事件 ack、去重落盘、评论区静默、永不重试。
+
+  it("回帖始终失败:不得写入持久去重(否则一次瞬时 5xx 就永久丢回复)", async () => {
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("已改好").catch(() => {});
+      return "completed" as const;
+    });
+    const { handler, dedupe } = makeHandler(dispatch, async () => { throw new Error("docs API 503"); });
+
+    await handler(mention());
+
+    // 未标记完成 → server 重投时仍可重放
+    expect(await dedupe.claim("k1")).toBe(false);
+  });
+
+  it("回帖瞬时失败后重试成功:视为已投递并写入去重", async () => {
+    let attempts = 0;
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("已改好");
+      return "completed" as const;
+    });
+    const { handler, dedupe } = makeHandler(dispatch, async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("docs API 503");
+    });
+
+    await handler(mention());
+
+    expect(attempts).toBeGreaterThanOrEqual(2);
+    expect(await dedupe.claim("k1")).toBe(true);
+  });
+
+  it("dispatch 返回 completed 却一条评论都没发:补兜底评论,且不写去重", async () => {
+    // 覆盖 dispatch 之前的早返回(resolveAgentRoute 抛错、能力门禁等):
+    // 那些是正常返回而非异常,连 catch 都进不去。
+    const dispatch = vi.fn(async () => "completed" as const);
+    const { handler, dedupe, postComment } = makeHandler(dispatch);
+
+    await handler(mention());
+
+    expect(postComment).toHaveBeenCalledTimes(1); // 兜底,保证评论区有痕迹
+    expect(await dedupe.claim("k1")).toBe(false); // 兜底不算成功交付
+  });
+
+  it("正常投递过就不再补兜底", async () => {
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("已改好");
+      return "completed" as const;
+    });
+    const { handler, postComment } = makeHandler(dispatch);
+
+    await handler(mention());
+
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(postComment.mock.calls[0][1]).toBe("已改好");
   });
 });
