@@ -48,6 +48,7 @@ import {
   type DocCommentMention,
 } from "./doc-mention.js";
 import { createFileDocMentionDedupeStore } from "./doc-mention-dedupe.js";
+import { createDocMentionHandler } from "./doc-mention-handler.js";
 import { handleCardAction } from "./card-action-handler.js";
 
 /**
@@ -1530,45 +1531,22 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       const docTasksEnabled = account.config.docTasks === true;
       const cardInteractionEnabled = account.config.cardInteraction !== false;
       const docMentionDedupe = createFileDocMentionDedupeStore({ accountId: account.accountId });
-      const handleDocMention = async (mention: DocCommentMention): Promise<void> => {
-        if (mention.botUid && mention.botUid !== credentials.robot_id) {
-          log?.error?.(
-            `octo: doc mention bot_uid=${mention.botUid} != this bot ${credentials.robot_id}, dropped`,
-          );
-          return;
-        }
-        if (await docMentionDedupe.claim(mention.idempotencyKey)) {
-          log?.info?.(`octo: doc mention ${mention.idempotencyKey} already processed, skipped`);
-          return;
-        }
-        const message = synthesizeDocMentionMessage(mention, credentials.robot_id);
-        // 只有任务真正跑完才写入持久去重。若在此之前崩溃/被拒,「进行中」标记随进程
-        // 消失,事件重投时得以重放 —— 否则任务被永久静默丢弃,评论区没有任何反馈。
-        let outcome: "completed" | "dropped" = "dropped";
-        try {
-          outcome = await dispatchInboundMessage(message, undefined, {
-          queueScope: docTaskQueueScope(mention),
-          docTask: {
+      const handleDocMention = createDocMentionHandler({
+        botUid: credentials.robot_id,
+        dedupe: docMentionDedupe,
+        dispatch: dispatchInboundMessage,
+        postComment: async (mention, text, signal) => {
+          await postDocComment({
+            apiUrl: account.config.apiUrl,
+            botToken: account.config.botToken ?? "",
             docId: mention.docId,
-            threadId: mention.threadId,
-            sessionScope: docTaskSessionScope(mention),
-            postComment: async (text, signal) => {
-              await postDocComment({
-                apiUrl: account.config.apiUrl,
-                botToken: account.config.botToken ?? "",
-                docId: mention.docId,
-                body: text,
-                parentId: docCommentParentId(mention),
-                signal,
-              });
-            },
-          },
+            body: text,
+            parentId: docCommentParentId(mention),
+            signal,
           });
-        } finally {
-          if (outcome === "completed") await docMentionDedupe.complete(mention.idempotencyKey);
-          else docMentionDedupe.release(mention.idempotencyKey);
-        }
-      };
+        },
+        log,
+      });
 
       let cardEventPoller: EventPoller | undefined;
       const startCardEventPoller = (): void => {

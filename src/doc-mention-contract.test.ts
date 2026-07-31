@@ -13,7 +13,8 @@ import {
   synthesizeDocMentionMessage,
   type DocCommentMention,
 } from "./doc-mention.js";
-import { createFileDocMentionDedupeStore } from "./doc-mention-dedupe.js";
+import { createFileDocMentionDedupeStore, type DocMentionDedupeStore } from "./doc-mention-dedupe.js";
+import { createDocMentionHandler } from "./doc-mention-handler.js";
 import { getInboundQueueKey } from "./inbound-queue.js";
 import { handleInboundMessage } from "./inbound.js";
 import { postDocComment } from "./api-fetch.js";
@@ -127,46 +128,46 @@ function installRuntime(finalText: string) {
   return { dispatch, finalizeInboundContext };
 }
 
-/** 复刻 channel.ts 的 onDocMention 接线,避免在测试里起完整 gateway。 */
+/**
+ * 用**真实**的 createDocMentionHandler(channel.ts 生产路径同一函数)驱动,
+ * 只把 dispatch / postComment 换成测试替身 —— 复刻一份接线的话,接线本身的
+ * 回归就抓不到了。
+ */
 function makeDocMentionHandler(params: {
-  dedupe: { claim(key: string): Promise<boolean> };
+  dedupe: DocMentionDedupeStore;
   promptSink?: (text: string) => void;
   finalText: string;
 }) {
-  return async (mention: DocCommentMention): Promise<void> => {
-    if (mention.botUid && mention.botUid !== BOT_UID) return;
-    if (await params.dedupe.claim(mention.idempotencyKey)) return;
-    const message = synthesizeDocMentionMessage(mention, BOT_UID);
-    params.promptSink?.(message.payload.content ?? "");
-    // 队列键在真实链路里由 dispatchInboundMessage 传给 enqueueInbound;
-    // 这里单独断言(见 queue 用例),此处直接调 handleInboundMessage。
-    await handleInboundMessage({
-      account: makeAccount(),
-      message: message as any,
-      botUid: BOT_UID,
-      groupHistories: new Map(),
-      lastBotReplySeqMap: new Map(),
-      memberMap: new Map(),
-      uidToNameMap: new Map(),
-      groupCacheTimestamps: new Map(),
-      log: undefined,
-      docTask: {
+  return createDocMentionHandler({
+    botUid: BOT_UID,
+    dedupe: params.dedupe,
+    postComment: async (mention, text, signal) => {
+      await postDocComment({
+        apiUrl: API,
+        botToken: "tok",
         docId: mention.docId,
-        threadId: mention.threadId,
-        sessionScope: docTaskSessionScope(mention),
-        postComment: async (text, signal) => {
-          await postDocComment({
-            apiUrl: API,
-            botToken: "tok",
-            docId: mention.docId,
-            body: text,
-            parentId: docCommentParentId(mention),
-            signal,
-          });
-        },
-      },
-    });
-  };
+        body: text,
+        parentId: docCommentParentId(mention),
+        signal,
+      });
+    },
+    dispatch: async (message, _routeOverride, extra) => {
+      params.promptSink?.(message.payload.content ?? "");
+      await handleInboundMessage({
+        account: makeAccount(),
+        message: message as any,
+        botUid: BOT_UID,
+        groupHistories: new Map(),
+        lastBotReplySeqMap: new Map(),
+        memberMap: new Map(),
+        uidToNameMap: new Map(),
+        groupCacheTimestamps: new Map(),
+        log: undefined,
+        docTask: extra.docTask,
+      });
+      return "completed";
+    },
+  });
 }
 
 async function drain(ms = 900): Promise<void> {
