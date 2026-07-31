@@ -1528,6 +1528,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 文档评论 @Bot 任务。持久去重:轮询器先执行后存游标,server 侧也可能在
       // enqueue 后 confirm 前崩溃重投,两条路径都靠 idempotency_key 收敛。
       const docTasksEnabled = account.config.docTasks === true;
+      const cardInteractionEnabled = account.config.cardInteraction !== false;
       const docMentionDedupe = createFileDocMentionDedupeStore({ accountId: account.accountId });
       const handleDocMention = async (mention: DocCommentMention): Promise<void> => {
         if (mention.botUid && mention.botUid !== credentials.robot_id) {
@@ -1571,7 +1572,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           cursorStore: createFileEventCursorStore({ accountId: account.accountId }),
           log,
           ...(docTasksEnabled ? { onDocMention: handleDocMention } : {}),
-          onCardAction: async (action) => {
+          // cardInteraction:false 时不注册:否则开启 doc 任务后常驻轮询会把运维
+          // 显式关掉的卡片回调又重新处理起来(轮询器只对已注册的类型做解析与 ack)。
+          onCardAction: cardInteractionEnabled ? async (action) => {
             await handleCardAction({
               action,
               accountId: account.accountId,
@@ -1591,7 +1594,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                 return result === "completed" ? "completed" : "rejected";
               },
             });
-          },
+          } : undefined,
         });
         log?.info?.(
           `octo: [${account.accountId}] bot event poller started (doc_tasks=${docTasksEnabled})`,
