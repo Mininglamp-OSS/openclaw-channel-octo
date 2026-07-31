@@ -843,6 +843,33 @@ export async function sendHeartbeat(params: {
   await postJson(params.apiUrl, params.botToken, "/v1/bot/heartbeat", {}, params.signal);
 }
 
+/**
+ * 在文档评论串下发布一条 Bot 评论(docs domain,与 IM 消息无关)。
+ *
+ * 文档任务的最终答复走这条出口而不是 sendMessage:合成消息是 DM 形状的,
+ * 走 IM 出口会把答复发进发起人的私聊 —— 正是本特性要消除的污染。
+ * parentId 省略时发布为根评论。
+ */
+export async function postDocComment(params: {
+  apiUrl: string;
+  botToken: string;
+  docId: string;
+  body: string;
+  parentId?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  await postJson(
+    params.apiUrl,
+    params.botToken,
+    `/v1/bot/docs/${encodeURIComponent(params.docId)}/comments`,
+    {
+      body: params.body,
+      ...(params.parentId !== undefined ? { parentId: params.parentId } : {}),
+    },
+    params.signal,
+  );
+}
+
 
 
 export async function registerBot(params: {

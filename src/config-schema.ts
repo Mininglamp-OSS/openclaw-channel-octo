@@ -33,6 +33,7 @@ export interface OctoAccountConfig {
   reasoningCardTemplateMode?: ReasoningCardTemplateMode;  // off=Model B, shadow=discover only, experimental=Model A when compatible
   cardDisplay?: boolean;  // false force-disables the display-card tool; true/unset follows server capabilities
   cardInteraction?: boolean;  // false force-disables interactive cards; true/unset follows server capabilities
+  docTasks?: boolean;  // true enables document comment @Bot tasks
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace); if neither resolves, write-secret fails closed (no process.cwd() fallback).
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms). Unset = derived from agents.defaults.timeoutSeconds + 60s buffer (issue #113).
@@ -55,6 +56,7 @@ export interface OctoConfig {
   reasoningCardTemplateMode?: ReasoningCardTemplateMode;  // Top-level Registry migration mode for reasoning cards
   cardDisplay?: boolean;  // Top-level default for the display-card tool
   cardInteraction?: boolean;  // Top-level default for interactive cards
+  docTasks?: boolean;  // Top-level default for document comment @Bot tasks
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret (see OctoAccountConfig)
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms); see OctoAccountConfig
@@ -97,7 +99,10 @@ const REASONING_CARD_TEMPLATE_MODE_SCHEMA = {
 export const CARD_DISPLAY_DESCRIPTION =
   "When omitted or true, follow the server card capability gate; false force-disables the octo_send_display_card tool. Per-account values override the top-level value.";
 
-export const CARD_INTERACTION_DESCRIPTION =
+export const DOC_TASKS_DESCRIPTION =
+  "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM.";
+
+const CARD_INTERACTION_DESCRIPTION =
   "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value.";
 
 // Shared description for commands.fork.scope, kept identical to the wording in
@@ -144,6 +149,7 @@ export const OctoConfigJsonSchema = {
       reasoningCardTemplateMode: REASONING_CARD_TEMPLATE_MODE_SCHEMA,
       cardDisplay: { type: "boolean", description: CARD_DISPLAY_DESCRIPTION },
       cardInteraction: { type: "boolean", description: CARD_INTERACTION_DESCRIPTION },
+      docTasks: { type: "boolean", description: DOC_TASKS_DESCRIPTION },
       onBehalfOf: { type: "string" },
       secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
       dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },
@@ -169,6 +175,7 @@ export const OctoConfigJsonSchema = {
             reasoningCardTemplateMode: REASONING_CARD_TEMPLATE_MODE_SCHEMA,
             cardDisplay: { type: "boolean", description: CARD_DISPLAY_DESCRIPTION },
             cardInteraction: { type: "boolean", description: CARD_INTERACTION_DESCRIPTION },
+            docTasks: { type: "boolean", description: DOC_TASKS_DESCRIPTION },
             onBehalfOf: { type: "string" },
             secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
             dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },

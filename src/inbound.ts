@@ -1526,8 +1526,24 @@ export async function handleInboundMessage(params: {
   statusSink?: OctoStatusSink;
   /** Trusted adapter-side route captured when an interactive card was authored. */
   routeOverride?: { sessionKey: string; agentId?: string };
+  /**
+   * 文档评论任务上下文(octo-server `doc_comment_mention`)。
+   *
+   * 一旦存在,本次 inbound 的全部 IM 出站被关闭,最终答复改投 `postComment`:
+   * 合成消息是 DM 形状的,不改道会把答复、正在输入、已读回执、进度卡全部发进
+   * 发起人的私聊 —— 正是本特性要消除的污染。`postComment` 由调用方注入,
+   * 便于测试直接断言 IM 出站零调用。
+   */
+  docTask?: {
+    docId: string;
+    threadId: string;
+    /** 会话作用域片段,如 `doctask:{docId}:{threadId}`(见 doc-mention.ts)。 */
+    sessionScope: string;
+    postComment: (text: string, signal?: AbortSignal) => Promise<void>;
+  };
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
+  const docTask = params.docTask;
   // Server-authoritative robot map. Default to a throwaway Map when the caller
   // omits it so the gate logic below can read it unconditionally; the real
   // channel call site passes a persistent per-account map.
@@ -2261,6 +2277,12 @@ export async function handleInboundMessage(params: {
       ...(params.routeOverride.agentId ? { agentId: params.routeOverride.agentId } : {}),
     };
   }
+  if (docTask) {
+    // 文档任务的会话粒度是「评论串」:同串追问共享上下文,跨串互不可见,且与
+    // DM/群会话彻底分开。刻意不落进 `octo:group:` 命名空间 —— group-md.ts 靠
+    // 该前缀正则决定是否注入 GROUP.md,文档任务不该继承群聊规则。
+    route = { ...route, sessionKey: `agent:${route.agentId}:${CHANNEL_ID}:${docTask.sessionScope}` };
+  }
 
   // Fire-and-forget: ensure GROUP.md is cached for this group
   if (isGroup && message.channel_id) {
@@ -2681,20 +2703,27 @@ export async function handleInboundMessage(params: {
 
   // 波 B:登记进度卡发送上下文(hook 侧懒发/更新时用)。route.sessionKey 桥接
   // dispatch↔hook(H1 实证一致)。OBO(persona-clone)场景由 setCardContext 内部标记跳过。
-  setCardContext(route.sessionKey, {
-    apiUrl,
-    botToken,
-    channelId: replyChannelId,
-    channelType: replyChannelType,
-    cardProgress: account.config.cardProgress,
-    reasoningCardTemplateMode: account.config.reasoningCardTemplateMode,
-    reasoningVisibility,
-    ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-  });
+  // 文档任务不登记进度卡上下文:进度卡走 IM sendCardMessage/editCardMessage,
+  // 登记了就会把进度卡发进发起人的私聊。
+  if (!docTask) {
+    setCardContext(route.sessionKey, {
+      apiUrl,
+      botToken,
+      channelId: replyChannelId,
+      channelType: replyChannelType,
+      cardProgress: account.config.cardProgress,
+      reasoningCardTemplateMode: account.config.reasoningCardTemplateMode,
+      reasoningVisibility,
+      ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
+    });
+  }
   const recordReasoningForGeneration = createCardReasoningRecorder(route.sessionKey);
 
   // 已读回执 + 正在输入 — fire-and-forget
-  if (isOBOv2) {
+  // 文档任务全部跳过:评论区没有对应语义,发出去就是 IM 侧的噪音。
+  if (docTask) {
+    log?.info?.(`octo: doc task ${docTask.docId}/${docTask.threadId} — IM outbound suppressed`);
+  } else if (isOBOv2) {
     // v2: send typing to origin group with grantor identity (skip readReceipt)
     log?.info?.(`octo: OBO v2 — sending typing to origin group=${replyChannelId} as=${effectiveOnBehalfOf}`);
     sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, onBehalfOf: effectiveOnBehalfOf })
@@ -2713,6 +2742,7 @@ export async function handleInboundMessage(params: {
 
   // Keep sending typing indicator while AI is processing
   const typingInterval = setInterval(() => {
+    if (docTask) return;
     sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) }).catch(() => {});
   }, 5000);
 
@@ -2729,6 +2759,19 @@ export async function handleInboundMessage(params: {
 
   // --- Shared helper: resolve mentions and send text ---
   const resolveAndSendText = async (content: string, signal?: AbortSignal): Promise<SendMessageResult | undefined> => {
+    if (docTask) {
+      // 出站重定向:文档任务的一切文本(最终答复、超时道歉、缓冲兜底)都从这里
+      // 收口,改投评论区。不做「直接丢弃」是刻意的 —— 丢弃会让失败/超时的任务在
+      // 评论区毫无反馈。@[uid:name] 结构化提及对评论区不适用,按纯文本发送。
+      // 失败只记日志,绝不回退 IM:回退等于把污染放回来;文档修改本身已经落盘。
+      try {
+        await docTask.postComment(content, signal);
+        statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
+      } catch (err) {
+        log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
+      }
+      return undefined;
+    }
     let replyMentionUids: string[] = [];
     let replyMentionEntities: MentionEntity[] = [];
     let finalContent = content;
@@ -2853,7 +2896,8 @@ export async function handleInboundMessage(params: {
   ): Promise<{ merged: boolean }> => {
     const hasPotentialMention = content.includes("@");
     if (
-      process.env.OCTO_CARD_MERGE_FINAL === "1"
+      !docTask // 文档任务没有 IM 进度卡可合并(setCardContext 已跳过)
+      && process.env.OCTO_CARD_MERGE_FINAL === "1"
       && sentMediaUrls.size === 0
       && !hasPotentialMention
     ) {

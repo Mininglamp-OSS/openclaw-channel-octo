@@ -14,7 +14,7 @@ import {
   resolveOctoAccount,
   type ResolvedOctoAccount,
 } from "./accounts.js";
-import { registerBot, sendMessage, sendHeartbeat, sendMediaMessage, inferContentType, ensureTextCharset, fetchBotGroups, getGroupMd, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl } from "./api-fetch.js";
+import { registerBot, sendMessage, sendHeartbeat, postDocComment, sendMediaMessage, inferContentType, ensureTextCharset, fetchBotGroups, getGroupMd, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl } from "./api-fetch.js";
 import type { GroupMember } from "./api-fetch.js";
 import { PLUGIN_VERSION } from "./version.js";
 import { getOctoRuntime } from "./runtime.js";
@@ -40,6 +40,14 @@ import {
   type EventPoller,
 } from "./events-poll.js";
 import { synthesizeCardActionMessage } from "./card-action.js";
+import {
+  docCommentParentId,
+  docTaskQueueScope,
+  docTaskSessionScope,
+  synthesizeDocMentionMessage,
+  type DocCommentMention,
+} from "./doc-mention.js";
+import { createFileDocMentionDedupeStore } from "./doc-mention-dedupe.js";
 import { handleCardAction } from "./card-action-handler.js";
 
 /**
@@ -1470,8 +1478,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       const dispatchInboundMessage = (
         msg: BotMessage,
         routeOverride?: { sessionKey: string; agentId?: string },
+        // 合成消息(文档任务)用 queueScope 脱离「按消息字段派生」的默认分区,
+        // docTask 则关闭 IM 出站并把答复改投评论区。
+        extra?: {
+          queueScope?: string;
+          docTask?: Parameters<typeof handleInboundMessage>[0]["docTask"];
+        },
       ): Promise<"completed" | "dropped"> =>
-        enqueueInbound(getInboundQueueKey(account.accountId, msg), async () => {
+        enqueueInbound(getInboundQueueKey(account.accountId, msg, extra?.queueScope), async () => {
           try {
             await runWithSessionInitRetry(
               () =>
@@ -1490,6 +1504,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   log,
                   statusSink,
                   routeOverride,
+                  ...(extra?.docTask ? { docTask: extra.docTask } : {}),
                 }),
               { ...SESSION_INIT_RETRY, log },
             );
@@ -1510,6 +1525,42 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           return "completed" as const;
         });
 
+      // 文档评论 @Bot 任务。持久去重:轮询器先执行后存游标,server 侧也可能在
+      // enqueue 后 confirm 前崩溃重投,两条路径都靠 idempotency_key 收敛。
+      const docTasksEnabled = account.config.docTasks === true;
+      const docMentionDedupe = createFileDocMentionDedupeStore({ accountId: account.accountId });
+      const handleDocMention = async (mention: DocCommentMention): Promise<void> => {
+        if (mention.botUid && mention.botUid !== credentials.robot_id) {
+          log?.error?.(
+            `octo: doc mention bot_uid=${mention.botUid} != this bot ${credentials.robot_id}, dropped`,
+          );
+          return;
+        }
+        if (await docMentionDedupe.claim(mention.idempotencyKey)) {
+          log?.info?.(`octo: doc mention ${mention.idempotencyKey} already processed, skipped`);
+          return;
+        }
+        const message = synthesizeDocMentionMessage(mention, credentials.robot_id);
+        await dispatchInboundMessage(message, undefined, {
+          queueScope: docTaskQueueScope(mention),
+          docTask: {
+            docId: mention.docId,
+            threadId: mention.threadId,
+            sessionScope: docTaskSessionScope(mention),
+            postComment: async (text, signal) => {
+              await postDocComment({
+                apiUrl: account.config.apiUrl,
+                botToken: account.config.botToken ?? "",
+                docId: mention.docId,
+                body: text,
+                parentId: docCommentParentId(mention),
+                signal,
+              });
+            },
+          },
+        });
+      };
+
       let cardEventPoller: EventPoller | undefined;
       const startCardEventPoller = (): void => {
         if (cardEventPoller || stopped) return;
@@ -1519,6 +1570,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           intervalMs: account.config.pollIntervalMs,
           cursorStore: createFileEventCursorStore({ accountId: account.accountId }),
           log,
+          ...(docTasksEnabled ? { onDocMention: handleDocMention } : {}),
           onCardAction: async (action) => {
             await handleCardAction({
               action,
@@ -1541,12 +1593,17 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             });
           },
         });
-        log?.info?.(`octo: [${account.accountId}] card_action poller started`);
+        log?.info?.(
+          `octo: [${account.accountId}] bot event poller started (doc_tasks=${docTasksEnabled})`,
+        );
       };
       if (account.config.cardInteraction !== false) {
         setCardEventPollStarter(account.accountId, startCardEventPoller);
         if (process.env.OCTO_CARD_POLL_FORCE === "1") startCardEventPoller();
       }
+      // 文档任务必须常驻轮询:卡片轮询是「发过卡片才懒启动」的,而 doc bot 可能
+      // 从不发卡片,不常驻就永远收不到 doc_comment_mention。
+      if (docTasksEnabled) startCardEventPoller();
 
       // 6. Connect WebSocket — pure real-time
       const socket = new WKSocket({

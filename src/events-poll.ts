@@ -6,6 +6,7 @@ import { normalizeAccountId } from "./account-id.js";
 import { ackBotEvent, fetchBotEvents } from "./api-fetch.js";
 import { CHANNEL_ID } from "./constants.js";
 import { parseCardAction, type CardAction } from "./card-action.js";
+import { parseDocCommentMention, type DocCommentMention } from "./doc-mention.js";
 
 const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_LIMIT = 50;
@@ -49,7 +50,9 @@ export interface EventPollerOptions {
   apiUrl: string;
   botToken: string;
   cursorStore: EventCursorStore;
-  onCardAction: (action: CardAction) => void | Promise<void>;
+  onCardAction?: (action: CardAction) => void | Promise<void>;
+  /** 文档评论 @Bot 任务(octo-server `doc_comment_mention`)。未提供则该类事件不被识别。 */
+  onDocMention?: (mention: DocCommentMention) => void | Promise<void>;
   intervalMs?: number;
   limit?: number;
   ack?: boolean;
@@ -106,20 +109,32 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
         options.log?.error?.(`octo: event poll dropped ${malformed} event(s) with a non-integer event_id`);
       }
       let cardActions = 0;
+      let docMentions = 0;
       const ordered = events
         .filter((event) => Number.isSafeInteger(event.event_id) && event.event_id > cursor)
         .sort((a, b) => a.event_id - b.event_id);
       for (const event of ordered) {
-        const action = parseCardAction(event);
+        // 已识别的事件才 ack。未识别的只推进游标(本消费者不再重复拉取),
+        // 留在服务端直至过期 —— 不 ack 自己没处理的事件。
+        let recognized = false;
+        const action = options.onCardAction ? parseCardAction(event) : null;
         if (action) {
+          recognized = true;
           cardActions += 1;
-          await options.onCardAction(action);
+          await options.onCardAction!(action);
+        } else if (options.onDocMention) {
+          const mention = parseDocCommentMention(event);
+          if (mention) {
+            recognized = true;
+            docMentions += 1;
+            await options.onDocMention(mention);
+          }
         }
 
         await options.cursorStore.save(event.event_id);
         cursor = event.event_id;
 
-        if (action && options.ack !== false) {
+        if (recognized && options.ack !== false) {
           try {
             await ackBotEvent({
               apiUrl: options.apiUrl,
@@ -135,7 +150,7 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       }
       if (events.length > 0) {
         options.log?.info?.(
-          `octo: event poll batch events=${events.length} card_actions=${cardActions} cursor=${cursor}`,
+          `octo: event poll batch events=${events.length} card_actions=${cardActions} doc_mentions=${docMentions} cursor=${cursor}`,
         );
       }
     } catch (error) {
@@ -150,7 +165,7 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
   const ready = options.cursorStore.load()
     .then((loaded) => {
       cursor = Number.isSafeInteger(loaded) && loaded >= 0 ? loaded : 0;
-      options.log?.info?.(`octo: card event poller ready at cursor=${cursor}`);
+      options.log?.info?.(`octo: bot event poller ready at cursor=${cursor}`);
       schedule();
     })
     .catch((error) => {

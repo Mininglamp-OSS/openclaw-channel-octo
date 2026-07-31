@@ -75,7 +75,7 @@ describe("event poller", () => {
         "https://api.test/v1/bot/events/12/ack",
       ]);
     expect(poller.cursor()).toBe(12);
-    expect(info).toContain("octo: event poll batch events=2 card_actions=2 cursor=12");
+    expect(info).toContain("octo: event poll batch events=2 card_actions=2 doc_mentions=0 cursor=12");
     poller.stop();
   });
 

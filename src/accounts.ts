@@ -24,6 +24,7 @@ export type ResolvedOctoAccount = {
     cardInteraction?: boolean;  // false disables interactive authoring and callback polling
     onBehalfOf?: string;  // Persona clone: grantor uid
     secretsFileRoot?: string;  // Jail root for write-secret file writes
+    docTasks?: boolean;  // true 开启文档评论 @Bot 任务(常驻事件轮询 + 出站改投评论区)
     dispatchTimeoutMs?: number;  // Explicit dispatch-timeout override; unset = derive from agents.defaults.timeoutSeconds (issue #113)
   };
 };
@@ -109,6 +110,7 @@ export function resolveOctoAccount(params: {
       reasoningCardTemplateMode: accountConfig.reasoningCardTemplateMode ?? channel.reasoningCardTemplateMode,
       cardDisplay: accountConfig.cardDisplay ?? channel.cardDisplay,
       cardInteraction: accountConfig.cardInteraction ?? channel.cardInteraction,
+      docTasks: accountConfig.docTasks ?? channel.docTasks,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,
       secretsFileRoot: accountConfig.secretsFileRoot ?? channel.secretsFileRoot,
       dispatchTimeoutMs: accountConfig.dispatchTimeoutMs ?? channel.dispatchTimeoutMs,

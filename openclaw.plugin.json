@@ -88,6 +88,10 @@
             "type": "boolean",
             "description": "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value."
           },
+          "docTasks": {
+            "type": "boolean",
+            "description": "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM."
+          },
           "accounts": {
             "type": "object",
             "additionalProperties": {
@@ -155,6 +159,10 @@
                 "cardInteraction": {
                   "type": "boolean",
                   "description": "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value."
+                },
+                "docTasks": {
+                  "type": "boolean",
+                  "description": "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM."
                 },
                 "onBehalfOf": {
                   "type": "string",
