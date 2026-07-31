@@ -322,3 +322,142 @@ describe("file event cursor store", () => {
     }
   });
 });
+
+describe("event poller long-poll", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("不设 waitSeconds 时请求体不带 wait —— 对旧服务端逐字节不变", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    global.fetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      bodies.push(init?.body ? JSON.parse(String(init.body)) : {});
+      return Response.json({ results: [] });
+    }) as typeof fetch;
+
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1000,
+      cursorStore: memoryCursor(0),
+      onCardAction: async () => {},
+    });
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(1000);
+
+    // `wait` must be absent, not `wait: 0` — a server that predates the field would
+    // otherwise see an unknown key on every poll.
+    expect(bodies[0]).toEqual({ event_id: 0, limit: 50 });
+    expect("wait" in bodies[0]).toBe(false);
+    poller.stop();
+  });
+
+  it("设了 waitSeconds 时请求体带 wait", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    global.fetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      bodies.push(init?.body ? JSON.parse(String(init.body)) : {});
+      return Response.json({ results: [] });
+    }) as typeof fetch;
+
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1000,
+      waitSeconds: 25,
+      cursorStore: memoryCursor(0),
+      onCardAction: async () => {},
+    });
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(bodies[0]).toEqual({ event_id: 0, limit: 50, wait: 25 });
+    poller.stop();
+  });
+
+  it("long-poll 模式下不再额外空等 intervalMs", async () => {
+    // The whole point: the server already paces the loop by holding the request. Sleeping
+    // intervalMs on top would give back most of the latency the hold just bought.
+    let calls = 0;
+    global.fetch = vi.fn().mockImplementation(async () => {
+      calls += 1;
+      return Response.json({ results: [] });
+    }) as typeof fetch;
+
+    const drain = async () => {
+      // The reschedule happens in a `finally` after an await chain, so one timer advance is
+      // not enough to observe the next tick; drain a few rounds instead of guessing.
+      // Advance by 1ms per round: a 0ms advance does not move the clock, so a freshly
+      // scheduled setTimeout(...,0) would never come due.
+      for (let i = 0; i < 5; i += 1) await vi.advanceTimersByTimeAsync(1);
+    };
+
+    const longPoll = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 60_000,
+      waitSeconds: 25,
+      cursorStore: memoryCursor(0),
+      onCardAction: async () => {},
+    });
+    await longPoll.ready;
+    await drain();
+    const longPollCalls = calls;
+    longPoll.stop();
+
+    calls = 0;
+    const shortPoll = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 60_000,
+      cursorStore: memoryCursor(0),
+      onCardAction: async () => {},
+    });
+    await shortPoll.ready;
+    await drain();
+    const shortPollCalls = calls;
+    shortPoll.stop();
+
+    // Same wall-clock (5ms advanced), same intervalMs: short polling is gated by the 60s
+    // timer and cannot fire at all, while long polling keeps going back for more as soon as
+    // each request settles.
+    expect(shortPollCalls).toBe(0);
+    expect(longPollCalls).toBeGreaterThan(1);
+  });
+
+  it("stop() 中断在途 hold，且不把中断记成轮询失败", async () => {
+    const errors: string[] = [];
+    let sawAbort = false;
+    global.fetch = vi.fn().mockImplementation(
+      (_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener("abort", () => {
+            sawAbort = true;
+            reject(new DOMException("aborted", "AbortError"));
+          });
+        }),
+    ) as typeof fetch;
+
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      waitSeconds: 25,
+      cursorStore: memoryCursor(0),
+      log: { error: (message) => errors.push(message) },
+      onCardAction: async () => {},
+    });
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(0);
+
+    poller.stop();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // A hold must be cut short on shutdown rather than waited out...
+    expect(sawAbort).toBe(true);
+    // ...and a deliberate shutdown abort must not surface as a poll failure, or every clean
+    // stop would leave a spurious error in the log.
+    expect(errors).toEqual([]);
+  });
+});

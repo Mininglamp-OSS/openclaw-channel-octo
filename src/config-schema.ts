@@ -24,6 +24,7 @@ export interface OctoAccountConfig {
   wsUrl?: string;
   cdnUrl?: string;  // CDN base URL for media files (e.g. https://cdn.example.com/bucket)
   pollIntervalMs?: number;
+  eventWaitSeconds?: number;  // Long-poll hold for /v1/bot/events; 0/unset = short poll at pollIntervalMs
   heartbeatIntervalMs?: number;
   requireMention?: boolean;
   botUid?: string;
@@ -46,6 +47,7 @@ export interface OctoConfig {
   wsUrl?: string;
   cdnUrl?: string;  // CDN base URL for media files (e.g. https://cdn.example.com/bucket)
   pollIntervalMs?: number;
+  eventWaitSeconds?: number;  // Long-poll hold for /v1/bot/events; 0/unset = short poll at pollIntervalMs
   heartbeatIntervalMs?: number;
   requireMention?: boolean;
   botUid?: string;
@@ -100,6 +102,9 @@ export const CARD_DISPLAY_DESCRIPTION =
 export const CARD_INTERACTION_DESCRIPTION =
   "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value.";
 
+export const EVENT_WAIT_SECONDS_DESCRIPTION =
+  "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";
+
 // Shared description for commands.fork.scope, kept identical to the wording in
 // openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
 export const FORK_SCOPE_DESCRIPTION =
@@ -135,6 +140,7 @@ export const OctoConfigJsonSchema = {
       wsUrl: { type: "string" },
       cdnUrl: { type: "string" },
       pollIntervalMs: { type: "number", minimum: 500 },
+      eventWaitSeconds: { type: "number", minimum: 0, maximum: 30, description: EVENT_WAIT_SECONDS_DESCRIPTION },
       heartbeatIntervalMs: { type: "number", minimum: 5000 },
       requireMention: { type: "boolean" },
       botUid: { type: "string" },
@@ -160,6 +166,7 @@ export const OctoConfigJsonSchema = {
             wsUrl: { type: "string" },
             cdnUrl: { type: "string" },
             pollIntervalMs: { type: "number", minimum: 500 },
+            eventWaitSeconds: { type: "number", minimum: 0, maximum: 30, description: EVENT_WAIT_SECONDS_DESCRIPTION },
             heartbeatIntervalMs: { type: "number", minimum: 5000 },
             requireMention: { type: "boolean" },
             botUid: { type: "string" },

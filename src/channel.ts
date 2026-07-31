@@ -1517,6 +1517,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           apiUrl: account.config.apiUrl,
           botToken: account.config.botToken ?? "",
           intervalMs: account.config.pollIntervalMs,
+          waitSeconds: account.config.eventWaitSeconds,
           cursorStore: createFileEventCursorStore({ accountId: account.accountId }),
           log,
           onCardAction: async (action) => {

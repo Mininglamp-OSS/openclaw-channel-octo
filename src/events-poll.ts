@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { normalizeAccountId } from "./account-id.js";
-import { ackBotEvent, fetchBotEvents } from "./api-fetch.js";
+import { ackBotEvent, eventsPollTimeoutMs, fetchBotEvents } from "./api-fetch.js";
 import { CHANNEL_ID } from "./constants.js";
 import { parseCardAction, type CardAction } from "./card-action.js";
 
@@ -52,6 +52,15 @@ export interface EventPollerOptions {
   onCardAction: (action: CardAction) => void | Promise<void>;
   intervalMs?: number;
   limit?: number;
+  /**
+   * Seconds to let the server hold an empty queue open (its `wait` parameter).
+   *
+   * Unset or 0 keeps the historical short-poll loop: one read per `intervalMs`. When set, the
+   * server supplies the pacing — it only answers early once an event lands — so the loop stops
+   * adding `intervalMs` of dead time between reads, which would otherwise eat much of the
+   * latency the hold just bought.
+   */
+  waitSeconds?: number;
   ack?: boolean;
   log?: { info?: (message: string) => void; error?: (message: string) => void };
 }
@@ -75,29 +84,47 @@ export function requestCardEventPolling(accountId: string): void {
 }
 
 /**
- * Start one non-overlapping short-poll loop. Cursor persistence happens before ack so a process
- * crash can at worst replay an action; it cannot acknowledge an event that it forgot locally.
+ * Start one non-overlapping poll loop, short-polling by default and long-polling when
+ * `waitSeconds` is set. Cursor persistence happens before ack so a process crash can at worst
+ * replay an action; it cannot acknowledge an event that it forgot locally.
  */
 export function startEventPoller(options: EventPollerOptions): EventPoller {
   const intervalMs = Math.max(500, Math.floor(options.intervalMs ?? DEFAULT_INTERVAL_MS));
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? DEFAULT_LIMIT)));
+  const waitSeconds =
+    options.waitSeconds && options.waitSeconds > 0 ? Math.floor(options.waitSeconds) : 0;
   let cursor = 0;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // Tracks the in-flight request so stop() can cut a hold short. Without this the loop is a
+  // single sequential chain, so a stop during a 25s hold would keep the account busy for the
+  // rest of that hold instead of shutting down.
+  let inFlight: AbortController | undefined;
 
   const schedule = (): void => {
     if (stopped) return;
-    timer = setTimeout(() => void tick(), intervalMs);
+    // When long-polling, the server already paces the loop: it holds an empty queue and answers
+    // early only when there is something to deliver. Sleeping another intervalMs on top would
+    // reintroduce exactly the latency the hold removes.
+    timer = setTimeout(() => void tick(), waitSeconds > 0 ? 0 : intervalMs);
   };
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
     try {
+      const controller = new AbortController();
+      inFlight = controller;
+      const timeoutSignal = AbortSignal.timeout(eventsPollTimeoutMs(waitSeconds));
       const events = await fetchBotEvents({
         apiUrl: options.apiUrl,
         botToken: options.botToken,
         sinceEventId: cursor,
         limit,
+        ...(waitSeconds > 0 ? { waitSeconds } : {}),
+        // Combine both reasons to give up: the ordinary per-request timeout, and an explicit
+        // stop. Passing a signal suppresses the default timeout inside fetchBotEvents, so the
+        // timeout has to be supplied here rather than relying on it.
+        signal: AbortSignal.any([controller.signal, timeoutSignal]),
       });
       // Validate ids *before* sorting: a non-integer event_id makes numeric-subtraction comparison
       // return NaN, which leaves the sort order unspecified and can drop a valid interleaved event.
@@ -139,10 +166,15 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
         );
       }
     } catch (error) {
-      options.log?.error?.(
-        `octo: event poll failed at cursor=${cursor}: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      // A stop() mid-hold aborts the request on purpose; reporting that as a poll failure would
+      // put a spurious error in the log on every clean shutdown.
+      if (!stopped) {
+        options.log?.error?.(
+          `octo: event poll failed at cursor=${cursor}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     } finally {
+      inFlight = undefined;
       schedule();
     }
   };
@@ -166,6 +198,9 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
     stop(): void {
       stopped = true;
       if (timer) clearTimeout(timer);
+      // Cut a hold short rather than waiting it out. Set `stopped` first so the abort is
+      // classified as a shutdown, not a poll failure.
+      inFlight?.abort();
     },
     cursor(): number {
       return cursor;

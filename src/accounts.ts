@@ -14,6 +14,8 @@ export type ResolvedOctoAccount = {
     wsUrl?: string;
     cdnUrl?: string;  // CDN base URL for media files (public-read, no auth)
     pollIntervalMs: number;
+    /** Server-side long-poll hold in seconds; 0 = short poll at pollIntervalMs. */
+    eventWaitSeconds: number;
     heartbeatIntervalMs: number;
     requireMention?: boolean;
     historyLimit?: number;  // 群聊历史消息条数限制
@@ -82,6 +84,10 @@ export function resolveOctoAccount(params: {
     accountConfig.pollIntervalMs ??
     channel.pollIntervalMs ??
     DEFAULT_POLL_INTERVAL_MS;
+  // 0/unset keeps the historical short poll; no default hold is applied, because a hold the
+  // operator did not ask for would break against servers predating the `wait` field.
+  const eventWaitSeconds =
+    accountConfig.eventWaitSeconds ?? channel.eventWaitSeconds ?? 0;
   const heartbeatIntervalMs =
     accountConfig.heartbeatIntervalMs ??
     channel.heartbeatIntervalMs ??
@@ -101,6 +107,7 @@ export function resolveOctoAccount(params: {
       wsUrl,
       cdnUrl,
       pollIntervalMs,
+      eventWaitSeconds,
       heartbeatIntervalMs,
       requireMention: accountConfig.requireMention ?? channel.requireMention,
       historyLimit: accountConfig.historyLimit ?? channel.historyLimit ?? 20,
