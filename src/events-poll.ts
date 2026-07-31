@@ -121,13 +121,27 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
         if (action) {
           recognized = true;
           cardActions += 1;
+          // 卡片动作**故意**让异常逃出去:不存游标、不 ack,下一轮重取同一事件。
+          // 卡片动作是幂等的即时响应,重放的代价只是再回一次;这条语义由
+          // events-poll.test.ts 钉住,不要顺手改。
           await options.onCardAction!(action);
         } else if (options.onDocMention) {
           const mention = parseDocCommentMention(event);
           if (mention) {
             recognized = true;
             docMentions += 1;
-            await options.onDocMention(mention);
+            // 文档任务相反,异常绝不能逃出去。下面的 cursorStore.save 和 ack 都排在
+            // handler 之后,异常逃出去就等于「不存游标、不 ack」,下一 tick 原样重取
+            // —— 而这是个会改文档、会往评论区发言的任务,重放不幂等:实测每个轮询
+            // 周期重跑一次,3.2s 内跑了 6 遍,永不收敛。handler 自己承诺不抛(见
+            // doc-mention-handler.ts 不变量 3),这里是轮询器侧的兜底,不依赖它。
+            try {
+              await options.onDocMention(mention);
+            } catch (error) {
+              options.log?.error?.(
+                `octo: doc mention handler threw for event ${event.event_id}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
           }
         }
 

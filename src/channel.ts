@@ -1515,8 +1515,13 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                 // 第五处 IM 出口:该回执按合成消息解析目标,会发进发起人的私聊。
                 // 文档任务改投评论区 —— 与 inbound 的出站收口同一条原则。
                 try {
+                  // kind:"notice" —— 回执只是留痕,活儿一点没干。标成产出会把一个
+                  // 从未执行的任务记为完成;而不标记的话,handler 又会在回执之后
+                  // 再补一条通用兜底,用户连着看到两句废话。
                   await extra.docTask.postComment(
                     "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
+                    undefined,
+                    { kind: "notice" },
                   );
                 } catch (postErr) {
                   log?.error?.(`octo: doc task conflict notice failed: ${String(postErr)}`);

@@ -38,6 +38,7 @@ export function createFileDocMentionDedupeStore(params: {
   accountId: string;
   baseDir?: string;
   capacity?: number;
+  log?: { error?: (message: string) => void };
 }): DocMentionDedupeStore {
   const capacity = Math.max(1, Math.floor(params.capacity ?? DEFAULT_CAPACITY));
   const baseDir = params.baseDir ?? join(homedir(), ".openclaw", "workspace", CHANNEL_ID);
@@ -58,7 +59,15 @@ export function createFileDocMentionDedupeStore(params: {
       return Array.isArray(raw.keys)
         ? raw.keys.filter((key): key is string => typeof key === "string").slice(-capacity)
         : [];
-    } catch {
+    } catch (err) {
+      // 「文件还不存在」是正常的冷启动,空表就是对的。其余情况(EACCES、JSON 被
+      // 截断、磁盘错误)也只能降级成空表 —— 但必须留一条日志:静默吞掉等于整张
+      // 去重表被清空,之后每个事件都会被当成新事件重放,而这类任务会改文档。
+      if ((err as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") {
+        params.log?.error?.(
+          `octo: doc mention dedupe store unreadable at ${file}, starting empty (replays possible): ${String(err)}`,
+        );
+      }
       return [];
     }
   };

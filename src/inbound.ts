@@ -21,6 +21,8 @@ const isReplyPayloadNonTerminalToolErrorWarning =
     : undefined;
 const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
+import { createImEgressGuard } from "./im-egress.js";
+import type { DocTaskPostKind } from "./doc-mention-handler.js";
 import type { GroupMember } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
 import { normalizeAccountId } from "./account-id.js";
@@ -1539,7 +1541,7 @@ export async function handleInboundMessage(params: {
     threadId: string;
     /** 会话作用域片段,如 `doctask:{docId}:{threadId}`(见 doc-mention.ts)。 */
     sessionScope: string;
-    postComment: (text: string, signal?: AbortSignal) => Promise<void>;
+    postComment: (text: string, signal?: AbortSignal, opts?: { kind?: DocTaskPostKind }) => Promise<void>;
   };
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
@@ -2719,6 +2721,21 @@ export async function handleInboundMessage(params: {
   }
   const recordReasoningForGeneration = createCardReasoningRecorder(route.sessionKey);
 
+  // --- IM 出站闸门 ---
+  // 文档任务下所有 IM 出站一律不发。下面每个显式的 `if (docTask)` 守卫都保留 ——
+  // 闸门是兜底,不是替代:守卫负责「不做无谓的工作」(不建 typing 定时器、不上传
+  // 附件),闸门负责「守卫漏了也发不出去」。新增出站点只要没经过闸门包装,
+  // inbound-im-egress-guard.test.ts 就会在 CI 变红。
+  const imEgress = createImEgressGuard({
+    suppressed: docTask !== undefined,
+    reason: docTask ? `doc task ${docTask.docId}/${docTask.threadId}` : "",
+    log,
+  });
+  const imSendMessage = imEgress.guard("sendMessage", sendMessage);
+  const imSendTyping = imEgress.guard("sendTyping", sendTyping);
+  const imSendReadReceipt = imEgress.guard("sendReadReceipt", sendReadReceipt);
+  const imUploadAndSendMedia = imEgress.guard("uploadAndSendMedia", uploadAndSendMedia);
+
   // 已读回执 + 正在输入 — fire-and-forget
   // 文档任务全部跳过:评论区没有对应语义,发出去就是 IM 侧的噪音。
   if (docTask) {
@@ -2726,16 +2743,16 @@ export async function handleInboundMessage(params: {
   } else if (isOBOv2) {
     // v2: send typing to origin group with grantor identity (skip readReceipt)
     log?.info?.(`octo: OBO v2 — sending typing to origin group=${replyChannelId} as=${effectiveOnBehalfOf}`);
-    sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, onBehalfOf: effectiveOnBehalfOf })
+    imSendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, onBehalfOf: effectiveOnBehalfOf })
       .then(() => log?.info?.("octo: OBO v2 typing sent OK"))
       .catch((err) => log?.error?.(`octo: OBO v2 typing failed: ${String(err)}`));
   } else {
     log?.info?.(`octo: sending readReceipt+typing to channel=${replyChannelId} type=${replyChannelType} apiUrl=${apiUrl}`);
     const messageIds = message.message_id ? [message.message_id] : [];
-    sendReadReceipt({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, messageIds })
+    imSendReadReceipt({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, messageIds })
       .then(() => log?.info?.("octo: readReceipt sent OK"))
       .catch((err) => log?.error?.(`octo: readReceipt failed: ${String(err)}`));
-    sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) })
+    imSendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) })
       .then(() => log?.info?.(`octo: typing sent OK${effectiveOnBehalfOf ? ` (as ${effectiveOnBehalfOf})` : ""}`))
       .catch((err) => log?.error?.(`octo: typing failed: ${String(err)}`));
   }
@@ -2743,7 +2760,7 @@ export async function handleInboundMessage(params: {
   // Keep sending typing indicator while AI is processing
   // 文档任务不建这个定时器:评论区没有「正在输入」语义,建了也只是每 5s 空转一次。
   const typingInterval = docTask ? undefined : setInterval(() => {
-    sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) }).catch(() => {});
+    imSendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) }).catch(() => {});
   }, 5000);
 
   // --- 文档任务的唯一出站出口 ---
@@ -2755,9 +2772,15 @@ export async function handleInboundMessage(params: {
   //
   // 失败只记日志,绝不回退 IM:回退等于把污染放回来;文档修改本身已经落盘。
   const docTaskMediaUrls: string[] = [];
-  const postDocTaskReply = async (content: string, signal?: AbortSignal): Promise<void> => {
+  const postDocTaskReply = async (
+    content: string,
+    signal?: AbortSignal,
+    opts?: { kind?: DocTaskPostKind },
+  ): Promise<void> => {
     if (!docTask) return;
-    const attachments = docTaskMediaUrls.splice(0, docTaskMediaUrls.length);
+    // 只读不清空:发失败就把附件留在队列里,交给本回合后续的出站(或兜底)再带出去。
+    // 先 splice 的话,一次失败的 POST 会把附件永久吞掉 —— 评论区既没答复也没附件。
+    const attachments = [...docTaskMediaUrls];
     // 允许「只有附件、没有文本」:agent 产出纯 media 的回合原先在这里无文本可发,
     // 附件就永远卡在队列里 —— 评论区静默,任务却被当成功。
     const body = [content.trim(), ...attachments.map((url) => `[附件] ${url}`)]
@@ -2765,20 +2788,28 @@ export async function handleInboundMessage(params: {
       .join("\n\n");
     if (!body) return;
     try {
-      await docTask.postComment(body, signal);
+      await docTask.postComment(body, signal, opts);
+      // 按「消费掉的条数」出队,而不是清空:await 期间 deliver 可能又推进了新附件。
+      docTaskMediaUrls.splice(0, attachments.length);
       statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
     } catch (err) {
       statusSink?.({ lastError: String(err) });
       log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
     }
   };
-  /** 用户可见的兜底通知(错误/超时/拒绝)。文档任务改投评论区,其余保持原样直发。 */
+  /**
+   * 用户可见的兜底通知(错误/超时/拒绝)。文档任务改投评论区,其余保持原样直发。
+   *
+   * `kind: "notice"` 是关键:一句道歉证明不了任务做成了。不标记的话,只发出道歉的
+   * 一个回合会被 handler 记成「投递成功」→ 写入持久去重 → 文档一个字没改,事件却
+   * 被永久吸收,再也不会重投。
+   */
   const sendUserFacingFallback = async (content: string, signal?: AbortSignal): Promise<void> => {
     if (docTask) {
-      await postDocTaskReply(content, signal);
+      await postDocTaskReply(content, signal, { kind: "notice" });
       return;
     }
-    await sendMessage({
+    await imSendMessage({
       apiUrl,
       botToken,
       channelId: replyChannelId,
@@ -2903,7 +2934,7 @@ export async function handleInboundMessage(params: {
     // Detect @all/@所有人 in final content
     const hasAtAll = /(?:^|(?<=\s))@(?:all|所有人)(?=\s|[^\w]|$)/i.test(finalContent);
 
-    const result = await sendMessage({
+    const result = await imSendMessage({
       apiUrl: account.config.apiUrl,
       botToken: account.config.botToken ?? "",
       channelId: replyChannelId,
@@ -2997,8 +3028,14 @@ export async function handleInboundMessage(params: {
       // messages.visibleReplies — the requested mode outranks config, so
       // injecting it for a group or over an explicit setting would change
       // group behaviour and override operator intent.
+      //
+      // 文档任务是例外,必须无条件 automatic。它是一条合成 DM,本来跟着上面那条 DM
+      // 规则走,于是运维一旦显式配了 messages.visibleReplies: "message_tool",最终
+      // 答复就不会经 deliver() 出来 —— 评论区只剩兜底提示,事件却照样 ack;而 agent
+      // 真去调 message tool 的话,输出又落回 IM,正是本特性要消除的污染。
+      // messages.visibleReplies 管的是 **IM 会话** 的显隐,对不落 IM 的文档任务没有语义。
       replyOptions:
-        !isGroup && config.messages?.visibleReplies === undefined
+        docTask || (!isGroup && config.messages?.visibleReplies === undefined)
           ? {
               sourceReplyDeliveryMode: "automatic" as const,
               onReasoningStream: captureReasoning,
@@ -3032,7 +3069,7 @@ export async function handleInboundMessage(params: {
               continue;
             }
             try {
-              const mediaResult = await uploadAndSendMedia({
+              const mediaResult = await imUploadAndSendMedia({
                 mediaUrl,
                 apiUrl: account.config.apiUrl,
                 botToken: account.config.botToken ?? "",
@@ -3054,6 +3091,9 @@ export async function handleInboundMessage(params: {
             // 否则本回合一条评论都不会产生。
             if (docTask) {
               await postDocTaskReply("");
+              // 和下面的非文档分支一样置位:不置位的话本回合会被判成「没答复过」,
+              // 走到 !replySucceeded 兜底,在已经发出附件评论之后再补一句道歉。
+              replySucceeded = true;
               return;
             }
             statusSink?.({ lastOutboundAt: Date.now(), lastError: null });

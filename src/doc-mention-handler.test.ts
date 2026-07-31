@@ -195,17 +195,76 @@ describe("文档任务接线", () => {
     expect(await dedupe.claim("k1")).toBe(false); // 有丢失 → 不写去重
   });
 
-  it("任务被判 dropped(如会话冲突):即使发过回执也不写去重 —— 活儿没干", async () => {
-    // 回归:回执经同一投递通道会把 delivered 抬到 1,从而把「从未执行的任务」
-    // 记为已完成,吸收掉本该重投的那次。
+  // --- 提示 ≠ 产出 ---
+
+  it("只发出一句道歉(kind:notice):不写去重,事件仍可重投 —— 一句道歉证明不了活儿干了", async () => {
+    // 回归:inbound 的三处兜底(onError / 超时 / dispatch 拒绝)都经同一投递通道,
+    // 不标 notice 的话会把 delivered 抬到 1;onError 路径 dispatcher 还会正常 resolve
+    // → outcome=completed → 判定完成 → 文档一个字没改,事件却被永久吸收。
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
-      await extra.docTask.postComment("⚠️ 上一轮任务尚未结束，本次请求已跳过。");
-      return "dropped" as const;
+      await extra.docTask.postComment("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", undefined, { kind: "notice" });
+      return "completed" as const;
+    });
+    const { handler, dedupe, postComment } = makeHandler(dispatch);
+
+    await handler(mention());
+
+    expect(await dedupe.claim("k1")).toBe(false); // 未记为完成 → 可重投
+    // 已经有提示了就不再补通用兜底,否则用户连着看两句废话
+    expect(postComment).toHaveBeenCalledTimes(1);
+  });
+
+  it("产出送达 + 另发过提示:仍按产出判定为完成", async () => {
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("进度提示", undefined, { kind: "notice" });
+      await extra.docTask.postComment("已改好");
+      return "completed" as const;
     });
     const { handler, dedupe } = makeHandler(dispatch);
 
     await handler(mention());
 
+    expect(await dedupe.claim("k1")).toBe(true);
+  });
+
+  // --- 去重落盘失败不得逃逸(不变量 3) ---
+
+  it("dedupe.complete 落盘失败:handler 仍正常返回 —— 外抛会让轮询器每周期重跑一次改文档的任务", async () => {
+    // reviewer 的复现:complete() 必抛时 polls=6 taskRuns=6 acked=[] cursorSaved=[],
+    // 3.2s 内把同一个任务对着线上文档跑了 6 遍,永不收敛。
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("已改好");
+      return "completed" as const;
+    });
+    const postComment = vi.fn(async () => {});
+    const failing = createMemoryDocMentionDedupeStore();
+    const completeErr = new Error("EACCES: dedupe file not writable");
+    const dedupe = {
+      claim: failing.claim,
+      release: failing.release,
+      complete: vi.fn(async () => { throw completeErr; }),
+    };
+    const handler = createDocMentionHandler({ botUid: BOT_UID, dedupe, dispatch, postComment });
+
+    await expect(handler(mention())).resolves.toBeUndefined();
+
+    expect(dedupe.complete).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1); // 答复照常发出,不因落盘失败重发
+  });
+
+  it("任务被判 dropped(如会话冲突):即使发过回执也不写去重 —— 活儿没干", async () => {
+    // 回归:回执经同一投递通道会把 delivered 抬到 1,从而把「从未执行的任务」
+    // 记为已完成,吸收掉本该重投的那次。
+    // channel.ts 发这条回执时标的就是 kind:"notice"(见 isSessionInitConflict 分支)。
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("⚠️ 上一轮任务尚未结束，本次请求已跳过。", undefined, { kind: "notice" });
+      return "dropped" as const;
+    });
+    const { handler, dedupe, postComment } = makeHandler(dispatch);
+
+    await handler(mention());
+
     expect(await dedupe.claim("k1")).toBe(false);
+    expect(postComment).toHaveBeenCalledTimes(1); // 回执本身就是痕迹,不再补兜底
   });
 });

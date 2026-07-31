@@ -101,6 +101,46 @@ describe("轮询器识别文档任务事件", () => {
     expect(poller.cursor()).toBe(12);
   });
 
+  it("handler 抛异常:游标仍推进并 ack,任务只跑一次 —— 否则每个轮询周期重跑一次改文档的任务", async () => {
+    // 回归(reviewer 复现):handler 的异常原先直接逃到 tick,而 cursorStore.save 和
+    // ack 都排在 await handler 之后 —— 于是「不存游标、不 ack」,下一 tick 原样重取,
+    // 实测 polls=6 taskRuns=6 acked=[] cursorSaved=[],3.2s 内把同一个会改文档的任务
+    // 跑了 6 遍,永不收敛。handler 自己承诺不抛,这里是轮询器侧的兜底,不依赖它。
+    const acked: number[] = [];
+    let polls = 0;
+    // 未被 ack 的事件会被 server 反复投递 —— 这正是死循环得以成立的前提。
+    globalThis.fetch = vi.fn(async (input: any) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const json = (data: unknown) =>
+        new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
+      const ackMatch = /\/v1\/bot\/events\/(\d+)\/ack/.exec(url);
+      if (ackMatch) { acked.push(Number(ackMatch[1])); return json({ status: 1 }); }
+      if (url.includes("/v1/bot/events")) {
+        polls += 1;
+        return json({ status: 1, results: acked.includes(14) ? [] : [docEvent(14)] });
+      }
+      return json({});
+    }) as unknown as typeof fetch;
+
+    const cursor = memoryCursor();
+    let taskRuns = 0;
+    const poller = startEventPoller({
+      apiUrl: API,
+      botToken: "tok",
+      intervalMs: 500,
+      cursorStore: cursor,
+      onDocMention: async () => { taskRuns += 1; throw new Error("dedupe persist failed"); },
+    });
+    await poller.ready;
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    poller.stop();
+
+    expect(polls).toBeGreaterThanOrEqual(2); // 确实轮询了多轮,不是没跑起来
+    expect(taskRuns).toBe(1);
+    expect(acked).toEqual([14]);
+    expect(cursor.saved).toEqual([14]);
+  });
+
   it("未知 event_type 既不派发也不 ack", async () => {
     const { acked } = installFetch([{ event_id: 13, event_type: "brand_new_type", event_data: {} }]);
     const seen: DocCommentMention[] = [];
