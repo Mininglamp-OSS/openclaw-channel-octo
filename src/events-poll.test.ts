@@ -379,9 +379,8 @@ describe("event poller long-poll", () => {
   it("服务端真 hold 时，返回后立即续拉（不再空等 intervalMs）", async () => {
     // The mock must actually hold. With an instantly-returning mock this test would pass
     // because of the hot-loop defect rather than because the server took over pacing —
-    // that is exactly how the original version of this test locked the defect in
-    // (PR #194 review, yujiawei).
-    const HOLD_MS = 3_000;
+    // that is exactly how the original version of this test locked the defect in.
+    const HOLD_MS = 5_000; // matches MIN_EVENT_WAIT_SECONDS; shorter holds are clamped up
     const starts: number[] = [];
     global.fetch = vi.fn().mockImplementation(
       () =>
@@ -395,7 +394,7 @@ describe("event poller long-poll", () => {
       apiUrl: "https://api.test",
       botToken: "bf_x",
       intervalMs: 60_000, // would dominate if the loop still slept between reads
-      waitSeconds: 3,
+      waitSeconds: 5,
       cursorStore: memoryCursor(0),
       onCardAction: async () => {},
     });
@@ -439,7 +438,7 @@ describe("event poller long-poll", () => {
     poller.stop();
   });
 
-  it("出错时指数退避，且成功后重置 —— 不在服务端最不健康时加压", async () => {
+  it("出错时指数退避，且成功后真的重置", async () => {
     let calls = 0;
     let failing = true;
     global.fetch = vi.fn().mockImplementation(async () => {
@@ -465,12 +464,57 @@ describe("event poller long-poll", () => {
 
     await vi.advanceTimersByTimeAsync(1_050); // 1st backoff = intervalMs
     expect(calls).toBe(2);
-    await vi.advanceTimersByTimeAsync(1_050); // 2nd backoff = 2x, not yet due
+    await vi.advanceTimersByTimeAsync(1_050); // 2nd backoff = 2x intervalMs, not yet due
     expect(calls).toBe(2);
     await vi.advanceTimersByTimeAsync(1_050);
     expect(calls).toBe(3);
 
+    // Now let one succeed. The earlier version of this test set `failing = true` and never
+    // cleared it, so the reset branch it claimed to cover was unreachable dead code.
+    failing = false;
+    await vi.advanceTimersByTimeAsync(4_100); // 3rd backoff = 4x -> the success lands here
+    const afterSuccess = calls;
+    expect(afterSuccess).toBeGreaterThanOrEqual(4);
+
+    // Backoff must be back to intervalMs, not still doubling: fail again and expect one more
+    // request after a single interval.
+    failing = true;
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(calls).toBeGreaterThan(afterSuccess);
     poller.stop();
+  });
+
+  it("非空但完全无法推进游标的响应不算 batch —— 否则 0ms 重排会打成风暴", async () => {
+    // Regression for a hot loop that survived the first pacing fix: `outcome` was classified
+    // from events.length, but a response can be non-empty and still advance nothing — event ids
+    // outside the safe-integer range, or a persisted cursor ahead of the server's ids after a
+    // store reset. The identical request then goes out at 0ms, forever. Measured at ~430 req/s.
+    for (const results of [
+      [{ event_id: "not-a-number", event_type: "card_action", event_data: {} }],
+      [{ event_id: 5, event_type: "card_action", event_data: {} }], // <= cursor
+    ]) {
+      let calls = 0;
+      global.fetch = vi.fn().mockImplementation(async () => {
+        calls += 1;
+        return Response.json({ results });
+      }) as typeof fetch;
+
+      const poller = startEventPoller({
+        apiUrl: "https://api.test",
+        botToken: "bf_x",
+        intervalMs: 2_000,
+        waitSeconds: 25,
+        cursorStore: memoryCursor(10),
+        log: { error: () => {} },
+        onCardAction: async () => {},
+      });
+      await poller.ready;
+      for (let i = 0; i < 20; i += 1) await vi.advanceTimersByTimeAsync(1);
+      expect(calls).toBeLessThanOrEqual(1);
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(calls).toBe(2); // paced by intervalMs, not spinning
+      poller.stop();
+    }
   });
 
   it("stop() 中断在途 hold，且不把中断记成轮询失败", async () => {

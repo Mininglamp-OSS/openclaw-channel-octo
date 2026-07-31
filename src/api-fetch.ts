@@ -24,8 +24,18 @@ const EVENTS_POLL_TIMEOUT_MS = 10_000;
 // jitter; the client must never be the side that times out first, because an abort loses the
 // batch the server was about to hand back.
 const EVENTS_POLL_WAIT_MARGIN_MS = 10_000;
-/** Mirrors the server-side clamp on `wait`; keeps the derived client timeout bounded too. */
-const MAX_EVENT_WAIT_SECONDS = 30;
+/**
+ * Mirrors the server-side clamp on `wait`. Single source of truth — the JSON schemas and the
+ * poller all derive from this, so the plugin and the server cannot drift apart silently.
+ */
+export const MAX_EVENT_WAIT_SECONDS = 30;
+/**
+ * Smallest useful hold. Below this the loop issues *more* requests than the short polling it
+ * replaces (a 1s hold with no added delay is 60 req/min against a 29 req/min baseline), and the
+ * "did the server actually hold?" guard shrinks to a window narrower than an ordinary slow RTT.
+ * A non-zero value under this is raised to it rather than rejected.
+ */
+export const MIN_EVENT_WAIT_SECONDS = 5;
 
 /**
  * Client timeout for one /v1/bot/events request.

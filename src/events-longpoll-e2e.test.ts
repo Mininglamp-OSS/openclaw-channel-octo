@@ -15,7 +15,8 @@
  * wake-up check additionally needs BOT_ID, a redis-cli that can reach the server's Redis, and an
  * explicit OCTO_E2E_ALLOW_DESTRUCTIVE=1, because it has to inject an event into the bot's queue
  * out of band (no HTTP endpoint enqueues one on demand) and clears that queue first. Point it at
- * a throwaway bot: it deletes robotEvent:{BOT_ID} and its doorbell.
+ * a throwaway bot: it deletes robotEvent:{BOT_ID} and its doorbell, before and after (in a
+ * finally, so a failed assertion still cleans up).
  */
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
@@ -53,7 +54,7 @@ suite("events long-poll E2E（真实 octo-server）", () => {
 
   // The wake-up case is destructive: it DELs the bot's event queue and doorbell to get a clean
   // measurement, which would discard real queued events if pointed at a shared bot. Gate it
-  // behind an explicit opt-in so the env vars alone can never trigger it (PR #194 review).
+  // behind an explicit opt-in so the env vars alone can never trigger it.
   const DESTRUCTIVE_OK = process.env.OCTO_E2E_ALLOW_DESTRUCTIVE === "1";
   const wakeIt = API && TOKEN && BOT_ID && REDIS_CLI && DESTRUCTIVE_OK ? it : it.skip;
   wakeIt("事件在 hold 期间到达时提前返回 —— 这次改动的全部意义（需 OCTO_E2E_ALLOW_DESTRUCTIVE=1，会清空该 bot 队列）", async () => {
@@ -62,8 +63,11 @@ suite("events long-poll E2E（真实 octo-server）", () => {
     const redis = (...args: string[]) =>
       execFileSync(REDIS_CLI!, args, { encoding: "utf8" }).trim();
 
-    redis("DEL", queueKey);
-    redis("DEL", bellKey);
+    const cleanup = () => {
+      redis("DEL", queueKey);
+      redis("DEL", bellKey);
+    };
+    cleanup();
 
     const eventId = 900001;
     const payload = JSON.stringify({
@@ -82,20 +86,23 @@ suite("events long-poll E2E（真实 octo-server）", () => {
       }, 1_500);
     });
 
-    const started = Date.now();
-    const [events, injectedAt] = await Promise.all([
-      fetchBotEvents({ apiUrl: API!, botToken: TOKEN!, waitSeconds: 20 }),
-      injected,
-    ]);
-    const returnedAt = Date.now();
+    try {
+      const started = Date.now();
+      const [events, injectedAt] = await Promise.all([
+        fetchBotEvents({ apiUrl: API!, botToken: TOKEN!, waitSeconds: 20 }),
+        injected,
+      ]);
+      const returnedAt = Date.now();
 
-    expect(events.map((event) => event.event_id)).toContain(eventId);
-    // The hold must break on the doorbell, not run to its 20s deadline.
-    expect(returnedAt - started).toBeLessThan(10_000);
-    // And it must react to the event, not merely happen to finish around then.
-    expect(returnedAt - injectedAt).toBeLessThan(3_000);
-
-    redis("DEL", queueKey);
-    redis("DEL", bellKey);
+      expect(events.map((event) => event.event_id)).toContain(eventId);
+      // The hold must break on the doorbell, not run to its 20s deadline.
+      expect(returnedAt - started).toBeLessThan(10_000);
+      // And it must react to the event, not merely happen to finish around then.
+      expect(returnedAt - injectedAt).toBeLessThan(3_000);
+    } finally {
+      // Must run even on a failed assertion or timeout: otherwise the injected event and the
+      // doorbell token survive and poison the next run, and any bot sharing this id.
+      cleanup();
+    }
   }, 60_000);
 });

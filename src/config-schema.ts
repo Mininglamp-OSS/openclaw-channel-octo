@@ -103,7 +103,7 @@ export const CARD_INTERACTION_DESCRIPTION =
   "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value.";
 
 export const EVENT_WAIT_SECONDS_DESCRIPTION =
-  "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";
+  "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";
 
 // Shared description for commands.fork.scope, kept identical to the wording in
 // openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).

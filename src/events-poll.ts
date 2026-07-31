@@ -3,7 +3,13 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { normalizeAccountId } from "./account-id.js";
-import { ackBotEvent, eventsPollTimeoutMs, fetchBotEvents } from "./api-fetch.js";
+import {
+  ackBotEvent,
+  eventsPollTimeoutMs,
+  fetchBotEvents,
+  MAX_EVENT_WAIT_SECONDS,
+  MIN_EVENT_WAIT_SECONDS,
+} from "./api-fetch.js";
 import { CHANNEL_ID } from "./constants.js";
 import { parseCardAction, type CardAction } from "./card-action.js";
 
@@ -17,8 +23,6 @@ const MAX_ERROR_BACKOFF_MS = 30_000;
  * arriving, is not mistaken for a non-holding server.
  */
 const HELD_FRACTION = 0.5;
-/** Mirrors the server-side clamp on `wait`, so the two agree by construction rather than convention. */
-const MAX_WAIT_SECONDS = 30;
 
 export interface EventCursorStore {
   load(): Promise<number>;
@@ -104,10 +108,24 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
   // Clamp at runtime, not just in the JSON schema: a host that surfaces the schema advisorily
   // rather than enforcing it would otherwise let eventWaitSeconds: 3600 through, yielding a
   // ~3610s client timeout against a server that clamps its own `wait` to 30s.
+  //
+  // The lower bound matters just as much and is less obvious: a hold shorter than
+  // MIN_EVENT_WAIT_SECONDS makes idle traffic *worse* than the short polling it replaces, and
+  // narrows the "did the server hold?" guard below a normal slow RTT, so a non-holding server
+  // gets misread as holding. Raise rather than reject — the operator asked for long polling and
+  // gets the shortest hold that actually delivers it. `Math.round` so 0.5 does not silently
+  // become 0 (which would disable the feature with no signal at all).
+  const requestedWait = options.waitSeconds ?? 0;
   const waitSeconds =
-    options.waitSeconds && options.waitSeconds > 0
-      ? Math.min(MAX_WAIT_SECONDS, Math.floor(options.waitSeconds))
+    requestedWait > 0
+      ? Math.min(MAX_EVENT_WAIT_SECONDS, Math.max(MIN_EVENT_WAIT_SECONDS, Math.round(requestedWait)))
       : 0;
+  if (requestedWait > 0 && waitSeconds !== Math.round(requestedWait)) {
+    options.log?.info?.(
+      `octo: eventWaitSeconds ${requestedWait} clamped to ${waitSeconds} ` +
+        `(valid range ${MIN_EVENT_WAIT_SECONDS}-${MAX_EVENT_WAIT_SECONDS}; 0 disables long polling)`,
+    );
+  }
   let cursor = 0;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -129,9 +147,8 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
    * Rescheduling at 0ms unconditionally (the first version of this) turns any fast return into a
    * hot loop: an older server that ignores `wait`, any 4xx/5xx, a connection refusal, or a proxy
    * closing the hold early all come back in one RTT, and the loop re-fires immediately, forever.
-   * Measured in review at ~800 req/s against an immediately-erroring server — the opposite of the
-   * traffic reduction this feature exists for, at exactly the moment the server can least absorb
-   * it (PR #194 review: Jerry-Xin, lml2468, yujiawei, mochashanyao).
+   * Measured at ~800 req/s against an immediately-erroring server — the opposite of the traffic
+   * reduction this feature exists for, at exactly the moment the server can least absorb it.
    *
    * So: only a hold that was genuinely honoured earns an immediate re-poll.
    */
@@ -209,7 +226,15 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
           }
         }
       }
-      outcome = events.length > 0 ? "batch" : "empty";
+      // Classify from forward progress, not from response size. `ordered` is what actually
+      // advances the cursor (:filtered by isSafeInteger + > cursor), and every element of it is
+      // assigned to `cursor` below. A response that is non-empty but entirely undrainable —
+      // event ids outside the IEEE-754 safe range, or a persisted cursor ahead of what the
+      // server returns after a store reset — would otherwise be classified "batch", reschedule
+      // at 0ms, and re-issue the identical request forever. Reproduced at ~430 req/s before
+      // this line was corrected; it falls through to "empty" and is paced by intervalMs now,
+      // which is the right treatment for a server that is not making progress for us.
+      outcome = ordered.length > 0 ? "batch" : "empty";
       if (events.length > 0) {
         options.log?.info?.(
           `octo: event poll batch events=${events.length} card_actions=${cardActions} cursor=${cursor}`,
