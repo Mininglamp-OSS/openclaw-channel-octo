@@ -3351,7 +3351,6 @@ export async function handleInboundMessage(params: {
             { final: true },
           );
           replySucceeded ||= delivery.outputDelivered;
-          userFacingFinalDelivered = delivery.finalDelivered;
         } catch (sendErr) {
           log?.error?.(`octo: failed to deliver buffered block text on dispatch error: ${String(sendErr)}`);
         }
@@ -3388,8 +3387,6 @@ export async function handleInboundMessage(params: {
           AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
         );
         replySucceeded ||= delivered.delivered;
-        // 只发过 block 的回合,答复正是从这里刷出去的 —— 这就是本回合的最终答复。
-        userFacingFinalDelivered = delivered.delivered;
         if (delivered.delivered) {
           log?.info?.(`octo: [deliver-buffer] fallback text sent (${deliverBuffer.lastText.length} chars)`);
         }

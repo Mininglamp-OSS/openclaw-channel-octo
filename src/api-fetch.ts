@@ -789,7 +789,7 @@ export async function fetchBotEvents(params: {
   return Array.isArray(response?.results) ? response.results : [];
 }
 
-/** Best-effort queue pruning after a card_action has been durably accepted locally. */
+/** Best-effort queue pruning after a recognized bot event has been accepted locally. */
 export async function ackBotEvent(params: {
   apiUrl: string;
   botToken: string;

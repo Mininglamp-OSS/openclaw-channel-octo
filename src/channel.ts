@@ -1511,9 +1511,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
               if (extra?.docTask) {
                 // 第五处 IM 出口:该回执按合成消息解析目标,会发进发起人的私聊。
                 // 文档任务改投评论区 —— 与 inbound 的出站收口同一条原则。
-                // 冲突回执不经 handleInboundMessage(这个回合根本没进去),所以
-                // 结论要在这里自己上报:notice-only —— 留了痕,但活儿一点没干,
-                // 不写去重、也不再补一条通用兜底(否则用户连着看两句废话)。
+                // 每次重试都会由 handleInboundMessage.finally 上报一次;handler 会
+                // 累计各 attempt 的事实。这里再补 notice-only:留了痕,但本次冲突
+                // 没产出,不再补一条通用兜底(否则用户连着看两句废话)。
                 try {
                   await extra.docTask.postComment(
                     "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",

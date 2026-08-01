@@ -80,12 +80,12 @@ export function requestCardEventPolling(accountId: string): void {
 /**
  * Start one non-overlapping short-poll loop.
  *
- * Ordering: the ACK is sent **before** the cursor is persisted, and the cursor write is not
- * allowed to throw. The ACK is what stops the server re-delivering an event; the on-disk cursor
- * is only this process's restart hint, so losing it costs a re-fetch (which the ACK already
- * makes a no-op) while losing the ACK costs an unbounded replay. The previous order — persist,
- * then ack — meant a single write failure in the state directory parked the cursor, skipped the
- * ACK and the rest of the batch, and replayed the event every tick.
+ * Ordering: the best-effort ACK is attempted **before** the cursor is persisted, and the cursor
+ * write is not allowed to throw. Fetching is cursor-driven; ACK additionally asks the server to
+ * prune an accepted event, but is not assumed here to be the sole durability guarantee. This
+ * order ensures a local state-write failure cannot skip the ACK attempt and the rest of the
+ * batch. The in-memory cursor still advances; after a restart, persistent doc-task dedupe closes
+ * a re-fetch caused by a stale on-disk cursor.
  */
 export function startEventPoller(options: EventPollerOptions): EventPoller {
   const intervalMs = Math.max(500, Math.floor(options.intervalMs ?? DEFAULT_INTERVAL_MS));
@@ -151,16 +151,16 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
           }
         }
 
-        // ACK 先于存游标,而且存游标不许抛。
-        //
-        // 两者是不同量级的失败:ack 才是真正止住 server 重投的东西,游标只是本进程
-        // 的重启起点 —— 已 ack 的事件 server 不会再投,所以游标丢了是可恢复的。
-        // 反过来写就不成立:游标存在轮询器状态目录里(events.cursor.json),和文档
+        // 先尝试 best-effort ACK,再存游标,而且存游标不许抛。fetch 本身由 cursor
+        // 驱动,这里不假设 ACK 单独保证不重投;它负责请求 server 清理已接收事件。
+        // 顺序的关键是本地写失败不能跳过 ACK 尝试和批次余项:游标存在轮询器状态
+        // 目录里(events.cursor.json),和文档
         // 任务的去重表(doc-mentions.processed.json)是**同一个目录**,EROFS /
         // ENOSPC / EACCES / EDQUOT 会同时命中两处写。原先 save() 裸在这里,一抛就
         // 逃出整个 for 循环:不 ack、游标不前进(它在 save 之后才赋值)、批次剩下
         // 的事件也一起不处理 —— 下一 tick 原样重取,把会改文档的任务每周期重跑
-        // 一遍,同时把卡片动作也一并楔死。实测 3.2s 跑 6 遍,永不收敛。
+        // 一遍,同时把卡片动作也一并楔死。重启后若因旧 cursor 再取文档事件,
+        // 持久去重表负责收敛。
         if (recognized && options.ack !== false) {
           try {
             await ackBotEvent({
