@@ -492,6 +492,77 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
     expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
   });
 
+  it("附件先落地、随后 buffered 最终文本 POST 失败:不得借前一次成功冒充答复送达", async () => {
+    // P1 回归:空 final 先把附件 POST 成功并把回合级 finalDelivered 置真;finally
+    // 随后刷新 block 文本时 POST 失败。若 deliverFinalText 返回回合级旧值,失败的
+    // 这一次仍会报告 delivered:true,最终写去重且不留失败提示,正文永久静默丢失。
+    installFetchStub();
+    installRuntime(async (args) => {
+      const mediaUrls = [`${API}/f/diff.png`];
+      await args.dispatcherOptions.deliver(
+        { text: "已按要求改好，正文说明如下", mediaUrls },
+        { kind: "block" },
+      );
+      await args.dispatcherOptions.deliver({ mediaUrls }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+    let attempt = 0;
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async (text) => {
+        attempt += 1;
+        if (attempt === 2) throw new Error("docs API 503");
+        posted.push(text);
+      },
+    });
+
+    expect(posted).toEqual([`[附件] ${API}/f/diff.png`]);
+    expect(reports).toEqual([report({ delivered: true, lost: true })]);
+  });
+
+  it("连续两个 final:第二个更正答复 POST 失败时最终状态必须失败", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "第一版答复" }, { kind: "final" });
+      await args.dispatcherOptions.deliver({ text: "更正后的最终答复" }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+    let attempt = 0;
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async (text) => {
+        attempt += 1;
+        if (attempt === 2) throw new Error("docs API 503");
+        posted.push(text);
+      },
+    });
+
+    expect(posted).toEqual(["第一版答复"]);
+    expect(reports).toEqual([report({ delivered: true, lost: true })]);
+  });
+
+  it("进度文本携带附件、随后无媒体引用的空 final:不能把进度附件洗成最终答复", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        { text: "正在生成预览…", mediaUrls: [`${API}/f/preview.png`] },
+        { kind: "tool" },
+      );
+      await args.dispatcherOptions.deliver({}, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual([`正在生成预览…\n\n[附件] ${API}/f/preview.png`]);
+    expect(reports).toEqual([report({ delivered: true })]);
+  });
+
   it("只有进度文本落地、随后收到空 final:不能把进度冒充最终答复", async () => {
     installFetchStub();
     installRuntime(async (args) => {
