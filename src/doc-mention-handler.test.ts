@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createDocMentionHandler } from "./doc-mention-handler.js";
 import { createMemoryDocMentionDedupeStore } from "./doc-mention-dedupe.js";
 import { parseDocCommentMention, type DocCommentMention } from "./doc-mention.js";
+import { DocCommentRejectedError } from "./api-fetch.js";
 
 /**
  * 接线本身的回归测试。
@@ -122,7 +123,8 @@ describe("文档任务接线", () => {
   it("回帖始终失败:不得写入持久去重(否则一次瞬时 5xx 就永久丢回复)", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好").catch(() => {});
-      extra.docTask.reportTurn({ finalDelivered: true, delivered: false, lost: true, noticed: false });
+      // POST 没成 → finalDelivered 为假(它由出站收口在成功之后才置位)
+      extra.docTask.reportTurn({ finalDelivered: false, delivered: false, lost: true, noticed: false });
       return "completed" as const;
     });
     const { handler, dedupe } = makeHandler(dispatch, async () => { throw new Error("docs API 503"); });
@@ -185,8 +187,8 @@ describe("文档任务接线", () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("正在读取文档…");
       await extra.docTask.postComment("这是最终答复").catch(() => {});
-      // inbound 侧:有产出发丢且没提示 → nothing
-      extra.docTask.reportTurn({ finalDelivered: true, delivered: false, lost: true, noticed: false });
+      // inbound 侧:最终答复没发成功 → finalDelivered 为假,且没发过提示 → 补兜底
+      extra.docTask.reportTurn({ finalDelivered: false, delivered: true, lost: true, noticed: false });
       return "completed" as const;
     });
     let call = 0;
@@ -200,6 +202,24 @@ describe("文档任务接线", () => {
     const bodies = postComment.mock.calls.map((c: any) => c[1]);
     expect(bodies.some((b: string) => b.includes("没有给出答复"))).toBe(true); // 有兜底提示
     expect(await dedupe.claim("k1")).toBe(false); // 有丢失 → 不写去重
+  });
+
+  it("确定性拒绝只尝试一次 —— 不在轮询器串行循环里白烧三次 POST", async () => {
+    // 「文档不存在」重试三次仍然不存在。而且后面的兜底通知还会再烧一遍同样的三次,
+    // 单个事件 ~6 次无望的 POST + 1.2s 退避,全都发生在轮询器的串行循环里。
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("已改好").catch(() => {});
+      extra.docTask.reportTurn({ finalDelivered: false, delivered: false, lost: true, noticed: false });
+      return "completed" as const;
+    });
+    const { handler, postComment } = makeHandler(dispatch, async () => {
+      throw new DocCommentRejectedError("Octo API /v1/bot/docs/d1/comments rejected the comment (status=404)");
+    });
+
+    await handler(mention());
+
+    // 一次真答复 + 一次兜底,各只尝试一次
+    expect(postComment).toHaveBeenCalledTimes(2);
   });
 
   // --- 结论由回合上报,不由本文件推断 ---
@@ -246,6 +266,24 @@ describe("文档任务接线", () => {
     expect(await dedupe.claim("k1")).toBe(true); // 已完成 → 不会重放
   });
 
+  it("进度评论发丢、最终答复送达:写去重,且不叠兜底 —— lost 不得否决 finalDelivered", async () => {
+    // 回归:`workLanded = finalDelivered && !lost` 里的 lost 是回合全局且粘性的,
+    // 任何非提示帖失败都会置位(进度、工具、附件)。于是一次进度评论的瞬时 5xx
+    // 就会否决掉一个确实落地的最终答复 —— 在正确答复下面贴出「没有给出答复」
+    // 并允许重放,而 agent 已经改过文档了。
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("已改好");
+      extra.docTask.reportTurn({ finalDelivered: true, delivered: true, lost: true, noticed: false });
+      return "completed" as const;
+    });
+    const { handler, dedupe, postComment } = makeHandler(dispatch);
+
+    await handler(mention());
+
+    expect(postComment).toHaveBeenCalledTimes(1); // 没有多出一条「没有给出答复」
+    expect(await dedupe.claim("k1")).toBe(true); // 已完成 → 不会重放
+  });
+
   it("答复送达之后又道歉(超时/onError):仍算落地,不再叠兜底", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好");
@@ -263,7 +301,7 @@ describe("文档任务接线", () => {
 
   it("答复发丢但道歉发出去了:不写去重,也不叠兜底 —— 用户已经知道失败了", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
-      extra.docTask.reportTurn({ finalDelivered: true, delivered: true, lost: true, noticed: true });
+      extra.docTask.reportTurn({ finalDelivered: false, delivered: true, lost: true, noticed: true });
       return "completed" as const;
     });
     const { handler, dedupe, postComment } = makeHandler(dispatch);

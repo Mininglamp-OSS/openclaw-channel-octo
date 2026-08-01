@@ -2402,7 +2402,14 @@ export async function handleInboundMessage(params: {
   }
 
   const commandBody = resolveCommandBody(rawBody, isGroup, isExplicitBotMention);
-  const commandAuthorized = resolveCommandAuthorized(isGroup, isOwner(account.accountId, message.from_uid), isExplicitBotMention);
+  // 文档任务一律不授权斜杠命令。它是一条合成 DM,而 resolveCommandAuthorized 对 DM
+  // 形态恒返回 true —— 于是攻击者可控的评论正文会带着 CommandAuthorized: true 进入
+  // core 的命令解析。今天唯一挡住它的是 formatDocMentionText 给正文加了前缀,使得
+  // 锚定在位置 0 的命令匹配不上;这和 /fork 那处是同一种「意外保护」,提示词格式
+  // 一改就失效。评论区没有斜杠命令语义,直接关掉。
+  const commandAuthorized = docTask
+    ? false
+    : resolveCommandAuthorized(isGroup, isOwner(account.accountId, message.from_uid), isExplicitBotMention);
 
   // `/fork` command split (spec §3). Runs BEFORE OBO detection /
   // finalizeInboundContext / recordInboundSession / the dispatch main path: a
@@ -2791,14 +2798,15 @@ export async function handleInboundMessage(params: {
   // 失败只记日志,绝不回退 IM:回退等于把污染放回来;文档修改本身已经落盘。
   // 本回合的事实记账。**只在 postDocTaskReply 里赋值**,回合末尾原样上报给 handler
   // —— 这里只说发生了什么,不下「算不算完成」的判断(那是 handler 的策略)。
+  let docTaskFinalDelivered = false; // 本回合的最终答复**确实发成功了**
   let docTaskDelivered = false; // 评论区收到过任何内容(含提示)
-  let docTaskLost = false; // 有非提示内容重试耗尽仍没发出去
+  let docTaskLost = false; // 有非提示内容重试耗尽仍没发出去(仅供观测)
   let docTaskNoticed = false; // 发出过提示(道歉/超时/拒绝)
   const docTaskMediaUrls: string[] = [];
   const postDocTaskReply = async (
     content: string,
     signal?: AbortSignal,
-    opts?: { notice?: boolean },
+    opts?: { notice?: boolean; final?: boolean },
   ): Promise<void> => {
     if (!docTask) return;
     // 只读不清空:发失败就把附件留在队列里,交给本回合后续的出站(或兜底)再带出去。
@@ -2814,8 +2822,13 @@ export async function handleInboundMessage(params: {
       await docTask.postComment(body, signal);
       // 按「消费掉的条数」出队,而不是清空:await 期间 deliver 可能又推进了新附件。
       docTaskMediaUrls.splice(0, attachments.length);
+      // 「最终答复落地了」只在这一行为真:这里是**唯一**同时知道「这帖带的是不是
+      // 本回合的最终产出」和「POST 到底 resolve 了没有」的地方。此前它在 deliver()
+      // 里、POST 之前就置位,于是要靠 `&& !lost` 补偿 —— 而那个补偿是回合全局的,
+      // 一次进度评论的瞬时 5xx 就会否决掉一个确实落地的答复。
       docTaskDelivered = true;
       if (opts?.notice) docTaskNoticed = true;
+      else if (opts?.final) docTaskFinalDelivered = true;
       statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
     } catch (err) {
       // 提示发失败不记 lost:提示本来就不是产出,发不出去只是没留下痕迹,
@@ -2860,9 +2873,13 @@ export async function handleInboundMessage(params: {
   let deliveryErrorOccurred = false;
 
   // --- Shared helper: resolve mentions and send text ---
-  const resolveAndSendText = async (content: string, signal?: AbortSignal): Promise<SendMessageResult | undefined> => {
+  const resolveAndSendText = async (
+    content: string,
+    signal?: AbortSignal,
+    opts?: { final?: boolean },
+  ): Promise<SendMessageResult | undefined> => {
     if (docTask) {
-      await postDocTaskReply(content, signal);
+      await postDocTaskReply(content, signal, opts);
       return undefined;
     }
     let replyMentionUids: string[] = [];
@@ -2983,6 +3000,7 @@ export async function handleInboundMessage(params: {
   // that emitted media keep the normal path because a card edit cannot retain
   // their notification / attachment semantics. A failed merge is transparent:
   // the caller still sends text and finally closes the progress card normally.
+  /** 承载本回合最终产出的出站。文档任务据此判定「答复落地了没有」。 */
   const deliverFinalText = async (
     content: string,
     signal?: AbortSignal,
@@ -3000,7 +3018,7 @@ export async function handleInboundMessage(params: {
         return { merged: true };
       }
     }
-    await resolveAndSendText(content, signal);
+    await resolveAndSendText(content, signal, { final: true });
     return { merged: false };
   };
 
@@ -3118,12 +3136,12 @@ export async function handleInboundMessage(params: {
             // 文档任务:附件此时还排在 docTaskMediaUrls 里,必须经出站收口发出去,
             // 否则本回合一条评论都不会产生。
             if (docTask) {
-              await postDocTaskReply("");
+              // 纯附件就是本回合 kind:"final" 的全部产出,和一段最终文本等价 ——
+              // 不标 final 的话这个回合永远拿不到去重记录,重投会把文档改第二遍。
+              await postDocTaskReply("", undefined, kind === "final" ? { final: true } : undefined);
               // 和下面的非文档分支一样置位:不置位的话本回合会被判成「没答复过」,
               // 走到 !replySucceeded 兜底,在已经发出附件评论之后再补一句道歉。
               replySucceeded = true;
-              // 纯附件就是本回合 kind:"final" 的全部产出,和一段最终文本等价 ——
-              // 不置位的话这个回合永远拿不到去重记录,重投会把文档改第二遍。
               if (kind === "final") userFacingFinalDelivered = true;
               return;
             }
@@ -3237,8 +3255,12 @@ export async function handleInboundMessage(params: {
       // 和下面 dispatch-rejected 分支同一条守卫(见其注释):答复已经发出去了就别再
       // 追一句「处理超时，请稍后重试」—— 用户会同时看到正确答复和自相矛盾的失败提示。
       // 对文档任务还多一层代价:那句道歉会把一个已经落地的回合拖成「未完成」。
-      if (replySucceeded) {
-        log?.info?.("octo: dispatch timed out after a reply already landed — suppressing the timeout notice");
+      // 必须是 userFacingFinalDelivered 而不是 replySucceeded:后者对进度/工具文本
+      // 也置位(见 kind === "tool" 分支),用它做守卫会让「只发过进度然后 hang」的
+      // 回合彻底收不到终态信号 —— 而那正好是超时提示最该出现的场景,且这条路径
+      // 在 docTasks 关着时也走,是普通 DM/群聊上的静默回归。
+      if (userFacingFinalDelivered) {
+        log?.info?.("octo: dispatch timed out after a final answer already landed — suppressing the timeout notice");
       } else {
         try {
           // The apology call itself MUST be bounded — otherwise a sick Octo API
@@ -3275,8 +3297,11 @@ export async function handleInboundMessage(params: {
           `octo: dispatch rejected but buffered block text exists; delivering instead of error fallback (${bufferedText.length} chars)`,
         );
         try {
-          await resolveAndSendText(bufferedText, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+          // 缓冲的 block 文本就是 agent 这一回合的真实答复,和 kind:"final" 等价 ——
+          // 不标 final 的话文档任务会在这条正确答复下面再贴一句「没有给出答复」。
+          await resolveAndSendText(bufferedText, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { final: true });
           replySucceeded = true;
+          userFacingFinalDelivered = true;
         } catch (sendErr) {
           log?.error?.(`octo: failed to deliver buffered block text on dispatch error: ${String(sendErr)}`);
         }
@@ -3313,6 +3338,8 @@ export async function handleInboundMessage(params: {
           AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
         );
         replySucceeded = true;
+        // 只发过 block 的回合,答复正是从这里刷出去的 —— 这就是本回合的最终答复。
+        userFacingFinalDelivered = true;
         log?.info?.(`octo: [deliver-buffer] fallback text sent (${deliverBuffer.lastText.length} chars)`);
       } catch (finalSendErr) {
         log?.error?.(`octo: [deliver-buffer] final text send failed: ${String(finalSendErr)}`);
@@ -3336,7 +3363,7 @@ export async function handleInboundMessage(params: {
     // 进度/工具文本也置位,拿它当「答复落地」会让「正在读取文档… + 道歉」被判成完成。
     if (docTask) {
       const report: DocTaskTurnReport = {
-        finalDelivered: userFacingFinalDelivered,
+        finalDelivered: docTaskFinalDelivered,
         delivered: docTaskDelivered,
         lost: docTaskLost,
         noticed: docTaskNoticed,

@@ -109,6 +109,10 @@ export function createFileDocMentionDedupeStore(params: {
         if (cache.includes(idempotencyKey)) { inFlight.delete(idempotencyKey); return; }
         // 先落盘、成功后才更新内存:反过来的话,persist 抛错时内存已记为「已完成」,
         // 而调用方仍会重试 —— 重试时被内存判定为重复,任务被永久静默丢弃。
+        //
+        // (评审建议过反过来写,理由是「ack 之前进程就没了」那个窗口里内存表能挡住
+        // 一次重放。但那个窗口比这条不变量保护的场景窄得多,而这条不变量有专门的
+        // 测试钉着,是当初为一个真实缺陷加的。不为一条 P2 建议翻掉它。)
         const next = [...cache, idempotencyKey];
         if (next.length > capacity) next.splice(0, next.length - capacity);
         try {

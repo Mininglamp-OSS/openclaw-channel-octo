@@ -22,14 +22,22 @@ import { describe, expect, it } from "vitest";
 const SRC = join(process.cwd(), "src");
 const SOURCE = readFileSync(join(SRC, "inbound.ts"), "utf8");
 
-/** 从 `import { … } from "./api-fetch.js"` 里取出实际引入的名字。 */
+/**
+ * 从**所有** `import { … } from "./api-fetch.js"` 语句里取出实际引入的名字。
+ *
+ * 必须是 matchAll:非全局 exec 只解析第一条 import,而 inbound.ts 本来就有两条
+ * (值导入 + `import type { GroupMember }`)。追加第三条 `import { editCardMessage }`
+ * 就能让一个未包装的出站对扫描完全隐形 —— 守卫自己开的后门。
+ */
 export function importedApiFetchNames(source: string): string[] {
-  const match = /import\s*\{([^}]*)\}\s*from\s*["']\.\/api-fetch\.js["']/s.exec(source);
-  if (!match) return [];
-  return match[1]
-    .split(",")
-    .map((part) => part.trim().split(/\s+as\s+/).pop()!.trim())
-    .filter(Boolean);
+  const names: string[] = [];
+  for (const match of source.matchAll(/import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*["']\.\/api-fetch\.js["']/gs)) {
+    for (const part of match[1].split(",")) {
+      const name = part.trim().split(/\s+as\s+/).pop()?.trim();
+      if (name) names.push(name);
+    }
+  }
+  return names;
 }
 
 /**
@@ -155,6 +163,19 @@ describe("inbound.ts 的 IM 出站闸门", () => {
     ].join("\n");
 
     expect(findUnguardedImEgress(fake)).toHaveLength(1);
+  });
+
+  it("负向对照:第二条 import 语句里的发送函数同样会被抓到", () => {
+    // 非全局 exec 只看第一条 import,追加一条就能让未包装的出站隐形。
+    const fake = [
+      'import { sendMessage } from "./api-fetch.js";',
+      'import type { GroupMember } from "./api-fetch.js";',
+      'import { editCardMessage } from "./api-fetch.js";',
+      "const imSendMessage = imEgress.guard('sendMessage', sendMessage);",
+      "await editCardMessage({ channelId: replyChannelId });",
+    ].join("\n");
+
+    expect(findUnguardedImEgress(fake)).toMatchObject([{ line: 5, name: "editCardMessage" }]);
   });
 
   it("负向对照:闸门绑定行本身不会被误报", () => {

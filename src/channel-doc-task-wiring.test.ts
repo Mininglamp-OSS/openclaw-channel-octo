@@ -124,7 +124,7 @@ describe("channel.ts:docTasks 开关是真的门禁", () => {
   it("未开启:常驻轮询器不启动,文档事件根本收不到", async () => {
     const stop = await startAccount({});
     try {
-      expect(startEventPoller).not.toHaveBeenCalled();
+      expect(pollerOptions().filter((o) => o.onDocMention !== undefined)).toEqual([]);
     } finally {
       await stop();
     }
@@ -143,7 +143,7 @@ describe("channel.ts:docTasks 开关是真的门禁", () => {
   it('docTasks: "true" 这类真值不算开启 —— 门禁是严格 === true', async () => {
     const stop = await startAccount({ docTasks: "true" });
     try {
-      expect(startEventPoller).not.toHaveBeenCalled();
+      expect(pollerOptions().filter((o) => o.onDocMention !== undefined)).toEqual([]);
     } finally {
       await stop();
     }
@@ -186,7 +186,9 @@ describe("channel.ts:会话冲突回执走评论区,不走发起人私聊", () =
       const bodies = postDocComment.mock.calls.map(
         (call: unknown) => (call as [{ body: string }])[0].body,
       );
-      expect(bodies.some((b) => b.includes("上一轮任务尚未结束"))).toBe(true);
+      // 必须是 toEqual 而不是 some:SESSION_INIT_RETRY 会重试 4 次,inbound 若在
+      // 每次尝试里都道歉一遍,评论区就是 5 句道歉 + 1 条回执,而 `some` 照样通过。
+      expect(bodies).toEqual(["⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。"]);
       // ……而不是发起人的私聊。
       expect(sendMessage).not.toHaveBeenCalled();
     } finally {

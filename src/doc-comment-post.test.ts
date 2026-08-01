@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { postDocComment } from "./api-fetch.js";
+import { DocCommentRejectedError, isPermanentDocCommentFailure, postDocComment } from "./api-fetch.js";
 
 /**
  * `postDocComment` 是整个文档任务特性**唯一**的投递凭证 —— handler 靠它成没成来
@@ -91,6 +91,24 @@ describe("postDocComment", () => {
     ).rejects.toThrow(/rejected the comment/);
   });
 
+  it('字符串型失败状态 {"status":"0"} 同样必须抛错', async () => {
+    // 断言的是**成功形状**而不是「不等于数字 0」。接口尚未对真实后端验证过,
+    // 字符串型状态完全可能出现;只否定数字会把它放过去,直接写进去重表。
+    captureFetch({ status: "0", msg: "permission denied" });
+
+    await expect(
+      postDocComment({ apiUrl: API, botToken: "tok", docId: "d1", body: "已改好" }),
+    ).rejects.toThrow(/rejected the comment/);
+  });
+
+  it('字符串型成功状态 {"status":"1"} 视为成功', async () => {
+    captureFetch({ status: "1" });
+
+    await expect(
+      postDocComment({ apiUrl: API, botToken: "tok", docId: "d1", body: "已改好" }),
+    ).resolves.toBeUndefined();
+  });
+
   it("信封 status = 1:正常返回", async () => {
     captureFetch({ status: 1, data: { id: 9 } });
 
@@ -107,5 +125,28 @@ describe("postDocComment", () => {
     await expect(
       postDocComment({ apiUrl: API, botToken: "tok", docId: "d1", body: "已改好" }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("isPermanentDocCommentFailure", () => {
+  // 它决定 postWithRetry 要不要继续重试。没有覆盖的话,那个 break 被删掉也全绿,
+  // 而 408/429 的豁免正是最容易在后续「简化」里被顺手删掉的部分。
+  it("信封拒绝:确定性失败,不重试", () => {
+    expect(isPermanentDocCommentFailure(new DocCommentRejectedError("rejected"))).toBe(true);
+  });
+
+  it("4xx:确定性失败,不重试", () => {
+    expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (404): not found"))).toBe(true);
+    expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (403): forbidden"))).toBe(true);
+  });
+
+  it("408 / 429 是「稍后再来」,要重试", () => {
+    expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (408): timeout"))).toBe(false);
+    expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (429): slow down"))).toBe(false);
+  });
+
+  it("5xx 与裸网络错误要重试", () => {
+    expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (503): unavailable"))).toBe(false);
+    expect(isPermanentDocCommentFailure(new Error("fetch failed"))).toBe(false);
   });
 });

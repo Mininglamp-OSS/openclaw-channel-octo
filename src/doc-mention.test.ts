@@ -78,6 +78,17 @@ describe("会话与队列作用域", () => {
     expect(docTaskSessionScope(other)).toBe(docTaskSessionScope(mention));
   });
 
+  it("字段里的 `:` 必须转义 —— 否则两条不相干的评论串会撞成同一个键", () => {
+    // docId="d:1"/threadId="2" 与 docId="d"/threadId="1:2" 不转义的话都是
+    // `doctask:d:1:2`,会共享会话和串行队列。
+    const a = parseDocCommentMention(event({ doc_id: "d:1", thread_id: "2" }))!;
+    const b = parseDocCommentMention(event({ doc_id: "d", thread_id: "1:2" }))!;
+
+    expect(docTaskSessionScope(a)).not.toBe(docTaskSessionScope(b));
+    expect(docTaskSessionScope(a)).toBe("doctask:d\\:1:2");
+    expect(docTaskSessionScope(b)).toBe("doctask:d:1\\:2");
+  });
+
   it("跨评论串隔离", () => {
     const other = parseDocCommentMention(event({ thread_id: "99" }))!;
     expect(docTaskSessionScope(other)).not.toBe(docTaskSessionScope(mention));

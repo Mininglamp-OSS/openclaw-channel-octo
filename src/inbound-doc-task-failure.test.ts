@@ -351,7 +351,7 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
     expect(reports).toEqual([report({ delivered: true, noticed: true })]);
   });
 
-  it("答复发丢:lost 为真,finalDelivered 仍为真 —— 由 handler 判定活儿没落地", async () => {
+  it("答复发丢:finalDelivered 为假 —— 它由出站收口在 POST 成功之后才置位", async () => {
     installFetchStub();
     installRuntime(async (args) => {
       await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
@@ -378,7 +378,81 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
       },
     });
 
-    expect(reports).toEqual([report({ finalDelivered: true, lost: true })]);
+    // 关键:不是「置真再用 !lost 补偿」。补偿是回合全局的,一次进度评论的瞬时 5xx
+    // 就会否决掉一个确实落地的答复(见下一条用例)。
+    expect(reports).toEqual([report({ lost: true })]);
+  });
+
+  it("只发 block 的回合:缓冲文本刷出去后必须算 finalDelivered", async () => {
+    // 回归(三位 reviewer 独立发现):block 文本经最外层 finally 刷出去时只置
+    // replySucceeded,不置最终答复标志。于是 agent 用 block 形式作答的回合上报
+    // finalDelivered:false → handler 判「用户在干等」→ 在正确答复下面贴一条
+    // 「本次文档任务没有给出答复」并且不写去重 —— 重投会把文档改第二遍。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "已按要求改好（块式答复）" }, { kind: "block" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual(["已按要求改好（块式答复）"]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
+  it("block 缓冲后 dispatch 拒绝:刷出去的仍是最终答复", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "已按要求改好（块式答复）" }, { kind: "block" });
+      throw new Error("non_deliverable_terminal_turn");
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await expect(runDocTask(posted, {}, { reports })).rejects.toThrow("non_deliverable_terminal_turn");
+
+    expect(posted).toEqual(["已按要求改好（块式答复）"]); // 没有多出一条道歉
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
+  it("进度评论发丢、最终答复发成功:仍算落地 —— lost 不得否决 finalDelivered", async () => {
+    // 回归:`workLanded = finalDelivered && !lost` 里的 lost 是回合全局且粘性的,
+    // 一次进度评论的瞬时 5xx 就会否决掉一个确实落地的答复,于是在正确答复下面贴出
+    // 「没有给出答复」并允许重放。触发条件只是一次 docs 5xx,凡有工具输出的回合都暴露。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "正在读取文档…" }, { kind: "tool" });
+      await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+    const mention = makeMention();
+
+    await handleInboundMessage({
+      account: makeAccount(),
+      message: synthesizeDocMentionMessage(mention, BOT_UID) as any,
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      log: undefined,
+      docTask: {
+        docId: mention.docId,
+        threadId: mention.threadId,
+        sessionScope: docTaskSessionScope(mention),
+        postComment: async (text) => {
+          if (text === "正在读取文档…") throw new Error("docs API 503");
+          posted.push(text);
+        },
+        reportTurn: (r) => { reports.push(r); },
+      },
+    });
+
+    expect(posted).toEqual(["已按要求改好"]); // 只有最终答复落地了,这是对的
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true, lost: true })]);
   });
 
   it("纯附件也是最终产出:finalDelivered", async () => {

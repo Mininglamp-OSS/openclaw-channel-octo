@@ -291,6 +291,72 @@ describe("dispatch timeout guard (issue #75)", () => {
     expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("dispatch hung"))).toBe(true);
   });
 
+  // --- 超时提示的抑制条件 ---
+  // 抑制「答复已经发出去了就别再追一句超时」是对的,但守卫必须用「**最终答复**
+  // 落地了」而不是 replySucceeded —— 后者对进度/工具文本也置位。用错的话,
+  // 「只发过进度然后 hang」的回合彻底收不到终态信号,而这条路径在 docTasks
+  // 关着时也走,是普通 DM/群聊上的静默回归。
+
+  it("只发过工具/进度文本然后 hang:超时提示必须照发", async () => {
+    const dispatch = vi.fn(async (args: any) => {
+      await args.dispatcherOptions.deliver({ text: "正在读取文档…" }, { kind: "tool" });
+      await new Promise<void>(() => {}); // 随后挂死
+    });
+    setOctoRuntime({
+      config: { loadConfig: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: { resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }) },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    const { sends } = installFetchStub();
+
+    await expect(runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } }))
+      .rejects.toThrow();
+
+    expect(pickTimeoutSends(sends)).toHaveLength(1);
+  });
+
+  it("最终答复已经发出去之后才 hang:抑制超时提示,不自相矛盾", async () => {
+    const dispatch = vi.fn(async (args: any) => {
+      await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
+      await new Promise<void>(() => {});
+    });
+    setOctoRuntime({
+      config: { loadConfig: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: { resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }) },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    const { sends } = installFetchStub();
+
+    await expect(runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } }))
+      .rejects.toThrow();
+
+    expect(pickTimeoutSends(sends)).toHaveLength(0);
+  });
+
   it("happy path: dispatchTimeoutHandle is cleared (no leaked timer)", async () => {
     // Spy on setTimeout/clearTimeout to find the specific dispatch-timeout
     // handle and verify it gets cleared. Filter by delay === TIMEOUT_MS_FOR_TESTS

@@ -14,23 +14,29 @@ import { isPermanentDocCommentFailure } from "./api-fetch.js";
  * 上报方只负责说事实,不负责下判断。
  */
 export interface DocTaskTurnReport {
-  /** 本回合的**最终答复**已经发进评论区(不含进度/工具文本,也不含道歉)。 */
+  /**
+   * 本回合的**最终答复**已经发进评论区(不含进度/工具文本,也不含道歉)。
+   *
+   * 由出站收口在 `await postComment(...)` **resolve 之后**置位 —— 那里是唯一同时
+   * 知道「这帖带的是不是最终产出」和「POST 成没成」的地方。在别处置位就必须再引入
+   * 一个补偿条件,而补偿条件会过度触发(见 handler 里的说明)。
+   */
   finalDelivered: boolean;
   /** 评论区收到过任何内容(进度、附件、最终答复、提示)。仅用于观测。 */
   delivered: boolean;
-  /** 有内容重试耗尽仍没发出去。 */
+  /** 有内容重试耗尽仍没发出去。**仅供观测**,不参与完成判定。 */
   lost: boolean;
   /** 发出过提示:道歉 / 超时 / 会话冲突回执。 */
   noticed: boolean;
 }
 
 /** 什么都没发生 —— dispatch 之前就早返回的回合(能力门禁、路由解析失败)。 */
-export const EMPTY_DOC_TASK_REPORT: DocTaskTurnReport = {
+export const EMPTY_DOC_TASK_REPORT: DocTaskTurnReport = Object.freeze({
   finalDelivered: false,
   delivered: false,
   lost: false,
   noticed: false,
-};
+});
 
 /** channel.ts 侧 dispatchInboundMessage 的最小契约。 */
 export type DocMentionDispatch = (
@@ -176,8 +182,12 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
     // 会话冲突,而那条路径由 channel.ts 自己上报(noticed),其余失败一律是 reject。
     // 拿 outcome 当完成条件等于把「抛错」误当成「没跑」,那正是上面那个 bug。
 
-    /** 活儿落地了:最终答复确实进了评论区,且没有内容发丢。 */
-    const workLanded = report.finalDelivered && !report.lost;
+    // `finalDelivered` 由出站收口在 POST **成功之后**置位,所以它已经是「答复确实
+    // 进了评论区」本身,不需要再用 `&& !lost` 去补偿。那个补偿是回合全局的:一次
+    // 进度评论的瞬时 5xx 会否决掉一个确实落地的最终答复,于是在正确答复下面贴出
+    // 「没有给出答复」并允许重放。`lost` 现在只作观测字段。
+    /** 活儿落地了:最终答复确实进了评论区。 */
+    const workLanded = report.finalDelivered;
     /** 用户在干等:既没拿到答复,也没收到任何失败提示。 */
     const userLeftHanging = !workLanded && !report.noticed;
 

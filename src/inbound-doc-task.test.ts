@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChannelType, MessageType } from "./types.js";
+const handleForkCommandIfMatched = vi.fn(async () => false);
+vi.mock("./commands/fork-inbound.js", () => ({
+  handleForkCommandIfMatched: (...args: unknown[]) => handleForkCommandIfMatched(...(args as [])),
+}));
+
 import { handleInboundMessage } from "./inbound.js";
 import { OCTO_GROUP_RE } from "./group-md.js";
 import { setOctoRuntime } from "./runtime.js";
@@ -177,6 +182,21 @@ describe("文档任务的出站改道", () => {
     // 用 group-md.ts 导出的**同一个**正则,而不是在测试里抄一份 —— 抄的那份会
     // 随源码漂移,且当时构造的键少一段,两边都对不上。
     expect(OCTO_GROUP_RE.test(sessionKey)).toBe(false);
+  });
+
+  it("文档任务不授权斜杠命令,也不进 /fork 短路", async () => {
+    // 两处都只靠「formatDocMentionText 给正文加了前缀所以锚定正则匹配不上」这种
+    // 意外保护挡着,提示词格式一改就重新打开。fork-inbound 还用它自己的 sendMessage
+    // 直发 IM(在另一个文件里,出站闸门看不到它),目标正是发起人的私聊。
+    installFetchStub();
+    const { finalizeInboundContext } = installRuntime();
+
+    await runDocTask(async () => {});
+
+    const ctx = finalizeInboundContext.mock.calls[0][0];
+    expect(ctx.CommandAuthorized).toBe(false);
+    // 连问都不该问 fork —— 它一旦匹配就用自己的出口发到私聊。
+    expect(handleForkCommandIfMatched).not.toHaveBeenCalled();
   });
 
   it("不同 account 的同一条评论串拿到不同会话键", async () => {

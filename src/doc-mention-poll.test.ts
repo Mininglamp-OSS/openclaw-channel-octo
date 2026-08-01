@@ -209,8 +209,21 @@ describe("轮询器识别文档任务事件", () => {
   it("未注册 onCardAction 时卡片事件不被识别,也不 ack", async () => {
     // 回归:`parseCardAction` 原先无条件调用,回调可选这件事没有任何测试钉住 ——
     // 把门禁去掉全套照绿。cardInteraction:false 的部署会因此收到并 ack 卡片事件。
+    // fixture 必须是 parseCardAction 真的能解析的形状:它要求 message_id /
+    // channel_id / channel_type / action_id / operator_uid 五个字段齐全,缺一返回
+    // null —— 上一版少了四个,于是这条测试无论门禁在不在都通过(空转)。
     const { acked } = installFetch([
-      { event_id: 31, event_type: "card_action", event_data: { action: "x", message_id: "1" } },
+      {
+        event_id: 31,
+        event_type: "card_action",
+        event_data: {
+          message_id: "m1",
+          channel_id: "c1",
+          channel_type: 1,
+          action_id: "a1",
+          operator_uid: "u1",
+        },
+      },
     ]);
     const seen: unknown[] = [];
     const poller = startEventPoller({
@@ -227,6 +240,38 @@ describe("轮询器识别文档任务事件", () => {
     expect(seen).toEqual([]);
     expect(acked).toEqual([]);
     expect(poller.cursor()).toBe(31); // 游标仍前进,不重复拉取
+  });
+
+  it("ACK 排在存游标之前 —— 顺序本身要被钉住", async () => {
+    // 上一轮整轮的主题就是这个顺序,却没有任何测试会在把它换回去时变红:
+    // 「游标必失败仍要 ack」那条靠的是 try/catch,不是顺序。这里直接记录时序。
+    const order: string[] = [];
+    globalThis.fetch = vi.fn(async (input: any) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const json = (data: unknown) =>
+        new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
+      if (/\/v1\/bot\/events\/(\d+)\/ack/.test(url)) { order.push("ack"); return json({ status: 1 }); }
+      if (url.includes("/v1/bot/events")) {
+        return json({ status: 1, results: order.includes("ack") ? [] : [docEvent(18)] });
+      }
+      return json({});
+    }) as unknown as typeof fetch;
+
+    const poller = startEventPoller({
+      apiUrl: API,
+      botToken: "tok",
+      intervalMs: 500,
+      cursorStore: {
+        async load() { return 0; },
+        async save() { order.push("cursor"); },
+      },
+      onDocMention: async () => { order.push("handler"); },
+    });
+    await poller.ready;
+    await drain();
+    poller.stop();
+
+    expect(order).toEqual(["handler", "ack", "cursor"]);
   });
 
   it("未知 event_type 既不派发也不 ack", async () => {
