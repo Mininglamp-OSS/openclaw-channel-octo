@@ -45,7 +45,7 @@ import {
   type DocCommentMention,
 } from "./doc-mention.js";
 import { createFileDocMentionDedupeStore } from "./doc-mention-dedupe.js";
-import { createDocMentionHandler } from "./doc-mention-handler.js";
+import { createDocMentionHandler, DOC_TASK_NOTICE_TIMEOUT_MS } from "./doc-mention-handler.js";
 import { handleCardAction } from "./card-action-handler.js";
 
 /**
@@ -1517,6 +1517,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                 try {
                   await extra.docTask.postComment(
                     "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
+                    AbortSignal.timeout(DOC_TASK_NOTICE_TIMEOUT_MS),
                   );
                   extra.docTask.reportTurn({
                     finalDelivered: false,

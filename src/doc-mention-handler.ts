@@ -54,8 +54,8 @@ export type DocMentionDispatch = (
        * dispatch 之前的早返回(能力门禁、路由解析失败)根本走不到上报点,而那些
        * 回合确实什么都没产出。保守方向天然正确:不写去重,允许重投。
        *
-       * 会话初始化冲突会重试,所以这里可能被调用多次,取最后一次 —— 每次调用
-       * 描述的都是「到目前为止发生了什么」,后一次严格更新。
+       * 会话初始化冲突会重试,所以这里可能被调用多次。不同 attempt 的事实必须
+       * 累计:后续 notice-only 不能覆盖此前已经落地的 final。
        */
       reportTurn: (report: DocTaskTurnReport) => void;
     };
@@ -74,6 +74,9 @@ export interface DocMentionHandlerDeps {
 // 措辞刻意不说「没有产生任何修改」:走到这里时 agent 可能已经改过文档了(答复
 // 发丢的情形),断言「没改过」是在撒谎。只说用户能验证的那一半 —— 没给出答复。
 const NOTHING_DELIVERED_NOTICE = "⚠️ 本次文档任务没有给出答复。请稍后重试或重新 @ 我。";
+
+/** 用户提示只占一个短窗口,不能按 postDocComment 的 30s 默认值阻塞串行 poller。 */
+export const DOC_TASK_NOTICE_TIMEOUT_MS = 10_000;
 
 /** 回帖的有界重试:docs 后端一次瞬时 5xx 不该让整条回复永久消失。 */
 const POST_ATTEMPTS = 3;
@@ -162,7 +165,16 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           threadId: mention.threadId,
           sessionScope: docTaskSessionScope(mention),
           postComment: postWithRetry,
-          reportTurn: (value) => { reported = value; },
+          reportTurn: (value) => {
+            reported = reported
+              ? {
+                  finalDelivered: reported.finalDelivered || value.finalDelivered,
+                  delivered: reported.delivered || value.delivered,
+                  lost: reported.lost || value.lost,
+                  noticed: reported.noticed || value.noticed,
+                }
+              : value;
+          },
         },
       });
     } catch (err) {
@@ -198,7 +210,10 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
 
     if (userLeftHanging) {
       try {
-        await postWithRetry(NOTHING_DELIVERED_NOTICE);
+        await postWithRetry(
+          NOTHING_DELIVERED_NOTICE,
+          AbortSignal.timeout(DOC_TASK_NOTICE_TIMEOUT_MS),
+        );
       } catch (err) {
         deps.log?.error?.(
           `octo: doc task fallback notice failed doc=${mention.docId} thread=${mention.threadId}: ${String(err)}`,

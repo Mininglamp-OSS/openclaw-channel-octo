@@ -3236,6 +3236,10 @@ export async function handleInboundMessage(params: {
           deliverBuffer.lastText = null;
           deliverBuffer.textSent = true;
           deliveryErrorOccurred = true;
+          if (userFacingFinalDelivered) {
+            log?.info?.("octo: dispatcher onError fired after a final answer already landed — suppressing the error notice");
+            return;
+          }
           try {
             // 经唯一出口:文档任务改投评论区,其余仍直发 IM。同样用受限 signal ——
             // 上游报错且 Octo API 也病了时,别把队列卡到外层 dispatch 超时。
