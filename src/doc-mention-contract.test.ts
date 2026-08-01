@@ -305,8 +305,8 @@ describe("端到端:server 事件 → bot 执行 → 评论区回帖", () => {
     poller.stop();
 
     expect(prompts).toHaveLength(1);
-    expect(prompts[0]).toContain(`doc_id=${DOC_ID}`);
-    expect(prompts[0]).toContain(`thread_id=${SERVER_DATA.thread_id}`);
+    expect(prompts[0]).toContain(`doc_id=${JSON.stringify(DOC_ID)}`);
+    expect(prompts[0]).toContain(`thread_id=${JSON.stringify(SERVER_DATA.thread_id)}`);
     expect(prompts[0]).toContain(JSON.stringify(SERVER_DATA.text));
     expect(prompts[0]).toContain("不要自己再发一条评论");
   });
