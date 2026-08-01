@@ -120,7 +120,11 @@ type Reported = { finalDelivered: boolean; delivered: boolean; lost: boolean; no
 function runDocTask(
   posted: string[],
   accountOverrides: Record<string, unknown> = {},
-  sinks: { reports?: Reported[]; log?: { error?: (m: string) => void } } = {},
+  sinks: {
+    reports?: Reported[];
+    log?: { error?: (m: string) => void };
+    postComment?: (text: string) => Promise<void>;
+  } = {},
 ) {
   const mention = makeMention();
   return handleInboundMessage({
@@ -137,7 +141,7 @@ function runDocTask(
       docId: mention.docId,
       threadId: mention.threadId,
       sessionScope: docTaskSessionScope(mention),
-      postComment: async (text) => { posted.push(text); },
+      postComment: sinks.postComment ?? (async (text) => { posted.push(text); }),
       reportTurn: (report) => { sinks.reports?.push(report); },
     },
   });
@@ -466,6 +470,91 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
     await runDocTask([], {}, { reports });
 
     expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
+  it("同一附件先作为中间产出落地、再由空 final 收口:仍算最终答复", async () => {
+    // 回归:第一次 deliver 已经把附件 POST 到评论区并抽干队列;第二次 final 重复
+    // 同一个 URL 时会被 sentMediaUrls 去重,于是 postDocTaskReply 收到空正文+空队列。
+    // 旧逻辑在 if (!body) return 提前退出,吞掉 final 事实,下游便叠加「没有给出答复」
+    // 并释放去重键,让改文档任务可以重放。
+    installFetchStub();
+    installRuntime(async (args) => {
+      const mediaUrls = [`${API}/f/a.png`];
+      await args.dispatcherOptions.deliver({ mediaUrls }, { kind: "tool" });
+      await args.dispatcherOptions.deliver({ mediaUrls }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual([`[附件] ${API}/f/a.png`]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
+  it("只有进度文本落地、随后收到空 final:不能把进度冒充最终答复", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "正在读取文档…" }, { kind: "tool" });
+      await args.dispatcherOptions.deliver({}, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual(["正在读取文档…"]);
+    expect(reports).toEqual([report({ delivered: true })]);
+  });
+
+  it("失败提示不得夹带并消费尚未成功投递的附件", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "tool" });
+      await args.dispatcherOptions.onError(new Error("boom"), { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+    let attempt = 0;
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async (text) => {
+        attempt += 1;
+        if (attempt === 1) throw new Error("docs API 503");
+        posted.push(text);
+      },
+    });
+
+    expect(posted).toEqual(["⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。"]);
+    expect(reports).toEqual([report({ delivered: true, lost: true, noticed: true })]);
+  });
+
+  it.each([
+    { label: "空正文/空附件/非 final", text: undefined, media: false, kind: "tool", final: false, delivered: false },
+    { label: "空正文/空附件/final", text: undefined, media: false, kind: "final", final: false, delivered: false },
+    { label: "空正文/有附件/非 final", text: undefined, media: true, kind: "tool", final: false, delivered: true },
+    { label: "空正文/有附件/final", text: undefined, media: true, kind: "final", final: true, delivered: true },
+    { label: "有正文/空附件/非 final", text: "内容", media: false, kind: "tool", final: false, delivered: true },
+    { label: "有正文/空附件/final", text: "内容", media: false, kind: "final", final: true, delivered: true },
+    { label: "有正文/有附件/非 final", text: "内容", media: true, kind: "tool", final: false, delivered: true },
+    { label: "有正文/有附件/final", text: "内容", media: true, kind: "final", final: true, delivered: true },
+  ] as const)("投递矩阵:$label", async ({ text, media, kind, final, delivered }) => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        {
+          ...(text ? { text } : {}),
+          ...(media ? { mediaUrls: [`${API}/f/matrix.png`] } : {}),
+        },
+        { kind },
+      );
+    });
+    const reports: Reported[] = [];
+
+    await runDocTask([], {}, { reports });
+
+    expect(reports).toEqual([report({ finalDelivered: final, delivered })]);
   });
 });
 
