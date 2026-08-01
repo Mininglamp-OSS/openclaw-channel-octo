@@ -235,6 +235,41 @@ describe("文档任务接线", () => {
     expect(postComment).toHaveBeenCalledTimes(2);
   });
 
+  it("POST 期间 signal 被 abort:不再空睡一次退避", async () => {
+    // 注意断言的是**退避有没有发生**,不是尝试次数:循环顶部那道检查会在下一轮
+    // 把它拦下,所以两种写法的尝试次数都是 1,唯一的差别是白睡的那 200ms ——
+    // 而这 200ms 是在串行的轮询循环里、在一个只有 10s 预算的兜底路径上花掉的。
+    const controller = new AbortController();
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      await extra.docTask.postComment("已改好", controller.signal).catch(() => {});
+      extra.docTask.reportTurn({ finalDelivered: false, delivered: false, lost: true, noticed: false });
+      return "completed" as const;
+    });
+    const { handler } = makeHandler(
+      dispatch,
+      async (_m: unknown, _text: string, signal?: AbortSignal) => {
+        if (signal === controller.signal) {
+          controller.abort(); // POST 进行中被取消
+          throw new Error("aborted");
+        }
+      },
+    );
+    const sleeps: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      if (ms === 200 || ms === 400) sleeps.push(ms);
+      return (realSetTimeout as any)(fn, ms, ...rest);
+    }) as typeof globalThis.setTimeout;
+
+    try {
+      await handler(mention());
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+
+    expect(sleeps).toEqual([]); // 一次退避都不该发生
+  });
+
   // --- 结论由回合上报,不由本文件推断 ---
 
   it("上报 notice-only:不写去重,也不再补一条兜底(评论区已有痕迹)", async () => {

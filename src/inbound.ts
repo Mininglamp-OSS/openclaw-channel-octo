@@ -2799,6 +2799,9 @@ export async function handleInboundMessage(params: {
   // 本回合的事实记账。**只在 postDocTaskReply 里赋值**,回合末尾原样上报给 handler
   // —— 这里只说发生了什么,不下「算不算完成」的判断(那是 handler 的策略)。
   let docTaskFinalDelivered = false; // 本回合的最终答复**确实发成功了**
+  // 本回合有过「带着自己内容的 final」投递尝试。收口(不带自己内容的空 final)看到
+  // 它为真就必须让路 —— 真正的最终答复另有其人,收口不能替它翻案。
+  let docTaskFinalClaimed = false;
   let docTaskDelivered = false; // 评论区收到过任何内容(含提示)
   let docTaskLost = false; // 有非提示内容重试耗尽仍没发出去(仅供观测)
   let docTaskNoticed = false; // 发出过提示(道歉/超时/拒绝)
@@ -2811,39 +2814,60 @@ export async function handleInboundMessage(params: {
     outputDelivered: boolean;
     finalDelivered: boolean;
   };
+  /**
+   * 文档任务的唯一出站。
+   *
+   * 关于 `finalDelivered` 这个事实,连续多轮评审的教训收敛成一条规则:
+   *
+   *   **只有「这一次调用自己带着最终产出去 POST 了」才有资格写它,写的值就是这次
+   *   POST 的结果。**
+   *
+   * 反复出错的根源是把这个事实从 `intent.final` 这个**意图标志**加上当时队列里
+   * 恰好有什么来推导 —— 而这两样都不知道「我这次实际发出去的 body 里装的是什么」。
+   * 于是同一个事实被七次写在不知情的地方:兜底道歉、进度文本、空转收口、别的
+   * payload 遗留的附件,都曾经冒充过最终答复,或者把一个真答复抹掉。
+   *
+   * 现在改成从**实际投递的内容**判定:
+   *
+   *   - 认领(claimsFinal):intent 是 final **且**这次带着自己的内容 —— 自己的
+   *     文本,或自己刚推进队列、还没发出去的附件。认领者按 POST 结果落定终态。
+   *   - 认养(adoptsDeliveredMedia):空收口没有自己的内容,但明确引用了本回合已经
+   *     投递成功的附件,且**本回合还没有任何 final 认领过**。这才是「纯附件产出被
+   *     一条空 final 收尾」的合法形态。
+   *   - 其余一律不写:进度、提示、空转收口、以及那种「body 里全是别的 payload
+   *     遗留附件」的调用。它们如实返回回合已有的结论。
+   */
   const postDocTaskReply = async (
     content: string,
     signal?: AbortSignal,
     intent: DocTaskReplyIntent = { type: "output" },
   ): Promise<DocTaskReplyResult> => {
-    // 返回值只描述**本次 intent**是否满足;回合级 finalDelivered 只用于最终 report。
-    // 两者不能互读,否则前一次成功会把后一次失败洗成 delivered:true。
-    const finish = (
-      outputDelivered: boolean,
-      finalDelivered: boolean,
-      /**
-       * 本次调用**是否给出了 final intent 的结论**。
-       *
-       * 只有「POST 成功」「POST 失败」「空 final 收口了本回合已投递的附件」三种情况
-       * 算给出结论。空转的收口(body 为空、又没引用任何已投递附件)什么都没发、也
-       * 没失败 —— 它没有资格改写回合级事实。
-       *
-       * 不加这个参数就会出现降级:一条空转的空 final 把此前**真的 POST 成功过**的
-       * final 抹成 false,于是评论区明明有正确答复,report 却说没有 —— handler 判
-       * 用户在干等,在正确答复下面贴一句「没有给出答复,请重新 @ 我」,并且 release
-       * 而不是 complete。用户照做,改文档的任务再跑一遍。这正是上一轮修复的镜像:
-       * 那次是「没答复的被提升成答复」,这次是「答复被降级成没答复」。
-       */
-      resolvesFinal = true,
-    ): DocTaskReplyResult => {
-      if (resolvesFinal && intent.type === "output" && intent.final) {
-        // final 是可覆盖的终态:后来的更正答复失败,必须覆盖此前成功,不能静默丢掉
-        // 最新答复后仍写去重。lost 保持粘性,用于观测曾发生过的投递失败。
-        docTaskFinalDelivered = finalDelivered;
-      }
-      return { outputDelivered, finalDelivered };
+    const ownText = content.trim();
+    // 这次 payload **自己**带来的、尚未发出的附件。队列里可能还压着别的 payload
+    // (尤其是 POST 失败的进度帖 —— 那里刻意不清队列)遗留的附件,那些不是这次的
+    // 内容,不能拿来给这次的 final 背书。
+    const ownPendingMedia =
+      intent.type === "output" && intent.mediaUrls
+        ? docTaskMediaUrls.filter((url) => intent.mediaUrls!.includes(url))
+        : [];
+    const claimsFinal =
+      intent.type === "output"
+      && intent.final === true
+      && (ownText.length > 0 || ownPendingMedia.length > 0);
+
+    /** 认领者落定终态。**回合级事实只在这里被写。** */
+    const settleFinal = (delivered: boolean): DocTaskReplyResult => {
+      docTaskFinalClaimed = true;
+      docTaskFinalDelivered = delivered;
+      return { outputDelivered: delivered, finalDelivered: delivered };
     };
-    if (!docTask) return finish(false, false);
+    /** 没有认领:这次没决定 final,如实返回回合已有的结论,不写任何东西。 */
+    const unchanged = (outputDelivered: boolean): DocTaskReplyResult => ({
+      outputDelivered,
+      finalDelivered: docTaskFinalDelivered,
+    });
+
+    if (!docTask) return unchanged(false);
     // 只读不清空:发失败就把附件留在队列里,交给本回合后续的出站(或兜底)再带出去。
     // 先 splice 的话,一次失败的 POST 会把附件永久吞掉 —— 评论区既没答复也没附件。
     // 提示与任务产出是两条语义通道:道歉不能顺手吞掉尚未投递成功的附件,否则一句
@@ -2851,31 +2875,25 @@ export async function handleInboundMessage(params: {
     const attachments = intent.type === "output" ? [...docTaskMediaUrls] : [];
     // 允许「只有附件、没有文本」:agent 产出纯 media 的回合原先在这里无文本可发,
     // 附件就永远卡在队列里 —— 评论区静默,任务却被当成功。
-    const body = [content.trim(), ...attachments.map((url) => `[附件] ${url}`)]
+    const body = [ownText, ...attachments.map((url) => `[附件] ${url}`)]
       .filter(Boolean)
       .join("\n\n");
     if (!body) {
-      // media 常先以中间 payload 发出,随后 dispatcher 用同 URL 的空 final 收口。
-      // 只有**本次 final 明确引用**且此前确实 POST 成功的 URL 才能满足这次 intent;
-      // 回合里任意一条进度评论带过附件,不能把一个无媒体引用的空 final 洗成成功。
-      const referencedMedia = intent.type === "output" && intent.final
-        ? [...(intent.mediaUrls ?? [])]
-        : [];
-      const closesDeliveredMedia = referencedMedia.length > 0
+      // 纯收口:什么都没得发。只有在本回合还没有任何 final 认领过、且它引用的附件
+      // 确实都已投递成功时,才允许把那些附件认养为最终产出。
+      const referencedMedia =
+        intent.type === "output" && intent.final ? [...(intent.mediaUrls ?? [])] : [];
+      const adoptsDeliveredMedia =
+        !docTaskFinalClaimed
+        && referencedMedia.length > 0
         && referencedMedia.every((url) => docTaskDeliveredMediaUrls.has(url));
-      if (closesDeliveredMedia) return finish(true, true);
-      // 空转:这一次既没投递也没失败。返回回合已有的结论,并且**不写**回合级事实
-      // —— 详见 finish 的 resolvesFinal 说明。
-      return finish(false, docTaskFinalDelivered, false);
+      if (adoptsDeliveredMedia) return settleFinal(true);
+      return unchanged(false);
     }
     try {
       await docTask.postComment(body, signal);
       // 按「消费掉的条数」出队,而不是清空:await 期间 deliver 可能又推进了新附件。
       docTaskMediaUrls.splice(0, attachments.length);
-      // 「最终答复落地了」只在这一行为真:这里是**唯一**同时知道「这帖带的是不是
-      // 本回合的最终产出」和「POST 到底 resolve 了没有」的地方。此前它在 deliver()
-      // 里、POST 之前就置位,于是要靠 `&& !lost` 补偿 —— 而那个补偿是回合全局的,
-      // 一次进度评论的瞬时 5xx 就会否决掉一个确实落地的答复。
       docTaskDelivered = true;
       if (intent.type === "notice") {
         docTaskNoticed = true;
@@ -2883,14 +2901,17 @@ export async function handleInboundMessage(params: {
         for (const url of attachments) docTaskDeliveredMediaUrls.add(url);
       }
       statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
-      return finish(intent.type === "output", intent.type === "output" && intent.final === true);
+      if (claimsFinal) return settleFinal(true);
+      return unchanged(intent.type === "output");
     } catch (err) {
       // 提示发失败不记 lost:提示本来就不是产出,发不出去只是没留下痕迹,
       // 由 handler 的兜底补。内容发失败才是「答复丢了」。
       if (intent.type === "output") docTaskLost = true;
       statusSink?.({ lastError: String(err) });
       log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
-      return finish(false, false);
+      // 认领者失败就必须落定为失败 —— 后来的更正答复发丢了,不能留着此前那次成功。
+      if (claimsFinal) return settleFinal(false);
+      return unchanged(false);
     }
   };
   /**
@@ -3162,6 +3183,18 @@ export async function handleInboundMessage(params: {
             if (sentMediaUrls.has(mediaUrl)) continue;
             if (docTask) {
               // 评论 API 不收附件:不上传、不发 IM,URL 附到评论正文里带出去。
+              //
+              // 只带 http(s)。IM 路径会把本地文件先经 presign 上传再引用,而这里是
+              // 直接把字符串写进公开评论 —— 原样带出去的话,读者拿到一个用不了的
+              // 路径,而且主机文件系统路径被发布进了文档评论区。跳过并记一条日志,
+              // 让这类产出在 report 里如实体现为「没有产出」,而不是假装投递成功。
+              if (!/^https?:\/\//i.test(mediaUrl)) {
+                sentMediaUrls.add(mediaUrl);
+                log?.error?.(
+                  `octo: doc task media skipped (not an http(s) URL, would leak a local path into a public comment): ${mediaUrl}`,
+                );
+                continue;
+              }
               docTaskMediaUrls.push(mediaUrl);
               sentMediaUrls.add(mediaUrl);
               log?.info?.(`octo: doc task media not sent to IM, attached to comment: ${mediaUrl}`);

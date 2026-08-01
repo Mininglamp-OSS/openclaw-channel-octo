@@ -147,6 +147,9 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           // 确定性失败(信封拒绝、4xx)重试不会变好 —— 只会在轮询器的串行循环里
           // 白烧三次 POST 和 600ms,而后面的兜底通知还要再烧一遍同样的三次。
           if (isPermanentDocCommentFailure(err)) break;
+          // signal 在这次 POST 期间被 abort 了:再退避 200/400ms 纯属在串行的轮询
+          // 循环里空耗 —— 循环顶部那道检查要到下一轮才生效,已经晚了。
+          if (signal?.aborted) break;
           if (attempt < POST_ATTEMPTS) {
             await new Promise((resolve) => setTimeout(resolve, POST_RETRY_BASE_MS * attempt));
           }

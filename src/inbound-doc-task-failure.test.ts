@@ -560,6 +560,124 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
     expect(reports).toEqual([report({ delivered: true, lost: true })]);
   });
 
+  it("本地文件路径不得写进公开评论,也不得算成已投递", async () => {
+    // IM 路径会把本地文件先经 presign 上传再引用;文档分支是直接把字符串写进评论。
+    // 原样带出去的话读者拿到一个用不了的路径,而且主机文件系统路径被发布进了评论区,
+    // 回合还被记成投递成功。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        { text: "报告已生成", mediaUrls: ["/tmp/report.pdf"] },
+        { kind: "final" },
+      );
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual(["报告已生成"]); // 正文照发,路径不带
+    expect(posted[0]).not.toContain("/tmp/report.pdf");
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
+  it("只有本地路径、没有文本:什么都发不出去,不能算成最终答复", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ mediaUrls: ["/tmp/report.pdf"] }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual([]);
+    // 什么痕迹都没有 → handler 会补兜底并允许重投,而不是静默记成完成。
+    expect(reports).toEqual([report()]);
+  });
+
+  // --- 收口不得把「不是本回合最终产出」的东西冒充成最终答复 ---
+  // 提升方向比降级方向更狠:handler 会写去重(永不重投)**并且**不发失败提示,
+  // 于是真答复没了、用户什么都不知道、事件也再不会回来。
+
+  it("final 尝试过并失败后,满足条件的 media 收口不得把它洗回成功", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "tool" });
+      await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
+      // dispatcher 用同 URL 收口。该 URL 确实已投递,但本回合的最终答复是上面那条
+      // 失败的文本 —— 收口不是一次新的投递尝试,不能替它翻案。
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async (text) => {
+        if (text === "已按要求改好") throw new Error("docs API 503");
+        posted.push(text);
+      },
+    });
+
+    expect(posted).toEqual([`[附件] ${API}/f/a.png`]);
+    expect(reports).toEqual([report({ delivered: true, lost: true })]);
+  });
+
+  it("更正 final 失败后,media 收口不得把上一版答复重新算作最终答复", async () => {
+    // 直接击穿「更正 final 失败必须覆盖此前成功」那条不变量:覆盖发生了,
+    // 然后收口又把它扶回来。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        { text: "初版答复", mediaUrls: [`${API}/f/b.png`] },
+        { kind: "final" },
+      );
+      await args.dispatcherOptions.deliver({ text: "更正答复" }, { kind: "final" });
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/b.png`] }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async (text) => {
+        if (text === "更正答复") throw new Error("docs API 503");
+        posted.push(text);
+      },
+    });
+
+    expect(posted).toEqual([`初版答复\n\n[附件] ${API}/f/b.png`]);
+    expect(reports).toEqual([report({ delivered: true, lost: true })]);
+  });
+
+  it("失败进度帖遗留的附件被空 final 冲出去:附件要发,但不算最终答复", async () => {
+    // 失败的帖子**故意**不清队列(附件留给后续出站带走),于是后面那条空 final
+    // 发现 body 非空,压根走不到空 body 那道守卫,直接按 intent.final 打了标。
+    // 附件该发 —— 但它是别的 payload 的遗留物,不是这一条 final 自己的产出。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        { text: "正在生成预览…", mediaUrls: [`${API}/f/preview.png`] },
+        { kind: "tool" },
+      );
+      await args.dispatcherOptions.deliver({}, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async (text) => {
+        if (text.includes("正在生成预览")) throw new Error("docs API 503");
+        posted.push(text);
+      },
+    });
+
+    expect(posted).toEqual([`[附件] ${API}/f/preview.png`]);
+    expect(reports).toEqual([report({ delivered: true, lost: true })]);
+  });
+
   // --- 空转的收口不得降级 ---
   // 上一条(以及它下面两条)钉的是**提升**方向:空 final 不能把没答复洗成有答复。
   // 镜像的**降级**方向此前没人钉,于是那条早返回把「真的 POST 成功过」抹成了 false

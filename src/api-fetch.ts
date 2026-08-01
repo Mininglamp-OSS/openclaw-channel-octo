@@ -855,14 +855,16 @@ export class DocCommentRejectedError extends Error {
 /**
  * 这个错误重试也不会变好吗?
  *
- * 信封拒绝 = 确定性失败。4xx 同理,但排除 408(请求超时)和 429(限流)—— 那两个
- * 是「稍后再来」的语义。其余(网络、5xx、超时)都值得重试。
+ * 信封拒绝 = 确定性失败。4xx 同理,但排除 408 / 423 / 425 / 429 —— 那几个是
+ * 「稍后再来」的语义。其余(网络、5xx、超时)都值得重试。
  */
 export function isPermanentDocCommentFailure(err: unknown): boolean {
   if (err instanceof DocCommentRejectedError) return true;
   const status = httpStatusFromApiFetchError(err);
   if (status === undefined) return false;
-  if (status === 408 || status === 429) return false;
+  // 408 请求超时 / 423 资源被锁(文档正被并发编辑)/ 425 太早 / 429 限流 —— 这四个
+  // 都是「稍后再来」的语义,重试有意义。其余 4xx 重试不会变好。
+  if (status === 408 || status === 423 || status === 425 || status === 429) return false;
   return status >= 400 && status < 500;
 }
 
@@ -903,7 +905,7 @@ export async function postDocComment(params: {
   //
   // 断言的是**成功形状**而不是「不等于某个已知失败值」:接口尚未对着真实 docs 后端
   // 验证过,`{"status":"0"}` 这种字符串型状态完全可能出现,只否定数字 0 会放它过去。
-  if (result && typeof result === "object" && "status" in result) {
+  if (result && typeof result === "object" && !Array.isArray(result) && "status" in result) {
     const { status } = result;
     const ok = status === 1 || status === "1";
     if (!ok) {

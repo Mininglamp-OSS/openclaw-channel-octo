@@ -117,6 +117,14 @@ describe("postDocComment", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("响应是数组:不当信封解读,也不误判为失败", async () => {
+    captureFetch([{ id: 9 }]);
+
+    await expect(
+      postDocComment({ apiUrl: API, botToken: "tok", docId: "d1", body: "已改好" }),
+    ).resolves.toBeUndefined();
+  });
+
   it("响应没有 status 字段(空 body 或非信封形状):不误判为失败", async () => {
     // docs 后端未必用同一套信封,缺字段时按 HTTP 语义处理即可,不能一律当失败 ——
     // 否则每条评论都会被判丢失,任务永远无法完成。
@@ -140,8 +148,12 @@ describe("isPermanentDocCommentFailure", () => {
     expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (403): forbidden"))).toBe(true);
   });
 
-  it("408 / 429 是「稍后再来」,要重试", () => {
+  it("408 / 423 / 425 / 429 是「稍后再来」,要重试", () => {
+    // 423 Locked 尤其贴题:文档正被并发编辑时后端就该这么答,而它当成确定性失败
+    // 的话答复、兜底提示、去重写入会一起失败,事件还照样被 ack。
     expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (408): timeout"))).toBe(false);
+    expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (423): locked"))).toBe(false);
+    expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (425): too early"))).toBe(false);
     expect(isPermanentDocCommentFailure(new Error("Octo API /x failed (429): slow down"))).toBe(false);
   });
 
