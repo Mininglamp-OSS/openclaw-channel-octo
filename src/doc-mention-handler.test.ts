@@ -165,6 +165,19 @@ describe("文档任务接线", () => {
     expect(await dedupe.claim("k1")).toBe(false); // 兜底不算成功交付
   });
 
+  it("兜底评论使用显式短超时,不能按 postDocComment 默认值阻塞串行 poller", async () => {
+    const dispatch = vi.fn(async () => "completed" as const);
+    const signals: Array<AbortSignal | undefined> = [];
+    const { handler } = makeHandler(dispatch, async (_mention: unknown, _text: string, signal?: AbortSignal) => {
+      signals.push(signal);
+    });
+
+    await handler(mention());
+
+    expect(signals).toHaveLength(1);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+  });
+
   it("正常投递过就不再补兜底", async () => {
     const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
       await extra.docTask.postComment("已改好");
@@ -296,6 +309,20 @@ describe("文档任务接线", () => {
     await handler(mention());
 
     expect(postComment).toHaveBeenCalledTimes(2);
+    expect(await dedupe.claim("k1")).toBe(true);
+  });
+
+  it("会话重试的多次 reportTurn 要累计事实,后续 notice 不得覆盖此前 final", async () => {
+    const dispatch = vi.fn(async (_m: any, _r: any, extra: any) => {
+      extra.docTask.reportTurn({ finalDelivered: true, delivered: true, lost: false, noticed: false });
+      extra.docTask.reportTurn({ finalDelivered: false, delivered: true, lost: false, noticed: true });
+      return "dropped" as const;
+    });
+    const { handler, dedupe, postComment } = makeHandler(dispatch);
+
+    await handler(mention());
+
+    expect(postComment).not.toHaveBeenCalled();
     expect(await dedupe.claim("k1")).toBe(true);
   });
 

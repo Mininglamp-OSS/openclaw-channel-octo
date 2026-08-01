@@ -313,6 +313,21 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
     expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
   });
 
+  it("答复送达之后 onError 才触发:不得追加自相矛盾的失败提示", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
+      await args.dispatcherOptions.onError(new Error("late error"), { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual(["已按要求改好"]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
   it("答复送达之后才超时:不再追发超时提示,回合仍算落地", async () => {
     // 超时分支原先无条件道歉,而它的兄弟分支(dispatch rejected)有 !replySucceeded
     // 守卫且注释写明了理由。少这一层,一个已经答复完的回合会被一句道歉拖成未完成。
