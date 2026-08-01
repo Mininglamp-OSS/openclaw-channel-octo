@@ -3213,7 +3213,9 @@ export async function handleInboundMessage(params: {
             pendingToolWarningFinal = undefined;
             deliverBuffer.lastText = null;
             deliverBuffer.textSent = true;
-            log?.info?.(`octo: [deliver] final ${delivered.merged ? "merged into progress card" : "text sent immediately"} (${content.length} chars)`);
+            if (delivered.delivered) {
+              log?.info?.(`octo: [deliver] final ${delivered.merged ? "merged into progress card" : "text sent immediately"} (${content.length} chars)`);
+            }
             return;
           }
 
@@ -3396,7 +3398,7 @@ export async function handleInboundMessage(params: {
     //
     // 只报事实,不下结论:「最终答复送达了吗」「有没有东西发丢」「道歉过没有」是
     // 三件独立的事,压成一个枚举就会出现无处安放的组合(见 doc-mention-handler.ts)。
-    // finalDelivered 用 userFacingFinalDelivered 而不是 replySucceeded —— 后者对
+    // finalDelivered 来自上面的文档评论出站事实,而不是 replySucceeded —— 后者对
     // 进度/工具文本也置位,拿它当「答复落地」会让「正在读取文档… + 道歉」被判成完成。
     if (docTask) {
       const report: DocTaskTurnReport = {
