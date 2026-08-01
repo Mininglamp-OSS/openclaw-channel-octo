@@ -2818,8 +2818,25 @@ export async function handleInboundMessage(params: {
   ): Promise<DocTaskReplyResult> => {
     // 返回值只描述**本次 intent**是否满足;回合级 finalDelivered 只用于最终 report。
     // 两者不能互读,否则前一次成功会把后一次失败洗成 delivered:true。
-    const finish = (outputDelivered: boolean, finalDelivered: boolean): DocTaskReplyResult => {
-      if (intent.type === "output" && intent.final) {
+    const finish = (
+      outputDelivered: boolean,
+      finalDelivered: boolean,
+      /**
+       * 本次调用**是否给出了 final intent 的结论**。
+       *
+       * 只有「POST 成功」「POST 失败」「空 final 收口了本回合已投递的附件」三种情况
+       * 算给出结论。空转的收口(body 为空、又没引用任何已投递附件)什么都没发、也
+       * 没失败 —— 它没有资格改写回合级事实。
+       *
+       * 不加这个参数就会出现降级:一条空转的空 final 把此前**真的 POST 成功过**的
+       * final 抹成 false,于是评论区明明有正确答复,report 却说没有 —— handler 判
+       * 用户在干等,在正确答复下面贴一句「没有给出答复,请重新 @ 我」,并且 release
+       * 而不是 complete。用户照做,改文档的任务再跑一遍。这正是上一轮修复的镜像:
+       * 那次是「没答复的被提升成答复」,这次是「答复被降级成没答复」。
+       */
+      resolvesFinal = true,
+    ): DocTaskReplyResult => {
+      if (resolvesFinal && intent.type === "output" && intent.final) {
         // final 是可覆盖的终态:后来的更正答复失败,必须覆盖此前成功,不能静默丢掉
         // 最新答复后仍写去重。lost 保持粘性,用于观测曾发生过的投递失败。
         docTaskFinalDelivered = finalDelivered;
@@ -2846,7 +2863,10 @@ export async function handleInboundMessage(params: {
         : [];
       const closesDeliveredMedia = referencedMedia.length > 0
         && referencedMedia.every((url) => docTaskDeliveredMediaUrls.has(url));
-      return finish(closesDeliveredMedia, closesDeliveredMedia);
+      if (closesDeliveredMedia) return finish(true, true);
+      // 空转:这一次既没投递也没失败。返回回合已有的结论,并且**不写**回合级事实
+      // —— 详见 finish 的 resolvesFinal 说明。
+      return finish(false, docTaskFinalDelivered, false);
     }
     try {
       await docTask.postComment(body, signal);

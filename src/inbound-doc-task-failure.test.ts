@@ -560,6 +560,67 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
     expect(reports).toEqual([report({ delivered: true, lost: true })]);
   });
 
+  // --- 空转的收口不得降级 ---
+  // 上一条(以及它下面两条)钉的是**提升**方向:空 final 不能把没答复洗成有答复。
+  // 镜像的**降级**方向此前没人钉,于是那条早返回把「真的 POST 成功过」抹成了 false
+  // —— 评论区有正确答复,report 却说没有,handler 于是在答复下面补一句「没有给出
+  // 答复,请重新 @ 我」并 release,用户照做就把改文档的任务再跑一遍。
+
+  it("最终答复已落地、随后一条空转的空 final:不得把已落地的事实抹掉", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        { text: "已按要求改好", mediaUrls: [`${API}/f/a.png`] },
+        { kind: "final" },
+      );
+      // dispatcher 用一条空 payload 收口 —— 代码注释自己写明这是常规行为。
+      // 它没重新带 URL,所以 closesDeliveredMedia 为假:什么都没发,也没失败。
+      await args.dispatcherOptions.deliver({}, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual([`已按要求改好\n\n[附件] ${API}/f/a.png`]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
+  it("进度附件 + 最终答复落地 + 空转空 final:同样不得降级", async () => {
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "tool" });
+      await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
+      await args.dispatcherOptions.deliver({}, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, { reports });
+
+    expect(posted).toEqual([`[附件] ${API}/f/a.png`, "已按要求改好"]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
+  it("最终答复 POST 失败、随后空转的空 final:仍然是失败 —— 空转不得反向洗白", async () => {
+    // 反向对照:空转返回的是回合已有的结论,不是无脑 true。答复真丢了就得是丢了。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
+      await args.dispatcherOptions.deliver({}, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async () => { throw new Error("docs API 503"); },
+    });
+
+    expect(posted).toEqual([]);
+    expect(reports).toEqual([report({ lost: true })]);
+  });
+
   it("进度文本携带附件、随后无媒体引用的空 final:不能把进度附件洗成最终答复", async () => {
     installFetchStub();
     installRuntime(async (args) => {
