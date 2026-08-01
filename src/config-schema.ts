@@ -102,7 +102,7 @@ export const CARD_DISPLAY_DESCRIPTION =
 export const DOC_TASKS_DESCRIPTION =
   "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM.";
 
-const CARD_INTERACTION_DESCRIPTION =
+export const CARD_INTERACTION_DESCRIPTION =
   "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value.";
 
 // Shared description for commands.fork.scope, kept identical to the wording in

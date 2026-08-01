@@ -113,9 +113,9 @@ export function docTaskQueueScope(mention: DocCommentMention): string {
 export function formatDocMentionText(mention: DocCommentMention): string {
   const lines = [
     "[Octo doc comment task]",
-    `doc_id=${mention.docId}`,
-    `comment_id=${mention.commentId}`,
-    `thread_id=${mention.threadId}`,
+    `doc_id=${JSON.stringify(mention.docId)}`,
+    `comment_id=${JSON.stringify(mention.commentId)}`,
+    `thread_id=${JSON.stringify(mention.threadId)}`,
   ];
   if (mention.url) lines.push(`url=${JSON.stringify(mention.url)}`);
   lines.push(`comment=${JSON.stringify(mention.text)}`);
@@ -162,6 +162,7 @@ export function synthesizeDocMentionMessage(mention: DocCommentMention, botUid: 
  * 应当原样透传 server 给的值,这个精度悬崖就一并消失了。
  */
 export function docCommentParentId(mention: DocCommentMention): number | undefined {
+  if (!/^\d+$/.test(mention.threadId)) return undefined;
   const parsed = Number(mention.threadId);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
