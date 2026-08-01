@@ -2802,11 +2802,10 @@ export async function handleInboundMessage(params: {
   let docTaskDelivered = false; // 评论区收到过任何内容(含提示)
   let docTaskLost = false; // 有非提示内容重试耗尽仍没发出去(仅供观测)
   let docTaskNoticed = false; // 发出过提示(道歉/超时/拒绝)
-  let docTaskOutputDelivered = false; // 评论区收到过非提示产出(进度/正文/附件)
-  let docTaskMediaDelivered = false; // 至少一个附件 URL 确实随评论 POST 成功
+  const docTaskDeliveredMediaUrls = new Set<string>(); // 确实随评论 POST 成功的附件 URL
   const docTaskMediaUrls: string[] = [];
   type DocTaskReplyIntent =
-    | { type: "output"; final?: boolean }
+    | { type: "output"; final?: boolean; mediaUrls?: readonly string[] }
     | { type: "notice" };
   type DocTaskReplyResult = {
     outputDelivered: boolean;
@@ -2817,11 +2816,17 @@ export async function handleInboundMessage(params: {
     signal?: AbortSignal,
     intent: DocTaskReplyIntent = { type: "output" },
   ): Promise<DocTaskReplyResult> => {
-    const result = (): DocTaskReplyResult => ({
-      outputDelivered: docTaskOutputDelivered,
-      finalDelivered: docTaskFinalDelivered,
-    });
-    if (!docTask) return result();
+    // 返回值只描述**本次 intent**是否满足;回合级 finalDelivered 只用于最终 report。
+    // 两者不能互读,否则前一次成功会把后一次失败洗成 delivered:true。
+    const finish = (outputDelivered: boolean, finalDelivered: boolean): DocTaskReplyResult => {
+      if (intent.type === "output" && intent.final) {
+        // final 是可覆盖的终态:后来的更正答复失败,必须覆盖此前成功,不能静默丢掉
+        // 最新答复后仍写去重。lost 保持粘性,用于观测曾发生过的投递失败。
+        docTaskFinalDelivered = finalDelivered;
+      }
+      return { outputDelivered, finalDelivered };
+    };
+    if (!docTask) return finish(false, false);
     // 只读不清空:发失败就把附件留在队列里,交给本回合后续的出站(或兜底)再带出去。
     // 先 splice 的话,一次失败的 POST 会把附件永久吞掉 —— 评论区既没答复也没附件。
     // 提示与任务产出是两条语义通道:道歉不能顺手吞掉尚未投递成功的附件,否则一句
@@ -2833,14 +2838,15 @@ export async function handleInboundMessage(params: {
       .filter(Boolean)
       .join("\n\n");
     if (!body) {
-      // media 常先以中间 payload 发出,随后 dispatcher 再用同 URL 的空 final 收口。
-      // 第二次 URL 会被去重且附件队列已抽干,但最终产出并没有丢:它已在前一次 POST
-      // 成功落地。只能用「附件确实 POST 成功」这个事实升级终态;进度文本、道歉或
-      // 仅见过但发送失败的 URL 都不能冒充最终答复。
-      if (intent.type === "output" && intent.final && docTaskMediaDelivered) {
-        docTaskFinalDelivered = true;
-      }
-      return result();
+      // media 常先以中间 payload 发出,随后 dispatcher 用同 URL 的空 final 收口。
+      // 只有**本次 final 明确引用**且此前确实 POST 成功的 URL 才能满足这次 intent;
+      // 回合里任意一条进度评论带过附件,不能把一个无媒体引用的空 final 洗成成功。
+      const referencedMedia = intent.type === "output" && intent.final
+        ? [...(intent.mediaUrls ?? [])]
+        : [];
+      const closesDeliveredMedia = referencedMedia.length > 0
+        && referencedMedia.every((url) => docTaskDeliveredMediaUrls.has(url));
+      return finish(closesDeliveredMedia, closesDeliveredMedia);
     }
     try {
       await docTask.postComment(body, signal);
@@ -2854,19 +2860,18 @@ export async function handleInboundMessage(params: {
       if (intent.type === "notice") {
         docTaskNoticed = true;
       } else {
-        docTaskOutputDelivered = true;
-        if (attachments.length > 0) docTaskMediaDelivered = true;
-        if (intent.final) docTaskFinalDelivered = true;
+        for (const url of attachments) docTaskDeliveredMediaUrls.add(url);
       }
       statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
+      return finish(intent.type === "output", intent.type === "output" && intent.final === true);
     } catch (err) {
       // 提示发失败不记 lost:提示本来就不是产出,发不出去只是没留下痕迹,
       // 由 handler 的兜底补。内容发失败才是「答复丢了」。
       if (intent.type === "output") docTaskLost = true;
       statusSink?.({ lastError: String(err) });
       log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
+      return finish(false, false);
     }
-    return result();
   };
   /**
    * 用户可见的兜底通知(错误/超时/拒绝)。文档任务改投评论区,其余保持原样直发。
@@ -2906,10 +2911,9 @@ export async function handleInboundMessage(params: {
     content: string,
     signal?: AbortSignal,
     opts?: { final?: boolean },
-  ): Promise<SendMessageResult | undefined> => {
+  ): Promise<DocTaskReplyResult> => {
     if (docTask) {
-      await postDocTaskReply(content, signal, { type: "output", final: opts?.final });
-      return undefined;
+      return postDocTaskReply(content, signal, { type: "output", final: opts?.final });
     }
     let replyMentionUids: string[] = [];
     let replyMentionEntities: MentionEntity[] = [];
@@ -3021,7 +3025,7 @@ export async function handleInboundMessage(params: {
       ...(signal ? { signal } : {}),
     });
     statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
-    return result;
+    return { outputDelivered: true, finalDelivered: opts?.final === true };
   };
 
   // Experimental opt-in: when a progress card is already visible, try to put
@@ -3047,8 +3051,8 @@ export async function handleInboundMessage(params: {
         return { merged: true, delivered: true };
       }
     }
-    await resolveAndSendText(content, signal, { final: true });
-    return { merged: false, delivered: docTask ? docTaskFinalDelivered : true };
+    const delivery = await resolveAndSendText(content, signal, { final: true });
+    return { merged: false, delivered: delivery.finalDelivered };
   };
 
   let replySucceeded = false;
@@ -3169,12 +3173,12 @@ export async function handleInboundMessage(params: {
               // 不标 final 的话这个回合永远拿不到去重记录,重投会把文档改第二遍。
               const delivery = await postDocTaskReply(
                 "",
-                undefined,
-                { type: "output", final: kind === "final" },
+                AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+                { type: "output", final: kind === "final", mediaUrls: outboundMediaUrls },
               );
               // 和下面的非文档分支一样置位:不置位的话本回合会被判成「没答复过」,
               // 走到 !replySucceeded 兜底,在已经发出附件评论之后再补一句道歉。
-              replySucceeded = delivery.outputDelivered;
+              replySucceeded ||= delivery.outputDelivered;
               if (kind === "final") userFacingFinalDelivered = delivery.finalDelivered;
               return;
             }
@@ -3190,9 +3194,11 @@ export async function handleInboundMessage(params: {
 
           if (kind === "tool") {
             // Verbose tool call output: send immediately
-            await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
-            replySucceeded = true;
-            log?.info?.(`octo: [deliver] tool text sent (${content.length} chars)`);
+            const delivery = await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+            replySucceeded ||= delivery.outputDelivered;
+            if (delivery.outputDelivered) {
+              log?.info?.(`octo: [deliver] tool text sent (${content.length} chars)`);
+            }
             return;
           }
 
@@ -3208,7 +3214,7 @@ export async function handleInboundMessage(params: {
             }
 
             const delivered = await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
-            replySucceeded = delivered.delivered;
+            replySucceeded ||= delivered.delivered;
             userFacingFinalDelivered = delivered.delivered;
             pendingToolWarningFinal = undefined;
             deliverBuffer.lastText = null;
@@ -3252,7 +3258,7 @@ export async function handleInboundMessage(params: {
           pendingToolWarningFinal = undefined;
           try {
             const delivered = await deliverFinalText(pending.text, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
-            replySucceeded = delivered.delivered;
+            replySucceeded ||= delivered.delivered;
             userFacingFinalDelivered = delivered.delivered;
             log?.info?.(
               `octo: [deliver] pending tool warning sent as fallback (${pending.text.length} chars)`,
@@ -3335,10 +3341,13 @@ export async function handleInboundMessage(params: {
         try {
           // 缓冲的 block 文本就是 agent 这一回合的真实答复,和 kind:"final" 等价 ——
           // 不标 final 的话文档任务会在这条正确答复下面再贴一句「没有给出答复」。
-          await resolveAndSendText(bufferedText, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { final: true });
-          const delivered = docTask ? docTaskFinalDelivered : true;
-          replySucceeded = delivered;
-          userFacingFinalDelivered = delivered;
+          const delivery = await resolveAndSendText(
+            bufferedText,
+            AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+            { final: true },
+          );
+          replySucceeded ||= delivery.outputDelivered;
+          userFacingFinalDelivered = delivery.finalDelivered;
         } catch (sendErr) {
           log?.error?.(`octo: failed to deliver buffered block text on dispatch error: ${String(sendErr)}`);
         }
@@ -3374,7 +3383,7 @@ export async function handleInboundMessage(params: {
           deliverBuffer.lastText,
           AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
         );
-        replySucceeded = delivered.delivered;
+        replySucceeded ||= delivered.delivered;
         // 只发过 block 的回合,答复正是从这里刷出去的 —— 这就是本回合的最终答复。
         userFacingFinalDelivered = delivered.delivered;
         if (delivered.delivered) {
