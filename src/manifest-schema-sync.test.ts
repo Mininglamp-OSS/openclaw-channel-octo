@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { OctoConfigJsonSchema } from "./config-schema.js";
+import { CARD_INTERACTION_DESCRIPTION, OctoConfigJsonSchema } from "./config-schema.js";
 
 // Regression guard for OpenClaw v2026.5.x channel manifest requirement:
 // openclaw.plugin.json#channelConfigs.octo.schema must stay in sync
@@ -52,6 +52,11 @@ describe("openclaw.plugin.json channelConfigs", () => {
       expect(description).toMatch(/server/i);
     },
   );
+
+  it("cardInteraction description remains part of the public schema API", () => {
+    expect(OctoConfigJsonSchema.schema.properties.cardInteraction.description)
+      .toBe(CARD_INTERACTION_DESCRIPTION);
+  });
 
   it("reasoningCardTemplateMode is synced at top-level and per-account", () => {
     const manifestProps = manifest.channelConfigs.octo.schema.properties;
