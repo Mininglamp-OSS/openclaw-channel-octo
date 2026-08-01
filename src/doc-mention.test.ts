@@ -9,6 +9,7 @@ import {
   type DocCommentMention,
 } from "./doc-mention.js";
 import { getInboundQueueKey } from "./inbound-queue.js";
+import { OCTO_GROUP_RE } from "./group-md.js";
 import { ChannelType, MessageType, type BotMessage } from "./types.js";
 
 /** 与 octo-server modules/bot_mention 的 event_data 契约保持一致的最小事件。 */
@@ -83,8 +84,14 @@ describe("会话与队列作用域", () => {
   });
 
   it("不落进 octo:group: 命名空间,GROUP.md 不会被注入", () => {
-    const sessionKey = `agent:main:octo:${docTaskSessionScope(mention)}`;
-    expect(/^agent:[^:]+:octo:group:(.+)$/.test(sessionKey)).toBe(false);
+    // 键的形状必须和 inbound.ts 生产的一致(含 accountId 段),并且用 group-md.ts
+    // **导出的那个**正则,而不是在测试里抄一份。旧版两样都不对:少一段、正则是抄的,
+    // 于是 docTaskSessionScope 改成返回 `group:…` 时这条会红,而真实的键
+    // `agent:agent1:octo:acct1:group:d1:70` 其实并不匹配 —— 断言的是个不存在的形状。
+    const sessionKey = `agent:main:octo:acct1:${docTaskSessionScope(mention)}`;
+    expect(OCTO_GROUP_RE.test(sessionKey)).toBe(false);
+    // 反向对照:真正会被注入的形状长这样,确认这条断言不是恒真。
+    expect(OCTO_GROUP_RE.test("agent:main:octo:group:12345")).toBe(true);
   });
 
   it("队列键与发起人的 DM 队列彻底分开", () => {

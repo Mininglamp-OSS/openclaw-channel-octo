@@ -78,8 +78,14 @@ export function requestCardEventPolling(accountId: string): void {
 }
 
 /**
- * Start one non-overlapping short-poll loop. Cursor persistence happens before ack so a process
- * crash can at worst replay an action; it cannot acknowledge an event that it forgot locally.
+ * Start one non-overlapping short-poll loop.
+ *
+ * Ordering: the ACK is sent **before** the cursor is persisted, and the cursor write is not
+ * allowed to throw. The ACK is what stops the server re-delivering an event; the on-disk cursor
+ * is only this process's restart hint, so losing it costs a re-fetch (which the ACK already
+ * makes a no-op) while losing the ACK costs an unbounded replay. The previous order — persist,
+ * then ack — meant a single write failure in the state directory parked the cursor, skipped the
+ * ACK and the rest of the batch, and replayed the event every tick.
  */
 export function startEventPoller(options: EventPollerOptions): EventPoller {
   const intervalMs = Math.max(500, Math.floor(options.intervalMs ?? DEFAULT_INTERVAL_MS));

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -75,8 +75,16 @@ export function createFileDocMentionDedupeStore(params: {
   const persist = async (keys: string[]): Promise<void> => {
     await mkdir(dir, { recursive: true });
     const tmp = join(dir, `.doc-mentions.${process.pid}.${randomUUID()}.tmp`);
-    await writeFile(tmp, `${JSON.stringify({ keys })}\n`, "utf8");
-    await rename(tmp, file);
+    let renamed = false;
+    try {
+      await writeFile(tmp, `${JSON.stringify({ keys })}\n`, "utf8");
+      await rename(tmp, file);
+      renamed = true;
+    } finally {
+      // 失败时清掉临时文件。触发它的最常见原因就是磁盘写不进去(ENOSPC/EDQUOT),
+      // 每次失败都换一个新 UUID 留一个孤儿文件,等于让病因自己复利。
+      if (!renamed) await rm(tmp, { force: true }).catch(() => {});
+    }
   };
 
   return {

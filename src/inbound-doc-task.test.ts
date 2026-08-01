@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChannelType, MessageType } from "./types.js";
 import { handleInboundMessage } from "./inbound.js";
+import { OCTO_GROUP_RE } from "./group-md.js";
 import { setOctoRuntime } from "./runtime.js";
 import { _clearKnownBots } from "./bot-registry.js";
 import { docTaskSessionScope, parseDocCommentMention, synthesizeDocMentionMessage } from "./doc-mention.js";
@@ -21,9 +22,9 @@ const HUMAN_UID = "human_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 const originalFetch = globalThis.fetch;
 
-function makeAccount(): ResolvedOctoAccount {
+function makeAccount(accountId = "acct1"): ResolvedOctoAccount {
   return {
-    accountId: "acct1",
+    accountId,
     enabled: true,
     configured: true,
     config: {
@@ -94,10 +95,10 @@ function installRuntime(finalText = "已按要求改写完成") {
   return { dispatch, finalizeInboundContext };
 }
 
-function runDocTask(postComment: (text: string) => Promise<void>) {
+function runDocTask(postComment: (text: string) => Promise<void>, opts: { accountId?: string } = {}) {
   const mention = makeMention();
   return handleInboundMessage({
-    account: makeAccount(),
+    account: makeAccount(opts.accountId),
     message: synthesizeDocMentionMessage(mention, BOT_UID) as any,
     botUid: BOT_UID,
     groupHistories: new Map(),
@@ -111,7 +112,7 @@ function runDocTask(postComment: (text: string) => Promise<void>) {
       threadId: mention.threadId,
       sessionScope: docTaskSessionScope(mention),
       postComment: async (text) => { await postComment(text); },
-      reportOutcome: () => {},
+      reportTurn: () => {},
     },
   });
 }
@@ -140,11 +141,15 @@ describe("文档任务的出站改道", () => {
   it("IM 出口全部静默:typing / readReceipt 一个都不发", async () => {
     const urls = installFetchStub();
     installRuntime();
+    const posted: string[] = [];
 
-    await runDocTask(async () => {});
+    await runDocTask(async (text) => { posted.push(text); });
 
     expect(urls.filter((u) => u.includes("/typing"))).toHaveLength(0);
     expect(urls.filter((u) => u.includes("/readReceipt"))).toHaveLength(0);
+    // 只断言「IM 没动静」的话,文档路径一条评论都没发也能通过 —— 那是静默丢弃,
+    // 不是成功。必须同时钉住评论区确实收到了东西。
+    expect(posted).toEqual(["已按要求改写完成"]);
   });
 
   it("评论区回帖失败不回退 IM(回退等于把污染放回来)", async () => {
@@ -156,7 +161,7 @@ describe("文档任务的出站改道", () => {
     expect(urls.filter((u) => u.includes("/sendMessage"))).toHaveLength(0);
   });
 
-  it("会话键脱离 DM/群命名空间,且不匹配 GROUP.md 注入正则", async () => {
+  it("会话键含 accountId 且脱离 GROUP.md 命名空间 —— 按生产键逐段断言", async () => {
     installFetchStub();
     const { finalizeInboundContext } = installRuntime();
 
@@ -164,9 +169,25 @@ describe("文档任务的出站改道", () => {
 
     expect(finalizeInboundContext).toHaveBeenCalled();
     const sessionKey: string = finalizeInboundContext.mock.calls[0][0].SessionKey ?? "";
-    expect(sessionKey).toContain("doctask:d1:70");
-    // 回归:落进 octo:group: 会让 group-md.ts 把群聊规则注入文档任务
-    expect(/^agent:[^:]+:octo:group:(.+)$/.test(sessionKey)).toBe(false);
+
+    // 整键精确断言。此前只 toContain("doctask:d1:70"),于是把 accountId 段整段删掉
+    // 测试照绿 —— 而那段正是「共用同一 agent 的两个 bot 账号不会塌成一个会话」的
+    // 唯一保证,是个数据泄漏形状的缺陷。
+    expect(sessionKey).toBe("agent:agent1:octo:acct1:doctask:d1:70");
+    // 用 group-md.ts 导出的**同一个**正则,而不是在测试里抄一份 —— 抄的那份会
+    // 随源码漂移,且当时构造的键少一段,两边都对不上。
+    expect(OCTO_GROUP_RE.test(sessionKey)).toBe(false);
+  });
+
+  it("不同 account 的同一条评论串拿到不同会话键", async () => {
+    installFetchStub();
+    const { finalizeInboundContext } = installRuntime();
+
+    await runDocTask(async () => {});
+    await runDocTask(async () => {}, { accountId: "acct2" });
+
+    const keys = finalizeInboundContext.mock.calls.map((c: any) => c[0].SessionKey);
+    expect(new Set(keys).size).toBe(2);
   });
 });
 

@@ -71,12 +71,17 @@ function installFetchStub(): string[] {
   return urls;
 }
 
-/** IM 出口:文本、媒体上传、媒体消息。文档任务下这些都必须是 0。 */
+/**
+ * IM 出口:文本、媒体(走的也是 /v1/bot/sendMessage,所以旧版那条
+ * `/sendMediaMessage` 过滤永远匹配不上)、上传预签名、typing、已读回执,
+ * 以及卡片编辑 `/v1/bot/message/edit` —— 后者是 editCardMessage /
+ * editTemplateCardMessage 的落点,此前完全不在断言范围内。
+ */
 function imOutbound(urls: string[]): string[] {
   return urls.filter(
     (u) =>
       u.includes("/sendMessage") ||
-      u.includes("/sendMediaMessage") ||
+      u.includes("/message/edit") ||
       u.includes("presigned") ||
       u.includes("/typing") ||
       u.includes("/readReceipt"),
@@ -109,13 +114,13 @@ function installRuntime(drive: DispatchDriver, openClawConfig: Record<string, un
   return dispatch;
 }
 
-/** 本回合上报的结论 —— handler 靠它决定要不要写去重,不再从副作用推断。 */
-type ReportedOutcome = "work-delivered" | "notice-only" | "nothing";
+/** 本回合上报的事实 —— handler 据此各自决定「写不写去重」和「补不补兜底」。 */
+type Reported = { finalDelivered: boolean; delivered: boolean; lost: boolean; noticed: boolean };
 
 function runDocTask(
   posted: string[],
   accountOverrides: Record<string, unknown> = {},
-  sinks: { outcomes?: ReportedOutcome[]; log?: { error?: (m: string) => void } } = {},
+  sinks: { reports?: Reported[]; log?: { error?: (m: string) => void } } = {},
 ) {
   const mention = makeMention();
   return handleInboundMessage({
@@ -133,7 +138,7 @@ function runDocTask(
       threadId: mention.threadId,
       sessionScope: docTaskSessionScope(mention),
       postComment: async (text) => { posted.push(text); },
-      reportOutcome: (outcome) => { sinks.outcomes?.push(outcome); },
+      reportTurn: (report) => { sinks.reports?.push(report); },
     },
   });
 }
@@ -231,15 +236,15 @@ describe("文档任务:最终答复的投递模式不受 messages.visibleReplies
       { messages: { visibleReplies: "message_tool" } },
     );
     const posted: string[] = [];
-    const outcomes: ReportedOutcome[] = [];
+    const reports: Reported[] = [];
 
-    await runDocTask(posted, {}, { outcomes });
+    await runDocTask(posted, {}, { reports });
 
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect((dispatch.mock.calls[0] as any)[0].replyOptions.sourceReplyDeliveryMode).toBe("automatic");
     expect(imOutbound(urls)).toHaveLength(0);
     expect(posted).toEqual(["已按要求改好"]);
-    expect(outcomes).toEqual(["work-delivered"]);
+    expect(reports).toEqual([{ finalDelivered: true, delivered: true, lost: false, noticed: false }]);
   });
 
   it("非文档任务的 DM 不受影响:显式配置仍然被尊重", async () => {
@@ -264,94 +269,94 @@ describe("文档任务:最终答复的投递模式不受 messages.visibleReplies
   });
 });
 
-describe("文档任务:一个回合的结论由它自己上报", () => {
-  // 回归:上一版让 handler 从 delivered/lost/noticed 三个计数器重建结论,每个出站点
-  // 都得记得给自己打对标签 —— 连续三轮有某个点标错。最后一次是 `delivered > 0 &&
-  // noticed`:一条「正在读取文档…」加一句道歉,就被判成完成、写进持久去重,而文档
-  // 一个字没改。现在结论由跑完整个回合的 inbound 说一次,规则是
-  // **道歉过的回合一律不算完成**。
-  it("onError:上报 notice-only", async () => {
-    installFetchStub();
-    installRuntime(async (args) => { await args.dispatcherOptions.onError(new Error("boom"), { kind: "final" }); });
-    const outcomes: ReportedOutcome[] = [];
-
-    await runDocTask([], {}, { outcomes });
-
-    expect(outcomes).toEqual(["notice-only"]);
+describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
+  // 回归:上一版把结论压成三值枚举(work-delivered / notice-only / nothing),
+  // 值域里没有「活儿落地了 **并且** 另外出了岔子」这一格。于是「答复已送达、之后
+  // dispatch 又抛错」被判成 nothing —— 在正确答复下面再贴一条「没有完成、也没有
+  // 产生任何修改，请重新 @ 我」,用户照做就把改文档的任务再跑一遍。
+  const report = (over: Partial<Reported> = {}): Reported => ({
+    finalDelivered: false, delivered: false, lost: false, noticed: false, ...over,
   });
 
-  it("超时:上报 notice-only", async () => {
-    installFetchStub();
-    installRuntime(async () => { await new Promise((resolve) => setTimeout(resolve, 5_000)); });
-    const outcomes: ReportedOutcome[] = [];
-
-    await runDocTask([], { dispatchTimeoutMs: 1000 }, { outcomes }).catch(() => {});
-
-    expect(outcomes).toEqual(["notice-only"]);
-  }, 20_000);
-
-  it("dispatch 拒绝:上报 notice-only(抛出前也必须先上报)", async () => {
-    installFetchStub();
-    installRuntime(async () => { throw new Error("dispatch rejected"); });
-    const outcomes: ReportedOutcome[] = [];
-
-    await expect(runDocTask([], {}, { outcomes })).rejects.toThrow("dispatch rejected");
-
-    expect(outcomes).toEqual(["notice-only"]);
-  });
-
-  it("正常答复:上报 work-delivered", async () => {
+  it("正常答复:final + delivered", async () => {
     installFetchStub();
     installRuntime(async (args) => {
       await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
     });
-    const outcomes: ReportedOutcome[] = [];
+    const reports: Reported[] = [];
     const posted: string[] = [];
 
-    await runDocTask(posted, {}, { outcomes });
+    await runDocTask(posted, {}, { reports });
 
-    expect(outcomes).toEqual(["work-delivered"]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
     expect(posted).toEqual(["已按要求改好"]);
   });
 
-  it("先发出进度、再道歉:上报 notice-only —— 进度不能把失败的回合顶成完成", async () => {
-    // 这正是 6c47a8f/f54ed93 两版都判错的形状。tool 文本走 resolveAndSendText,
-    // 上一版按「产出」记账,于是 delivered > 0 让整个回合被判完成。
+  it("答复送达之后 dispatch 才抛错:仍然是 finalDelivered —— 活儿落地了", async () => {
+    // Jerry-Xin 和 yujiawei 独立复现的同一格。inbound 的 !replySucceeded 守卫
+    // 已经正确地不发道歉了,坏在下游把它判成了「什么都没发生」。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "已改好，diff 见版本记录" }, { kind: "final" });
+      throw new Error("non_deliverable_terminal_turn");
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await expect(runDocTask(posted, {}, { reports })).rejects.toThrow("non_deliverable_terminal_turn");
+
+    expect(posted).toEqual(["已改好，diff 见版本记录"]); // 没有多出一条自相矛盾的道歉
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+  });
+
+  it("答复送达之后才超时:不再追发超时提示,回合仍算落地", async () => {
+    // 超时分支原先无条件道歉,而它的兄弟分支(dispatch rejected)有 !replySucceeded
+    // 守卫且注释写明了理由。少这一层,一个已经答复完的回合会被一句道歉拖成未完成。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, { dispatchTimeoutMs: 1000 }, { reports }).catch(() => {});
+
+    expect(posted).toEqual(["已按要求改好"]);
+    expect(reports[reports.length - 1]).toEqual(report({ finalDelivered: true, delivered: true }));
+  }, 20_000);
+
+  it("先发出进度、再道歉:finalDelivered 为假 —— 进度不是答复", async () => {
     installFetchStub();
     installRuntime(async (args) => {
       await args.dispatcherOptions.deliver({ text: "正在读取文档…" }, { kind: "tool" });
       await args.dispatcherOptions.onError(new Error("boom"), { kind: "final" });
     });
-    const outcomes: ReportedOutcome[] = [];
+    const reports: Reported[] = [];
     const posted: string[] = [];
 
-    await runDocTask(posted, {}, { outcomes });
+    await runDocTask(posted, {}, { reports });
 
     expect(posted).toHaveLength(2);
-    expect(outcomes).toEqual(["notice-only"]);
+    expect(reports).toEqual([report({ delivered: true, noticed: true })]);
   });
 
-  it("只发出附件、随后出错:同样是 notice-only", async () => {
-    // media-only 分支经 postDocTaskReply("") 出站并置 replySucceeded,上一版把它
-    // 记成产出,于是「附件 + 道歉」也会被判完成。
+  it("onError / dispatch 拒绝:noticed", async () => {
     installFetchStub();
-    installRuntime(async (args) => {
-      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "final" });
-      await args.dispatcherOptions.onError(new Error("boom"), { kind: "final" });
-    });
-    const outcomes: ReportedOutcome[] = [];
+    installRuntime(async (args) => { await args.dispatcherOptions.onError(new Error("boom"), { kind: "final" }); });
+    const reports: Reported[] = [];
 
-    await runDocTask([], {}, { outcomes });
+    await runDocTask([], {}, { reports });
 
-    expect(outcomes).toEqual(["notice-only"]);
+    expect(reports).toEqual([report({ delivered: true, noticed: true })]);
   });
 
-  it("产出发丢且没来得及提示:上报 nothing —— 由 handler 补兜底", async () => {
+  it("答复发丢:lost 为真,finalDelivered 仍为真 —— 由 handler 判定活儿没落地", async () => {
     installFetchStub();
     installRuntime(async (args) => {
       await args.dispatcherOptions.deliver({ text: "已按要求改好" }, { kind: "final" });
     });
-    const outcomes: ReportedOutcome[] = [];
+    const reports: Reported[] = [];
     const mention = makeMention();
 
     await handleInboundMessage({
@@ -369,11 +374,24 @@ describe("文档任务:一个回合的结论由它自己上报", () => {
         threadId: mention.threadId,
         sessionScope: docTaskSessionScope(mention),
         postComment: async () => { throw new Error("docs API 503"); },
-        reportOutcome: (outcome) => { outcomes.push(outcome); },
+        reportTurn: (r) => { reports.push(r); },
       },
     });
 
-    expect(outcomes).toEqual(["nothing"]);
+    expect(reports).toEqual([report({ finalDelivered: true, lost: true })]);
+  });
+
+  it("纯附件也是最终产出:finalDelivered", async () => {
+    // 不置位的话这个回合永远拿不到去重记录,重投会把文档改第二遍。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+
+    await runDocTask([], {}, { reports });
+
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
   });
 });
 

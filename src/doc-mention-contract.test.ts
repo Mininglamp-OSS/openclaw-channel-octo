@@ -23,11 +23,20 @@ import { _clearKnownBots } from "./bot-registry.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 
 /**
- * 跨仓库契约测试:octo-server(modules/bot_mention)→ 本插件 → docs 评论 API。
+ * 解析器契约测试:octo-server(modules/bot_mention)→ 本插件 → docs 评论 API。
  *
  * fixture 由 octo-server PR 分支的真实代码生成(normalizeMentionRequest +
- * mentionEventData,包在 /v1/bot/events 的 eventResp 形状里),不是手抄字段 ——
- * server 改了 event_data 而插件没跟,这里会直接红。
+ * mentionEventData,包在 /v1/bot/events 的 eventResp 形状里),不是手抄字段。
+ *
+ * **它保证什么、不保证什么**(上一版把这两件事说混了):
+ *
+ *   保证 —— 本插件的解析/合成/回帖链路对着这份**冻结快照**保持一致。谁改了
+ *   `parseDocCommentMention` 的字段映射,下面的 toMatchObject 会红。
+ *
+ *   不保证 —— server 端真的改了字段名时这里**不会**自动变红:fixture 是签进仓库的
+ *   静态文件,没有任何 CI 步骤去重新生成它并比对差异。要拿到那个保证,需要一个
+ *   从 server 仓库重新生成 fixture 并对 diff 失败的 job。在那之前,这是一份
+ *   「解析器不许自己漂移」的回归测试,不是跨服务的活契约。
  */
 
 const FIXTURE = JSON.parse(
@@ -188,7 +197,9 @@ afterEach(async () => {
 });
 
 describe("server 事件契约", () => {
-  it("fixture 就是 /v1/bot/events 的真实形状", () => {
+  it("fixture 是 /v1/bot/events 的形状,且字段集没被人手改过", () => {
+    // 注意这条断言的性质:它约束的是**这份签进仓库的快照**,不是线上的 server。
+    // 快照被人手工编辑会红,server 真的改了字段名不会红(见文件头说明)。
     expect(FIXTURE.status).toBe(1);
     expect(SERVER_EVENT.event_type).toBe("doc_comment_mention");
     expect(Object.keys(SERVER_DATA).sort()).toEqual([

@@ -22,7 +22,7 @@ const isReplyPayloadNonTerminalToolErrorWarning =
 const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
 import { createImEgressGuard } from "./im-egress.js";
-import type { DocTaskOutcome } from "./doc-mention-handler.js";
+import type { DocTaskTurnReport } from "./doc-mention-handler.js";
 import type { GroupMember } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
 import { normalizeAccountId } from "./account-id.js";
@@ -57,6 +57,7 @@ import { registerGroupAccount, ensureGroupMd, handleGroupMdEvent, broadcastGroup
 import { handleForkCommandIfMatched } from "./commands/fork-inbound.js";
 import { isForkCommandHistoryMessage } from "./commands/fork-history-filter.js";
 import { isOwner } from "./owner-registry.js";
+import { isSessionInitConflict } from "./session-retry.js";
 import { isKnownBot } from "./bot-registry.js";
 import { getPersonaPromptForSession } from "./persona-prompt.js";
 import { createWriteStream } from "node:fs";
@@ -1542,8 +1543,8 @@ export async function handleInboundMessage(params: {
     /** 会话作用域片段,如 `doctask:{docId}:{threadId}`(见 doc-mention.ts)。 */
     sessionScope: string;
     postComment: (text: string, signal?: AbortSignal) => Promise<void>;
-    /** 回合末尾恰好上报一次;没上报按 nothing 处理(见 doc-mention-handler.ts)。 */
-    reportOutcome: (outcome: DocTaskOutcome) => void;
+    /** 回合末尾上报一次事实;没上报按「什么都没发生」处理(见 doc-mention-handler.ts)。 */
+    reportTurn: (report: DocTaskTurnReport) => void;
   };
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
@@ -2409,7 +2410,13 @@ export async function handleInboundMessage(params: {
   // and early-returns — so it never writes the parent session nor reaches the
   // LLM on this (parent) conversation. Non-fork messages return false here and
   // fall through unchanged (a cheap regex, no behavior change for the hot path).
+  // 文档任务一律不走 /fork:评论串里没有「分叉出一个子群」的语义,而 fork-inbound
+  // 会用自己的 sendMessage 直发 IM(它在另一个文件,inbound 的出站闸门管不到它),
+  // 目标又是合成消息的 DM channel —— 也就是发起人的私聊。今天只是因为
+  // formatDocMentionText 给正文加了前缀、锚定的 /^\/fork…$/ 匹配不上才碰不到,
+  // 提示词格式一改就重新打开。而且这条早返回排在任何 reportTurn 之前。
   if (
+    !docTask &&
     await handleForkCommandIfMatched({
       commandBody,
       commandAuthorized,
@@ -2782,11 +2789,10 @@ export async function handleInboundMessage(params: {
   // 新增出站点只要不经过它就会被失败路径测试抓住。
   //
   // 失败只记日志,绝不回退 IM:回退等于把污染放回来;文档修改本身已经落盘。
-  // 本回合的产出记账。**只在这三处赋值**,回合末尾归纳成一个结论上报给 handler。
-  // 判定集中在这里而不是散在各出站点,是因为只有这里同时看得到「答复发出去没有」
-  // 和「中间道歉过没有」—— 散开判定的版本连续三轮有某个点标错。
-  let docTaskWorkDelivered = false; // 至少一条真实产出发成功
-  let docTaskWorkLost = false; // 有真实产出没发出去
+  // 本回合的事实记账。**只在 postDocTaskReply 里赋值**,回合末尾原样上报给 handler
+  // —— 这里只说发生了什么,不下「算不算完成」的判断(那是 handler 的策略)。
+  let docTaskDelivered = false; // 评论区收到过任何内容(含提示)
+  let docTaskLost = false; // 有非提示内容重试耗尽仍没发出去
   let docTaskNoticed = false; // 发出过提示(道歉/超时/拒绝)
   const docTaskMediaUrls: string[] = [];
   const postDocTaskReply = async (
@@ -2808,13 +2814,13 @@ export async function handleInboundMessage(params: {
       await docTask.postComment(body, signal);
       // 按「消费掉的条数」出队,而不是清空:await 期间 deliver 可能又推进了新附件。
       docTaskMediaUrls.splice(0, attachments.length);
+      docTaskDelivered = true;
       if (opts?.notice) docTaskNoticed = true;
-      else docTaskWorkDelivered = true;
       statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
     } catch (err) {
       // 提示发失败不记 lost:提示本来就不是产出,发不出去只是没留下痕迹,
-      // 由 handler 的兜底补。产出发失败才是「答复丢了」。
-      if (!opts?.notice) docTaskWorkLost = true;
+      // 由 handler 的兜底补。内容发失败才是「答复丢了」。
+      if (!opts?.notice) docTaskLost = true;
       statusSink?.({ lastError: String(err) });
       log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
     }
@@ -3116,6 +3122,9 @@ export async function handleInboundMessage(params: {
               // 和下面的非文档分支一样置位:不置位的话本回合会被判成「没答复过」,
               // 走到 !replySucceeded 兜底,在已经发出附件评论之后再补一句道歉。
               replySucceeded = true;
+              // 纯附件就是本回合 kind:"final" 的全部产出,和一段最终文本等价 ——
+              // 不置位的话这个回合永远拿不到去重记录,重投会把文档改第二遍。
+              if (kind === "final") userFacingFinalDelivered = true;
               return;
             }
             statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
@@ -3225,15 +3234,22 @@ export async function handleInboundMessage(params: {
       );
       deliverBuffer.lastText = null;
       deliverBuffer.textSent = true;
-      try {
-        // The apology call itself MUST be bounded — otherwise a sick Octo API
-        // hangs this sendMessage too, defeating the whole timeout fix. See
-        // DISPATCH_TIMEOUT_APOLOGY_MS above.
-        await sendUserFacingFallback("⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
-      } catch (sendErr) {
-        log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
+      // 和下面 dispatch-rejected 分支同一条守卫(见其注释):答复已经发出去了就别再
+      // 追一句「处理超时，请稍后重试」—— 用户会同时看到正确答复和自相矛盾的失败提示。
+      // 对文档任务还多一层代价:那句道歉会把一个已经落地的回合拖成「未完成」。
+      if (replySucceeded) {
+        log?.info?.("octo: dispatch timed out after a reply already landed — suppressing the timeout notice");
+      } else {
+        try {
+          // The apology call itself MUST be bounded — otherwise a sick Octo API
+          // hangs this sendMessage too, defeating the whole timeout fix. See
+          // DISPATCH_TIMEOUT_APOLOGY_MS above.
+          await sendUserFacingFallback("⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+        } catch (sendErr) {
+          log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
+        }
       }
-    } else if (!deliveryErrorOccurred && !replySucceeded) {
+    } else if (!deliveryErrorOccurred && !replySucceeded && !isSessionInitConflict(err)) {
       // Dispatch itself rejected (e.g. non_deliverable_terminal_turn) and the
       // onError callback was never invoked, AND no visible reply has been
       // delivered to the user yet, so no fallback has been sent yet.
@@ -3241,6 +3257,11 @@ export async function handleInboundMessage(params: {
       // dispatcher already sent a visible reply before the top-level rejection
       // (e.g. a post-delivery terminal throw): without this guard the user
       // would receive both a real answer and a contradictory error message.
+      //
+      // 会话初始化冲突也排除在外:它会被 runWithSessionInitRetry 重试(默认 4 次),
+      // 每次都道歉一遍就是 5 句道歉,而且 session-retry.ts 的前提正是「冲突发生在
+      // 任何投递之前,所以重试不产生重复回复」—— 在这里道歉会亲手打破那个前提。
+      // 重试全败之后由 channel.ts 发一条冲突回执收尾。
       clearInterval(typingInterval);
       if (deliverBuffer.lastText && !deliverBuffer.textSent) {
         // A blocks-only reply was buffered (replySucceeded is not set for block
@@ -3304,21 +3325,26 @@ export async function handleInboundMessage(params: {
     // Safety net: clean up pending inbound context in case the hook didn't fire
     pendingInboundContext.delete(route.sessionKey);
 
-    // --- 文档任务:把本回合的结论上报一次 ---
+    // --- 文档任务:把本回合的事实上报一次 ---
     // 放在最外层 finally,所以正常结束、dispatch 抛错、超时三条路径都会走到;
-    // dispatch 之前的早返回(能力门禁、路由解析失败)走不到,handler 按「没上报」
-    // 处理 —— 那些回合确实什么都没产出,不写去重、允许重投,方向天然正确。
+    // dispatch 之前的早返回(能力门禁、路由解析失败)走不到,handler 按「什么都没
+    // 发生」处理 —— 那些回合确实什么都没产出,不写去重、允许重投,方向天然正确。
+    //
+    // 只报事实,不下结论:「最终答复送达了吗」「有没有东西发丢」「道歉过没有」是
+    // 三件独立的事,压成一个枚举就会出现无处安放的组合(见 doc-mention-handler.ts)。
+    // finalDelivered 用 userFacingFinalDelivered 而不是 replySucceeded —— 后者对
+    // 进度/工具文本也置位,拿它当「答复落地」会让「正在读取文档… + 道歉」被判成完成。
     if (docTask) {
-      const docTaskOutcome =
-        docTaskWorkDelivered && !docTaskWorkLost && !docTaskNoticed
-          ? "work-delivered"
-          : docTaskNoticed
-            ? "notice-only"
-            : "nothing";
+      const report: DocTaskTurnReport = {
+        finalDelivered: userFacingFinalDelivered,
+        delivered: docTaskDelivered,
+        lost: docTaskLost,
+        noticed: docTaskNoticed,
+      };
       log?.info?.(
-        `octo: doc task turn outcome=${docTaskOutcome} work=${docTaskWorkDelivered} lost=${docTaskWorkLost} noticed=${docTaskNoticed}`,
+        `octo: doc task turn final=${report.finalDelivered} delivered=${report.delivered} lost=${report.lost} noticed=${report.noticed}`,
       );
-      docTask.reportOutcome(docTaskOutcome);
+      docTask.reportTurn(report);
     }
 
     // Record last answered inbound message_seq for history segmentation (don't clear history).

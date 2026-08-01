@@ -206,6 +206,29 @@ describe("轮询器识别文档任务事件", () => {
     expect(acked).toEqual([16, 17]);
   });
 
+  it("未注册 onCardAction 时卡片事件不被识别,也不 ack", async () => {
+    // 回归:`parseCardAction` 原先无条件调用,回调可选这件事没有任何测试钉住 ——
+    // 把门禁去掉全套照绿。cardInteraction:false 的部署会因此收到并 ack 卡片事件。
+    const { acked } = installFetch([
+      { event_id: 31, event_type: "card_action", event_data: { action: "x", message_id: "1" } },
+    ]);
+    const seen: unknown[] = [];
+    const poller = startEventPoller({
+      apiUrl: API,
+      botToken: "tok",
+      intervalMs: 500,
+      cursorStore: memoryCursor(),
+      onDocMention: async (mention) => { seen.push(mention); },
+    });
+    await poller.ready;
+    await drain();
+    poller.stop();
+
+    expect(seen).toEqual([]);
+    expect(acked).toEqual([]);
+    expect(poller.cursor()).toBe(31); // 游标仍前进,不重复拉取
+  });
+
   it("未知 event_type 既不派发也不 ack", async () => {
     const { acked } = installFetch([{ event_id: 13, event_type: "brand_new_type", event_data: {} }]);
     const seen: DocCommentMention[] = [];
@@ -284,6 +307,38 @@ describe("文档任务持久去重", () => {
     await rmOne(join(dir, "nested"), { force: true });
     store.release("k1");
     expect(await store.claim("k1")).toBe(false);
+  });
+
+  it("去重表读不出来时记一条 error —— 静默降级等于整表清空、每个事件重放一遍", async () => {
+    // 回归:这条日志分支加了,但生产调用点(channel.ts)当时没传 log,分支不可达 ——
+    // 注释描述的行为接线根本没实现。这条测试钉住「传了 log 就一定看得见」。
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const acct = join(dir, "acct-unreadable");
+    await mkdir(acct, { recursive: true });
+    await writeFile(join(acct, "doc-mentions.processed.json"), "{ this is not json", "utf8");
+
+    const errors: string[] = [];
+    const store = createFileDocMentionDedupeStore({
+      accountId: "acct-unreadable",
+      baseDir: dir,
+      log: { error: (m) => errors.push(m) },
+    });
+
+    expect(await store.claim("k1")).toBe(false); // 降级成空表,放行
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("unreadable");
+  });
+
+  it("文件不存在是正常冷启动,不记 error", async () => {
+    const errors: string[] = [];
+    const store = createFileDocMentionDedupeStore({
+      accountId: "acct-fresh",
+      baseDir: dir,
+      log: { error: (m) => errors.push(m) },
+    });
+
+    expect(await store.claim("k1")).toBe(false);
+    expect(errors).toEqual([]);
   });
 
   it("超出容量时淘汰最旧的键", async () => {

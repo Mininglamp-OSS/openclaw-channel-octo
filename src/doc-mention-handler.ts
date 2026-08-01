@@ -1,20 +1,36 @@
 import { docTaskQueueScope, docTaskSessionScope, synthesizeDocMentionMessage, type DocCommentMention } from "./doc-mention.js";
 import type { DocMentionDedupeStore } from "./doc-mention-dedupe.js";
 import type { BotMessage } from "./types.js";
+import { isPermanentDocCommentFailure } from "./api-fetch.js";
 
 /**
- * 一个回合的产出结论。**由跑这个回合的人上报,不由本文件从副作用推断。**
+ * 一个回合到底发生了什么。**由跑这个回合的人如实上报四个事实,不预先归纳成结论。**
  *
- * - `work-delivered` —— 真实产出送达,且这一回合没有发生任何需要道歉的事。
- * - `notice-only`    —— 活儿没干成,但评论区已有提示(道歉/超时/冲突回执)。
- * - `nothing`        —— 评论区没有任何痕迹,或有产出发丢且没来得及提示。
+ * 为什么是四个布尔而不是一个三值枚举:枚举的值域表达不了「活儿落地了 **并且**
+ * 另外出了岔子」——答复发出去之后再超时、再抛错,都是这一类。四轮评审里每一轮都
+ * 有一个这种状态被硬塞进 work-delivered / notice-only / nothing 之一,每次塞错一个
+ * 不同的。把事实原样交上来,由 handler 定策略,这类状态就不再需要被压扁。
  *
- * 为什么是上报而不是推断:上一版让 handler 从 delivered/lost/noticed 三个计数器
- * 重建结论,于是每个出站点都得记得给自己打对标签 —— 连续三轮都有某个点标错。
- * 只有跑完整个回合的 inbound 才同时知道「答复发出去没有」和「中间道歉过没有」,
- * 结论就该由它说一次,而不是让别处拼。
+ * 上报方只负责说事实,不负责下判断。
  */
-export type DocTaskOutcome = "work-delivered" | "notice-only" | "nothing";
+export interface DocTaskTurnReport {
+  /** 本回合的**最终答复**已经发进评论区(不含进度/工具文本,也不含道歉)。 */
+  finalDelivered: boolean;
+  /** 评论区收到过任何内容(进度、附件、最终答复、提示)。仅用于观测。 */
+  delivered: boolean;
+  /** 有内容重试耗尽仍没发出去。 */
+  lost: boolean;
+  /** 发出过提示:道歉 / 超时 / 会话冲突回执。 */
+  noticed: boolean;
+}
+
+/** 什么都没发生 —— dispatch 之前就早返回的回合(能力门禁、路由解析失败)。 */
+export const EMPTY_DOC_TASK_REPORT: DocTaskTurnReport = {
+  finalDelivered: false,
+  delivered: false,
+  lost: false,
+  noticed: false,
+};
 
 /** channel.ts 侧 dispatchInboundMessage 的最小契约。 */
 export type DocMentionDispatch = (
@@ -28,11 +44,14 @@ export type DocMentionDispatch = (
       sessionScope: string;
       postComment: (text: string, signal?: AbortSignal) => Promise<void>;
       /**
-       * 回合结束时恰好上报一次。**没上报按 `nothing` 处理** —— dispatch 之前的
-       * 早返回(能力门禁、路由解析失败)根本走不到上报点,而那些回合确实什么都
-       * 没产出。保守方向天然正确:不写去重,允许重投。
+       * 回合结束时上报一次事实。**没上报按 EMPTY_DOC_TASK_REPORT 处理** ——
+       * dispatch 之前的早返回(能力门禁、路由解析失败)根本走不到上报点,而那些
+       * 回合确实什么都没产出。保守方向天然正确:不写去重,允许重投。
+       *
+       * 会话初始化冲突会重试,所以这里可能被调用多次,取最后一次 —— 每次调用
+       * 描述的都是「到目前为止发生了什么」,后一次严格更新。
        */
-      reportOutcome: (outcome: DocTaskOutcome) => void;
+      reportTurn: (report: DocTaskTurnReport) => void;
     };
   },
 ) => Promise<"completed" | "dropped">;
@@ -46,7 +65,9 @@ export interface DocMentionHandlerDeps {
 }
 
 /** 兜底评论:本轮评论区一点痕迹都没留下时补发,保证用户不是干等。 */
-const NOTHING_DELIVERED_NOTICE = "⚠️ 本次文档任务没有完成，也没有产生任何修改。请稍后重试或重新 @ 我。";
+// 措辞刻意不说「没有产生任何修改」:走到这里时 agent 可能已经改过文档了(答复
+// 发丢的情形),断言「没改过」是在撒谎。只说用户能验证的那一半 —— 没给出答复。
+const NOTHING_DELIVERED_NOTICE = "⚠️ 本次文档任务没有给出答复。请稍后重试或重新 @ 我。";
 
 /** 回帖的有界重试:docs 后端一次瞬时 5xx 不该让整条回复永久消失。 */
 const POST_ATTEMPTS = 3;
@@ -64,13 +85,15 @@ const POST_RETRY_BASE_MS = 200;
  *      (resolveAgentRoute 抛错、能力门禁)根本不是异常。三者都会写入持久去重
  *      并 ack —— 评论区静默、永不重试。
  *
- *   2. **结论由回合自己上报(reportOutcome),本文件不从副作用推断。**
- *      推断版连续三轮出错,每次都是某个出站点忘了给自己打标:第一次把兜底道歉
- *      记成产出;第二次修成「delivered === 0 且发过提示」才算未完成,漏了
- *      「发过进度 + 最后道歉」——一条「正在读取文档…」就能把这种回合顶成完成。
- *      根因是判定散落在各调用点。现在只有跑完整个回合的 inbound 说一次:它同时
- *      知道答复发出去没有、以及中间道歉过没有。**道歉过的回合一律不算完成。**
- *      被判 dropped 的任务(如会话冲突)哪怕上报了产出也不算完成 —— 活儿没干。
+ *   2. **回合只上报事实,本文件定策略,而且两个决定是分开的。**
+ *      推断版连续四轮出错,形态一次比一次隐蔽:先是把兜底道歉记成产出;再是
+ *      「发过进度 + 最后道歉」被顶成完成;最后是把结论压成三值枚举,导致
+ *      「答复已送达、之后 dispatch 又抛错」无处安放而被判成 nothing。根因不是
+ *      某个点标错,而是**值域表达不了「活儿落地了并且另外出了岔子」**。
+ *      现在上报 DocTaskTurnReport 四个事实,本文件据此各自决定:
+ *        - 写不写去重  ← 最终答复是否落地(workLanded)
+ *        - 补不补兜底  ← 用户是否在干等(既无答复也无提示)
+ *      两者互不牵连,所以「答复落地 + 事后道歉」既能写去重、又不会叠一条废话。
  *
  *   3. 异常不外抛,**包括去重落盘失败**。events-poll.ts 在 ack 之前 await 本函数,
  *      外抛就等于不 ack,重投后再次失败,形成每个轮询周期一次的死循环 —— 而这是个
@@ -81,8 +104,8 @@ const POST_RETRY_BASE_MS = 200;
  *
  *   4. 事件指向别的 bot 时在 claim 之前丢弃,避免用外部 bot 的 key 污染去重存储。
  *
- *   5. 兜底提示只在结论为 `nothing`(评论区一点痕迹都没有)时补发。`notice-only`
- *      说明道歉/回执已经在评论区了,再补一条通用兜底等于让用户连着看两句废话。
+ *   5. 兜底提示只在**用户干等**时补发 —— 既没拿到答复,也没收到任何失败提示。
+ *      已经有道歉或冲突回执时不再叠加,否则用户连着看两句废话。
  */
 export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
   return async function handleDocMention(mention: DocCommentMention): Promise<void> {
@@ -112,6 +135,9 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           deps.log?.error?.(
             `octo: doc comment post failed (attempt ${attempt}/${POST_ATTEMPTS}) doc=${mention.docId}: ${String(err)}`,
           );
+          // 确定性失败(信封拒绝、4xx)重试不会变好 —— 只会在轮询器的串行循环里
+          // 白烧三次 POST 和 600ms,而后面的兜底通知还要再烧一遍同样的三次。
+          if (isPermanentDocCommentFailure(err)) break;
           if (attempt < POST_ATTEMPTS) {
             await new Promise((resolve) => setTimeout(resolve, POST_RETRY_BASE_MS * attempt));
           }
@@ -120,7 +146,7 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
       throw lastErr;
     };
 
-    let reported: DocTaskOutcome | undefined;
+    let reported: DocTaskTurnReport | undefined;
     let outcome: "completed" | "dropped" = "dropped";
     try {
       outcome = await deps.dispatch(synthesizeDocMentionMessage(mention, deps.botUid), undefined, {
@@ -130,7 +156,7 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           threadId: mention.threadId,
           sessionScope: docTaskSessionScope(mention),
           postComment: postWithRetry,
-          reportOutcome: (value) => { reported = value; },
+          reportTurn: (value) => { reported = value; },
         },
       });
     } catch (err) {
@@ -139,21 +165,38 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
       );
     }
 
-    // 上报的结论是权威,但「任务真的跑完了」仍由 dispatch 说了算:被判 dropped 的
-    // 回合(会话冲突)根本没执行,哪怕上报了产出也不能算完成 —— 记为完成会吸收掉
-    // 本该重投的那一次。
-    const result: DocTaskOutcome =
-      reported === undefined
-        ? "nothing"
-        : reported === "work-delivered" && outcome !== "completed"
-          ? "nothing"
-          : reported;
+    const report = reported ?? EMPTY_DOC_TASK_REPORT;
+
+    // 两个**互相独立**的决定。上一版把它们压进一个三值枚举,于是
+    // 「答复发出去了、之后 dispatch 又抛错」这种状态无处安放,被判成 nothing ——
+    // 在正确答复下面又贴一条「没有完成、也没有产生任何修改,请重新 @ 我」,
+    // 用户照做就把改文档的任务再跑一遍。
+    //
+    // 注意这里**不看** dispatch 返回的 completed/dropped:唯一返回 dropped 的路径是
+    // 会话冲突,而那条路径由 channel.ts 自己上报(noticed),其余失败一律是 reject。
+    // 拿 outcome 当完成条件等于把「抛错」误当成「没跑」,那正是上面那个 bug。
+
+    /** 活儿落地了:最终答复确实进了评论区,且没有内容发丢。 */
+    const workLanded = report.finalDelivered && !report.lost;
+    /** 用户在干等:既没拿到答复,也没收到任何失败提示。 */
+    const userLeftHanging = !workLanded && !report.noticed;
 
     deps.log?.info?.(
-      `octo: doc task result=${result} doc=${mention.docId} thread=${mention.threadId} reported=${reported ?? "none"} outcome=${outcome}`,
+      `octo: doc task doc=${mention.docId} thread=${mention.threadId} workLanded=${workLanded} ` +
+        `final=${report.finalDelivered} delivered=${report.delivered} lost=${report.lost} noticed=${report.noticed} dispatch=${outcome}`,
     );
 
-    if (result === "work-delivered") {
+    if (userLeftHanging) {
+      try {
+        await postWithRetry(NOTHING_DELIVERED_NOTICE);
+      } catch (err) {
+        deps.log?.error?.(
+          `octo: doc task fallback notice failed doc=${mention.docId} thread=${mention.threadId}: ${String(err)}`,
+        );
+      }
+    }
+
+    if (workLanded) {
       try {
         await deps.dedupe.complete(mention.idempotencyKey);
       } catch (err) {
@@ -166,15 +209,6 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
       return;
     }
 
-    if (result === "nothing") {
-      try {
-        await postWithRetry(NOTHING_DELIVERED_NOTICE);
-      } catch (err) {
-        deps.log?.error?.(
-          `octo: doc task fallback notice failed doc=${mention.docId} thread=${mention.threadId}: ${String(err)}`,
-        );
-      }
-    }
     deps.dedupe.release(mention.idempotencyKey);
   };
 }

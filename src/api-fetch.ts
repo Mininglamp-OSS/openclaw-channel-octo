@@ -844,6 +844,29 @@ export async function sendHeartbeat(params: {
 }
 
 /**
+ * docs 后端明确拒绝了这条评论(2xx 但信封是失败)。与传输故障区分开:重试它没有
+ * 意义 —— 「文档不存在」重试三次仍然不存在,只会在轮询器的串行循环里白烧 3 次
+ * POST 和 600ms,而后续的兜底通知还会再烧一遍同样的三次。
+ */
+export class DocCommentRejectedError extends Error {
+  readonly name = "DocCommentRejectedError";
+}
+
+/**
+ * 这个错误重试也不会变好吗?
+ *
+ * 信封拒绝 = 确定性失败。4xx 同理,但排除 408(请求超时)和 429(限流)—— 那两个
+ * 是「稍后再来」的语义。其余(网络、5xx、超时)都值得重试。
+ */
+export function isPermanentDocCommentFailure(err: unknown): boolean {
+  if (err instanceof DocCommentRejectedError) return true;
+  const status = httpStatusFromApiFetchError(err);
+  if (status === undefined) return false;
+  if (status === 408 || status === 429) return false;
+  return status >= 400 && status < 500;
+}
+
+/**
  * 在文档评论串下发布一条 Bot 评论(docs domain,与 IM 消息无关)。
  *
  * 文档任务的最终答复走这条出口而不是 sendMessage:合成消息是 DM 形状的,
@@ -876,13 +899,17 @@ export async function postDocComment(params: {
 
   // 平台返回的是 {status, ...} 信封,业务失败(文档不存在、无评论权限、正文超长)
   // 一样可能是 HTTP 200。而这条 POST 的成败是整个特性**唯一**的投递凭证 —— 只看
-  // response.ok 会把业务失败记成「已投递」,进而写入持久去重、永不重投。
+  // response.ok 会把业务失败记成「已投递」,进而写入去重、永不重投。
+  //
+  // 断言的是**成功形状**而不是「不等于某个已知失败值」:接口尚未对着真实 docs 后端
+  // 验证过,`{"status":"0"}` 这种字符串型状态完全可能出现,只否定数字 0 会放它过去。
   if (result && typeof result === "object" && "status" in result) {
     const { status } = result;
-    if (typeof status === "number" && status !== 1) {
+    const ok = status === 1 || status === "1";
+    if (!ok) {
       const detail = result.msg ?? result.message;
-      throw new Error(
-        `Octo API ${path} rejected the comment (status=${status})${detail ? `: ${String(detail)}` : ""}`,
+      throw new DocCommentRejectedError(
+        `Octo API ${path} rejected the comment (status=${String(status)})${detail ? `: ${String(detail)}` : ""}`,
       );
     }
   }

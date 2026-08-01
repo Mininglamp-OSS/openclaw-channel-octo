@@ -1518,9 +1518,19 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   await extra.docTask.postComment(
                     "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
                   );
-                  extra.docTask.reportOutcome("notice-only");
+                  extra.docTask.reportTurn({
+                    finalDelivered: false,
+                    delivered: true,
+                    lost: false,
+                    noticed: true,
+                  });
                 } catch (postErr) {
-                  extra.docTask.reportOutcome("nothing");
+                  extra.docTask.reportTurn({
+                    finalDelivered: false,
+                    delivered: false,
+                    lost: false,
+                    noticed: false,
+                  });
                   log?.error?.(`octo: doc task conflict notice failed: ${String(postErr)}`);
                 }
               } else {
