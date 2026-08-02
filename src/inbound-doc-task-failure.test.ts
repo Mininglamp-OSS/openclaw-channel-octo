@@ -508,17 +508,19 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
   });
 
   it("附件先落地、随后 buffered 最终文本 POST 失败:不得借前一次成功冒充答复送达", async () => {
-    // P1 回归:空 final 先把附件 POST 成功并把回合级 finalDelivered 置真;finally
-    // 随后刷新 block 文本时 POST 失败。若 deliverFinalText 返回回合级旧值,失败的
-    // 这一次仍会报告 delivered:true,最终写去重且不留失败提示,正文永久静默丢失。
+    // P1 回归:附件先 POST 成功并把回合级 finalDelivered 置真;finally 随后刷新
+    // block 文本时 POST 失败。若 deliverFinalText 返回回合级旧值,失败的这一次仍会
+    // 报告 delivered:true,最终写去重且不留失败提示,正文永久静默丢失。
+    //
+    // 附件由独立的中间产出 payload 发出 —— 附件队列拆成 per-payload 之后,
+    // 「同一个 payload 的文本 + 附件」会合成一条评论一次发出,构不成两次 POST。
     installFetchStub();
     installRuntime(async (args) => {
-      const mediaUrls = [`${API}/f/diff.png`];
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/diff.png`] }, { kind: "tool" });
       await args.dispatcherOptions.deliver(
-        { text: "已按要求改好，正文说明如下", mediaUrls },
+        { text: "已按要求改好，正文说明如下" },
         { kind: "block" },
       );
-      await args.dispatcherOptions.deliver({ mediaUrls }, { kind: "final" });
     });
     const reports: Reported[] = [];
     const posted: string[] = [];
@@ -651,10 +653,15 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
     expect(reports).toEqual([report({ delivered: true, lost: true })]);
   });
 
-  it("失败进度帖遗留的附件被空 final 冲出去:附件要发,但不算最终答复", async () => {
-    // 失败的帖子**故意**不清队列(附件留给后续出站带走),于是后面那条空 final
-    // 发现 body 非空,压根走不到空 body 那道守卫,直接按 intent.final 打了标。
-    // 附件该发 —— 但它是别的 payload 的遗留物,不是这一条 final 自己的产出。
+  it("进度帖连同附件一起发失败:附件不顺延,后面的空 final 也不算最终答复", async () => {
+    // 曾经的 door 2:失败的帖子把附件留在回合级队列里,于是后面那条空 final 发现
+    // body 非空、压根走不到空 body 那道守卫,直接按 intent.final 打了标 —— 拿别人
+    // 失败帖的遗留物给自己背书。
+    //
+    // 队列拆成 per-payload 之后,附件跟着那次失败的投递一起作废(有 error 日志),
+    // 空 final 自己没有内容、引用的附件也从未落地,于是这一回合评论区什么都没有、
+    // 如实 report lost —— handler 补兜底通知并 release,允许重投。这是本方案明确
+    // 接受的代价:回合内不再有「失败附件顺延给后续帖子」的补救。
     installFetchStub();
     installRuntime(async (args) => {
       await args.dispatcherOptions.deliver(
@@ -674,8 +681,113 @@ describe("文档任务:回合只上报事实,不预先归纳成结论", () => {
       },
     });
 
-    expect(posted).toEqual([`[附件] ${API}/f/preview.png`]);
-    expect(reports).toEqual([report({ delivered: true, lost: true })]);
+    expect(posted).toEqual([]);
+    expect(reports).toEqual([report({ lost: true })]);
+  });
+
+  // --- 附件按 payload 归属:一次 POST 的 body 只装它自己的内容 ---
+  // 这一组钉的是「跨 payload 共享附件队列」被拆掉之后的两个方向。此前失败的 POST
+  // 会把附件留在回合级队列里,于是后来的 payload 可以拿别人的遗留物给自己的 final
+  // 背书(提升方向);而收紧认领资格时又极容易顺手打死「带着自己新附件的 final」
+  // (降级方向)。两个方向必须同时钉住。
+
+  it("带同一附件的 final 发失败后,同 URL 的收口 final 不得替它认领", async () => {
+    // dispatcher 的正常收口协议:media 先作为中间产出发,再由引用同一 URL 的 final
+    // 收口。当这一回合真正的答复(文本 + 同一附件)POST 失败时,那条收口自己什么都
+    // 没带 —— 它引用的附件从来没落地过,不能把这个回合说成有答复。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        { text: "已按要求改好:第 3 段已改写", mediaUrls: [`${API}/f/a.png`] },
+        { kind: "final" },
+      );
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/a.png`] }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async (text) => {
+        if (text.includes("已按要求改好")) throw new Error("docs API 413");
+        posted.push(text);
+      },
+    });
+
+    // 答复没发出去,收口也没有自己的内容可发:评论区应当什么都没有,
+    // 由 handler 补兜底通知并 release,而不是留一行光秃秃的附件加一条去重记录。
+    expect(posted).toEqual([]);
+    expect(reports).toEqual([report({ lost: true })]);
+  });
+
+  it("附件 final 发失败后,另一个新附件的 final 成功:仍算最终答复", async () => {
+    // 上一条的镜像。第二条 final 带的是它**自己**的新附件、而且确实发出去了,
+    // 那就是这一回合的最终产出。判成 false 会在正确答复下面补一句「没有给出
+    // 答复」并 release,用户照做就把改文档的任务再跑一遍。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/x.png`] }, { kind: "final" });
+      await args.dispatcherOptions.deliver({ mediaUrls: [`${API}/f/y.png`] }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+
+    await runDocTask(posted, {}, {
+      reports,
+      postComment: async (text) => {
+        if (text.includes("x.png")) throw new Error("docs API 503");
+        posted.push(text);
+      },
+    });
+
+    expect(posted).toEqual([`[附件] ${API}/f/y.png`]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true, lost: true })]);
+  });
+
+  it("block 文本自带附件:缓冲期间不丢,收尾时与文本合成一条评论发出", async () => {
+    // 拆掉共享队列之后新出现的路径:block 的文本被缓冲(还没 POST),它自己的附件
+    // 必须跟着一起等,并由接管这段缓冲的那次投递带出去。漏掉这一步的话,这一回合
+    // 附件一条都发不出去,而文本照常送达 —— report 说落地了,读者少了附件。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        { text: "已按要求改好", mediaUrls: [`${API}/f/b.png`] },
+        { kind: "block" },
+      );
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+    const errors: string[] = [];
+
+    await runDocTask(posted, {}, { reports, log: { error: (m: string) => { errors.push(m); } } });
+
+    expect(posted).toEqual([`已按要求改好\n\n[附件] ${API}/f/b.png`]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+    // 取走即消费:接管之后缓冲必须是空的,否则收尾会报「附件没人接管」。
+    expect(errors.filter((m) => m.includes("never delivered"))).toEqual([]);
+  });
+
+  it("block 附件 + 随后的 final 文本:附件必须由这条 final 带出去,不能随缓冲一起丢", async () => {
+    // final 会把缓冲文本清掉(它取代了那段草稿),所以缓冲里那些还没投递过的附件
+    // 也必须由它接管。漏掉的话收尾流程已经被 textSent 关掉,附件这一回合再没有
+    // 出口 —— 用户拿到最终答复,却少了它引用的图。
+    installFetchStub();
+    installRuntime(async (args) => {
+      await args.dispatcherOptions.deliver(
+        { text: "草稿:先看看这个", mediaUrls: [`${API}/f/c.png`] },
+        { kind: "block" },
+      );
+      await args.dispatcherOptions.deliver({ text: "最终答复:第 3 段已改写" }, { kind: "final" });
+    });
+    const reports: Reported[] = [];
+    const posted: string[] = [];
+    const errors: string[] = [];
+
+    await runDocTask(posted, {}, { reports, log: { error: (m: string) => { errors.push(m); } } });
+
+    expect(posted).toEqual([`最终答复:第 3 段已改写\n\n[附件] ${API}/f/c.png`]);
+    expect(reports).toEqual([report({ finalDelivered: true, delivered: true })]);
+    expect(errors.filter((m) => m.includes("never delivered"))).toEqual([]);
   });
 
   // --- 空转的收口不得降级 ---

@@ -2806,9 +2806,22 @@ export async function handleInboundMessage(params: {
   let docTaskLost = false; // 有非提示内容重试耗尽仍没发出去(仅供观测)
   let docTaskNoticed = false; // 发出过提示(道歉/超时/拒绝)
   const docTaskDeliveredMediaUrls = new Set<string>(); // 确实随评论 POST 成功的附件 URL
-  const docTaskMediaUrls: string[] = [];
   type DocTaskReplyIntent =
-    | { type: "output"; final?: boolean; mediaUrls?: readonly string[] }
+    | {
+        type: "output";
+        final?: boolean;
+        /**
+         * **这一次投递自己的**、尚未发出的附件。只有它进 body,也只有它能给这次的
+         * final 背书。回合级的附件队列已经拆掉:一次 POST 的 body 只装它自己的内容。
+         */
+        ownMedia?: readonly string[];
+        /**
+         * 这个 payload 引用到的全部附件(含本回合早先已经发出去的)。**不进 body**,
+         * 只用于「纯收口」的认养判定 —— dispatcher 会先把 media 作为中间产出发出去,
+         * 再用一条引用同一 URL 的空 final 收口,那种形态才是合法的最终产出。
+         */
+        referencedMedia?: readonly string[];
+      }
     | { type: "notice" };
   type DocTaskReplyResult = {
     outputDelivered: boolean;
@@ -2824,18 +2837,24 @@ export async function handleInboundMessage(params: {
    *
    * 反复出错的根源是把这个事实从 `intent.final` 这个**意图标志**加上当时队列里
    * 恰好有什么来推导 —— 而这两样都不知道「我这次实际发出去的 body 里装的是什么」。
-   * 于是同一个事实被七次写在不知情的地方:兜底道歉、进度文本、空转收口、别的
+   * 于是同一个事实被八次写在不知情的地方:兜底道歉、进度文本、空转收口、别的
    * payload 遗留的附件,都曾经冒充过最终答复,或者把一个真答复抹掉。
    *
-   * 现在改成从**实际投递的内容**判定:
+   * **前七次都是在补这个谓词,第八次(case D)才看清补不完的原因:附件放在跨
+   * payload 共享的回合级队列里,所以一次 POST 的 body 里可以装着别人的内容,
+   * 「这次投递了什么」这个问题本身就没法从 body 回答。** 队列已经拆掉 ——
+   * 每次投递只带 `intent.ownMedia`(自己刚产出、还没发过的附件),失败就丢掉、
+   * 不顺延给后面的帖子。于是下面这条规则可以只看这一次调用:
    *
    *   - 认领(claimsFinal):intent 是 final **且**这次带着自己的内容 —— 自己的
-   *     文本,或自己刚推进队列、还没发出去的附件。认领者按 POST 结果落定终态。
-   *   - 认养(adoptsDeliveredMedia):空收口没有自己的内容,但明确引用了本回合已经
+   *     文本,或自己的 `ownMedia`。认领者按这次 POST 的结果落定终态(成败都写)。
+   *   - 认养(adoptsDeliveredMedia):没有自己的内容可发,但明确引用了本回合已经
    *     投递成功的附件,且**本回合还没有任何 final 认领过**。这才是「纯附件产出被
    *     一条空 final 收尾」的合法形态。
-   *   - 其余一律不写:进度、提示、空转收口、以及那种「body 里全是别的 payload
-   *     遗留附件」的调用。它们如实返回回合已有的结论。
+   *   - 其余一律不写:进度、提示、空转收口。它们如实返回回合已有的结论。
+   *
+   * 「body 里全是别的 payload 遗留附件」这一类调用现在**不可表达**,不再需要单独
+   * 挡:body 只由 `ownText` + `ownMedia` 组成,别人的东西进不来。
    */
   const postDocTaskReply = async (
     content: string,
@@ -2843,17 +2862,14 @@ export async function handleInboundMessage(params: {
     intent: DocTaskReplyIntent = { type: "output" },
   ): Promise<DocTaskReplyResult> => {
     const ownText = content.trim();
-    // 这次 payload **自己**带来的、尚未发出的附件。队列里可能还压着别的 payload
-    // (尤其是 POST 失败的进度帖 —— 那里刻意不清队列)遗留的附件,那些不是这次的
-    // 内容,不能拿来给这次的 final 背书。
-    const ownPendingMedia =
-      intent.type === "output" && intent.mediaUrls
-        ? docTaskMediaUrls.filter((url) => intent.mediaUrls!.includes(url))
-        : [];
-    const claimsFinal =
-      intent.type === "output"
-      && intent.final === true
-      && (ownText.length > 0 || ownPendingMedia.length > 0);
+    // 这次投递自己的内容。**提示(notice)永远不带附件** —— 一句道歉后面挂着任务
+    // 产出是另一类事故,这里从类型上就取不到。
+    const ownMedia = intent.type === "output" ? [...(intent.ownMedia ?? [])] : [];
+    // 「这次带着自己的内容」不再需要单独写成条件:body 只由 ownText + ownMedia 组成,
+    // 所以 body 非空 ⟺ 这两样至少有一个非空。而 claimsFinal 只在空 body 提前返回
+    // **之后**才被读到,那里已经证明了这一点 —— 资格由实际要发的内容本身担保,不是
+    // 另写一个可能和 body 走偏的谓词。(变异测试发现原来那个子句已经恒真。)
+    const claimsFinal = intent.type === "output" && intent.final === true;
 
     /** 认领者落定终态。**回合级事实只在这里被写。** */
     const settleFinal = (delivered: boolean): DocTaskReplyResult => {
@@ -2868,21 +2884,16 @@ export async function handleInboundMessage(params: {
     });
 
     if (!docTask) return unchanged(false);
-    // 只读不清空:发失败就把附件留在队列里,交给本回合后续的出站(或兜底)再带出去。
-    // 先 splice 的话,一次失败的 POST 会把附件永久吞掉 —— 评论区既没答复也没附件。
-    // 提示与任务产出是两条语义通道:道歉不能顺手吞掉尚未投递成功的附件,否则一句
-    // 「处理失败」后面会挂着任务产出,而后续真正的答复反而再也拿不到这些附件。
-    const attachments = intent.type === "output" ? [...docTaskMediaUrls] : [];
-    // 允许「只有附件、没有文本」:agent 产出纯 media 的回合原先在这里无文本可发,
-    // 附件就永远卡在队列里 —— 评论区静默,任务却被当成功。
-    const body = [ownText, ...attachments.map((url) => `[附件] ${url}`)]
+    // 允许「只有附件、没有文本」:agent 产出纯 media 的回合在这里无文本可发,
+    // 不发的话评论区静默、任务却被当成功。
+    const body = [ownText, ...ownMedia.map((url) => `[附件] ${url}`)]
       .filter(Boolean)
       .join("\n\n");
     if (!body) {
-      // 纯收口:什么都没得发。只有在本回合还没有任何 final 认领过、且它引用的附件
-      // 确实都已投递成功时,才允许把那些附件认养为最终产出。
+      // 纯收口:自己没有内容可发。只有在本回合还没有任何 final 认领过、且它引用的
+      // 附件确实都已投递成功时,才允许把那些附件认养为最终产出。
       const referencedMedia =
-        intent.type === "output" && intent.final ? [...(intent.mediaUrls ?? [])] : [];
+        intent.type === "output" && intent.final ? [...(intent.referencedMedia ?? [])] : [];
       const adoptsDeliveredMedia =
         !docTaskFinalClaimed
         && referencedMedia.length > 0
@@ -2892,13 +2903,11 @@ export async function handleInboundMessage(params: {
     }
     try {
       await docTask.postComment(body, signal);
-      // 按「消费掉的条数」出队,而不是清空:await 期间 deliver 可能又推进了新附件。
-      docTaskMediaUrls.splice(0, attachments.length);
       docTaskDelivered = true;
       if (intent.type === "notice") {
         docTaskNoticed = true;
       } else {
-        for (const url of attachments) docTaskDeliveredMediaUrls.add(url);
+        for (const url of ownMedia) docTaskDeliveredMediaUrls.add(url);
       }
       statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
       if (claimsFinal) return settleFinal(true);
@@ -2909,6 +2918,12 @@ export async function handleInboundMessage(params: {
       if (intent.type === "output") docTaskLost = true;
       statusSink?.({ lastError: String(err) });
       log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
+      // 附件跟着这次投递一起作废,**不顺延**给本回合后续的帖子。顺延正是此前三个
+      // 阻塞缺陷的来源:遗留物会让后来的 payload 拿别人的产出给自己的 final 背书。
+      // 这一回合会如实 report lost,由 handler 补兜底通知并 release,允许重投。
+      if (ownMedia.length > 0) {
+        log?.error?.(`octo: doc task attachments dropped with the failed post (not carried over): ${ownMedia.join(", ")}`);
+      }
       // 认领者失败就必须落定为失败 —— 后来的更正答复发丢了,不能留着此前那次成功。
       if (claimsFinal) return settleFinal(false);
       return unchanged(false);
@@ -2941,7 +2956,22 @@ export async function handleInboundMessage(params: {
   const deliverBuffer = {
     lastText: null as string | null,
     textSent: false,
+    // 文档任务:被缓冲的 block payload 自己带的附件。文本被缓冲(还没 POST)时附件
+    // 也必须跟着等,否则这一回合它们一条都发不出去。**这不是回合级共享队列** ——
+    // 只有「尚未投递过的 payload」的内容会进来,任何已经 POST 过(成功或失败)的
+    // 附件都不会回流,所以别的投递拿不到它们。
+    docTaskMedia: [] as string[],
   };
+  /**
+   * 取走并清空缓冲里的附件,交给**接管这段缓冲**的那次投递(final 覆盖了缓冲文本,
+   * 或收尾把缓冲刷出去)。取走即消费,不会被第二次投递再拿到。
+   *
+   * 这些附件从未 POST 过 —— 它们属于文本被 dispatcher 自己覆盖/延后的 payload,
+   * 和「某次 POST 已经发生过之后遗留下来的东西」是两回事,后者才是那三个阻塞缺陷
+   * 的来源,而拆掉共享队列之后已经不可表达。
+   */
+  const takeBufferedDocTaskMedia = (): string[] =>
+    deliverBuffer.docTaskMedia.splice(0, deliverBuffer.docTaskMedia.length);
   const sentMediaUrls = new Set<string>();
   let userFacingFinalDelivered = false;
   let pendingToolWarningFinal: { text: string } | undefined;
@@ -2951,10 +2981,15 @@ export async function handleInboundMessage(params: {
   const resolveAndSendText = async (
     content: string,
     signal?: AbortSignal,
-    opts?: { final?: boolean },
+    opts?: { final?: boolean; ownMedia?: readonly string[]; referencedMedia?: readonly string[] },
   ): Promise<DocTaskReplyResult> => {
     if (docTask) {
-      return postDocTaskReply(content, signal, { type: "output", final: opts?.final });
+      return postDocTaskReply(content, signal, {
+        type: "output",
+        final: opts?.final,
+        ownMedia: opts?.ownMedia,
+        referencedMedia: opts?.referencedMedia,
+      });
     }
     let replyMentionUids: string[] = [];
     let replyMentionEntities: MentionEntity[] = [];
@@ -3078,6 +3113,7 @@ export async function handleInboundMessage(params: {
   const deliverFinalText = async (
     content: string,
     signal?: AbortSignal,
+    opts?: { ownMedia?: readonly string[]; referencedMedia?: readonly string[] },
   ): Promise<{ merged: boolean; delivered: boolean }> => {
     const hasPotentialMention = content.includes("@");
     if (
@@ -3092,7 +3128,11 @@ export async function handleInboundMessage(params: {
         return { merged: true, delivered: true };
       }
     }
-    const delivery = await resolveAndSendText(content, signal, { final: true });
+    const delivery = await resolveAndSendText(content, signal, {
+      final: true,
+      ownMedia: opts?.ownMedia,
+      referencedMedia: opts?.referencedMedia,
+    });
     return { merged: false, delivered: delivery.finalDelivered };
   };
 
@@ -3179,6 +3219,9 @@ export async function handleInboundMessage(params: {
 
           // --- Media: send immediately (no edit/forward issue) with dedup ---
           const outboundMediaUrls = resolveOutboundMediaUrls(payload);
+          // 文档任务:这一次 payload **自己**新产出的附件。只有它会进这次 POST 的
+          // body,也只有它能给这次的 final 背书 —— 回合级共享队列已经拆掉。
+          const docTaskOwnMedia: string[] = [];
           for (const mediaUrl of outboundMediaUrls) {
             if (sentMediaUrls.has(mediaUrl)) continue;
             if (docTask) {
@@ -3195,7 +3238,7 @@ export async function handleInboundMessage(params: {
                 );
                 continue;
               }
-              docTaskMediaUrls.push(mediaUrl);
+              docTaskOwnMedia.push(mediaUrl);
               sentMediaUrls.add(mediaUrl);
               log?.info?.(`octo: doc task media not sent to IM, attached to comment: ${mediaUrl}`);
               continue;
@@ -3219,15 +3262,21 @@ export async function handleInboundMessage(params: {
           // --- Text handling based on kind ---
           const content = payload.text?.trim() ?? "";
           if (!content && sentMediaUrls.size > 0) {
-            // 文档任务:附件此时还排在 docTaskMediaUrls 里,必须经出站收口发出去,
-            // 否则本回合一条评论都不会产生。
+            // 文档任务:附件必须经出站收口发出去,否则本回合一条评论都不会产生。
             if (docTask) {
               // 纯附件就是本回合 kind:"final" 的全部产出,和一段最终文本等价 ——
               // 不标 final 的话这个回合永远拿不到去重记录,重投会把文档改第二遍。
+              // `ownMedia` 为空(附件早先已发过)时这次就没有自己的内容,只能凭
+              // `referencedMedia` 走认养 —— 那才是 dispatcher 的空 final 收口协议。
               const delivery = await postDocTaskReply(
                 "",
                 AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-                { type: "output", final: kind === "final", mediaUrls: outboundMediaUrls },
+                {
+                  type: "output",
+                  final: kind === "final",
+                  ownMedia: docTaskOwnMedia,
+                  referencedMedia: outboundMediaUrls,
+                },
               );
               // 和下面的非文档分支一样置位:不置位的话本回合会被判成「没答复过」,
               // 走到 !replySucceeded 兜底,在已经发出附件评论之后再补一句道歉。
@@ -3247,7 +3296,10 @@ export async function handleInboundMessage(params: {
 
           if (kind === "tool") {
             // Verbose tool call output: send immediately
-            const delivery = await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+            const delivery = await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), {
+              ownMedia: docTaskOwnMedia,
+              referencedMedia: outboundMediaUrls,
+            });
             replySucceeded ||= delivery.outputDelivered;
             if (delivery.outputDelivered) {
               log?.info?.(`octo: [deliver] tool text sent (${content.length} chars)`);
@@ -3266,7 +3318,12 @@ export async function handleInboundMessage(params: {
               return;
             }
 
-            const delivered = await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+            // final 覆盖缓冲文本(下面就把它清掉),所以缓冲里那些还没投递过的附件
+            // 由这次 final 一并带出去 —— 否则它们会随缓冲一起被丢掉。
+            const delivered = await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), {
+              ownMedia: [...takeBufferedDocTaskMedia(), ...docTaskOwnMedia],
+              referencedMedia: outboundMediaUrls,
+            });
             replySucceeded ||= delivered.delivered;
             userFacingFinalDelivered = delivered.delivered;
             pendingToolWarningFinal = undefined;
@@ -3279,6 +3336,10 @@ export async function handleInboundMessage(params: {
           }
 
           // kind === "block" / anything else: buffer, send only once after dispatcher finishes
+          // 文本被缓冲就没有 POST 发生,这一条自己的附件必须跟着一起等 —— 否则本回合
+          // 它们一条都发不出去。文本是覆盖语义(只留最后一段),附件是累加:每段
+          // block 的附件都还没投递过,谁都不该被后一段挤掉。
+          if (docTask) deliverBuffer.docTaskMedia.push(...docTaskOwnMedia);
           deliverBuffer.lastText = content;
           log?.debug?.(`octo: [deliver-buffer] ${kind} text buffered (${content.length} chars)`);
         },
@@ -3314,7 +3375,11 @@ export async function handleInboundMessage(params: {
           const pending = pendingToolWarningFinal;
           pendingToolWarningFinal = undefined;
           try {
-            const delivered = await deliverFinalText(pending.text, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+            const delivered = await deliverFinalText(
+              pending.text,
+              AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+              { ownMedia: takeBufferedDocTaskMedia() },
+            );
             replySucceeded ||= delivered.delivered;
             userFacingFinalDelivered = delivered.delivered;
             log?.info?.(
@@ -3401,7 +3466,7 @@ export async function handleInboundMessage(params: {
           const delivery = await resolveAndSendText(
             bufferedText,
             AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-            { final: true },
+            { final: true, ownMedia: takeBufferedDocTaskMedia() },
           );
           replySucceeded ||= delivery.outputDelivered;
         } catch (sendErr) {
@@ -3438,6 +3503,7 @@ export async function handleInboundMessage(params: {
         const delivered = await deliverFinalText(
           deliverBuffer.lastText,
           AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+          { ownMedia: takeBufferedDocTaskMedia() },
         );
         replySucceeded ||= delivered.delivered;
         if (delivered.delivered) {
@@ -3446,6 +3512,11 @@ export async function handleInboundMessage(params: {
       } catch (finalSendErr) {
         log?.error?.(`octo: [deliver-buffer] final text send failed: ${String(finalSendErr)}`);
       }
+    }
+    // 缓冲里的附件没人接管(比如 onError 把缓冲文本清掉后只发了一句道歉)。
+    // 提示不夹带产出是刻意的,但静默丢弃不行 —— 至少让运维能看见。
+    if (deliverBuffer.docTaskMedia.length > 0) {
+      log?.error?.(`octo: doc task buffered attachments never delivered: ${takeBufferedDocTaskMedia().join(", ")}`);
     }
     clearInterval(typingInterval);
     // 波 B:收尾进度卡(终态帧 + 清理);fire-and-forget，不阻塞 dispatch 结束/会话释放。
