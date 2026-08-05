@@ -2726,6 +2726,16 @@ export async function handleInboundMessage(params: {
   let userFacingFinalDelivered = false;
   let pendingToolWarningFinal: { text: string } | undefined;
   let deliveryErrorOccurred = false;
+  /**
+   * 本轮 dispatch 是否真的失败过(供进度卡终态)。`replySucceeded === false` 混了两种状态:
+   * 「没有可投递的 final text」(agent 可能已用 message 工具投递,卡片不该报错)和「这一轮
+   * 真的失败了」。只有后者置这个标志,finalizeCard 据此拒绝用工具投递证据洗白失败。
+   *
+   * 刻意只是布尔、不带原因文本:错误串会渲染进群内全员可见的卡片,把 dispatcher 的内部
+   * 措辞(`dispatch rejected: Error: …`)推到用户面前,而用户可见文案应由既有的 curated
+   * 字符串决定。参见 card-progress.ts 的 succeededOrDeliveredByTool。
+   */
+  let dispatchFailed = false;
 
   // --- Shared helper: resolve mentions and send text ---
   const resolveAndSendText = async (content: string, signal?: AbortSignal): Promise<SendMessageResult | undefined> => {
@@ -2958,6 +2968,7 @@ export async function handleInboundMessage(params: {
               });
               sentMediaUrls.add(mediaUrl);
             } catch (err) {
+              dispatchFailed = true;
               log?.error?.(`octo: media send failed for ${mediaUrl}: ${String(err)}`);
             }
           }
@@ -3015,6 +3026,7 @@ export async function handleInboundMessage(params: {
           deliverBuffer.lastText = null;
           deliverBuffer.textSent = true;
           deliveryErrorOccurred = true;
+          dispatchFailed = true;
           try {
             await sendMessage({
               apiUrl,
@@ -3053,6 +3065,7 @@ export async function handleInboundMessage(params: {
             );
             return { visibleReplySent: true };
           } catch (err) {
+            dispatchFailed = true;
             log?.error?.(
               `octo: [deliver] tool warning fallback send failed: ${String(err)}`,
             );
@@ -3077,6 +3090,7 @@ export async function handleInboundMessage(params: {
     // out of scope for #75 (see scope-note comment above timeoutError).
     if (err === timeoutError) {
       clearInterval(typingInterval);
+      dispatchFailed = true;
       log?.warn?.(
         `octo: dispatch hung past ${dispatchTimeoutMs}ms, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
       );
@@ -3099,6 +3113,7 @@ export async function handleInboundMessage(params: {
         log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
       }
     } else if (!deliveryErrorOccurred && !replySucceeded) {
+      dispatchFailed = true;
       // Dispatch itself rejected (e.g. non_deliverable_terminal_turn) and the
       // onError callback was never invoked, AND no visible reply has been
       // delivered to the user yet, so no fallback has been sent yet.
@@ -3167,13 +3182,17 @@ export async function handleInboundMessage(params: {
         replySucceeded = true;
         log?.info?.(`octo: [deliver-buffer] fallback text sent (${deliverBuffer.lastText.length} chars)`);
       } catch (finalSendErr) {
+        dispatchFailed = true;
         log?.error?.(`octo: [deliver-buffer] final text send failed: ${String(finalSendErr)}`);
       }
     }
     clearInterval(typingInterval);
     // 波 B:收尾进度卡(终态帧 + 清理);fire-and-forget，不阻塞 dispatch 结束/会话释放。
     // finalizeCard 内部同步删 Map(立即释放关联),终态 edit 后台异步发送。
-    void finalizeCard(route.sessionKey, { success: replySucceeded });
+    void finalizeCard(route.sessionKey, {
+      success: replySucceeded,
+      ...(!replySucceeded && dispatchFailed ? { failed: true } : {}),
+    });
     // Safety net: clean up pending inbound context in case the hook didn't fire
     pendingInboundContext.delete(route.sessionKey);
 

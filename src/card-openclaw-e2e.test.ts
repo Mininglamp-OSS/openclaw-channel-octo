@@ -383,3 +383,50 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
     }
   }, 120_000);
 });
+
+/**
+ * Regression guard for the "every step green but the card says Failed" report.
+ *
+ * The agent delivers its answer with the `message` tool and ends the turn with
+ * no final text. OpenClaw scores that attempt as a success (it counts messaging
+ * delivery evidence in resolveAttemptTrajectoryTerminal), so dispatch resolves
+ * normally — but the plugin's deliver callback never fires, `replySucceeded`
+ * stays false, and finalizeCard drives the card to phase=error.
+ */
+suite("OpenClaw messaging-tool delivery E2E", () => {
+  it("does not mark the card failed when the answer was delivered by the message tool", async () => {
+    expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
+    const marker = randomUUID();
+    const sessionKey = `agent:main:octo-host-e2e:${marker}`;
+
+    await callBridge({ kind: "configure-reasoning", marker, targetUid, sessionKey });
+    const startedAtMs = Date.now();
+    const accepted = await callBridge({ kind: "tool-delivery", marker, targetUid, sessionKey });
+    expect(accepted.kind).toBe("tool-delivery");
+
+    const completed = await waitForEvidence(
+      marker,
+      sessionKey,
+      startedAtMs,
+      (evidence) => evidence.toolCalls.some((call) => call.name === "message") &&
+        evidence.cards.some((card) => card.state === "completed" || card.state === "error"),
+      90_000,
+    );
+
+    const names = completed.toolCalls.map((call) => call.name);
+    expect(names).toEqual(["exec", "message"]);
+    expect(completed.toolCalls[1]?.arguments).toMatchObject({
+      action: "send",
+      target: `user:${targetUid}`,
+    });
+
+    const card = completed.cards.at(-1);
+    const text = cardText(card);
+    // Both tool steps ran clean, so the card must not claim the run failed.
+    expect(text).toContain("exec");
+    expect(text).toContain("message");
+    expect(text).not.toContain("Generation failed");
+    expect(text).not.toContain("Reasoning was interrupted");
+    expect(card?.state).toBe("completed");
+  }, 150_000);
+});
