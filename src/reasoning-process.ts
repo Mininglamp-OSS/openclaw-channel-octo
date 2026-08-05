@@ -50,7 +50,32 @@ export interface ReasoningProcessData {
   errorMessage?: string;
 }
 
-const FALLBACK_THOUGHT = "Thinking through…";
+/**
+ * OpenClaw substitutes this exact sentence when a provider returns a *signed* reasoning block whose
+ * text is empty — `extractAssistantThinking` in `embedded-agent-utils`, verified against OpenClaw
+ * 2026.6.9. It is a host diagnostic, not prose meant for a channel-visible card.
+ *
+ * KNOWN FRAGILITY: recognising this state depends on matching a hardcoded English sentence in the
+ * host. An OpenClaw upgrade that rewords it makes this check silently stop matching, and the state
+ * degrades to `none` ("no reasoning content") — our own tests use our own constant and will NOT go
+ * red. Re-check this string when upgrading OpenClaw. The durable fix belongs upstream: a structured
+ * flag on the event rather than a sentence.
+ */
+const HOST_NO_SUMMARY_PLACEHOLDER = "Native reasoning was produced; no summary text was returned.";
+
+/**
+ * The model demonstrably reasoned but returned no readable text. Reached via the host placeholder
+ * above: OpenAI Responses when `summary: "auto"` yields nothing, and Anthropic `redacted_thinking`.
+ */
+const NO_SUMMARY_THOUGHT = "Reasoned without a visible summary";
+
+/**
+ * Our own guard withheld the text. Points at the redaction rules rather than at the content on
+ * purpose: the guard is fail-safe, so a hit does not prove a credential was present — long hex,
+ * git SHAs and other high-entropy strings trip it too. This is the only state that tells an
+ * operator where to look, so it must stay distinguishable from NO_SUMMARY_THOUGHT.
+ */
+const REDACTED_THOUGHT = "Reasoning hidden — matched a redaction rule";
 const THOUGHT_MAX = 280;
 const TOOL_NAME_MAX = 80;
 const MAX_RENDERED_PHASES = 6;
@@ -194,20 +219,49 @@ export function summarizeToolResult(toolName: string | undefined, result: unknow
   return "completed";
 }
 
+/**
+ * Why a thought line reads the way it does. These four used to collapse into one string, so a
+ * reader could not tell "the model did not reason" from "we withheld what it said" — and the second
+ * is the only one that points at something an operator can act on.
+ */
+export type ReasoningThoughtKind = "text" | "none" | "no-summary" | "redacted";
+
+export interface ReasoningThought {
+  kind: ReasoningThoughtKind;
+  /** Display string; empty for `none`, where no thought line is rendered at all. */
+  text: string;
+}
+
 /** Reasoning lane text is visible to channel members, so fail closed on protected/secret shapes. */
-export function sanitizeReasoningThought(text: string | undefined): string {
-  if (!text) return FALLBACK_THOUGHT;
+export function resolveReasoningThought(text: string | undefined): ReasoningThought {
+  if (!text) return { kind: "none", text: "" };
   let normalized = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (!normalized ||
-      normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
+  // Whitespace-only input carries no reasoning; it is not something we withheld.
+  if (!normalized) return { kind: "none", text: "" };
+  if (normalized === HOST_NO_SUMMARY_PLACEHOLDER) {
+    return { kind: "no-summary", text: NO_SUMMARY_THOUGHT };
+  }
+  if (normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
       normalized.includes("<<<END_OPENCLAW_INTERNAL_CONTEXT>>>")) {
-    return FALLBACK_THOUGHT;
+    return { kind: "redacted", text: REDACTED_THOUGHT };
   }
   normalized = reduceUrlsInText(normalized).replace(/\s+/g, " ").trim();
-  if (!normalized || isSensitive(normalized, true)) return FALLBACK_THOUGHT;
-  return normalized.length > THOUGHT_MAX ? normalized.slice(0, THOUGHT_MAX) + "…" : normalized;
+  // Empty after URL reduction means the whole thought was a URL we downgraded away: withheld, not
+  // absent, so it stays distinguishable from `none`.
+  if (!normalized || isSensitive(normalized, true)) {
+    return { kind: "redacted", text: REDACTED_THOUGHT };
+  }
+  return {
+    kind: "text",
+    text: normalized.length > THOUGHT_MAX ? normalized.slice(0, THOUGHT_MAX) + "…" : normalized,
+  };
+}
+
+/** Display string for a captured thought. See resolveReasoningThought for the classification. */
+export function sanitizeReasoningThought(text: string | undefined): string {
+  return resolveReasoningThought(text).text;
 }
 
 /**
@@ -216,15 +270,15 @@ export function sanitizeReasoningThought(text: string | undefined): string {
  * only mutates while its model call streams, so cache per step and re-sanitize on change. Keyed by
  * the step object, so entries die with the card entry.
  */
-const sanitizedThoughts = new WeakMap<CardStep, { raw: string; clean: string }>();
+const sanitizedThoughts = new WeakMap<CardStep, { raw: string; resolved: ReasoningThought }>();
 
 function cachedThought(step: CardStep): string {
   const raw = step.thought ?? "";
   const cached = sanitizedThoughts.get(step);
-  if (cached && cached.raw === raw) return cached.clean;
-  const clean = sanitizeReasoningThought(step.thought);
-  sanitizedThoughts.set(step, { raw, clean });
-  return clean;
+  if (cached && cached.raw === raw) return cached.resolved.text;
+  const resolved = resolveReasoningThought(step.thought);
+  sanitizedThoughts.set(step, { raw, resolved });
+  return resolved.text;
 }
 
 function safeToolName(tool: string): string {
@@ -275,12 +329,16 @@ function phasesFromSteps(
       continue;
     }
     if (!current) {
-      current = { thought: FALLBACK_THOUGHT, actions: [] };
+      // Actions with no preceding model call: structural, not a reasoning state. An empty thought
+      // renders no thought line rather than implying a thought we never had.
+      current = { thought: "", actions: [] };
       phases.push(current);
     }
     current.actions.push(actionFromStep(step));
   }
-  if (phases.length === 0) phases.push({ thought: FALLBACK_THOUGHT, actions: [] });
+  // No steps at all. Note this phase has no actions, so buildReasoningProcessWireData filters it
+  // out regardless — it is not what keeps the Model A first frame from being deferred.
+  if (phases.length === 0) phases.push({ thought: "", actions: [] });
   if (opts.synthesizeEmptyActions === false) return phases;
   const thinkingSteps = steps.filter((step) => step.tool === "__thinking__");
   for (let index = 0; index < phases.length; index++) {
@@ -428,7 +486,9 @@ function phaseBlock(phase: ReasoningProcessPhase, first: boolean): Record<string
     spacing: first ? "None" : "Large",
     separator: !first,
     items: [
-      textBlock(phase.thought, { size: "Small", spacing: "None" }),
+      // An empty thought means there is nothing to say about this phase's reasoning; render the
+      // actions alone rather than an empty line.
+      ...(phase.thought ? [textBlock(phase.thought, { size: "Small", spacing: "None" })] : []),
       {
         type: "Container",
         style: "emphasis",
@@ -442,7 +502,7 @@ function phaseBlock(phase: ReasoningProcessPhase, first: boolean): Record<string
 function plainText(data: ReasoningProcessData): string {
   const lines = [`${data.statusLabel} · ${data.timerText}`];
   for (const phase of data.phases) {
-    lines.push(phase.thought);
+    if (phase.thought) lines.push(phase.thought);
     for (const action of phase.actions) lines.push(`${action.tool} · ${action.detail}`);
   }
   if (data.progressText) lines.push(data.progressText);

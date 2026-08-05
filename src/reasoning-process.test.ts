@@ -3,6 +3,7 @@ import {
   buildReasoningProcessWireData,
   buildReasoningProcessData,
   renderReasoningProcessCard,
+  resolveReasoningThought,
   sanitizeReasoningThought,
   selectReasoningProcessTemplate,
   summarizeToolResult,
@@ -119,13 +120,15 @@ describe("ai.reasoning-process successor-compatible contract", () => {
     });
   });
 
-  it("keeps every phase schema-valid when reasoning text or actions are unavailable", () => {
+  it("renders actions with no thought line when a phase has no model call behind it", () => {
     const data = buildReasoningProcessData(state({
       steps: [{ tool: "read", status: "running", summary: "/work/README.md" }],
     }));
 
     expect(data.phases).toHaveLength(1);
-    expect(data.phases[0]?.thought.length).toBeGreaterThan(0);
+    // Structural, not a reasoning state: there was no model call, so claiming a thought here would
+    // be inventing one.
+    expect(data.phases[0]?.thought).toBe("");
     expect(data.phases[0]?.actions).toEqual([{
       tool: "read",
       detail: "/work/README.md",
@@ -399,11 +402,62 @@ describe("reasoning detail sanitization", () => {
 
   it("redacts secret-shaped or protected internal reasoning and bounds visible text", () => {
     expect(sanitizeReasoningThought("Authorization: Bearer abcdefghijklmnop"))
-      .toBe("Thinking through…");
+      .toBe("Reasoning hidden — matched a redaction rule");
     expect(sanitizeReasoningThought(
       "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>> private completion event",
-    )).toBe("Thinking through…");
+    )).toBe("Reasoning hidden — matched a redaction rule");
     expect(sanitizeReasoningThought("x".repeat(600)).length).toBeLessThanOrEqual(281);
+  });
+
+  /**
+   * The four outcomes used to collapse into one string. "Redacted" is the only one that tells an
+   * operator where to look, so it must never be confusable with "the model produced nothing".
+   */
+  it("classifies the four thought outcomes distinguishably", () => {
+    expect(resolveReasoningThought("Checking the reducer.")).toEqual({
+      kind: "text",
+      text: "Checking the reducer.",
+    });
+    expect(resolveReasoningThought(undefined)).toEqual({ kind: "none", text: "" });
+    expect(resolveReasoningThought("   ")).toEqual({ kind: "none", text: "" });
+    // Verbatim host placeholder: OpenClaw emits this for a signed reasoning block with empty text
+    // (OpenAI Responses with no summary, Anthropic redacted_thinking).
+    expect(resolveReasoningThought("Native reasoning was produced; no summary text was returned."))
+      .toEqual({ kind: "no-summary", text: "Reasoned without a visible summary" });
+    expect(resolveReasoningThought("Authorization: Bearer abcdefghijklmnop")).toEqual({
+      kind: "redacted",
+      text: "Reasoning hidden — matched a redaction rule",
+    });
+    // A thought whose only content is an unparseable URI is erased by URL reduction. Withheld, not
+    // absent — a parseable one keeps its registrable domain and stays `text`.
+    expect(resolveReasoningThought("ftp://:::/").kind).toBe("redacted");
+    expect(resolveReasoningThought("https://internal-admin.corp.example.com/reset?u=1")).toEqual({
+      kind: "text",
+      text: "https://example.com",
+    });
+  });
+
+  it("never renders the host's own diagnostic sentence onto a card", () => {
+    const { card, plain } = renderReasoningProcessCard(state({
+      steps: [
+        {
+          tool: "__thinking__",
+          status: "done",
+          modelCallId: "call-1",
+          thought: "Native reasoning was produced; no summary text was returned.",
+        },
+        { tool: "exec", status: "done", toolCallId: "tool-1", summary: "npm" },
+      ],
+    }), {
+      elements: new Set(["TextBlock", "Container", "ColumnSet", "ActionSet"]),
+      actions: new Set(["Action.ToggleVisibility"]),
+      maxNodes: 200,
+    });
+
+    const json = JSON.stringify(card);
+    expect(json).not.toContain("Native reasoning was produced");
+    expect(plain).not.toContain("Native reasoning was produced");
+    expect(json).toContain("Reasoned without a visible summary");
   });
 
   it("reduces scheme-less credentials and host paths before rendering reasoning text", () => {
@@ -436,7 +490,7 @@ describe("reasoning detail sanitization", () => {
 
     step.thought = "Checking the reducer. Authorization: Bearer abcdefghijklmnop";
     expect(buildReasoningProcessData(state({ steps })).phases[0]?.thought)
-      .toBe("Thinking through…");
+      .toBe("Reasoning hidden — matched a redaction rule");
 
     step.thought = "Checking the reducer again.";
     expect(buildReasoningProcessData(state({ steps })).phases[0]?.thought)
