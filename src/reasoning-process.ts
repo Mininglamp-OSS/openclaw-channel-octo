@@ -326,7 +326,14 @@ function buildReasoningProcessDataWithPhases(
   const toolCount = state.steps.filter((step) =>
     step.tool !== "__thinking__" && step.tool !== SUBAGENT_WAIT_STEP_TOOL).length;
   const active = mapped === "reasoning" || mapped === "answering";
-  const errorMessage = sanitizeErrorText(state.errorText) ||
+  // The failure reason must ride in an always-visible field. The error block lives inside the
+  // collapsible trace, and for Model A the server template owns the layout — so hiding the trace
+  // by default would bury the reason on both renderers unless the header carries it. This mirrors
+  // renderProgressCard's header (`⚠️ Interrupted: <detail>` / `⏱️ Wait timed out`), including its
+  // ERROR_MAX cap, which sanitizeErrorText already applies.
+  const failureDetail = sanitizeErrorText(state.errorText);
+  const failureLabel = state.phase === "expired" ? "Wait timed out" : "Interrupted";
+  const errorMessage = failureDetail ||
     (state.phase === "expired"
       ? "Timed out waiting for the background task."
       : "Reasoning was interrupted. Completed steps were preserved.");
@@ -346,7 +353,7 @@ function buildReasoningProcessDataWithPhases(
     timerText: mapped === "reasoning" ? "Reasoning…"
       : mapped === "answering" ? "Writing the answer…"
         : mapped === "stopped" ? `${elapsed} · stopped at phase ${phases.length}`
-          : mapped === "error" ? "Interrupted"
+          : mapped === "error" ? (failureDetail ? `${failureLabel} · ${failureDetail}` : failureLabel)
             : `${elapsed} · ${phaseCount(phases.length)} · ${toolCallCount(toolCount)}`,
     // Every terminal state collapses (done/stopped/error/expired), matching renderProgressCard:
     // a settled card is a summary, and collapsedSummary tells the reader to open it for the steps.
@@ -355,7 +362,7 @@ function buildReasoningProcessDataWithPhases(
     traceCollapsed: !active,
     collapsedSummary: mapped === "answering" ? "Reasoning complete · answer in progress"
       : mapped === "stopped" ? `Kept ${phaseCount(phases.length)} from before the stop`
-        : mapped === "error" ? "Interrupted · open to see the steps so far"
+        : mapped === "error" ? `${failureLabel} · open to see the steps so far`
           : mapped === "completed" ? `${elapsed} · trace collapsed`
             : "Reasoning in progress · open to follow along",
     phases,
@@ -437,6 +444,14 @@ function plainText(data: ReasoningProcessData): string {
   return lines.join("\n") || PROGRESS_CARD_PLACEHOLDER;
 }
 
+/**
+ * Glyph for the collapsed summary line. A terminal card is collapsed by default, so this glyph is
+ * the default presentation of the outcome — a hardcoded `✓` would badge a failed run as successful.
+ */
+function collapsedGlyph(state: ReasoningProcessState): string {
+  return state === "completed" ? "✓" : state === "error" || state === "stopped" ? "⚠" : "◌";
+}
+
 /** Render the local toggle-only variant of the shared Registry data shape. */
 export function renderReasoningProcessCard(
   state: CardProgressState,
@@ -504,7 +519,7 @@ export function renderReasoningProcessCard(
       id: "collapsed_panel",
       isVisible: canToggle ? data.traceCollapsed : false,
       spacing: "Medium",
-      items: [textBlock(`✓  ${data.collapsedSummary}`, { size: "Small", isSubtle: true, spacing: "None" })],
+      items: [textBlock(`${collapsedGlyph(data.state)}  ${data.collapsedSummary}`, { size: "Small", isSubtle: true, spacing: "None" })],
     },
   ];
   if (canToggle) {
