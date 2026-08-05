@@ -78,11 +78,48 @@ function scriptedReply(body) {
   const allText = messages.map((message) => contentText(message?.content)).join("\n");
   const marker = allText.match(/(?:CHILD|PARENT)_E2E_OK:([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/FILES_E2E_WORKFLOW:([0-9a-f-]{36})/i)?.[1] ??
+    allText.match(/TOOL_DELIVERY_E2E:([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/OpenClaw host E2E marker: ([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/Ordinary user follow-up for ([0-9a-f-]{36})/i)?.[1];
   if (!marker) return { text: "E2E_SCRIPT_ERROR: missing marker" };
 
   const toolMessages = messages.filter((message) => message?.role === "tool");
+
+  // Reproduces the "every step green but the card says Failed" report: the agent
+  // delivers its answer through the `message` tool and ends the turn with no
+  // final text. OpenClaw scores this attempt as success (messaging delivery
+  // evidence), while the Octo plugin never sees a deliver callback.
+  if (allText.includes(`TOOL_DELIVERY_E2E:${marker}`)) {
+    const target = allText.match(/TOOL_DELIVERY_TARGET=(\S+)/)?.[1] ?? "";
+    if (toolMessages.length === 0) {
+      return {
+        tool: "exec",
+        // Runs long enough to clear FLUSH_DEBOUNCE_MS so the progress card is
+        // actually sent before the turn finalizes — same as a real curl step.
+        arguments: {
+          command: "sleep 2 && printf TOOL_DELIVERY_PREFLIGHT_OK",
+          yieldMs: 5_000,
+          timeout: 15,
+          background: false,
+        },
+        reasoning: "Check the environment before answering.",
+        delayMs: 1_200,
+      };
+    }
+    if (toolMessages.length === 1) {
+      return {
+        tool: "message",
+        arguments: {
+          action: "send",
+          target,
+          message: `TOOL_DELIVERY_E2E_SENT:${marker}`,
+        },
+        reasoning: "Deliver the answer through the messaging tool.",
+      };
+    }
+    // Terminal turn with no assistant text at all.
+    return { text: "", reasoning: "The answer is already delivered." };
+  }
 
   if (allText.includes(`FILES_E2E_WORKFLOW:${marker}`)) {
     const workDir = `/tmp/octo-realistic-e2e/${marker}`;
@@ -307,8 +344,18 @@ function resolveAccountId(config, requested) {
   return first;
 }
 
-function buildPrompt(kind, marker, childDelaySeconds) {
+function buildPrompt(kind, marker, childDelaySeconds, targetUid) {
   if (kind === "configure-reasoning") return "/reasoning stream";
+  if (kind === "tool-delivery") {
+    return [
+      `TOOL_DELIVERY_E2E:${marker}.`,
+      `TOOL_DELIVERY_TARGET=user:${targetUid}`,
+      "First call exec exactly once with command=\"printf TOOL_DELIVERY_PREFLIGHT_OK\", yieldMs=1000, timeout=10, background=false.",
+      `After exec succeeds, call message exactly once with action="send", target="user:${targetUid}",`,
+      `message="TOOL_DELIVERY_E2E_SENT:${marker}".`,
+      "The message tool already delivered the answer, so end the turn with no final text at all.",
+    ].join(" ");
+  }
   if (kind === "followup") {
     return `Ordinary user follow-up for ${marker}. Do not call tools. Reply exactly FOLLOWUP_E2E_OK:${marker}`;
   }
@@ -361,7 +408,7 @@ export default {
     const runRequest = async (params) => {
       try {
         const kind = params.kind === "followup" || params.kind === "configure-reasoning" ||
-          params.kind === "file-tools"
+          params.kind === "file-tools" || params.kind === "tool-delivery"
           ? params.kind
           : "spawn";
         const marker = requiredString(params, "marker");
@@ -397,7 +444,7 @@ export default {
             timestamp: Math.floor(now / 1000),
             payload: {
               type: MessageType.Text,
-              content: buildPrompt(kind, marker, delay),
+              content: buildPrompt(kind, marker, delay, targetUid),
             },
           },
           groupHistories: new Map(),

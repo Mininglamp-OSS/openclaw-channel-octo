@@ -33,7 +33,27 @@ function messageText(message) {
     .join("\n");
 }
 
+/**
+ * Resolve this session's transcript from the session store. The content-based
+ * scan below is a fallback: an unrelated live session in the same container can
+ * mention the marker (for example while someone reads these very logs), and the
+ * scan would then pick the wrong file.
+ */
+function transcriptFromSessionStore() {
+  try {
+    const store = JSON.parse(fs.readFileSync(
+      "/root/.openclaw-dev/agents/main/sessions/sessions.json", "utf8"));
+    const file = store[sessionKey]?.sessionFile;
+    if (typeof file !== "string" || !fs.existsSync(file)) return undefined;
+    return { file, rows: readJsonLines(file) };
+  } catch {
+    return undefined;
+  }
+}
+
 function findParentTranscript() {
+  const fromStore = transcriptFromSessionStore();
+  if (fromStore) return fromStore;
   const dir = "/root/.openclaw-dev/agents/main/sessions";
   let files = [];
   try {
@@ -47,7 +67,8 @@ function findParentTranscript() {
     const rows = readJsonLines(file);
     const serialized = JSON.stringify(rows);
     if (serialized.includes(marker) &&
-        (serialized.includes("sessions_yield") || serialized.includes("FILES_E2E_WORKFLOW"))) {
+        (serialized.includes("sessions_yield") || serialized.includes("FILES_E2E_WORKFLOW") ||
+          serialized.includes("TOOL_DELIVERY_E2E"))) {
       return { file, rows };
     }
   }

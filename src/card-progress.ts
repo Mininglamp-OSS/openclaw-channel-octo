@@ -35,6 +35,8 @@ import {
   summarizeToolResult,
 } from "./reasoning-process.js";
 import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.js";
+import { collapseParentScope, parentGroupOf, resolveOutboundTarget } from "./target.js";
+import { getKnownGroupIds } from "./group-md.js";
 import type { ReasoningCardTemplateMode } from "./config-schema.js";
 
 /** dispatch 侧登记的发送上下文。 */
@@ -100,6 +102,16 @@ interface CardEntry {
   nextCardSeq: number;
   /** Stable for every frame, including paused continuation runs. */
   reasoningId?: string;
+  /**
+   * `message` 工具调用中,目标已确认就是本卡频道的那些 toolCallId。before_tool_call 记录
+   * (只有它带 params),after_tool_call 用成功结果兑现成 `deliveredByTool`。
+   */
+  pendingMessageToolCallIds?: Set<string>;
+  /**
+   * 本 run 已通过 `message` 工具向本卡频道成功投递过内容。等价于 OpenClaw core 的
+   * messaging delivery evidence,`finalizeCard` 据此不把这类 turn 误判为失败。
+   */
+  deliveredByTool?: boolean;
 }
 
 type CachedCardProfile = {
@@ -755,6 +767,11 @@ async function editTrackedCardState(
   }
 }
 
+/**
+ * lifecycle 驱动的 paused 卡收尾。这里**不看**投递证据,与 finalizeCard /
+ * finalizeOrphanedPausedCard 有意不对称:`end` 分支已由 host 明确判定为 done,`error` 分支带着
+ * 真实错误串 —— 两者都不存在「replySucceeded 为 false 但其实交付了」那种歧义,证据无从发挥。
+ */
 function finishPausedCard(
   sessionKey: string,
   entry: CardEntry,
@@ -807,8 +824,8 @@ function markCardPaused(sessionKey: string, runId?: string, expectedEntry?: Card
  */
 async function finalizeOrphanedPausedCard(
   sessionKey: string,
-  opts: { success: boolean; errorText?: string },
-  owner: { identity: string; runId?: string },
+  opts: { success: boolean; errorText?: string; failed?: boolean },
+  owner: { identity: string; runId?: string; deliveredByTool?: boolean },
 ): Promise<void> {
   const paused = pausedCards.get(sessionKey);
   if (!paused || paused.skip || !paused.messageId) return;
@@ -819,7 +836,11 @@ async function finalizeOrphanedPausedCard(
   // run 归属 fail-closed:只有本 paused 流程的 run(同 run resume)可收尾;缺 runId 或与
   // pausedFromRunId 不符(等待期间的无关 dispatch)→ 不接管,留给真正的 continuation / TTL。
   if (!owner.runId || paused.pausedFromRunId !== owner.runId) return;
-  const phase = opts.success ? "done" : "error";
+  // 交付证据取自**本次收尾的 run**(owner),不是停放在 pausedCards 里的旧 entry —— 后者的
+  // deliveredByTool 属于 yield 之前那一轮,拿它判定会把本轮的失败洗成成功。
+  const phase = succeededOrDeliveredByTool({ deliveredByTool: owner.deliveredByTool }, opts)
+    ? "done"
+    : "error";
   await editTrackedCardState(
     sessionKey,
     paused,
@@ -831,12 +852,30 @@ async function finalizeOrphanedPausedCard(
 }
 
 /**
+ * `replySucceeded` 只在 reply dispatcher 的 deliver 回调里置真,因此 agent 用 `message`
+ * 工具直接投递、turn 结束又没有 final text 时它恒为 false —— 但这一轮其实交付了。补上工具
+ * 投递证据,避免把「每步都绿」的成功 turn 渲染成「⚠️ Interrupted」。
+ *
+ * 失败优先:`failed`(dispatch 真的失败过)或显式 errorText 都会否决证据。core 的
+ * resolveAttemptTrajectoryTerminal 同样让 promptError 短路在 delivery-evidence 之前 ——
+ * 证据只用来判定「空 turn 是否算交付」,从不用来覆盖 error 终态。
+ */
+function succeededOrDeliveredByTool(
+  evidence: { deliveredByTool?: boolean },
+  opts: { success: boolean; errorText?: string; failed?: boolean },
+): boolean {
+  if (opts.success) return true;
+  if (opts.failed || opts.errorText) return false;
+  return evidence.deliveredByTool === true;
+}
+
+/**
  * dispatch `finally` 收尾:完成/失败时清理；yield 时保留原卡供 continuation 更新。
  * 幂等:未登记或没发过占位卡则仅清理。
  */
 export async function finalizeCard(
   sessionKey: string,
-  opts: { success: boolean; errorText?: string } = { success: true },
+  opts: { success: boolean; errorText?: string; failed?: boolean } = { success: true },
 ): Promise<void> {
   const entry = cards.get(sessionKey);
   // 没登记 entry → 无 identity/runId 可校验,fail-closed:不碰 pausedCards(sessionKey 碰撞时
@@ -861,6 +900,9 @@ export async function finalizeCard(
     cards.delete(sessionKey);
     // 没发出 messageId 的懒卡没有可更新对象，不能长期滞留在 pausedCards。
     if (retainForContinuation && !entry.skip && entry.messageId) {
+      // 证据是 per-run 的事实。entry 从这里开始跨 run 存活,留着会被后续 run 误读。
+      entry.deliveredByTool = undefined;
+      entry.pendingMessageToolCallIds = undefined;
       pausedCards.set(sessionKey, entry);
       schedulePausedCardExpiry(sessionKey, entry);
     }
@@ -872,7 +914,11 @@ export async function finalizeCard(
     // messageId),真正可见的卡还在 pausedCards。若本 run 已收尾(非 paused/resuming)且**归属**
     // 该 paused 流程,把孤儿卡收到终态;否则(如等待期间的无关消息)不碰,留给真正的 continuation / TTL。
     if (!retainForContinuation) {
-      await finalizeOrphanedPausedCard(sessionKey, opts, { identity: entry.identity, runId: entry.runId });
+      await finalizeOrphanedPausedCard(sessionKey, opts, {
+        identity: entry.identity,
+        runId: entry.runId,
+        ...(entry.deliveredByTool ? { deliveredByTool: true } : {}),
+      });
     }
     return;
   }
@@ -884,7 +930,7 @@ export async function finalizeCard(
 
   const terminalPhase: CardProgressState["phase"] = entry.phase === "stopped"
     ? "stopped"
-    : opts.success ? "done" : "error";
+    : succeededOrDeliveredByTool(entry, opts) ? "done" : "error";
   const state = entryProgressState(sessionKey, entry, terminalPhase, {
     elapsedMs: Date.now() - entry.startedAt,
     ...(opts.errorText ? { errorText: opts.errorText } : {}),
@@ -1072,6 +1118,57 @@ export function markCardAnswering(sessionKey: string): void {
   if (entry.messageId) scheduleFlush(sessionKey, entry);
 }
 
+/** OpenClaw core 的 messaging 工具规范名(`normalizeCliMessagingToolName`)。 */
+const MESSAGING_TOOL_NAME = "message";
+
+/**
+ * 判断一次 `message` 工具调用是否**就是**向本卡频道投递可见内容。
+ *
+ * 归一化必须与真实发送路径一致,否则「发送确实落到本卡频道」的 target 会被判为不是本轮答复,
+ * 卡片照旧误报失败。故复用 `resolveOutboundTarget`(与 actions.ts 的 resolveOutboundOctoTarget
+ * 同一实现):堆叠前缀折叠、内联 `@uid` 剥离、threadId 合并、knownGroupIds 分类裸 id。
+ *
+ * 另需复现 handleSend 的 in-thread 重路由(issue #98):线程会话内的 bare-parent target 会被
+ * 改写成当前线程。本卡频道就是「当前频道」,所以这里能独立判定,无需 toolContext。
+ *
+ * 仍然 fail-closed:action 必须是 send、target 必须显式给出,解析结果的 channelId + channelType
+ * 都要匹配。群卡不认发往子区的投递(发送路径也落在子区),`scope:"parent"` 不认 bare-parent。
+ */
+function messageToolTargetsThisCard(entry: CardEntry, params: unknown): boolean {
+  const args = asRecord(params);
+  if (!args || args.action !== "send") return false;
+  const target = typeof args.target === "string" ? args.target.trim() : "";
+  if (!target) return false;
+  const parentScope = args.scope === "parent";
+  // scope:"parent" 在发送路径里最先生效:折叠到父群、清掉 ambient threadId、跳过 in-thread
+  // 重路由。归属判定必须先做同一折叠,否则子区卡会认领发往父群的投递,父群卡又不认真正发给
+  // 它的投递(两个方向都错)。
+  const knownGroupIds = getKnownGroupIds();
+  const collapsed = parentScope ? collapseParentScope(target, knownGroupIds) : null;
+  const effectiveTarget = collapsed ?? target;
+  const threadId = parentScope
+    ? undefined
+    : typeof args.threadId === "string" || typeof args.threadId === "number"
+      ? args.threadId
+      : undefined;
+  let resolved: { channelId: string; channelType: ChannelType };
+  try {
+    resolved = resolveOutboundTarget(effectiveTarget, threadId, knownGroupIds);
+  } catch {
+    return false; // 空频道等非法 target:发送路径也会抛,不构成交付证据
+  }
+  if (resolved.channelId === entry.ctx.channelId && resolved.channelType === entry.ctx.channelType) {
+    return true;
+  }
+  // in-thread 重路由:本卡是子区,且 target 落在本子区的父群 → 发送路径会改写成本子区。
+  // scope:"parent" 明确要求发父群,发送路径会跳过该重路由,这里同样不适用。
+  return !parentScope &&
+    entry.ctx.channelType === ChannelType.CommunityTopic &&
+    resolved.channelType === ChannelType.Group &&
+    resolved.channelId === parentGroupOf(entry.ctx.channelId);
+}
+
+
 /**
  * runId 归属守卫。before_agent_run 是唯一绑定点;普通 hook 永不认领 entry。
  * 旧 host 完全不提供 runId 时保留 sessionKey-only 兼容;一旦 entry 已绑定 runId,
@@ -1198,6 +1295,18 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       return;
     }
     dbg(`before_tool_call tool=${e.toolName} session=${sk}`);
+    // 只有 before 事件带 params;先记下「目标是本卡频道」的 send 调用,等 after 的成功结果兑现。
+    // 必须有 toolCallId:缺了就无法把 after 的成败对回具体调用,同一 turn 里「发往别处的调用
+    // 成功」会兑现「发往本卡的调用」的 pending,把失败洗成成功。宁可旧 host 不享受该修复。
+    if (e.toolName === MESSAGING_TOOL_NAME) {
+      if (e.toolCallId && messageToolTargetsThisCard(entry, e.params)) {
+        (entry.pendingMessageToolCallIds ??= new Set()).add(e.toolCallId);
+      }
+    } else if (messageToolTargetsThisCard(entry, e.params)) {
+      // 形状像「发往本卡频道」却挂在别的工具名下:host 可能用了别名/自定义 messaging 工具,
+      // 此时本修复静默失效。留一条诊断,否则下次只能从「卡片又误报 Failed」倒推。
+      dbg(`send-shaped call to this card under tool=${e.toolName} (expected ${MESSAGING_TOOL_NAME}); delivery evidence not counted`);
+    }
     endRunningThinking(entry, Date.now()); // P1-g:上一轮 thinking 收尾
     entry.phase = "tool";
     entry.steps.push({
@@ -1270,6 +1379,12 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       if (typeof e.durationMs === "number") target.durationMs = e.durationMs;
       if (e.error) target.error = e.error;
       if (!e.error) target.resultSummary = summarizeToolResult(e.toolName, e.result);
+    }
+    // 成功投递到本卡频道 = 本轮已交付,即使 dispatcher 没拿到任何 final text。
+    if (e.toolName === MESSAGING_TOOL_NAME && !e.error && e.toolCallId &&
+        entry.pendingMessageToolCallIds?.delete(e.toolCallId)) {
+      entry.deliveredByTool = true;
+      dbg(`message tool delivered to this card session=${sk}`);
     }
     if (e.toolName === "sessions_spawn" && !e.error) {
       const childSessionKey = acceptedSpawnChildSessionKey(e.result);

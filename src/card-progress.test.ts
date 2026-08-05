@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ChannelType } from "./types.js";
+import { registerGroupAccount, _testGetGroupAccountMap } from "./group-md.js";
 import { OCTO_CARD_LAYOUTS } from "./card-render.js";
 import {
   setCardContext,
@@ -1316,6 +1317,288 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(continuationData?.reasoningId).toBe(firstData?.reasoningId);
   });
 
+  /**
+   * agent 用 `message` 工具把答复直接投递给用户、turn 结束又没有 final text 时,
+   * dispatch 的 `replySucceeded` 保持 false —— 但这一轮其实成功了(OpenClaw core 的
+   * resolveAttemptTrajectoryTerminal 同样把 messaging 投递算作交付证据)。卡片不能
+   * 因此谎报「⚠️ Interrupted」。归属校验 fail-closed:只认发往本卡频道的成功 send。
+   */
+  describe("message 工具投递证据", () => {
+    async function runMessageToolTurn(opts: {
+      sessionKey: string;
+      channelId: string;
+      channelType: ChannelType;
+      params: Record<string, unknown>;
+      toolError?: string;
+      toolName?: string;
+    }) {
+      const { fn, calls } = mockFetch();
+      global.fetch = fn as unknown as typeof fetch;
+      const { handlers } = makeApi();
+      const hookCtx = { sessionKey: opts.sessionKey, runId: "run-msg" };
+      setCardContext(opts.sessionKey, {
+        apiUrl: "https://msg-tool.test",
+        botToken: "bf",
+        channelId: opts.channelId,
+        channelType: opts.channelType,
+      });
+      handlers.before_agent_run({}, hookCtx);
+      const toolName = opts.toolName ?? "message";
+      handlers.before_tool_call({ toolName, toolCallId: "msg-1", params: opts.params }, hookCtx);
+      await vi.advanceTimersByTimeAsync(900);
+      handlers.after_tool_call({
+        toolName,
+        toolCallId: "msg-1",
+        durationMs: 20,
+        ...(opts.toolError ? { error: opts.toolError } : { result: {} }),
+      }, hookCtx);
+      calls.length = 0;
+
+      // The dispatcher never saw a deliverable final text for this turn.
+      await finalizeCard(opts.sessionKey, { success: false });
+
+      const edit = calls.find((call) => call.url.includes("/message/edit"));
+      expect(edit).toBeTruthy();
+      return progressHeaderText(JSON.parse(edit!.body!.content_edit as string).card);
+    }
+
+    it("成功投递到本卡频道时收成完成态,而不是已中断", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-deliver-dm",
+        channelId: "u1",
+        channelType: ChannelType.DM,
+        params: { action: "send", target: "user:u1", message: "答复正文" },
+      });
+      expect(header).toContain("✅ Done");
+      expect(header).not.toContain("Interrupted");
+    });
+
+    it("群卡认同 group: 前缀的成功投递", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-deliver-group",
+        channelId: "g1",
+        channelType: ChannelType.Group,
+        params: { action: "send", target: "group:g1", message: "答复正文" },
+      });
+      expect(header).toContain("✅ Done");
+    });
+
+    it("投递到别的频道不算本卡交付", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-other-channel",
+        channelId: "g1",
+        channelType: ChannelType.Group,
+        params: { action: "send", target: "group:g-other", message: "发给别人的通知" },
+      });
+      expect(header).toContain("Interrupted");
+    });
+
+    it("群卡不认发往子区的投递(发送路径也会落到子区)", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-thread-vs-parent",
+        channelId: "g1",
+        channelType: ChannelType.Group,
+        params: { action: "send", target: "group:g1____t1", message: "发到子区" },
+      });
+      expect(header).toContain("Interrupted");
+    });
+
+    /**
+     * 归一化必须和真实发送路径一致(resolveOutboundTarget),否则发送**确实落到本卡频道**的
+     * target 会被判为「不是本轮答复」,本 PR 要修的 Failed 卡在这些形态下原样存活。
+     */
+    it("认同堆叠前缀 octo:user: 的投递", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-stacked-user",
+        channelId: "u1",
+        channelType: ChannelType.DM,
+        params: { action: "send", target: "octo:user:u1", message: "答复正文" },
+      });
+      expect(header).toContain("✅ Done");
+    });
+
+    it("认同带内联 @uid 后缀的群投递", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-mention-suffix",
+        channelId: "g1",
+        channelType: ChannelType.Group,
+        params: { action: "send", target: "group:g1@u2", message: "答复正文" },
+      });
+      expect(header).toContain("✅ Done");
+    });
+
+    it("线程卡认同 bare-parent 投递(发送路径会自动重路由到本线程,issue #98)", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-thread-reroute",
+        channelId: "g1____t1",
+        channelType: ChannelType.CommunityTopic,
+        params: { action: "send", target: "group:g1", message: "答复正文" },
+      });
+      expect(header).toContain("✅ Done");
+    });
+
+    it("scope=parent 时不认 bare-parent(发送路径发往父群,不是本线程)", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-thread-scope-parent",
+        channelId: "g1____t1",
+        channelType: ChannelType.CommunityTopic,
+        params: { action: "send", target: "group:g1", scope: "parent", message: "发到父群" },
+      });
+      expect(header).toContain("Interrupted");
+    });
+
+    it("裸 id 在 knownGroupIds 命中时认同群投递,未命中则不认", async () => {
+      // 发送路径把裸 id 交给 knownGroupIds 分类,evidence 检查共用同一套输入。
+      registerGroupAccount("gk1", "acct-known", "agent-known");
+      try {
+        expect(await runMessageToolTurn({
+          sessionKey: "msg-bare-known",
+          channelId: "gk1",
+          channelType: ChannelType.Group,
+          params: { action: "send", target: "gk1", message: "答复正文" },
+        })).toContain("✅ Done");
+      } finally {
+        _testGetGroupAccountMap().delete("agent-known:gk1");
+      }
+      // 未注册的裸 id 会被解析成 DM,群卡不认。
+      expect(await runMessageToolTurn({
+        sessionKey: "msg-bare-unknown",
+        channelId: "gk2",
+        channelType: ChannelType.Group,
+        params: { action: "send", target: "gk2", message: "答复正文" },
+      })).toContain("Interrupted");
+    });
+
+    /**
+     * scope:"parent" 在发送路径里**最先**生效:group-like target 被折叠到父群、ambient
+     * threadId 被清掉,随后跳过 in-thread 重路由。归属判定必须先做同样的折叠再比较,否则
+     * 两个方向都会错 —— 子区卡把发往父群的投递记成自己的,父群卡又不认真正发给它的投递。
+     */
+    it("scope=parent + 显式子区 target:子区卡不得认领(实际发往父群)", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-scope-parent-thread",
+        channelId: "g1____t1",
+        channelType: ChannelType.CommunityTopic,
+        params: { action: "send", target: "group:g1____t1", scope: "parent", message: "发到父群" },
+      });
+      expect(header).toContain("Interrupted");
+    });
+
+    it("scope=parent + 显式子区 target:父群卡应认领(实际就发给它)", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-scope-parent-group",
+        channelId: "g1",
+        channelType: ChannelType.Group,
+        params: { action: "send", target: "group:g1____t1", scope: "parent", message: "答复正文" },
+      });
+      expect(header).toContain("✅ Done");
+    });
+
+    it("认同 threadId 参数合成出的子区目标", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-threadid-merge",
+        channelId: "g1____t1",
+        channelType: ChannelType.CommunityTopic,
+        params: { action: "send", target: "group:g1", threadId: "t1", message: "答复正文" },
+      });
+      expect(header).toContain("✅ Done");
+    });
+
+    it("投递失败不算交付", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-send-failed",
+        channelId: "u1",
+        channelType: ChannelType.DM,
+        params: { action: "send", target: "user:u1", message: "答复正文" },
+        toolError: "Octo API /v1/bot/sendMessage failed (400)",
+      });
+      expect(header).toContain("Interrupted");
+    });
+
+    it("非 send 动作不算交付", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-read-action",
+        channelId: "u1",
+        channelType: ChannelType.DM,
+        params: { action: "read", target: "user:u1" },
+      });
+      expect(header).toContain("Interrupted");
+    });
+
+    it("同名的其它工具不算交付", async () => {
+      const header = await runMessageToolTurn({
+        sessionKey: "msg-not-message-tool",
+        channelId: "u1",
+        channelType: ChannelType.DM,
+        toolName: "read",
+        params: { action: "send", target: "user:u1" },
+      });
+      expect(header).toContain("Interrupted");
+    });
+
+    it("旧 host 缺 toolCallId 时不认投递证据(无法归因,fail-closed)", async () => {
+      const { fn, calls } = mockFetch();
+      global.fetch = fn as unknown as typeof fetch;
+      const { handlers } = makeApi();
+      const hookCtx = { sessionKey: "msg-no-tool-call-id", runId: "run-msg" };
+      setCardContext("msg-no-tool-call-id", {
+        apiUrl: "https://msg-tool.test",
+        botToken: "bf",
+        channelId: "u1",
+        channelType: ChannelType.DM,
+      });
+      handlers.before_agent_run({}, hookCtx);
+      // 发往本卡频道的调用(最终会失败)。
+      handlers.before_tool_call(
+        { toolName: "message", params: { action: "send", target: "user:u1" } },
+        hookCtx,
+      );
+      // 发往别处的通知(会成功)。两次调用都没有 toolCallId,彼此不可区分。
+      handlers.before_tool_call(
+        { toolName: "message", params: { action: "send", target: "user:other" } },
+        hookCtx,
+      );
+      await vi.advanceTimersByTimeAsync(900);
+      handlers.after_tool_call({ toolName: "message", result: {} }, hookCtx); // 别处那次成功
+      calls.length = 0;
+
+      await finalizeCard("msg-no-tool-call-id", { success: false });
+
+      const edit = calls.find((call) => call.url.includes("/message/edit"));
+      const header = progressHeaderText(JSON.parse(edit!.body!.content_edit as string).card);
+      // 成功的那次并非发往本卡,不能被当成本轮答复。
+      expect(header).toContain("Interrupted");
+    });
+
+    it("显式失败(errorText)优先于工具投递证据", async () => {
+      const { fn, calls } = mockFetch();
+      global.fetch = fn as unknown as typeof fetch;
+      const { handlers } = makeApi();
+      const hookCtx = { sessionKey: "msg-explicit-error", runId: "run-msg" };
+      setCardContext("msg-explicit-error", {
+        apiUrl: "https://msg-tool.test",
+        botToken: "bf",
+        channelId: "u1",
+        channelType: ChannelType.DM,
+      });
+      handlers.before_agent_run({}, hookCtx);
+      handlers.before_tool_call(
+        { toolName: "message", toolCallId: "msg-1", params: { action: "send", target: "user:u1" } },
+        hookCtx,
+      );
+      await vi.advanceTimersByTimeAsync(900);
+      handlers.after_tool_call({ toolName: "message", toolCallId: "msg-1", result: {} }, hookCtx);
+      calls.length = 0;
+
+      await finalizeCard("msg-explicit-error", { success: false, errorText: "provider timeout" });
+
+      const edit = calls.find((call) => call.url.includes("/message/edit"));
+      const header = progressHeaderText(JSON.parse(edit!.body!.content_edit as string).card);
+      expect(header).toContain("Interrupted");
+      expect(header).toContain("provider timeout");
+    });
+  });
+
   it("OBO 场景跳过(不发任何请求)", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
@@ -1861,6 +2144,51 @@ describe("card-progress 状态机 + hook + 节流", () => {
       return progressHeaderText(env.card).includes("⚠️ Interrupted");
     });
     expect(errEdit).toBeTruthy();
+  });
+
+  /**
+   * 投递证据属于产生它的那个 run。CardEntry 会跨 run 存活(finalizeCard 把它停进
+   * pausedCards),若证据不清除,孤儿收尾就会拿上一个 run 的投递去洗白本轮的失败 ——
+   * 用户刚收到道歉消息,卡片却显示 ✅ Done。
+   */
+  it("前一 run 的工具投递不得洗白 continuation 的失败", async () => {
+    const { fn, calls } = mockFetch();
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi({ lifecycle: false });
+    const ctx = {
+      apiUrl: "https://leak-guard.test",
+      botToken: "bf",
+      channelId: "u1",
+      channelType: ChannelType.DM,
+    };
+    setCardContext("leak-guard", ctx);
+    handlers.before_agent_run({}, { sessionKey: "leak-guard", runId: "run-a" });
+    // run A 通过 message 工具向本卡频道投递 → 本 run 有交付证据
+    handlers.before_tool_call(
+      { toolName: "message", toolCallId: "msg-1", params: { action: "send", target: "user:u1" } },
+      { sessionKey: "leak-guard", runId: "run-a" },
+    );
+    handlers.after_tool_call(
+      { toolName: "message", toolCallId: "msg-1", result: {} },
+      { sessionKey: "leak-guard", runId: "run-a" },
+    );
+    handlers.before_tool_call({ toolName: "sessions_yield", toolCallId: "y-1" }, { sessionKey: "leak-guard", runId: "run-a" });
+    handlers.after_tool_call({ toolName: "sessions_yield", toolCallId: "y-1", durationMs: 5 }, { sessionKey: "leak-guard", runId: "run-a" });
+    await vi.advanceTimersByTimeAsync(900);
+    await finalizeCard("leak-guard", { success: true });
+    calls.length = 0;
+
+    // continuation:同 runId 恢复,自己没有任何工具调用、也没有任何投递。
+    setCardContext("leak-guard", ctx);
+    handlers.before_agent_run({ prompt: "继续", messages: [] }, { sessionKey: "leak-guard", runId: "run-a" });
+    // 生产形态:inbound.ts 只传 success,不传 errorText。
+    await finalizeCard("leak-guard", { success: false });
+
+    const edit = calls.filter((c) => c.url.includes("/message/edit")).pop();
+    expect(edit).toBeTruthy();
+    const header = progressHeaderText(JSON.parse(edit!.body!.content_edit as string).card);
+    expect(header).toContain("Interrupted");
+    expect(header).not.toContain("Done");
   });
 
   it("bare yield 等待期间无关 run 收尾不得接管原 paused 卡,真正 resume 才收尾", async () => {
