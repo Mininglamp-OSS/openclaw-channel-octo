@@ -1316,6 +1316,74 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(continuationData?.reasoningId).toBe(firstData?.reasoningId);
   });
 
+  /**
+   * D12 manifest 目前对同一部署的所有 bot 返回同一份能力清单,但服务端一旦把 elements /
+   * limits 按 bot 分化(套餐配额、灰度),只按 apiUrl 缓存的渲染 caps 就会跨 bot 污染:
+   * 同部署上先探测的那个 bot 的裁剪上限会被另一个 bot 直接复用,可能发出对方不支持的元素。
+   * 本仓明确支持多 bot 共存(identity 指纹 / 跨账号 fail-closed),故 caps 必须按 bot 隔离。
+   */
+  it("同部署不同 bot 的渲染能力互不污染(caps 按 bot 隔离)", async () => {
+    const apiUrl = "https://shared-deployment.test";
+    const calls: Array<{ url: string; token: string; body: Record<string, unknown> | undefined }> = [];
+    const fn = vi.fn().mockImplementation(async (
+      url: string,
+      init?: { body?: string; headers?: Record<string, string> },
+    ) => {
+      const token = (init?.headers?.Authorization ?? "").replace("Bearer ", "");
+      calls.push({ url: String(url), token, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (String(url).includes("/card/profile")) {
+        // bot-a 的部署没有 RichTextBlock;bot-b 有。两者共享同一个 apiUrl。
+        const elements = token === "token-b"
+          ? ["TextBlock", "RichTextBlock", "Container", "ColumnSet"]
+          : ["TextBlock", "Container", "ColumnSet"];
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ enabled: true, profiles: ["octo/v1"], elements, limits: { max_nodes: 200 } }),
+        };
+      }
+      if (String(url).includes("/sendMessage")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: `card-${token}` }) };
+      }
+      return { ok: true, status: 200, text: async () => "" };
+    });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+
+    // bot-a 先跑,把它的 caps 探测进缓存。
+    setCardContext("caps-a1", { apiUrl, botToken: "token-a", channelId: "g1", channelType: ChannelType.Group });
+    handlers.before_tool_call({ toolName: "exec", params: { command: "ls" } }, { sessionKey: "caps-a1" });
+    await vi.advanceTimersByTimeAsync(900);
+    // bot-b 紧随其后,同一个 apiUrl —— 它的探测会覆盖 apiUrl 键上的 caps。
+    setCardContext("caps-b", { apiUrl, botToken: "token-b", channelId: "g2", channelType: ChannelType.Group });
+    handlers.before_tool_call({ toolName: "exec", params: { command: "ls" } }, { sessionKey: "caps-b" });
+    await vi.advanceTimersByTimeAsync(900);
+    // bot-a 在自己的 profile 缓存 TTL 内再发一张卡:不会重探 profile,因此只能读缓存里的 caps。
+    // 这一步才是污染暴露点 —— apiUrl-only 的键会让它读到 bot-b 写入的能力集。
+    setCardContext("caps-a2", { apiUrl, botToken: "token-a", channelId: "g3", channelType: ChannelType.Group });
+    handlers.before_tool_call({ toolName: "exec", params: { command: "ls" } }, { sessionKey: "caps-a2" });
+    await vi.advanceTimersByTimeAsync(900);
+
+    const stepRenderType = (channelId: string): string | undefined => {
+      const send = calls.find((c) =>
+        c.url.includes("/sendMessage") && (c.body as { channel_id?: string })?.channel_id === channelId);
+      const card = (send?.body?.payload as {
+        card?: { body?: Array<{ items?: Array<{ type?: string; items?: Array<{ type?: string }> }> }> };
+      })?.card;
+      const stepRow = card?.body?.[1]?.items?.[0];
+      // 未 advertise RichTextBlock 时步骤行直接是 TextBlock;advertise 后包一层 Container。
+      return stepRow?.type === "Container" ? stepRow.items?.[0]?.type : stepRow?.type;
+    };
+
+    // 每个 bot 各探一次 profile(bot 级缓存),bot-a 的第二张卡命中缓存不重探。
+    expect(calls.filter((c) => c.url.includes("/card/profile")).map((c) => c.token))
+      .toEqual(["token-a", "token-b"]);
+    expect(stepRenderType("g1")).toBe("TextBlock");
+    expect(stepRenderType("g2")).toBe("RichTextBlock");
+    // 污染时这里会变成 RichTextBlock —— bot-a 用上了 bot-b 的能力集。
+    expect(stepRenderType("g3")).toBe("TextBlock");
+  });
+
   it("OBO 场景跳过(不发任何请求)", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;

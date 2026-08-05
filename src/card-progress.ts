@@ -150,7 +150,7 @@ const pausedCards = sharedState.pausedCards;
 const profileCache = sharedState.profileCache;
 
 /**
- * D12 能力(elements/limits 派生的渲染 caps)缓存,key = apiUrl(部署级,同 gate)。gateEnabled
+ * D12 能力(elements/limits 派生的渲染 caps)缓存,key 见 capsCacheKey(按 bot 隔离)。gateEnabled
  * 探测 manifest 时一并填充;渲染时按元素以及节点/深度/字节上限裁剪。旧部署无这些字段 → caps 为空 → 渲染
  * 走保守默认(等同今天行为)。
  */
@@ -186,6 +186,21 @@ function contextIdentity(ctx: CardContext): string {
 
 /** Profile enabled/catalog facts are authorized by botToken, not shared by an apiUrl deployment. */
 function profileCacheKey(ctx: CardContext): string {
+  return JSON.stringify([ctx.apiUrl, ctx.botToken]);
+}
+
+/**
+ * 渲染能力(elements/inputs/actions/limits)的缓存键。
+ *
+ * `/v1/bot/card/profile` 是 bot 鉴权端点(无 token 返回 401),返回的是**该 bot 的**卡片配置,
+ * 未单独设置时回落到部署默认值。因此这些字段本就是 bot 维度的事实 —— 原先按 apiUrl 缓存是
+ * 错误假设,只因当前所有 bot 都落在同一份默认值上才没显现。任何一个 bot 被单独配置(能力灰度、
+ * 套餐配额)就会触发:同部署上先探测的 bot 之后读到的是后探测者写入的能力集。
+ *
+ * 本仓明确支持多 bot 共存(见 contextIdentity 的跨账号 fail-closed),故按 bot 隔离。与
+ * profileCacheKey 同形,但语义不同:一个是授权事实,一个是渲染能力。
+ */
+function capsCacheKey(ctx: CardContext): string {
   return JSON.stringify([ctx.apiUrl, ctx.botToken]);
 }
 
@@ -244,8 +259,8 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
   if (cached) profileCache.delete(cacheKey);
   try {
     const m = await getCardProfile({ apiUrl: ctx.apiUrl, botToken: ctx.botToken, signal });
-    // 能力清单是部署级事实(与 enabled 无关),探到就缓存供渲染裁剪。
-    capsCache.set(ctx.apiUrl, deriveCardCaps(m));
+    // 探到就缓存供渲染裁剪。按 bot 隔离,见 capsCacheKey。
+    capsCache.set(capsCacheKey(ctx), deriveCardCaps(m));
     // Profile 来自带 botToken 的请求，其中 enabled/templating 都是 Bot 级事实。
     profileCache.set(cacheKey, {
       manifest: m,
@@ -386,7 +401,7 @@ function renderEntryProgress(
   entry: CardEntry,
   state: CardProgressState,
 ): { card: Record<string, unknown>; plain: string } {
-  const caps = capsCache.get(entry.ctx.apiUrl);
+  const caps = capsCache.get(capsCacheKey(entry.ctx));
   return usesReasoningProcessContract(entry)
     ? renderReasoningProcessCard(state, caps)
     : renderProgressCard(state, caps);
@@ -935,7 +950,7 @@ export async function finalizeCardWithResponse(
     phase: "done",
     steps: entry.steps,
     elapsedMs: Date.now() - entry.startedAt,
-  }, responseText, capsCache.get(entry.ctx.apiUrl));
+  }, responseText, capsCache.get(capsCacheKey(entry.ctx)));
   if (!rendered) return false;
 
   // Freeze late hook/debounce activity while the terminal edit is in flight so
