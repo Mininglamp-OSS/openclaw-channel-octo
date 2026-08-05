@@ -71,6 +71,17 @@ function cardText(card: CardEvidence | undefined): string {
   ].filter((value): value is string => typeof value === "string" && value.length > 0).join(" · ");
 }
 
+/**
+ * Assert the card was authored from the Registry reasoning template without
+ * pinning its version. The plugin deliberately trusts whatever version the Bot
+ * catalog advertises (`cd0538a`), so hardcoding one here just goes red the next
+ * time the server rolls the catalog forward — as it did going 0.2.0 → 0.3.0.
+ */
+function expectReasoningTemplateRef(ref: CardEvidence["templateRef"]): void {
+  expect(ref?.id).toBe("ai.reasoning-process");
+  expect(ref?.version).toMatch(/^\d+\.\d+\.\d+$/);
+}
+
 function expectStrictlyIncreasing(values: number[]): void {
   expect(values.length).toBeGreaterThan(0);
   for (let index = 1; index < values.length; index++) {
@@ -258,7 +269,7 @@ async function runLifecycleFlow({
   });
   expect(completed.cards).toHaveLength(1);
   expect(completed.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
-  expect(completed.cards[0]?.templateRef).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+  expectReasoningTemplateRef(completed.cards[0]?.templateRef);
   expect(completed.cards[0]?.state).toBe("completed");
   expect(completed.cards[0]?.transient).toBe(false);
   expectStrictlyIncreasing(completed.cards[0]?.editCardSeqs ?? []);
@@ -350,7 +361,7 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
       expect(report).toBe("Processed: alpha=7\n");
       expect(completed.cards).toHaveLength(1);
       const text = cardText(completed.cards[0]);
-      expect(completed.cards[0]?.templateRef).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+      expectReasoningTemplateRef(completed.cards[0]?.templateRef);
       expect(completed.cards[0]?.state).toBe("completed");
       expect(completed.cards[0]?.transient).toBe(false);
       expectStrictlyIncreasing(completed.cards[0]?.editCardSeqs ?? []);
