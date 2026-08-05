@@ -348,8 +348,11 @@ function buildReasoningProcessDataWithPhases(
         : mapped === "stopped" ? `${elapsed} · stopped at phase ${phases.length}`
           : mapped === "error" ? "Interrupted"
             : `${elapsed} · ${phaseCount(phases.length)} · ${toolCallCount(toolCount)}`,
-    traceExpanded: active || mapped === "error",
-    traceCollapsed: !active && mapped !== "error",
+    // Every terminal state collapses (done/stopped/error/expired), matching renderProgressCard:
+    // a settled card is a summary, and collapsedSummary tells the reader to open it for the steps.
+    // Only a running turn stays expanded.
+    traceExpanded: active,
+    traceCollapsed: !active,
     collapsedSummary: mapped === "answering" ? "Reasoning complete · answer in progress"
       : mapped === "stopped" ? `Kept ${phaseCount(phases.length)} from before the stop`
         : mapped === "error" ? "Interrupted · open to see the steps so far"

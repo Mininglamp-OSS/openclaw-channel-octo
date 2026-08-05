@@ -98,14 +98,24 @@ describe("ai.reasoning-process successor-compatible contract", () => {
       timerText: "6.0s · stopped at phase 1",
       collapsedSummary: "Kept 1 phase from before the stop",
     });
+    // 终态一律折叠(与 Model B 的 renderProgressCard 一致):失败卡默认收起,
+    // collapsedSummary 的 "open to see the steps so far" 才有意义 —— 展开时它永不显示。
     expect(buildReasoningProcessData(state({ phase: "error", errorText: "provider timeout" }))).toMatchObject({
       state: "error",
       statusLabel: "Failed",
       statusTone: "Attention",
-      traceExpanded: true,
-      traceCollapsed: false,
+      traceExpanded: false,
+      traceCollapsed: true,
+      collapsedSummary: "Interrupted · open to see the steps so far",
       errorTitle: "Generation failed",
       errorMessage: "provider timeout",
+    });
+    // expired 走同一条 error 契约状态,同样折叠。
+    expect(buildReasoningProcessData(state({ phase: "expired" }))).toMatchObject({
+      state: "error",
+      traceExpanded: false,
+      traceCollapsed: true,
+      errorMessage: "Timed out waiting for the background task.",
     });
   });
 
