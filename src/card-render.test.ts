@@ -7,6 +7,7 @@ import {
   resolveToolMeta,
   summarizeToolParams,
   sanitizeErrorText,
+  reduceUrlsInText,
   fmtDuration,
   stepLine,
   cardSupports,
@@ -214,9 +215,34 @@ describe("summarizeToolParams", () => {
       "x/user:pass@localhost",
       "prefix/user:pa/ss@db.example.com",
     ]) expect(summarizeToolParams("grep", { pattern: s }), s).toBe("");
+    // 反向:兜底不能把普通搜索模式打成空白。query/path 没有程序名可退,拦下来就是一张空白卡 ——
+    // RESIDUAL_QUERY_RE 的注释早就写明了这个危险并加了豁免,这条当时没加对应的。
+    // 判据两条:`@` 后必须是主机形状(`\S+`、`b"}` 都不是);口令段必须含字母数字(`.*` 不是口令)。
+    for (const s of [
+      "email:\\s*\\S+@\\S+",
+      '{"host":"a@b"}',
+      "user:.*@example",
+      "TODO:.*@alice",
+    ]) expect(summarizeToolParams("grep", { pattern: s }), s).toBe(s);
+    // 但**字符集**不收窄 —— 收窄会让「归约匹配不上的串兜底也匹配不上」的缝重新出现。
+    // 加的是「至少一个字母数字」的存在性要求,口令里多一个元字符不会让它失效:
+    expect(summarizeToolParams("grep", { pattern: "user:p*ss@localhost" })).toBe("");
     // 反向:`scheme://` 必须排掉,否则路径里带 `@` 的正常 URL 会被整串隐藏。
     expect(summarizeToolParams("fetch", { url: "https://x.example.com/users/@me" }))
       .toBe("https://example.com");
+  });
+  it("归约不得造出输入里没有的字符串:端口在词边界收尾、单标签主机须含字母", () => {
+    // 端口分支若能匹配更长 token 的**数字前缀**,匹配会在词中间结束,尾巴被拼到替换结果后面。
+    // digest 固定的容器引用是最常见的形状 —— 加约束前实测 `https://sha256abcd`,输入里没有这个串。
+    expect(summarizeToolParams("grep", { pattern: "nginx:1.21@sha256:1234abcd" })).toBe("");
+    expect(summarizeToolParams("grep", { pattern: "repo/app:v2@sha256:9f8e/x" })).toBe("");
+    // 纯数字单标签主机会被 new URL() 按整数 IPv4 规范化:`2` → `0.0.0.2`,同样是凭空造串。
+    expect(summarizeToolParams("grep", { pattern: "3:4@2/x" })).toBe("");
+    expect(summarizeToolParams("read", { file_path: "t:1@2/3" })).toBe("");
+    // 不匹配 ≠ 放行:两条都落到兜底整串不渲染(上面四条断言的 "" 就是兜底给的)。
+    // 能确定的 DSN 仍照常剥 userinfo —— 收紧的是改写条件,不是覆盖面。
+    expect(summarizeToolParams("grep", { pattern: "user:hunter2@localhost:5432/prod" }))
+      .toBe("https://localhost");
   });
   it("单标签主机的 query 段被剥掉(上面几趟都要求主机带点,漏掉这一类)", () => {
     // 归约:主机/路径保留,query 整段剥掉。
@@ -225,6 +251,10 @@ describe("summarizeToolParams", () => {
     // 前导必须认引号与 `=` —— 命令行上给 URL 加引号、或挂在 `--url=` 后面都是常态写法。
     expect(summarizeToolParams("read", { file_path: "'localhost/reset?code=abc'" })).toBe("'localhost/reset'");
     expect(summarizeToolParams("read", { file_path: "--url=localhost/reset?code=abc" })).toBe("--url=localhost/reset");
+    // IPv4 字面量:内网/开发环境里最常见的无字母主机。只要求字母时它既过不了这一趟、也过不了
+    // 第 4 趟(要求字母 TLD),query 原样渲染 —— 按本分支自己的论据,这正是要挡的那类。
+    expect(summarizeToolParams("grep", { pattern: "192.168.0.1?code=abc" })).toBe("192.168.0.1");
+    expect(summarizeToolParams("read", { file_path: "127.0.0.1?sid=abcdef" })).toBe("127.0.0.1");
     // 不误伤:普通相对路径、以及不含 `=` 的 shell glob。
     expect(summarizeToolParams("read", { file_path: "src/index.ts" })).toBe("src/index.ts");
     expect(summarizeToolParams("read", { file_path: "src/file?.ts" })).toBe("src/file?.ts");
@@ -272,10 +302,33 @@ describe("summarizeToolParams", () => {
     // 正常长英文 / 纯字母长串不误伤。
     expect(summarizeToolParams("web_search", { query: "how to configure oauth flow correctly" })).toBe("how to configure oauth flow correctly");
   });
-  // 这是本文件唯一一条计时断言。用耗时而不是「输出被截断」来断言,是因为要守的性质就是耗时本身
-  // —— 归约管线里的正则在长串上是二次的,而 summarizeToolParams 由 before_tool_call 同步调用、
-  // 无 try/catch,工具参数又是模型生成的。删掉 SUMMARY_INPUT_MAX 那两行,这条会红。
+  // 这两条是本文件仅有的计时断言。用耗时而不是「输出被截断」来断言,是因为要守的性质就是耗时本身
+  // —— 归约管线里的正则在长串上是二次的,而这几个函数都在同步路径上、都没有 try/catch。
   //
+  // **第一条直接测 reduceUrlsInText,而不是只测它的某一个调用方。** 上一版只测了
+  // summarizeToolParams,于是上限被放进那一个调用方里也能让测试全绿 —— 而另外八个调用方跑的
+  // 还是同一条二次管线,其中 card-action-status 的 neutralizeEcho 输入是**群成员提交的表单值**。
+  // 测调用方测不出上限放错了地方,测管线本身才行。
+  it("归约管线自身有无条件输入上限(不是只有某一个调用方有)", () => {
+    const SHAPES: Array<[string, string]> = [
+      ["无点长串 + query", "a".repeat(100_000) + "?x"],
+      ["scheme + 长主机", "http://" + "a".repeat(120_000)],
+      ["userinfo 前缀 + 长串", "a:b@" + "a".repeat(60_000)],
+    ];
+    for (const [shape, input] of SHAPES) {
+      for (const [name, run] of [
+        ["reduceUrlsInText", () => reduceUrlsInText(input)],
+        ["sanitizeErrorText", () => sanitizeErrorText(input)],
+      ] as Array<[string, () => unknown]>) {
+        const t0 = performance.now();
+        run();
+        const ms = performance.now() - t0;
+        // 修好后实测每格 20 ms 内;上限 2000 ms 给 CI 留余量,仍能抓住回归(未设上限时
+        // reduceUrlsInText × 无点长串实测 11171 ms,sanitizeErrorText 9452 ms)。
+        expect(ms, `${name} / ${shape} 耗时 ${ms.toFixed(0)} ms`).toBeLessThan(2000);
+      }
+    }
+  });
   // 三种形状分别测:回溯代价随输入形状变化很大(`http://` 那条走第 1 趟,无点长串走第 3/4 趟),
   // 只测一种会得出「另外几趟不要紧」的错误结论。
   it("超长输入不进归约管线:默认档、所有策略都有无条件上限", () => {

@@ -113,23 +113,31 @@ export function resolveToolMeta(tool: string): { icon: string; label: string } {
 
 const SUMMARY_MAX = 64;
 /**
- * 进入 URL 归约管线前的**无条件**输入长度上限。
+ * `reduceUrlsInText` 的**无条件**输入长度上限。
  *
- * 归约管线里的几趟正则在长串上是二次的。实测(本文件当前状态,默认配置,无任何开关):
+ * 归约管线里的几趟正则在长串上是二次的。实测(`b1e3def`,默认配置,`"a"×100k + "?x"`):
  *
- *     read  {file_path: "a"×50k  + "?x"}   2363 ms
- *     read  {file_path: "a"×100k + "?x"}   9311 ms      ← 输入 ×2,耗时 ×4
- *     exec  {command:   "a:b@"   + "a"×60k} 3442 ms
+ *     reduceUrlsInText(直接)      11171 ms
+ *     sanitizeErrorText            9452 ms
+ *     summarizeToolParams(read)    9463 ms
+ *     renderCardActionStatus       9371 ms
  *
- * summarizeToolParams 由 before_tool_call 钩子**同步**调用且没有 try/catch,而工具参数是模型
- * 生成的 —— 这几秒是整个插件的事件循环被卡住,所有账号、所有群一起停。
+ * 这些函数都在同步路径上、都没有 try/catch,几秒就是整个插件的事件循环被卡住,所有账号、所有群
+ * 一起停。
  *
- * 截断而不是整串丢弃:渲染上限只有 SUMMARY_MAX(64),截断掉的部分本来也不会被渲染,所以下游
- * 的敏感串守卫仍然跑在「会被渲染的那一段」的完整形态上,判定不受影响。
+ * **上限住在 reduceUrlsInText 里,不是住在调用方。** 上一版把它放在 summarizeToolParams 里,
+ * 于是九个调用方只有一个被挡住;剩下八个跑的还是同一条二次管线。最要命的是
+ * card-action-status.ts 的 neutralizeEcho —— 它的输入是**群成员提交的表单值**和用户自设的
+ * 显示名(它自己的文档注释就写着 untrusted),信任边界比「模型生成的工具参数」还低,而且因为
+ * summarizeToolParams 已经快了,它成了唯一剩下的那条路,反而更难被发现。
  *
- * 上限必须落在**进管线之前**。放在管线中间或之后等于没设 —— 代价全部发生在管线里。
+ * 截断而不是整串丢弃:各 sink 的渲染上限分别是 64(摘要)/120(错误、放开档摘要)/512(debug
+ * 串)/2000(授权卡文本),都远小于这个值,所以截掉的部分本来就不会被渲染,守卫仍然跑在「会被
+ * 渲染的那一段」的完整形态上。唯一可观察的差异在 card-blocks.ts 的 noReducibleUrl:它拿
+ * 归约结果与原串比等值,超过上限的串会一律判为"可归约"而退到单个 TextBlock(丢富文本样式)。
+ * 那正是它自己注释里写的保守回退方向。
  */
-const SUMMARY_INPUT_MAX = 4000;
+const REDUCE_INPUT_MAX = 4000;
 
 /**
  * 敏感串守卫模式。群卡片对全体成员可见 —— 摘要一旦命中即整串隐藏(fail-safe:
@@ -367,10 +375,31 @@ const USERINFO_USER_CHARS = "A-Za-z0-9._%+-";
  * `psql :hunter2@db.example.com/prod` 一样漏。空匹配用不了 `\b`(空格与 `:` 都是非词字符,中间
  * 没有词边界),故改用「前面不是 userinfo 字符」的负向后顾。
  */
+// 单标签分支上有两个约束,都是为了「宁可不改写,也不要造出输入里没有的字符串」:
+//
+//  1. **端口必须在词边界收尾**(`(?!${HOST_TOKEN_CHARS})`)。少了它,`:\d+` 会匹配一个更长
+//     token 的**数字前缀**,匹配在词中间结束,没匹配上的尾巴被原样拼到替换结果后面:
+//
+//         nginx:1.21@sha256:1234abcd   →   https://sha256abcd     ← 输入里没有这个串
+//         repo/app:v2@sha256:9f8e/x    →   repo/https://sha256f8e/x
+//
+//     digest 固定的容器引用是最常见的形状。
+//
+//  2. **单标签主机必须含字母**。纯数字主机会被 `new URL()` 按整数 IPv4 规范化,`2` 变成
+//     `0.0.0.2`,同样是凭空造串:
+//
+//         3:4@2/x   →   https://0.0.0.2
+//         t:1@2/3   →   https://0.0.0.2
+//
+// 两条都不匹配的形状不是"放行",而是落到 RESIDUAL_USERINFO_RE 整串不渲染 —— 归约只处理能确定
+// 的形状,确定不了的宁可不显示,也绝不半改写。这正是本文件反复强调的那条:半改写的输出看起来
+// 像脱敏过的,操作者没有任何信号知道自己读到的是被改过的内容。
+const HOST_TOKEN_CHARS = "[0-9A-Za-z_.-]";
 const SCHEMELESS_USERINFO_RE = new RegExp(
   `(?<![${USERINFO_USER_CHARS}])[${USERINFO_USER_CHARS}]*:[^\\s/]+@`
-  + `(?:[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+(?::\\d+)?(?:\\/[^\\s]*)?`
-  + `|[A-Za-z0-9-]+(?::\\d+(?:\\/[^\\s]*)?|:\\/[^\\s]*|\\/[^\\s]*))`,
+  + `(?:[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+(?::\\d+(?!${HOST_TOKEN_CHARS}))?(?:\\/[^\\s]*)?`
+  + `|(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z0-9-]+`
+  + `(?::\\d+(?!${HOST_TOKEN_CHARS})(?:\\/[^\\s]*)?|:\\/[^\\s]*|\\/[^\\s]*))`,
   "g",
 );
 
@@ -396,8 +425,31 @@ const SCHEMELESS_USERINFO_RE = new RegExp(
  * (`/users/@me`、`/@scope/pkg`)。带 scheme 的串在第 1 趟已经过 `new URL()` 剥掉 userinfo,
  * 本来就不需要这条兜底;解析失败的那些在同一趟被整段抹除,也不会走到这里。
  */
+// 两个收窄,方向与上面那条**相反**:这里要挡的不是泄漏,是过度隐藏。
+//
+// 这条兜底命中即整串不渲染,而 query/path 两个策略**没有程序名可退**,卡片直接空白 —— 看起来
+// 就像 bug。RESIDUAL_QUERY_RE 的注释里已经把这个危险写清楚了,并为此加了字母前瞻;这条当时没加
+// 对应的豁免,于是下面这些普通搜索模式在 main 上正常渲染、在这条分支上全变成空:
+//
+//     grep {pattern: "email:\s*\S+@\S+"}   grep {pattern: '{"host":"a@b"}'}
+//     grep {pattern: "user:.*@example"}    grep {pattern: "TODO:.*@alice"}
+//
+// 又是「本该互为镜像的第二张表和第一张不同步」—— 这次两张表还是同一个 commit 里写的。
+//
+//  1. **`@` 之后必须是主机形状**,且必须在词边界收尾。`\S+`、`b"}` 都不是主机。
+//  2. **口令段必须含至少一个字母数字**。`.*` / `.+` / `[^@]*` 这类纯正则元字符的"口令"不是
+//     真凭据:一个没有任何字母数字的口令既不值得保护,也不可能是 base64/十六进制密钥。
+//
+// 注意口令段的**字符集**没有收窄,仍是最宽的 `[^\s]` —— 收窄字符集会让「归约因为某个字符匹配
+// 不上的串,兜底也同样匹配不上」的缝重新出现(`user:pa/ss@host` 就是这么漏的)。这里加的是
+// 「至少要有一个字母数字」的存在性要求,它不会因为口令里多了某个字符而失效,所以 `p*ss`、
+// `pa/ss`、`h#nter2` 一律照旧withheld。
+//
+// 剩下仍会被误伤的:`from:me@x to:you`、`meeting at 10:30@office` —— 口令有字母数字、`@` 后是
+// 合法主机形状,与 `guest:guestpw@rabbitmq` 在形状上完全一致,无法区分。README 里写明。
 const RESIDUAL_USERINFO_RE = new RegExp(
-  `(?<![${USERINFO_USER_CHARS}])[^\\s:@/]*:(?!\\/\\/)[^\\s]*@`,
+  `(?<![${USERINFO_USER_CHARS}])[^\\s:@/]*:(?!\\/\\/)(?=[^\\s]*[A-Za-z0-9][^\\s]*@)[^\\s]*@`
+  + `[A-Za-z0-9](?:${HOST_TOKEN_CHARS}*[A-Za-z0-9])?(?![^\\s:/])`,
 );
 /** 任意无 scheme 的 `host.tld/path`:path 常承载 webhook token、签名或对象凭据。 */
 const SCHEMELESS_HOST_PATH_RE =
@@ -436,8 +488,23 @@ const URL_LEAD = `${SHELL_BREAK}=,`;
 // 交给 RESIDUAL_QUERY_RE 整串不渲染。与 userinfo 那条走的是同一个判据。
 //
 // `&` 必须留在集合内 —— 多参数 query(`?a=1&b=2`)靠它,排除掉会把 `&b=2` 留在渲染串里。
+// 主机形状前瞻。归约与兜底**共用这一个常量** —— 两条一旦分头演化,就是这条 PR 反复出现的
+// 「第二张表和第一张不同步」。
+//
+// 含字母,**或**点分四段 IPv4。只要字母的话,内网/开发环境里最常见的无字母主机 —— IPv4 字面量
+// —— 既过不了这里、也过不了第 4 趟(那趟要求字母 TLD),于是 query 原样渲染:
+//
+//     grep {pattern: "192.168.0.1?code=abc"}   →   192.168.0.1?code=abc
+//     read {file_path: "127.0.0.1?sid=abcdef"} →   127.0.0.1?sid=abcdef
+//
+// 按本分支自己的论据(OAuth 授权码等价于 bearer),这正是这一趟要挡的那类。
+//
+// 裸数字单标签(`8080?code=abc`、`2026?code=abc`)仍然不碰:它们与 `10/20?ok=yes`、
+// `2026-08-06?ok=yes` 这种日期/比值散文在形状上完全一致,而 query 策略没有程序名可退,拦下来
+// 就是一张空白卡。README 里写明这条残留。
+const QUERY_HOST_LEAD = `(?:(?=[A-Za-z0-9._-]*[A-Za-z])|(?=\\d{1,3}(?:\\.\\d{1,3}){3}(?:[:/?]|$)))`;
 const SCHEMELESS_QUERY_RE = new RegExp(
-  `(^|[${URL_LEAD}])((?=[A-Za-z0-9._-]*[A-Za-z])[A-Za-z0-9._-]+(?::\\d+)?(?:\\/[^\\s?]*)?)\\?[^\\s'"]*=[^\\s'"]*(?=$|\\s|['"](?:[${SHELL_BREAK}]|$))`,
+  `(^|[${URL_LEAD}])(${QUERY_HOST_LEAD}[A-Za-z0-9._-]+(?::\\d+)?(?:\\/[^\\s?]*)?)\\?[^\\s'"]*=[^\\s'"]*(?=$|\\s|['"](?:[${SHELL_BREAK}]|$))`,
   "g",
 );
 
@@ -457,11 +524,15 @@ const SCHEMELESS_QUERY_RE = new RegExp(
  * OAuth 回调里的 `state='…'`)一趟都不匹配,而 `code=`/`sid=`/`refresh=` 这些既不在关键词表里、
  * 值也没有高熵形状,下游守卫同样抓不住 —— `code` 是 OAuth 授权码,等价于 bearer。
  */
-const RESIDUAL_QUERY_RE =
-  /(?=[A-Za-z0-9._-]*[A-Za-z])[A-Za-z0-9._-]+(?::\d+)?(?:\/[^\s?]*)?\?[^\s]*=/;
+const RESIDUAL_QUERY_RE = new RegExp(
+  `${QUERY_HOST_LEAD}[A-Za-z0-9._-]+(?::\\d+)?(?:\\/[^\\s?]*)?\\?[^\\s]*=`,
+);
 
 /** 把文本里内嵌的 URI 就地降级为 scheme://注册域(解析失败则整段抹除)。 */
 export function reduceUrlsInText(s: string): string {
+  // 无条件先截断,再进管线 —— 见 REDUCE_INPUT_MAX。这里是这条管线的**唯一**入口,所以上限也
+  // 只该有这一处;放在任何一个调用方里都只挡住那一个调用方。
+  if (s.length > REDUCE_INPUT_MAX) s = s.slice(0, REDUCE_INPUT_MAX);
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。
   let out = s.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, (m) => originDomain(m) ?? "");
@@ -515,13 +586,10 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
     case "query": v = firstString(p, ["query", "pattern"]); break;
   }
   if (!v) return "";
-  let s = v.replace(/\s+/g, " ").trim();
-  // 无条件先截断,再进归约管线 —— 见 SUMMARY_INPUT_MAX。不按策略分流:二次回溯在 query 策略
-  // (原样返回 pattern)、path 策略、shell 策略上都实测可达。
-  if (s.length > SUMMARY_INPUT_MAX) s = s.slice(0, SUMMARY_INPUT_MAX);
   // 单一 choke point:所有策略统一把内嵌 URL 降级为 scheme://注册域。避免逐 sink 加降级时
   // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
-  s = reduceUrlsInText(s).replace(/\s+/g, " ").trim();
+  // 输入上限住在 reduceUrlsInText 内部,这里不再重复设界(见 REDUCE_INPUT_MAX)。
+  const s = reduceUrlsInText(v.replace(/\s+/g, " ").trim()).replace(/\s+/g, " ").trim();
   // 归约管线处理不掉的 userinfo 形状 → 整串不渲染。必须放在归约**之后**:能确定是 DSN 的形状
   // 此时已被剥掉 userinfo,不会在这里误伤。
   if (RESIDUAL_USERINFO_RE.test(s)) return "";

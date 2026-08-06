@@ -154,26 +154,56 @@ to paste a secret in plaintext. Whether to adjust the configuration is up to you
 7. Sends display and submit-interactive cards with negotiated fallback
 8. Polls durable `card_action` events only after an interactive card is sent
 
-### Query strings are never rendered on a card
+### Query strings are stripped from host-shaped values
 
 Anything this plugin renders into a card goes through one URL-reduction step, and
-that step strips the query string. A query string is where callback codes, signed
-URLs, session ids and one-time tokens live, and cards are visible to every member
-of the channel, so the rule has no per-sink exceptions.
+that step strips the query string off anything it can identify as a host: a
+dotted hostname, a single-label host such as `localhost`, or an IPv4 literal. A
+query string is where callback codes, signed URLs, session ids and one-time
+tokens live, and cards are visible to every member of the channel, so the rule
+applies at every sink rather than only to progress cards.
 
-Two consequences are worth knowing, because they are not just cosmetic:
+It is stated as *host-shaped* rather than unconditionally, because two shapes are
+deliberately left alone and it is better to know which:
+
+- **A bare numeric label** — `8080?code=abc`, `2026?code=abc`. These cannot be
+  told apart from ordinary prose such as `10/20?ok=yes` or `2026-08-06?ok=yes`,
+  and a `grep` pattern has no program name to fall back to, so withholding would
+  render a blank card that reads as a bug.
+- **A fragment** — `localhost/cb#code=abc` renders in full. Implicit-flow OAuth
+  does return tokens in the fragment, so this is a real gap; it predates this
+  option and closing it would also hit `file.ts#L10` and markdown anchors, so it
+  is left for its own change rather than folded in here.
+
+Three consequences are worth knowing, because they are not just cosmetic:
 
 - Rich-text blocks may collapse. When more of a string counts as reducible, a
   display card can fall back to a single text block and lose its formatting.
+  Text over 4000 characters always takes that fallback, because the reduction
+  step bounds its own input (see below).
 - **A value you submitted may be echoed back without its query string.** The
   status card that records an interactive submission runs the same reduction over
   the submitted value, so `docs/parser?mode=fast` is frozen into the card as
   `docs/parser`. The card is no longer a verbatim record of what was submitted.
+- **`?` is read as a query delimiter even where it was a quantifier.** A `grep`
+  pattern of `colou?r=red` renders as `colou`, and `reports/q3?draft=1.pdf`
+  renders as `reports/q3`. The rewrite is silent — there is no ellipsis or marker.
 
-Where the shape cannot be reduced cleanly — a quote inside the query string, for
-instance — the summary is withheld entirely rather than half-rewritten. A
-partially rewritten command looks sanitized while still carrying its tail, and
-gives the operator no signal that what they are reading has been altered.
+Where the shape cannot be reduced cleanly — a quote inside the query string, a
+`user:pass@host` whose host is not identifiable, a port that would end in the
+middle of a token — the summary is withheld entirely rather than half-rewritten.
+A partially rewritten command looks sanitized while still carrying its tail, and
+gives the operator no signal that what they are reading has been altered. That
+withholding is deliberately blunt, and it costs some ordinary search patterns:
+`from:me@x to:you` and `meeting at 10:30@office` render nothing, because they are
+the same shape as `guest:guestpw@rabbitmq`. Patterns whose "password" carries no
+alphanumeric character (`user:.*@example`) or whose host is not host-shaped
+(`email:\s*\S+@\S+`) are exempted and render normally.
+
+The reduction step bounds its own input at 4000 characters. It runs on untrusted
+text — a submitted form value, a display name, tool arguments — on synchronous
+paths with no error boundary, and its passes are quadratic, so an unbounded input
+stalls the plugin's event loop for every account at once.
 
 ## Architecture
 
