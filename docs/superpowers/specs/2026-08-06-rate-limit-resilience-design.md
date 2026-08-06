@@ -37,7 +37,8 @@
 ## 非目标
 
 - **不**在插件侧做客户端自限流 / 令牌桶（决定见"自限流"一节）。
-- **不**改服务端限流配额设计。
+- **不**改服务端限流配额设计。**这是刻意的先后顺序，不是遗漏**：本次事故的症状（断联 40 分钟 + 人工重启）完全由插件侧造成、也能完全由插件侧消除，因为心跳被限流本身不影响消息路由（`bot:heartbeat` 无读方）。而"谁把那个 500 rps 的 per-IP 桶打满"目前**没有证据** —— 单 bot 的量级差好几个数量级，在不知来源时调服务端配额是在猜。本设计 §2 把 `scope` / `remaining` / `Retry-After` 打进日志，正是为了产出这个证据；拿到数据后再评估要不要给 `/v1/bot/*` 按 bot token 单独发桶。
+- **不**承诺"限流期间消息一定发得出去"。桶持续干涸时，一次发送带 2 次重试也就跨 2~3 秒，三次全撞 429 仍会失败，用户仍可能看到失败提示 —— 只是频率显著降低（我们不再往干涸的桶里加压）。彻底解决需要服务端配额隔离，见上一条。
 - **不**为 5xx / 网络错误新增重试。5xx 时写请求可能已在服务端落地，重试有重复副作用；429 由限流中间件在业务逻辑之前 `RenderError` + `Abort`（`octo-lib/pkg/wkhttp/ratelimit.go:259-269`，不会执行 `c.Next`），请求确定未落地，重试是安全的。这条边界是刻意的，且只对已核实的限流中间件成立。
 - **不**把 `botFetchJson` / 裸 `fetch` 的低频写接口迁到统一请求层（见 §2 覆盖面）。
 
@@ -71,9 +72,10 @@ export class OctoApiError extends Error {
 attempt = 0; waited = 0
 loop:
   if callerSignal?.aborted: throw callerSignal.reason      // 进入前先查
-  // deadline 必须每次尝试重建 —— 建在循环外会变成跨尝试共享，第 2 次尝试可能一出生就过期
-  fetchSignal = callerSignal ? AbortSignal.any([callerSignal, AbortSignal.timeout(DEFAULT_TIMEOUT_MS)])
-                             : AbortSignal.timeout(DEFAULT_TIMEOUT_MS)
+  // 调用方传了 signal 就完全尊重它（它比我们更清楚这次请求该等多久）；
+  // 只有在调用方没表达意见时才补一个默认 deadline。deadline 必须每次尝试重建 ——
+  // 建在循环外会变成跨尝试共享，第 2 次尝试可能一出生就过期。
+  fetchSignal = callerSignal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS)
   resp = fetch(..., fetchSignal)
   if resp.ok: return parsed
   err = OctoApiError.from(resp, path)
@@ -89,12 +91,15 @@ loop:
 
 - `MAX_429_RETRIES = 2`（合计最多 3 次尝试）。
 - **抖动只能向上（1.0..1.25），不能向下。** `Retry-After` 的语义是"最早可重试时间"，`0.75×` 会让我们比服务端明确要求的更早再撞一次 —— 那正是这个 issue 要消掉的行为。同理，**服务端给的等待超过 `MAX_RETRY_AFTER_MS = 10_000` 时直接放弃重试，而不是把它 clamp 短**：clamp 短等于提前重试。上限只在这里用来决定"还值不值得等"，解析层不得截断（见 §1）。
-- **`MAX_429_BACKOFF_WAIT_MS = 15_000` 只约束退避等待的累计时长，不是端到端预算 —— 名字要如实。** 端到端的兜底靠**每次尝试独立重建的 fetch deadline**：调用方没传 signal 时用 `AbortSignal.timeout(DEFAULT_TIMEOUT_MS)`（`api-fetch.ts:12` 已有的 30s，与 `:744,895` 同款约定），传了则 `AbortSignal.any` 合并。现在 `postJson` 把调用方 signal 原样交给 `fetch`，调用方不传就等于无超时 —— 一个挂住的连接可以永久卡住。
+- **`MAX_429_BACKOFF_WAIT_MS = 15_000` 只约束退避等待的累计时长，不是端到端预算 —— 名字要如实。** 端到端兜底靠**每次尝试独立重建的 fetch deadline**：现在 `postJson` 把调用方 signal 原样交给 `fetch`，调用方不传就等于无超时，一个挂住的连接可以永久卡住；补上默认 `DEFAULT_TIMEOUT_MS`（`api-fetch.ts:12` 已有的 30s，与 `:744,895` 同款约定）即可。
+- **不要用 `AbortSignal.any([callerSignal, 内部 deadline])` 求交集。** `/v1/bot/events` 的 long poll 会**故意**要求远超 30s 的超时：`fetchBotEvents`（`:839`）传的是 `eventsPollTimeoutMs(waitSeconds)`，而 `eventWaitSeconds` 上限 30（`config-schema.ts:143,169`）、margin 10s（`api-fetch.ts:26`），最大 **40s**。求交集会在 hold 中途把它砍掉，而这正是上游刻意避免的失败模式 —— 客户端在 hold 中途 abort 会丢弃服务端正要返回的那批事件，把循环退化成超时重试风暴。规则：**调用方给了 signal 就只用它；没给才补默认 30s。**
+
 - `sleep` 被 abort 时抛出的错误要把原 `OctoApiError` 挂在 `cause` 上，否则现场只剩一个 `TimeoutError`，丢掉"是被限流"这个诊断语义。
 - `OctoApiError.from()` 读响应头必须**容错**（`resp.headers?.get?.(…)`）：`Response`-like 的 mock 与非标准实现可能没有 `headers`，不能因为读头把一个正常的错误路径变成 `TypeError`。
 - 新增第 6 个可选参数 `opts?: { retryOn429?: boolean }`，默认 `true`；**以下调用点显式传 `false`**：
   - `sendHeartbeat` —— 周期性任务，30s 后自然重试；且 `bot:heartbeat` 无人读，重试没有收益。
   - `sendTyping`（`inbound.ts:2715` 每 5s 一次）、`sendReadReceipt` —— 可丢弃，重试只给正在干涸的桶加压。
+  - **`fetchBotEvents` / `ackBotEvent`** —— 事件轮询有自己的、按结果分档的节奏控制（`events-poll.ts:152-175`：错误走指数退避并在成功时重置）。让 postJson 在里面偷偷睡会**破坏它的判定依据**：`requestMs` 是绕整个调用测的（`:178 → :254`），包含退避睡眠；`eventWaitSeconds: 5` 时"服务端是否真的 hold 了"的阈值是 `5000 × HELD_FRACTION(0.5) = 2500ms`，两次约 1s 的 429 退避就能把 `requestMs` 推过阈值 → poller 误判服务端 hold 过 → `nextDelayMs` 返回 0 → 立即重 poll，正是上游刚修掉的热循环。429 交给 poller 自己的错误退避处理，语义更准。
   - **card-progress 的 flush 路径（占位卡首帧 + `transient: true` 编辑）** —— 见 §3。
 
 **覆盖面（修正过的说法）。** `postJson` 是这些端点的出口：`sendMessage` 全部变体（`:163,308,378,460,548`）、`message/edit`（`:616,645`，即卡片进度帧）、`events` + `events/ack`（`:779,799`）、`typing`（`:816`）、`readReceipt`（`:831`）、`heartbeat`（`:843`）、`register`（`:871`）。
@@ -280,7 +285,7 @@ WS 断开（任何原因）
 - 退避中 `signal` abort → 立刻抛，且 `cause` 是原 `OctoApiError`
 - 进入时 signal 已 aborted → 不发请求
 - **调用方未传 signal 时，fetch 仍带 `DEFAULT_TIMEOUT_MS` 的内部 deadline**（挂住的 fetch 会被中断）
-- 调用方传了 signal 时，内部 deadline 与调用方 signal 合并，任一触发都中断
+- **调用方传了 signal 时，只用调用方的，不与内部 deadline 求交集** —— 用 `fetchBotEvents` 的 long-poll 场景锁死：`waitSeconds = 30` 时 40s 的超时不得被砍到 30s
 - **deadline 每次尝试重建**：第 1 次尝试耗掉大部分 deadline 后，第 2 次尝试仍有完整预算
 - 响应对象缺 `headers` 时不抛 `TypeError`，退回默认 `retryAfterMs`
 
@@ -329,6 +334,11 @@ WS 断开（任何原因）
 - 新增：**finalize / 终态帧绕过冷却门**，即使在窗口内也照发
 - 新增：网络失败 / 5xx 仍按原策略重试（不回归）
 - 新增：非 transient（finalize / 最终卡）遇 429 → 走 postJson 退避后成功
+
+**`src/events-poll.test.ts`（扩充）**
+- `/v1/bot/events` 遇 429 时 postJson **不睡不重试**，poller 走自己的错误指数退避
+- long poll 场景下 429 不会把 `requestMs` 推过 `waitSeconds × HELD_FRACTION` 阈值、不会导致 0ms 立即重 poll
+- `waitSeconds = 30` 时请求超时仍是 40s（内部 deadline 不得把它砍到 30s）
 
 **回归**：`npm run type-check` + 全量 `npm test` + `npm run pack:check`
 
