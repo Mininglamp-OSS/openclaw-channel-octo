@@ -222,10 +222,38 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
  * 返回值三态:`true`=启用,`false`=**明确禁用**(可永久 skip 本 session),
  * `null`=**瞬时探测失败**(5xx/网络,不缓存、不 skip,下次 flush 重探)。
  */
+function getBotCardProfileForCaller(
+  ctx: CardContext,
+  signal?: AbortSignal,
+): Promise<CardProfileManifest> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  const sharedRead = getBotCardProfile({ apiUrl: ctx.apiUrl, botToken: ctx.botToken });
+  if (!signal) return sharedRead;
+
+  return new Promise<CardProfileManifest>((resolve, reject) => {
+    const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+    const onAbort = (): void => {
+      cleanup();
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    sharedRead.then(
+      (manifest) => {
+        cleanup();
+        resolve(manifest);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<boolean | null> {
   try {
     if (ctx.accountId) requestCardEventPolling(ctx.accountId);
-    const m = await getBotCardProfile({ apiUrl: ctx.apiUrl, botToken: ctx.botToken });
+    const m = await getBotCardProfileForCaller(ctx, signal);
     if (signal?.aborted) throw signal.reason;
     return !!reasoningTemplateForProfile(m);
   } catch (err: unknown) {

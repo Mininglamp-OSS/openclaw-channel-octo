@@ -349,8 +349,7 @@ describe("server-driven Registry reasoning progress", () => {
     handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-1" }, hookContext);
 
     vi.advanceTimersByTime(900);
-    for (let index = 0; index < 10 && !sendStarted; index++) await Promise.resolve();
-    expect(sendStarted).toBe(true);
+    await vi.waitFor(() => expect(sendStarted).toBe(true));
     const finalized = finalizeCard("send-race", { success: true });
     resolveSend();
     await finalized;
@@ -364,7 +363,8 @@ describe("server-driven Registry reasoning progress", () => {
     });
   });
 
-  it("releases finalize at the progress timeout while the shared profile read continues", async () => {
+  it("releases the old finalize when a replacement aborts its shared profile wait", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
     let resolveProfile!: (response: Response) => void;
     const profileGate = new Promise<Response>((resolve) => { resolveProfile = resolve; });
     global.fetch = vi.fn().mockImplementation(async (url: string) => {
@@ -387,16 +387,23 @@ describe("server-driven Registry reasoning progress", () => {
     const finalizing = finalizeCard("profile-timeout", { success: true }).then(() => {
       finalized = true;
     });
-    await vi.advanceTimersByTimeAsync(10_100);
-    await Promise.resolve();
-
-    expect(finalized).toBe(true);
+    setCardContext("profile-timeout", context());
+    await vi.waitFor(() => expect(finalized).toBe(true));
     expect(vi.mocked(global.fetch).mock.calls.some(([url]) => String(url).includes("/sendMessage")))
       .toBe(false);
 
     resolveProfile(Response.json(profile()));
     await finalizing;
     for (let index = 0; index < 5; index++) await Promise.resolve();
+
+    const replacementContext = { sessionKey: "profile-timeout", runId: "run-2" };
+    handlers.before_agent_run?.({}, replacementContext);
+    handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-2" }, replacementContext);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(vi.mocked(global.fetch).mock.calls.filter(([url]) => String(url).includes("/card/profile")))
+      .toHaveLength(1);
+    expect(vi.mocked(global.fetch).mock.calls.filter(([url]) => String(url).includes("/sendMessage")))
+      .toHaveLength(1);
   });
 
   it("fails closed when the same sessionKey is replaced by a different Bot identity", async () => {
