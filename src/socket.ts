@@ -243,6 +243,17 @@ interface WKSocketOptions {
 }
 
 /**
+ * Bound on the entire connection build-up: TCP/Upgrade, then the CONNECT packet, then
+ * CONNACK.
+ *
+ * `connected`, the ping timer and the stability timer all start only after a successful
+ * CONNACK, so a build-up that stalls anywhere before that emits no close event and no
+ * ping timeout — nothing else in the process would ever notice. Both halves matter: the
+ * upgrade can hang in CONNECTING, and a socket can reach OPEN and then never be answered.
+ */
+export const CONNECT_DEADLINE_MS = 15_000;
+
+/**
  * WuKongIM WebSocket client for bot connections.
  *
  * Implements the WuKongIM binary protocol directly over WebSocket,
@@ -262,6 +273,8 @@ export class WKSocket extends EventEmitter {
   private readonly pingMaxRetry = 3;
   private reconnectAttempts = 0;
   private stableTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Deadline for the whole connection build-up; see startConnectDeadline. */
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private lastConnectTime = 0;
   private rapidDisconnectCount = 0;
 
@@ -297,6 +310,7 @@ export class WKSocket extends EventEmitter {
     this.lastConnectTime = 0;
     this.rapidDisconnectCount = 0;
     this.stopHeart();
+    this.clearConnectDeadline();
     this.stopReconnectTimer();
     this.clearStableTimer();
     if (this.ws) {
@@ -312,6 +326,7 @@ export class WKSocket extends EventEmitter {
     this.stopHeart();
     this.stopReconnectTimer();
     this.clearStableTimer();
+    this.clearConnectDeadline();
 
     const oldWs = this.ws;
     this.ws = null;
@@ -338,10 +353,67 @@ export class WKSocket extends EventEmitter {
     });
   }
 
+  /**
+   * True only after a successful CONNACK — i.e. the connection can actually carry traffic.
+   *
+   * Distinct from {@link isConnectingOrConnected}: between `open` and CONNACK the socket is
+   * OPEN but unusable, and anything that reports liveness must not treat that window as
+   * connected.
+   */
+  isConnected(): boolean {
+    return this.connected;
+  }
+
+  /**
+   * True while a socket exists and is either connecting or open — "somebody is already
+   * building this connection, stay out of the way".
+   *
+   * Compared against the numeric readyState values rather than the ws class's statics: the
+   * class is mocked in tests, and a mock missing a static would silently make this
+   * predicate wrong instead of failing loudly.
+   */
+  isConnectingOrConnected(): boolean {
+    const state = this.ws?.readyState;
+    return state === 0 /* CONNECTING */ || state === 1 /* OPEN */;
+  }
+
+  /** True while a backoff reconnect is scheduled but has not fired yet. */
+  hasPendingReconnect(): boolean {
+    return this.reconnectTimer !== null;
+  }
+
+  /**
+   * Arm the build-up deadline for one specific socket.
+   *
+   * The callback is bound to the socket that created it and guarded the same way every
+   * other handler here is, so a deadline left over from an abandoned attempt can never
+   * close the connection that replaced it.
+   */
+  private startConnectDeadline(ws: WebSocket): void {
+    this.clearConnectDeadline();
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null;
+      if (this.ws !== ws) return; // stale guard
+      console.debug("[WKSocket] connect deadline expired before CONNACK, closing");
+      try { ws.close(); } catch { /* ignore */ }
+      // The close handler takes over from here: needReconnect is still true, so the
+      // ordinary backoff schedules the next attempt.
+    }, CONNECT_DEADLINE_MS);
+  }
+
+  private clearConnectDeadline(): void {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+
   // ─── Internal Connection Logic ──────────────────────────────────────────
 
   private doConnect(): void {
     this.clearStableTimer();
+    // The socket being replaced takes its deadline with it.
+    this.clearConnectDeadline();
     if (this.ws) {
       try { this.ws.close(); } catch { /* ignore */ }
       this.ws = null;
@@ -351,6 +423,7 @@ export class WKSocket extends EventEmitter {
     const ws = new WebSocket(this.opts.wsUrl);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    this.startConnectDeadline(ws);
 
     ws.on("open", () => {
       if (this.ws !== ws) return; // stale guard
@@ -397,6 +470,7 @@ export class WKSocket extends EventEmitter {
       }
       this.stopHeart();
       this.clearStableTimer();
+      this.clearConnectDeadline();
 
       // Track rapid disconnects: if connection lasted <5s, it's unstable
       if (this.lastConnectTime > 0) {
@@ -439,6 +513,9 @@ export class WKSocket extends EventEmitter {
     const delay = Math.floor(jitter);
     this.reconnectAttempts++;
     this.reconnectTimer = setTimeout(() => {
+      // Cleared on entry: leaving the handle set makes "a reconnect is already pending"
+      // permanently true, which silences everything that consults it.
+      this.reconnectTimer = null;
       if (this.needReconnect) {
         this.doConnect();
       }
@@ -629,6 +706,10 @@ export class WKSocket extends EventEmitter {
       const _nodeId = dec.readInt64BigInt();
     }
 
+    // The build-up is over however this turns out; cleared once here rather than in each
+    // branch so a new rejection reason cannot forget to do it.
+    this.clearConnectDeadline();
+
     if (reasonCode === 1) {
       // Success — derive AES key from DH shared secret
       const serverPubKey = Uint8Array.from(Buffer.from(serverKey, "base64"));
@@ -719,6 +800,7 @@ export class WKSocket extends EventEmitter {
     this.needReconnect = false;
     this.stopHeart();
     this.clearStableTimer();
+    this.clearConnectDeadline();
     if (this.ws) { try { this.ws.close(); } catch {} this.ws = null; }
     this.opts.onError?.(new Error("Kicked by server"));
     this.opts.onDisconnected?.();
