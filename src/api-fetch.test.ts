@@ -2341,6 +2341,8 @@ describe("getCardProfile server-driven config", () => {
     const { getCardProfile } = await import("./api-fetch.js");
     await expect(getCardProfile({ apiUrl: "https://api.test", botToken: "bot-a" }))
       .rejects.toThrow(/card\/profile failed \(500\)/);
+  });
+});
 
 describe("postJson 429 backoff", () => {
   const originalFetch = global.fetch;

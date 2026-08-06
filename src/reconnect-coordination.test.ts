@@ -4,6 +4,7 @@ import {
   buildWatchdogPredicate,
   createDeferredReconnect,
   createReconnectSequencer,
+  createSingleFlightFlag,
 } from "./reconnect-coordination.js";
 
 describe("createReconnectSequencer", () => {
@@ -180,5 +181,52 @@ describe("createDeferredReconnect", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(sequencer.isInFlight()).toBe(true);
     release?.();
+  });
+});
+
+describe("createSingleFlightFlag", () => {
+  it("is raised for the duration of the work and lowered after", async () => {
+    const flag = createSingleFlightFlag();
+    let release: (() => void) | undefined;
+    expect(flag.isRaised()).toBe(false);
+
+    const running = flag.run(() => new Promise<void>((res) => (release = res)));
+    expect(flag.isRaised()).toBe(true);
+
+    release?.();
+    await running;
+    expect(flag.isRaised()).toBe(false);
+  });
+
+  // The trap this unit exists for. Raising the flag and then handing the work to something
+  // that may decline to run it — a sequencer already busy with another sequence — used to
+  // leave the flag raised forever, because the lowering lived inside the work.
+  it("lowers the flag even when the work does nothing at all", async () => {
+    const flag = createSingleFlightFlag();
+    await flag.run(async () => {
+      /* declined: the callback never ran anything */
+    });
+    expect(flag.isRaised()).toBe(false);
+  });
+
+  it("lowers the flag when the work throws", async () => {
+    const flag = createSingleFlightFlag();
+    await expect(
+      flag.run(async () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    expect(flag.isRaised()).toBe(false);
+  });
+
+  it("can be raised again after the previous run finished", async () => {
+    const flag = createSingleFlightFlag();
+    await flag.run(async () => {});
+    let seen = false;
+    await flag.run(async () => {
+      seen = flag.isRaised();
+    });
+    expect(seen).toBe(true);
+    expect(flag.isRaised()).toBe(false);
   });
 });

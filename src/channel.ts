@@ -11,6 +11,7 @@ import {
   buildWatchdogPredicate,
   createDeferredReconnect,
   createReconnectSequencer,
+  createSingleFlightFlag,
 } from "./reconnect-coordination.js";
 import { OctoConfigJsonSchema, type OctoConfig } from "./config-schema.js";
 import { CHANNEL_ID, MAX_UPLOAD_SIZE, stripAllChannelPrefixes, getChannelConfig } from "./constants.js";
@@ -1443,7 +1444,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 5. Token refresh state — time-based cooldown to prevent refresh storms
       let lastTokenRefreshAt = 0;
       const TOKEN_REFRESH_COOLDOWN_MS = 60_000; // 60 seconds
-      let isRefreshingToken = false; // Guard against concurrent refreshes (#43)
+      // Guard against concurrent refreshes (#43). A unit rather than a bare boolean because
+      // the lowering has to survive the inner call declining to run — see
+      // createSingleFlightFlag.
+      const refreshGuard = createSingleFlightFlag();
 
       // 5c. Serialises the reconnect sequences so the watchdog can tell that one is already
       // running — including during the awaits, when nothing else shows it.
@@ -1607,20 +1611,12 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
 
           // If kicked or connect failed, try refreshing the IM token with a cooldown
           // to prevent refresh storms (e.g. 9000+ refreshes across 11 bots).
-          // Use isRefreshingToken to prevent concurrent refresh attempts (#43)
+          // refreshGuard prevents concurrent refresh attempts (#43)
           const cooldownElapsed = Date.now() - lastTokenRefreshAt > TOKEN_REFRESH_COOLDOWN_MS;
-          if (cooldownElapsed && !isRefreshingToken && !stopped &&
+          if (cooldownElapsed && !refreshGuard.isRaised() && !stopped &&
               (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
-            isRefreshingToken = true;
             lastTokenRefreshAt = Date.now();
-            // The reset wraps the whole call, not the callback: run() returns without
-            // invoking it when another sequence is already in flight, and a reset that only
-            // lives inside the callback would leave this flag stuck on — which silences the
-            // watchdog predicate and the cooldown branch for good. Exactly the permanent
-            // wedge this change exists to remove.
-            try {
-              // Inside the try as well: a host logger that throws would otherwise strand the
-              // flag between raising it and reaching the protection.
+            await refreshGuard.run(async () => {
               log?.warn?.(`octo: [${account.accountId}] connection rejected — refreshing IM token...`);
               await reconnectSequencer.run("token-refresh", async () => {
                 try {
@@ -1656,10 +1652,8 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   deferredReconnect.schedule("post-register-retry");
                 }
               });
-            } finally {
-              isRefreshingToken = false;
-            }
-          } else if (!isRefreshingToken && !stopped &&
+            });
+          } else if (!refreshGuard.isRaised() && !stopped &&
               (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
             // Cooldown active — skip token refresh but still reconnect with current credentials.
             log?.warn?.(`octo: [${account.accountId}] cooldown active, scheduling reconnect with current credentials...`);
@@ -1668,6 +1662,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         },
       });
 
+      // Must stay above socket.connect(): the onError closure defined earlier captures this
+      // binding, and connect() is what can trigger onError. Moving the start-up sequence
+      // (connect / heartbeat.start / watchdog.start) above this const turns that capture into
+      // a temporal-dead-zone throw, and the else-branch call site is not inside a try.
       const deferredReconnect = createDeferredReconnect({
         isStopped: () => stopped,
         sequencer: reconnectSequencer,
@@ -1706,7 +1704,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           isReconnectInFlight: () => reconnectSequencer.isInFlight(),
           isConnectingOrConnected: () => socket.isConnectingOrConnected(),
           hasPendingReconnect: () => socket.hasPendingReconnect(),
-          isRefreshingToken: () => isRefreshingToken,
+          isRefreshingToken: () => refreshGuard.isRaised(),
           hasDeferredReconnect: () => deferredReconnect.isPending(),
         }),
         reconnect: () =>

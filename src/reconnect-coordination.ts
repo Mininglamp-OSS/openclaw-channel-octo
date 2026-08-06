@@ -120,3 +120,37 @@ export function createDeferredReconnect(deps: {
     },
   };
 }
+
+export interface SingleFlightFlag {
+  isRaised(): boolean;
+  /**
+   * Raise the flag, run `fn`, and lower it again — whatever `fn` does, including nothing
+   * at all and including throwing.
+   */
+  run(fn: () => Promise<void>): Promise<void>;
+}
+
+/**
+ * A guard flag whose lowering cannot be skipped.
+ *
+ * Written as a unit because the obvious hand-rolled version has a trap that cost this
+ * codebase a real defect: raise the flag, then hand the work to something that may decline
+ * to run it, and put the lowering inside the work. When the work is declined the flag stays
+ * raised for the lifetime of the process — and this particular flag gates both the watchdog
+ * predicate and the fallback reconnect branch, so leaving it raised is indistinguishable from
+ * the outage it was meant to prevent.
+ */
+export function createSingleFlightFlag(): SingleFlightFlag {
+  let raised = false;
+  return {
+    isRaised: () => raised,
+    async run(fn): Promise<void> {
+      raised = true;
+      try {
+        await fn();
+      } finally {
+        raised = false;
+      }
+    },
+  };
+}

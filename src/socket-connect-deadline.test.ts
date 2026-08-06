@@ -185,6 +185,24 @@ describe("connection build-up deadline", () => {
     expect(ws.closed).toBe(false);
   });
 
+  // The branch N2 fixed. A CONNACK reporting a failed connect used to leave the socket OPEN
+  // and non-null, so readyState claimed somebody was still connecting and the supervisor
+  // stayed out of the way forever.
+  it("closes and drops the socket when CONNACK reports a failed connect", async () => {
+    const onError = vi.fn();
+    const socket = createSocket({ onError });
+    socket.connect();
+    instances[0].complete();
+    instances[0].emit("message", buildConnackPacket(2)); // neither success nor kicked
+
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("Connect failed") }),
+    );
+    expect(instances[0].closed).toBe(true);
+    expect(socket.isConnectingOrConnected()).toBe(false);
+    expect(socket.isConnected()).toBe(false);
+  });
+
   it("drops the deadline on a rejected CONNACK", async () => {
     const onError = vi.fn();
     const socket = createSocket({ onError });

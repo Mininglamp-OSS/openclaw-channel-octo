@@ -190,12 +190,68 @@ describe("Bug A fix: Exponential backoff grows correctly", () => {
 });
 
 
-// "Kicked during cooldown still reconnects" used to live here as a hand-copied onError with
-// local variables. It reset its refresh flag synchronously, so no amount of exercising it could
-// have caught the real implementation leaving that flag stuck on — the defect a reviewer found
-// by reading the production code instead. Deleted rather than repaired: the behaviour it claimed
-// to protect is covered against real code in reconnect-coordination.test.ts (a deferred
-// reconnect is armed, cancellable, visible, and skipped for a stopped account).
+// The onError branch selection that used to be simulated here with local variables is gone:
+// it reset its refresh flag synchronously, so no amount of exercising it could have caught the
+// real implementation leaving that flag stuck on. That behaviour is now covered against real
+// code in reconnect-coordination.test.ts.
+//
+// The case below is a different thing and stays: it drives a real WKSocket.
+describe("Kicked bots can be revived", () => {
+  it("socket reconnects after channel.ts calls disconnect+connect on kick", () => {
+    /**
+     * When CONNACK returns kicked (reasonCode=0), needReconnect is set to false
+     * and the close event won't trigger scheduleReconnect. But channel.ts can
+     * call socket.disconnect() + socket.connect() to revive the bot.
+     */
+    const originalSetTimeout = global.setTimeout;
+    const setTimeoutCalls: { fn: Function; delay: number }[] = [];
+    global.setTimeout = vi.fn((fn: Function, delay?: number) => {
+      setTimeoutCalls.push({ fn, delay: delay ?? 0 });
+      return 999 as any;
+    }) as any;
+
+    mockWsInstances.length = 0;
+    (globalThis as any).__mockWsInstances = mockWsInstances;
+
+    const onError = vi.fn();
+    const socket = new WKSocket({
+      wsUrl: "ws://test:5200",
+      uid: "bot1",
+      token: "tok1",
+      onMessage: vi.fn(),
+      onError,
+    });
+
+    // Initial connection → kicked
+    socket.connect();
+    const ws1 = mockWsInstances[0];
+    ws1.emit("open");
+    ws1.emit("message", buildConnackKicked());
+
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+      message: "Kicked by server",
+    }));
+
+    // needReconnect is false after kick, close won't trigger scheduleReconnect
+    setTimeoutCalls.length = 0;
+    ws1.emit("close");
+    expect(setTimeoutCalls.length).toBe(0);
+
+    // channel.ts calls disconnect + connect → bot reconnects
+    socket.disconnect();
+    socket.connect();
+
+    // Verify a new WebSocket was created (bot is alive!)
+    expect(mockWsInstances.length).toBeGreaterThan(1);
+    const ws2 = mockWsInstances[mockWsInstances.length - 1];
+    expect(ws2).not.toBe(ws1);
+
+    socket.disconnect();
+    global.setTimeout = originalSetTimeout;
+    delete (globalThis as any).__mockWsInstances;
+    vi.restoreAllMocks();
+  });
+});
 
 
 describe("Bug C fix: Rapid silent disconnects trigger onError", () => {
