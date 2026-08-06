@@ -126,7 +126,7 @@ const SUMMARY_MAX = 64;
  * 一起停。
  *
  * **上限住在 reduceUrlsInText 里,不是住在调用方。** 上一版把它放在 summarizeToolParams 里,
- * 于是九个调用方只有一个被挡住;剩下八个跑的还是同一条二次管线。最要命的是
+ * 于是十一个调用点只有一个被挡住;剩下十个跑的还是同一条二次管线。最要命的是
  * card-action-status.ts 的 neutralizeEcho —— 它的输入是**群成员提交的表单值**和用户自设的
  * 显示名(它自己的文档注释就写着 untrusted),信任边界比「模型生成的工具参数」还低,而且因为
  * summarizeToolParams 已经快了,它成了唯一剩下的那条路,反而更难被发现。
@@ -267,6 +267,45 @@ function firstString(p: Record<string, unknown>, keys: string[]): string {
 const SHELL_BREAK = "\\s'\"(;|&`<>)";
 
 const PROGRAM_TOKEN_RE = /^[A-Za-z0-9_./@:+-]+$/;
+/**
+ * `user:pass@host` 形状的 token —— **不是程序名**,是凭据。
+ *
+ * `PROGRAM_TOKEN_RE` 的字符类里 `:` 和 `@` 都在,所以一个 DSN 能当程序名渲染出去。main 上这
+ * 通常撞不到,因为空白分词把带引号的值切碎、候选停在 `b'` 这种带引号的碎片上、被形状校验挡下;
+ * 赋值折叠**把分词修好了**,搜索于是多走一个 token,正好落到 DSN 上:
+ *
+ *     X='a b' user:hunter2@localhost      main ""  →  折叠后 "user:hunter2@localhost"
+ *
+ * 底下那个凭据形状是 UNFIXED 里那一类(单标签主机,归约要求带点),折叠没有开新口,但它扩大了
+ * 可达面 —— 而"折叠结果永不渲染,所以最多让卡片空白"这句话正是因此不成立:折叠不渲染自己,
+ * 它改变**选中哪个 token**,而选中的那个是原样渲染的。
+ *
+ * 带 scheme 的要排除掉:`mysql://root:hunter2@10.0.0.5:3306/prod` 由第 1 趟 `new URL()` 归约成
+ * `mysql://10.0.0.5`,那是正确输出,不该在这里被打成空白。这条只管**无 scheme** 的形状 ——
+ * 也正是归约够不着、会原样渲染出去的那一类。
+ *
+ * **按最后一个 `@` 判定,和 pass 3 一致。** 第一版写成正则 `[^@]*:[^@]*@`,而 `[^@]*` 跨不过
+ * `@`,于是它要求冒号在**第一个** `@` 之前 —— 可 SCHEMELESS_USERINFO_RE 的注释写得很清楚:
+ * 「密码可含 `@`,按最后一个 `@` 分隔主机」。两条规则一分岔,用户名里带 `@` 的 DSN(Azure SQL /
+ * MongoDB Atlas / Snowflake 都是这个形态)就整类走过去:
+ *
+ *     X='a b' alice@corp.com:hunter2@localhost     main ""  →  原样渲染
+ *     X='a b' alice@corp.com:p/w@db.example.com    main ""  →  原样渲染
+ *
+ * 这正是本分支反复犯的那一个错:第二张表本该照着第一张写,却没有。
+ *
+ * 用下标而不是正则,还顺带解决了代价:`[^@]*:[^@]*@` 在「冒号密集、没有 `@`」的 token 上是
+ * 二次的,而 summarizeShell 跑在**归约那道界之上**,`REDUCE_INPUT_MAX` 管不到它 ——
+ * `":"×131072` 实测 19 077 ms(main 4.3 ms)。indexOf/lastIndexOf 是线性的。
+ */
+const TOKEN_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+function isDsnShapedToken(t: string): boolean {
+  if (TOKEN_SCHEME_RE.test(t)) return false;
+  const host = t.lastIndexOf("@");
+  if (host <= 0) return false;
+  const colon = t.indexOf(":");
+  return colon >= 0 && colon < host;
+}
 const ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
@@ -320,7 +359,8 @@ function summarizeShell(p: Record<string, unknown>): string {
   let i = 0;
   while (i < tokens.length && ASSIGNMENT_TOKEN_RE.test(tokens[i])) i++;
   const prog = tokens[i] ?? "";
-  return PROGRAM_TOKEN_RE.test(prog) ? prog : "";
+  if (!PROGRAM_TOKEN_RE.test(prog) || isDsnShapedToken(prog)) return "";
+  return prog;
 }
 
 /**
@@ -358,6 +398,15 @@ const SCHEMELESS_HOST_PATH_RE =
   /(^|[^A-Za-z0-9@._/:+-])([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?\/[^\s]+)/g;
 
 /**
+ * 调用方自己的敏感判定。界要用它去查**被丢掉的那一段** —— 见 boundedForReduction 里
+ * 「被丢掉的那一段要过一遍调用方自己的守卫」。
+ */
+export type SensitivePredicate = (s: string) => boolean;
+
+/** 缺省谓词取最严的一档:不知道调用方是谁时,宁可过度隐藏。 */
+const DEFAULT_SENSITIVE: SensitivePredicate = (s) => isSensitive(s, true);
+
+/**
  * 超长输入的截断:**切口只能落在空白上**,切不到就整串不渲染。
  *
  * 上一版是 `s.slice(0, REDUCE_INPUT_MAX)` —— 盲切。它自己就是一条泄漏路径:下面几趟归约靠
@@ -385,12 +434,52 @@ const SCHEMELESS_HOST_PATH_RE =
  * 前 4000 字符已经是一个完整的、token 边界对齐的前缀,取 4000 会把它连同整串一起拒掉。
  * (`"a"×4000 + " " + "b"×100` 曾整串不渲染,而 `"a"×3999 + " " + …` 正常留下 3999 字符。)
  * 多取的那一个字符只用于**发现**切点,不会进入结果 —— 返回值长度恒 ≤ REDUCE_INPUT_MAX。
+ *
+ * **被丢掉的那一段要过一遍调用方自己的守卫。** 切开 token 不是界唯一能造成的伤害:守卫读的是
+ * **截断后**的串,所以界还能把「正在压住一个凭据的那个关键词」一起删掉,让本该 fail-closed 的
+ * 输入变成看起来干净的输入:
+ *
+ *     "user:hunter2@localhost " + "x "×1988 + "y token"      (4006 字符)
+ *       main   ""                       ← 尾部的 `token` 命中 SECRET_RE,整串扣下
+ *       无此守卫  "user:hunter2@localhost x x x…"  ← ` token` 被切掉,剩下的在守卫眼里干净
+ *
+ * 凭据在 offset 0,所以摘要 64 / 错误 120 的渲染上限一个都挡不住。
+ *
+ * 判定必须是**调用方自己那一个**,不能写死。实测 main 的行为本身就按策略分岔 —— 同一个尾部
+ * 长 hex,`grep`(generic=true)扣下、`read`(generic=false)渲染。写死 `true` 会把 git SHA /
+ * docker digest 结尾的普通长文本打空(main 渲染),写死 `false` 又漏掉纯高熵尾巴(main 扣下)。
+ * 传进来的是**同一个函数**,所以这道守卫和下游那道不会在"用哪套规则"上分岔。
+ *
+ * 只查**被丢掉的那一段**,不查整串:整串查会把归约本该救回来的内容打空 —— 一段以 webhook
+ * 开头、后接 900 个普通词的文本,整串查是 null,只查尾巴仍渲染 4000 字符。
+ *
+ * **这道守卫比下游那道严,这是明知故犯的。** 它跑在归约**之前**,看到的是原文;下游那道跑在
+ * 归约之后。于是尾巴里一条普通文档链接(路径 ≥32 字符、含 `/`)会命中 hasGenericSecretShape,
+ * 而它在下游是被归约掉、根本看不见的。代价真实:
+ *
+ *     "connection refused after 3 retries " + "word "×900 + "see https://docs.example.com/…"
+ *       main  "connection refused after 3 retries word word…"(121 字符)
+ *       这里  ""
+ *
+ * 看起来的修法是「尾巴也先定界再归约,然后才判」。**实测它会开一个新泄漏**:尾巴自己超过 4000
+ * 时,定界会把尾巴的尾巴也切掉,而 main 是看得到那一段的 ——
+ *
+ *     "word "×900 + "pad "×1100 + "AKIAIOSFODNN7EXAMPLE"   密钥在尾巴的第 4901 位
+ *       查整条 raw 尾巴        isSensitive=true   ← 抓到
+ *       尾巴先定界再归约        isSensitive=false  ← 漏掉
+ *
+ * 用可用性换泄漏是这条管线不做的交易,所以守卫维持查原文。代价钉在 COST_CORPUS。
  */
-function boundedForReduction(s: string): string | null {
+export function boundedForReduction(
+  s: string,
+  isSensitiveHere: SensitivePredicate = DEFAULT_SENSITIVE,
+): string | null {
   if (s.length <= REDUCE_INPUT_MAX) return s;
   const cut = s.slice(0, REDUCE_INPUT_MAX + 1);
   const lastSpace = cut.search(/\s\S*$/);
-  return lastSpace >= 0 ? cut.slice(0, lastSpace) : null;
+  if (lastSpace < 0) return null;
+  const kept = cut.slice(0, lastSpace);
+  return isSensitiveHere(s.slice(kept.length)) ? null : kept;
 }
 
 /**
@@ -412,10 +501,13 @@ function boundedForReduction(s: string): string | null {
  * 也就是说,把第 1 趟提到界之上,等于把本 PR 修掉的那个 9–11 秒停顿原样放回来,触发条件还更
  * 宽松(任意超长无空白 token,不需要任何 URL 语法)。所以界留在最前面,代价记在文档和语料里。
  */
-export function reduceUrlsInText(input: string): string {
+export function reduceUrlsInText(
+  input: string,
+  isSensitiveHere: SensitivePredicate = DEFAULT_SENSITIVE,
+): string {
   // 截断先于管线 —— 这里是这条管线的**唯一**入口,所以上限也只该有这一处;放在任何一个调用方
-  // 里都只挡住那一个调用方。
-  const s = boundedForReduction(input);
+  // 里都只挡住那一个调用方。`isSensitiveHere` 是调用方下游那道守卫,界用它检查自己丢掉了什么。
+  const s = boundedForReduction(input, isSensitiveHere);
   if (s === null) return "";
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。
@@ -461,14 +553,17 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
     case "query": v = firstString(p, ["query", "pattern"]); break;
   }
   if (!v) return "";
-  // 单一 choke point:所有策略统一把内嵌 URL 降级为 scheme://注册域。避免逐 sink 加降级时
-  // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
-  // 输入上限住在 reduceUrlsInText 内部,这里不再重复设界(见 REDUCE_INPUT_MAX)。
-  const s = reduceUrlsInText(v.replace(/\s+/g, " ").trim()).replace(/\s+/g, " ").trim();
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
   // + 明确前缀,避免把 git SHA / docker digest / 缓存哈希等正常路径误伤成空。
   const generic = strategy === "query" || strategy === "url";
-  if (!s || isSensitive(s, generic)) return "";
+  const sensitiveHere: SensitivePredicate = (t) => isSensitive(t, generic);
+  // 单一 choke point:所有策略统一把内嵌 URL 降级为 scheme://注册域。避免逐 sink 加降级时
+  // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
+  // 输入上限住在 reduceUrlsInText 内部,这里不再重复设界(见 REDUCE_INPUT_MAX)。**同一个谓词
+  // 传进去**,界丢掉的那一段就用下面这道守卫检查,两者不可能再分岔。
+  const s = reduceUrlsInText(v.replace(/\s+/g, " ").trim(), sensitiveHere)
+    .replace(/\s+/g, " ").trim();
+  if (!s || sensitiveHere(s)) return "";
   return s.length > SUMMARY_MAX ? s.slice(0, SUMMARY_MAX) + "…" : s;
 }
 
@@ -508,7 +603,8 @@ export function sanitizeErrorText(err?: string): string {
   if (!err) return "";
   let s = err.replace(/\s+/g, " ").trim();
   if (!s) return "";
-  s = reduceUrlsInText(s).replace(/\s+/g, " ").trim(); // URL 降级可能留下空隙
+  // 传自己的守卫:界丢掉的那一段用**同一个**判定检查(错误文本这道多一条构建哈希豁免)。
+  s = reduceUrlsInText(s, isSensitiveErrorText).replace(/\s+/g, " ").trim(); // URL 降级可能留下空隙
   if (!s || isSensitiveErrorText(s)) return "";
   return s.length > ERROR_MAX ? s.slice(0, ERROR_MAX) + "…" : s;
 }

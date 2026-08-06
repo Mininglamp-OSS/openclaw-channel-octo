@@ -184,67 +184,93 @@ whole, which also means a secret near the cut is either kept entirely (and caugh
 by the guards) or dropped entirely, and that a UTF-16 surrogate pair is never
 split.
 
-Text whose first 4000 characters contain no whitespace at all has no safe cut, so
-it is **not rendered**.
+Text with no whitespace anywhere in the first 4001 characters has no safe cut and
+is **not rendered**. (4001, not 4000: whitespace sitting at exactly index 4000
+means the first 4000 characters are already a token-whole prefix, and that prefix
+is kept.) The limit counts **UTF-16 code units, not characters** — CJK prose
+carries no ASCII whitespace, so a long Chinese message is a single unbroken token,
+and an astral character such as an emoji spends two units, halving the effective
+threshold.
 
-That costs real output, and it is worth being exact about how much. It is *not*
-only the unparseable case: **a URL longer than 4000 characters with no whitespace
-is dropped rather than reduced to its registered domain**, which is the module's
-most useful single output. A presigned S3 URL, an Azure SAS URL, or a `data:` URI
-inside an error string all take this path. Measured against `main`:
+**The cut also may not delete evidence the caller's guard was reading.** Severing
+a token is not the only harm a bound can do. The guards downstream inspect the
+*truncated* string, so a bound that discards the keyword suppressing a credential
+turns an input that would have failed closed into one that looks clean — with the
+credential at offset 0, where no downstream render cap reaches it. So
+`boundedForReduction` runs the caller's own sensitivity predicate over the segment
+it is about to discard, and withholds everything if it fires.
 
-| input | `main` | here |
-|---|---|---|
-| `"https://example.com/" + "z"×4100` | `https://example.com` | not rendered |
-| `grep` on a 4045-character presigned URL | `https://amazonaws.com` | `""` |
-| `sanitizeErrorText("failed to fetch " + that URL)` | `failed to fetch https://amazonaws.com` | `failed to fetch` |
+That predicate is passed in rather than fixed, because there is no single right
+answer: `main`'s own behaviour forks by strategy, withholding a trailing long hex
+run under `grep` and rendering it under `read`. Hard-coding the strict form blanks
+ordinary text ending in a git SHA; hard-coding the lenient form misses a
+high-entropy tail. Taking the caller's predicate makes this guard *identical* to
+the one downstream by construction, which is the only version that cannot drift.
+It checks only the discarded segment: checking the whole string blanks content
+the reduction exists to make safe, such as a webhook URL followed by a page of
+prose.
 
-The obvious repair is to run the first reduction pass — which is `new URL()`-based
-and *shrinks* its input — above the bound, and bound only what is left. **That
-repair does not work, and the reason is worth recording so it is not tried again.**
-The first pass's regex is quadratic whenever the text contains no `://`: measured
-alone, 18 ms at 4000 characters, 415 ms at 20 000, and **10 877 ms at 100 000**.
-Only the shapes that *do* contain `://` are cheap (120 000 characters in 1.25 ms),
-and gating on `input.includes("://")` does not rescue it either — `"a"×100000 + "
-http://x.com"` contains `://` and still takes 10 580 ms, because the backtracking
-happens before the match is reached. Hoisting the pass would restore the same 9–11
-second stall this bound exists to prevent, on a *wider* trigger: any long unbroken
-token, with no URL syntax required.
+That guard is deliberately **stricter** than the downstream one, and the earlier
+claim here that they are identical was wrong. It runs before reduction and reads
+raw text, so an ordinary documentation link in the discarded tail — any path of
+32 characters or more containing a `/` — trips the entropy check that would never
+have seen it downstream, and a long error message ending in a docs URL renders
+nothing. The apparent repair, bounding and reducing the tail before testing it,
+**opens a leak**: when the tail itself exceeds the bound, a credential past its
+own 4000th character stops being seen at all, and `main` does see it. Trading a
+leak for availability is not a trade this pipeline makes, so the guard reads raw
+text and the cost is pinned in `COST_CORPUS`.
 
-So the order stands and the cost is paid deliberately. The affected shapes are
-pinned in `COST_CORPUS` in `src/card-render.corpus.ts` rather than left to be
-discovered.
+**Every input/output pair for all of this lives in `src/card-render.corpus.ts`,
+not here.** That is deliberate: this section and the corpus and the PR description
+were three hand-maintained descriptions of one function, and they drifted out of
+sync with each other and with the code in successive rounds — a claim here was
+falsified by a one-line change in the same commit. Prose explains *why*; the
+corpus records *what*, is executable, and fails when it stops being true. The
+`COST` group carries the availability price with each row's measured `main` output
+beside it.
+
+One argument does belong here, because it is reasoning rather than a snapshot.
+The obvious repair for the availability cost is to run the first reduction pass —
+`new URL()`-based, and it *shrinks* its input — above the bound, and bound only
+what is left. **That does not work.** The first pass's regex is quadratic whenever
+the text contains no `://`, because the scheme character class consumes the whole
+token at every start position before backtracking to look for it: measured alone,
+18 ms at 4000 characters, 415 ms at 20 000, **10 877 ms at 100 000**. Only shapes
+that *do* contain `://` are cheap (120 000 characters in 1.25 ms), and gating on
+`input.includes("://")` does not rescue it — `"a"×100000 + " http://x.com"`
+contains `://` and still takes 10 580 ms, because the backtracking happens before
+the match is reached. Hoisting would restore the same 9–11 second stall this bound
+exists to prevent, on a *wider* trigger: any long unbroken token, no URL syntax
+required.
 
 Three sinks apply no render cap of their own, so what the bound does is directly
-visible at them, and each says so:
+visible at them:
 
-- **A display-card text block** renders long text in full; over the bound it is
-  checked for credential shapes before truncation, then truncated.
+- **A display-card text block** renders long text in full. It carries no guard of
+  its own — an earlier version ran `isSensitive` over the whole untruncated string
+  here. The bound's discarded-segment check replaces it at all eleven callers
+  instead of one, and drops that version's cost of blanking safe long content.
+  The two are not nested: the discarded segment is a *subset* of what the old
+  check read, so coverage moved rather than grew. Nothing measurable was lost —
+  the shapes only the old check saw are ones the reduction neutralises anyway —
+  but "strictly greater" would be the wrong word for it.
 - **A copy-to-clipboard block** over the bound is refused rather than truncated,
   with a message that says *characters* — its other limit, 4 KiB, is a byte limit
   and gets its own message. A reader pastes that content somewhere, so a partial
   value is worse than an honest refusal.
-- **The status card that echoes an interactive submission** renders the submitted
-  value through the same reduction. It carries no separate guard; the
-  whitespace-boundary cut is what keeps a credential in that value from being
-  split out of the reduction's reach.
+- **The status card that echoes an interactive submission** renders a
+  member-submitted value through the same reduction, and is the lowest trust
+  boundary of the three. It has no guard of its own; it gets the default strict
+  predicate.
 
-Those three are where the bound is *visible*. It is not where the bound *acts* —
-`reduceUrlsInText` has nine callers and the bound is inside it, so every one of
-them changes at long input. Four are worth naming because they change in a way a
-reader would not predict from "long text gets truncated":
-
-- **A rich text block** keeps its per-segment `TextRun` styling only when
-  `reduceUrlsInText(joined) === joined`. Past the bound that equality is
-  necessarily false, so a long rich block degrades to a single `TextBlock` even
-  with no URL in it. That is the safer of the two outputs — it also closes a
-  `card ⊋ plain` divergence `main` has on long rich input, where raw segment text
-  reaches the `TextRun`s — so it is left as is, not repaired.
-- **An authored interactive card** rejects a title over the bound with *"title is
-  required and must not contain sensitive data"*. Refusing is defensible; that
-  message names the wrong cause.
-- **A debug value in a display tool** and **a reasoning step** both yield `""`
-  rather than a truncation.
+Those three are where the bound is *visible*, not where it *acts*: it lives inside
+`reduceUrlsInText`, so all eleven callers change at long input. Three change in a way
+"long text gets truncated" does not predict — a rich text block loses per-segment
+styling (the safer output, and it closes a `card ⊋ plain` divergence `main` has),
+an authored interactive card rejects an over-long title with a message naming the
+wrong cause, and a debug value and a reasoning step both yield `""` rather than a
+truncation.
 
 ## Architecture
 

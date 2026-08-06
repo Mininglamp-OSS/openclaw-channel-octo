@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { summarizeToolParams, reduceUrlsInText, sanitizeErrorText } from "./card-render.js";
-import { REDUCE_INPUT_MAX } from "./card-render.js";
+import { REDUCE_INPUT_MAX, boundedForReduction } from "./card-render.js";
 import { LEAK_CORPUS, BENIGN_CORPUS, COST_CORPUS, REWRITE_CORPUS, UNFIXED_CORPUS, PERF_CORPUS, type CorpusRow } from "./card-render.corpus.js";
 
 const PARAM: Record<string, (s: string) => Record<string, unknown>> = {
@@ -48,20 +48,21 @@ describe("摘要管线形状语料", () => {
     assertRows(BENIGN_CORPUS);
   });
 
-  // 这一组期望值全是空串 —— 但**空不等于记录到了代价**:上一轮那行 `"a"×4100` 在 main 上同样
-  // 是空,两边一致,整行空转。所以除了逐行等值,再断言一次「这一组必须真的和 main 有差异」:
-  // 每行都要在 main 上有非空输出。main 的行为写在各行 note 里,这里断言的是**别再放进一行
-  // 两边都空的**。判据用 main 上不成立、这里成立的性质:输入超过上限且前 4000 字符无空白。
+  // 这一组期望值全是空串 —— 但**空不等于记录到了代价**。上一轮这里放的是三条结构检查(超长、
+  // 前 4000 无空白、非纯 hex),而那是**代理不是观测**:`"token=" + "z"×4100` 三条全过,两边
+  // 却都是空。现在判据换成 `mainRenders` —— 每行必须带上它在 main 上的实测输出,且非空。
+  // 想加一行,得先去 main 上量;量出来是空,就说明这行根本不属于这一组。
   it("COST:刻意付出的代价 —— 每一行都必须真的记录到一处差异", () => {
     assertRows(COST_CORPUS);
     for (const row of COST_CORPUS) {
-      expect(row.input.length, `${JSON.stringify(row.input.slice(0, 40))} 不超过上限,进不了这一组`)
-        .toBeGreaterThan(REDUCE_INPUT_MAX);
-      expect(/\s/.test(row.input.slice(0, REDUCE_INPUT_MAX)),
-        `${JSON.stringify(row.input.slice(0, 40))} 前 4000 字符含空白,它不会被拒,这一行记录不到代价`).toBe(false);
-      // main 上是空的输入(如全十六进制长串)放进来只会空转 —— 长 hex 是 isSensitive 自己就拦下的。
-      expect(/^[0-9a-fA-F]+$/.test(row.input),
-        `${JSON.stringify(row.input.slice(0, 40))} 是纯十六进制串,main 上同样打空,这一行记录不到差异`).toBe(false);
+      const at = JSON.stringify(row.input.slice(0, 40));
+      expect(row.mainRenders, `${at} 的 mainRenders 为空 —— main 上也不渲染,这一行记录不到差异`)
+        .not.toBe("");
+      // 期望值必须全空:有一项非空就说明这不是"刻意打空",放错组了。
+      for (const [tool, want] of Object.entries(row.expect)) {
+        expect(want, `${at} 的 ${tool} 期望值非空,它不属于 COST 组`).toBe("");
+      }
+      expect(row.input.length, `${at} 不超过上限,进不了这一组`).toBeGreaterThan(REDUCE_INPUT_MAX);
     }
   });
 
@@ -92,7 +93,12 @@ describe("摘要管线形状语料", () => {
   // 「那几趟有界」。这条断言让「某行悄悄滑进短路组」变成红,而不是安静地失去覆盖。
   it("PERF:每行是否真的进入管线,与它的标注一致", () => {
     for (const { label, input, reachesPasses } of PERF_CORPUS) {
-      const actual = input.length <= REDUCE_INPUT_MAX || /\s/.test(input.slice(0, REDUCE_INPUT_MAX));
+      // **调用真正的守卫,不复刻一份判定。** 上一版写的是
+      //     input.length <= REDUCE_INPUT_MAX || /\s/.test(input.slice(0, REDUCE_INPUT_MAX))
+      // 它当时等价于守卫,然后 `+1` 一落地就悄悄错了(空白正好在下标 4000 时模型说 false、
+      // 守卫其实跑完了整条管线),而且因为当时没有一行是那个形状,断言还是绿的 —— 正是它自己
+      // 要防的那种漂移。观测守卫本身,这一类由构造消失。
+      const actual = boundedForReduction(input) !== null;
       expect(actual, `${label}:标注 reachesPasses=${reachesPasses},实际 ${actual}`).toBe(reachesPasses);
     }
     // 至少要有真正跑完管线的行,否则整组退化成「长度守卫存在」的重复断言。

@@ -136,22 +136,23 @@ export interface BuildDisplayCardResult {
 function sanitize(text: string, generic = true): string | null {
   let s = text.replace(/\s+/g, " ").trim();
   if (!s) return null;
-  // 超长输入:守卫要**先跑在未截断的原串上**。reduceUrlsInText 对超过 REDUCE_INPUT_MAX 的输入
-  // 会截断(那是它的二次回溯性能界),而这个 sink **没有渲染上限** —— 与摘要(64)、错误(120)、
-  // debug 串(512)不同,一段长文本会整段渲染。于是横跨截断点的密钥被切成两半,`isSensitive`
-  // 认不出那个片段,整块照渲:
+  // 这个 sink **没有渲染上限** —— 与摘要(64)、错误(120)、debug 串(512)不同,一段长文本
+  // 会整段渲染,所以界在这里的影响是直接可见的。曾经这里另有一道「截断前先在未截断原串上跑
+  // isSensitive」的预检,用来挡住横跨切口被切成两半、守卫认不出的密钥。
   //
-  //     "z"×3990 + " AKIAIOSFODNN7EXAMPLE"   →  渲染 4000 字符,尾部是 `AKIAIOSFO`
+  // 那道预检**已经删掉**,因为界自己现在会用下面这同一个谓词检查它丢掉的那一段
+  // (见 boundedForReduction)。不是"覆盖面严格更大" —— 被丢掉的那一段是预检所查范围的
+  // **子集**,覆盖面是**挪了位置**:预检只装在这一个 sink 上,界覆盖全部十一个调用点。
+  // 只有预检看得见的那些形状,归约本来就会把它们中和掉,实测没有可观察的损失。
+  // 留着它还要付一笔与界无关的代价 —— 它查的是**整串**,于是
   //
-  // 偏移量是可选的,padding 调一下几乎整个 token 都能渲染出来。
+  //     "https://hooks.slack.com/services/T../B../XXXX " + "word "×900
   //
-  // 判定**只在真会截断时**才提前跑。无条件提前跑是错的:归约的全部意义就是把危险形状变安全,
-  // 提前判会把 `https://hooks.slack.com/services/T../B../XXXX`(归约后是 `https://slack.com`)
-  // 这类本该正常渲染的内容整块丢掉。截断不发生时不存在盲区,也就不需要这一步。
-  if (s.length > REDUCE_INPUT_MAX && isSensitive(s, generic)) return null;
-  s = reduceUrlsInText(s).replace(/\s+/g, " ").trim();
+  // 这种空白充裕、归约后完全安全的内容被整块丢掉(main 渲染 4517 字符)。
+  const sensitiveHere = (t: string) => isSensitive(t, generic);
+  s = reduceUrlsInText(s, sensitiveHere).replace(/\s+/g, " ").trim();
   if (!s) return null;
-  if (isSensitive(s, generic)) return null;
+  if (sensitiveHere(s)) return null;
   return s;
 }
 
@@ -316,6 +317,10 @@ function renderRich(segments: RichSegment[], ctx: RenderCtx): Rendered {
   // 关键(F1 修复):仅当 joined 里**没有任何可降级 URL** 时,才保留逐段 TextRun 的富样式 ——
   // 否则某个 segment(或跨段拆开)的 URL 会以原文进 TextRun,而 plain 已降级 → card ⊋ plain 泄露。
   // 含 URL 时降级为单个 TextBlock(用已降级的 clean),card 与 plain 一致、绝不多出密钥。
+  // 这里**不传谓词**,因为传了也没用:`reduceUrlsInText(joined, P) === joined` 的结果与 P 无关。
+  // joined ≤ 4000 时界原样返回,与 P 无关;> 4000 时界要么返回 ""、要么返回一个 ≤4000 的前缀,
+  // 两者都不可能等于 joined。曾经这里传了一个谓词并配了段注释说"两次调用的界必须一致",那个
+  // 约束根本约束不到任何东西 —— 留着只会让下一个读者以为它在起作用。
   const noReducibleUrl = reduceUrlsInText(joined) === joined;
   if (noReducibleUrl && cardSupports(ctx.caps, "RichTextBlock")) {
     return {

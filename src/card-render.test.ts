@@ -228,12 +228,14 @@ describe("summarizeToolParams", () => {
   // 「空白正好在下标 4000」曾经是错的:搜索范围取 REDUCE_INPUT_MAX 而不是 +1,前 4000 字符
   // 明明已经是一个完整的、token 边界对齐的前缀,却连同整串一起被拒。
   it("空白边界截断:切点搜索的边界形态", () => {
+    // 填充字符全部用非十六进制的 `z`/`y`。用 `a`/`b` 会踩到 LONG_HEX_RE —— 被丢掉的那一段现在
+    // 要过一遍守卫,而 `"b"×100` 是一个 100 字符的十六进制串,于是测的就不是切点而是守卫了。
     const CASES: Array<[string, string, number]> = [
-      ["空白正好在下标 4000", "a".repeat(4000) + " " + "b".repeat(100), 4000],
-      ["空白在下标 3999", "a".repeat(3999) + " " + "b".repeat(100), 3999],
-      ["长度正好 4000、无空白", "a".repeat(4000), 4000],
-      ["长度 4001、无空白", "a".repeat(4001), 0],
-      ["空白只在下标 0", " " + "a".repeat(4100), 0],
+      ["空白正好在下标 4000", "z".repeat(4000) + " " + "y".repeat(100), 4000],
+      ["空白在下标 3999", "z".repeat(3999) + " " + "y".repeat(100), 3999],
+      ["长度正好 4000、无空白", "z".repeat(4000), 4000],
+      ["长度 4001、无空白", "z".repeat(4001), 0],
+      ["空白只在下标 0", " " + "z".repeat(4100), 0],
       ["全是空白", " ".repeat(5000), 4000],
     ];
     for (const [label, input, wantLen] of CASES) {
@@ -244,12 +246,31 @@ describe("summarizeToolParams", () => {
     // 代理对不会被从中间切开。切在空白上时这一条由构造成立,但它是切法改动时最容易回归的一项。
     const LONE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
     for (const input of [
-      "a".repeat(3998) + "\u{1F600}".repeat(60), // 切口落在代理对中间
-      "a".repeat(3990) + " " + "\u{1F600}".repeat(60), // 切口前有空白,emoji 整段落在保留段外
+      "z".repeat(3998) + "\u{1F600}".repeat(60), // 切口落在代理对中间
+      "z".repeat(3990) + " " + "\u{1F600}".repeat(60), // 切口前有空白,emoji 整段落在保留段外
     ]) {
       expect(LONE.test(reduceUrlsInText(input)), `${JSON.stringify(input.slice(0, 12))}… 输出里出现孤立代理`).toBe(false);
     }
   });
+  // 界丢掉的那一段用**哪一个**谓词判定,是可观察的 —— 但上一版三处接线里有两处删掉之后
+  // 整个 1838 条的套件依然全绿(子代理评审跑变异发现的)。下面三条各钉一处接线。
+  it("界丢掉的那一段:三处谓词接线各自可观察", () => {
+    const PAD = "word ".repeat(900);
+    // 1) 缺省谓词必须是**最严**的一档:尾巴只有高熵、没有关键词也没有明确前缀。
+    //    写成 isSensitive(s, false) 时这一条会渲染出来。
+    expect(reduceUrlsInText(PAD + "aB3dE7gH1jK4mN8pQ2rS5tU9vW6xY0zA")).toBe("");
+    expect(reduceUrlsInText(PAD + "just more ordinary words here")).not.toBe("");
+    // 2) sanitizeErrorText 必须传自己那道(带构建哈希豁免的)判定。不传就退回缺省的最严档,
+    //    而缺省档不认 `commit:` 豁免 → 一条标注过的构建哈希把整条错误打空。
+    const withHash = PAD + "commit: 2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c";
+    expect(sanitizeErrorText(withHash), "错误文本没把自己的豁免传进界里").not.toBe("");
+    // 3) query/url 策略是 generic=true、path/shell 是 false —— 同一个尾部 git SHA,
+    //    grep 扣下、read 渲染。任一侧接错线,这里立刻分岔。
+    const withSha = PAD + "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c";
+    expect(summarizeToolParams("grep", { pattern: withSha })).toBe("");
+    expect(summarizeToolParams("read", { file_path: withSha })).not.toBe("");
+  });
+
   it("前缀式密钥被前置词字符粘连也隐藏(去词界锚点;两类 sink 都覆盖)", () => {
     // 回归 yujiawei P1:`\b` 词界锚点会被"前面粘一个词字符"绕过 → 明文密钥泄露。
     // query 策略(generic=true):

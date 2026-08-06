@@ -74,8 +74,92 @@ export const LEAK_CORPUS: CorpusRow[] = [
   },
   {
     input: "z".repeat(3990) + " AKIAIOSFODNN7EXAMPLE",
-    expect: { grep: "z".repeat(64) + "…", read: "z".repeat(64) + "…" },
-    note: "R4:横跨切口的密钥。切在空白上后 token 不会被切开 —— 密钥整个落在保留段之外、被丢掉,而不是留下一个守卫认不出的片段。盲切时它渲染成 `…AKIAIOSFO`",
+    expect: { grep: "", read: "" },
+    note: "R4:横跨切口的密钥。盲切时渲染成 `…AKIAIOSFO`。R6 起整串扣下而不是渲染安全前缀 —— 界会把丢掉的那一段过一遍调用方自己的守卫,**与 main 的判定一致**(main 无界,守卫看到 AKIA,同样扣下)。exec 不列:shell 策略只取程序名,密钥在第二个 token 上",
+  },
+  // R6-P0:界删掉的不只是字符,还可能是**正在压住一个凭据的那个关键词**。守卫读的是截断后的
+  // 串,所以尾部的 `token`/`password` 被切掉之后,剩下的部分在守卫眼里是干净的。凭据在
+  // offset 0,摘要 64 / 错误 120 的上限一个都挡不住。修法见 boundedForReduction。
+  {
+    input: "user:hunter2@localhost " + "x ".repeat(1988) + "y token",
+    expect: { grep: "", read: "" },
+    note: "R6-P0:尾部关键词被界删掉 → main `\"\"`,修复前 head 渲染 `user:hunter2@localhost x x x…`",
+  },
+  {
+    input: "user:hunter2@localhost " + "x ".repeat(1988) + "y password",
+    expect: { grep: "", read: "" },
+    note: "R6-P0:同上,`password` 作触发词",
+  },
+  {
+    input: "/user:hunter2@localhost " + "x ".repeat(1988) + "y token",
+    expect: { grep: "", read: "" },
+    note: "R6-P0:前导 `/` 的 DSN(UNFIXED 那一类),同一成因",
+  },
+  {
+    input: "user:hunter2@localhost " + "x ".repeat(1988) + "y AKIAIOSFODNN7EXAMPLE",
+    expect: { grep: "", read: "" },
+    note: "R6-P0:尾部是**明确前缀**凭据而非关键词,SECRET_PREFIX_RES 这一路同样被界删掉",
+  },
+  {
+    input: "user:hunter2@localhost " + "x ".repeat(1988) + "y aB3dE7gH1jK4mN8pQ2rS5tU9vW6xY0zA",
+    expect: { grep: "" },
+    note: "R6-P0:尾部是**纯高熵**串(无关键词、无前缀),只有 generic=true 的调用方抓得到。read 在 main 上同样渲染,故不列 —— 与 BENIGN 那条 git SHA 行合起来钉住「谓词必须来自调用方」",
+  },
+  // R6-P1:赋值折叠改变了**选中哪个 token**,而选中的那个是原样渲染的。main 上空白分词把带
+  // 引号的值切碎,候选停在 `b'` 上、被形状校验挡下;折叠修好分词后,搜索多走一个 token,
+  // 正好落到 DSN 上。见 DSN_SHAPED_TOKEN_RE。
+  {
+    input: "X='a b' user:hunter2@localhost",
+    expect: { exec: "" },
+    note: "R6-P1:main `\"\"`(候选是 `b'`,带引号被挡),修复前 head 渲染 `user:hunter2@localhost`",
+  },
+  {
+    input: 'X="a b" user:hunter2@localhost',
+    expect: { exec: "" },
+    note: "R6-P1:双引号形态",
+  },
+  {
+    input: "X=$'a b' user:hunter2@localhost",
+    expect: { exec: "" },
+    note: "R6-P1:ANSI-C 引用形态",
+  },
+  {
+    input: "A='p q' B='r s' user:hunter2@localhost",
+    expect: { exec: "" },
+    note: "R6-P1:多个赋值,跳过循环走得更远",
+  },
+  {
+    input: "X='a b' user:hun/ter2@db.example.com",
+    expect: { exec: "" },
+    note: "R6-P1:主机带点、但口令含 `/`,归约的 `[^\\s/]+` 匹配不上,所以归约救不回来",
+  },
+  // 子代理评审(R6 推送前)找出的那一类:**用户名里带 `@`**。第一版守卫写成正则
+  // `[^@]*:[^@]*@`,`[^@]*` 跨不过 `@`,于是它按**第一个** `@` 判定,而 pass 3 按最后一个。
+  // 两条规则一分岔,Azure SQL / MongoDB Atlas / Snowflake 那套 email-username DSN 整类走过去。
+  {
+    input: "X='a b' alice@corp.com:hunter2@localhost",
+    expect: { exec: "" },
+    note: "R6-审:用户名含 `@`。main `\"\"`,第一版守卫渲染 `alice@corp.com:hunter2@localhost`",
+  },
+  {
+    input: "X='a b' alice@corp:hunter2@postgres",
+    expect: { exec: "" },
+    note: "R6-审:同上,单标签主机",
+  },
+  {
+    input: "X='a b' alice@corp.com:p/w@db.example.com",
+    expect: { exec: "" },
+    note: "R6-审:用户名含 `@` **且**口令含 `/` —— 上一行只覆盖了这一类的一半",
+  },
+  {
+    input: "X='a b' @alice:hunter2@localhost",
+    expect: { exec: "" },
+    note: "R6-审:`@` 就在开头",
+  },
+  {
+    input: "X='a b' user:hun@ter2@db.example.com",
+    expect: { exec: "" },
+    note: "R6-审:`@` 在**口令**里(第一版就挡住了)。留着是因为它和上面几行合起来钉住「按最后一个 `@`」这条规则本身",
   },
   {
     input: "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234",
@@ -141,6 +225,14 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     expect: { grep: "risk-averse task-force" },
     note: "既有:前缀式密钥的长度下限不能误伤连字符英文",
   },
+  // R6:**这一行钉住的是「界用的谓词必须来自调用方」。** 被丢掉的尾巴是一个 git SHA;
+  // read(generic=false)在 main 上照常渲染,把界里的谓词写死成最严的一档就会把它打空。
+  // 与 LEAK 里那条「尾部纯高熵」正好夹住:写死宽的漏那条,写死严的误伤这条。
+  {
+    input: "word ".repeat(900) + "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
+    expect: { read: "word ".repeat(12) + "word…" },
+    note: "R6:尾部 git SHA 的普通长文本。main 的 read 渲染它、grep 扣下它 —— main 自己就按策略分岔,所以界不能有一个写死的判定",
+  },
 ];
 
 /**
@@ -159,27 +251,73 @@ export const BENIGN_CORPUS: CorpusRow[] = [
  *
  * 未列入(expect 只覆盖工具策略):`sanitizeErrorText("failed to fetch " + 4045 字符预签名 URL)`
  * 在 `main` 上是 `failed to fetch https://amazonaws.com`,这里是 `failed to fetch`。
+ *
+ * **`mainRenders` 是必填的实测值,不是注释。** 上一轮这一组靠三条结构检查(超长、前 4000 无
+ * 空白、非纯 hex)来保证"每行都记录到差异",那是**代理不是观测** —— `"token=" + "z"×4100`
+ * 三条全过,两边却都是空。把 main 的输出写成字段,再断言它非空,空转的行就写不进来了:
+ * 要加一行,得先去 main 上量;量出来是空,就说明这行根本不属于这一组。
  */
-export const COST_CORPUS: CorpusRow[] = [
+export interface CostRow extends CorpusRow {
+  /** 同一输入在 `main`(b1e3def)上 grep 策略的实测输出。必须非空 —— 否则这行记录不到代价。 */
+  mainRenders: string;
+}
+
+export const COST_CORPUS: CostRow[] = [
   {
     input: "https://example.com/" + "z".repeat(4100),
     expect: { grep: "", read: "" },
-    note: "R5-P1:超长无空白 URL。main → `https://example.com`(0.8 ms,第 1 趟线性)",
+    mainRenders: "https://example.com",
+    note: "R5-P1:超长无空白 URL。main 上第 1 趟线性,0.8 ms 归约成注册域",
   },
   {
     input: "https://s3.amazonaws.com/b/k?X-Amz-Signature=" + "a".repeat(4000),
     expect: { grep: "", read: "" },
-    note: "R5-P1:预签名 URL,现实形状。main → `https://amazonaws.com`(0.1 ms)",
+    mainRenders: "https://amazonaws.com",
+    note: "R5-P1:预签名 URL,现实形状。read 策略在 main 上渲染 65 字符的 path+query",
   },
   {
     input: "z".repeat(4100),
     expect: { grep: "", read: "" },
-    note: "R5-P2:空白边界截断的代价本体。**必须用非十六进制字符** —— `\"a\"×4100` 在 main 上也是空(isSensitive 长 hex 分支),记录不到差异。main → `\"z\"×64 + \"…\"`",
+    mainRenders: "z".repeat(64) + "…",
+    note: "R5-P2:空白边界截断的代价本体。**必须用非十六进制字符** —— `\"a\"×4100` 在 main 上也是空(isSensitive 长 hex 分支),那一行空转了整整一轮评审",
   },
   {
     input: "zq".repeat(2050),
     expect: { grep: "", read: "" },
+    mainRenders: "zq".repeat(32) + "…",
     note: "R5-P2:同上,展示块形态。main 渲染 4100 字符,这里整块不渲染",
+  },
+  // R6:界按 **UTF-16 code unit** 计,而 CJK 散文不含 ASCII 空白 —— 一整段中文就是一个不可切
+  // 的 token。对中文产品这是真实用户最可能碰到这条拒绝的路径,而「4000 字符」这个说法在这里
+  // 不成立:星平面字符每个占 2 units,实际阈值只有一半。
+  {
+    input: "中".repeat(4100),
+    expect: { grep: "", read: "" },
+    mainRenders: "中".repeat(64) + "…",
+    note: "R6-P1:普通中文长文本。4100 units,无 ASCII 空白 → 整段不渲染",
+  },
+  // 子代理评审找出的一类,**这一组此前一行都没覆盖**:上面每行都是"无空白长 token",而这一类
+  // 空白充裕、切点完全正常,被打空的原因是**尾巴里那条普通链接**。守卫跑在归约之前,看到的是
+  // 原文里 ≥32 字符、含 `/` 的路径,而下游那道看到的是归约完的串,根本没有这一段。
+  // 明知故犯的取舍,理由写在 boundedForReduction 上方(顺着改会开一个新泄漏)。
+  {
+    input: "connection refused after 3 retries " + "word ".repeat(900)
+      + "see https://docs.example.com/troubleshooting/connection-refused-timeouts",
+    expect: { grep: "" },
+    mainRenders: "connection refused after 3 retries " + "word ".repeat(6) + "word…",
+    note: "R6-审:长错误文本 + 尾部文档链接。**只在 generic 那一侧被打空** —— read(generic=false)不套用高熵检测,两边都渲染,故不列。sanitizeErrorText 也走高熵那一路:main 121 字符,这里空",
+  },
+  {
+    input: "word ".repeat(900) + "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234",
+    expect: { grep: "" },
+    mainRenders: "word ".repeat(12) + "word…",
+    note: "R6-审:webhook 在**尾部**。同样内容放在开头时正常渲染(那正是删掉 card-blocks 预检修好的),放尾部则被界的守卫扣下 —— 两个方向都要有行,否则读者以为整类都好了",
+  },
+  {
+    input: "😀".repeat(2001),
+    expect: { grep: "", read: "" },
+    mainRenders: "😀".repeat(32) + "…",
+    note: "R6-P1:星平面字符每个 2 units,所以 **2001 个** emoji 就越界 —— 文档说的「4000 字符」在这里是 2000 个。`\"😀\"×1999`(3998 units)仍正常渲染",
   },
 ];
 
@@ -384,6 +522,16 @@ export const PERF_CORPUS: PerfRow[] = [
     input: "x X=" + "$(a".repeat(1332),
     reachesPasses: true,
     note: "R5-nit:命令替换分支,原子内还含一层 `[^)]*`",
+  },
+  {
+    // 子代理评审找出来的:程序名形状校验跑在**归约那道界之上**,所以它自己的正则必须线性。
+    // 第一版 `[^@]*:[^@]*@` 在「冒号密集、无 `@`」上是二次的 —— 实测 `":"×131072` 19 077 ms
+    // (main 4.3 ms)。PERF 组当时一行都没覆盖到这个形状:`"a:"×3000` 才 20 ms,而带 `://`
+    // 的那行被 scheme 前瞻瞬间否掉。
+    label: "冒号密集、无 @(程序名校验)",
+    input: ":".repeat(100_000),
+    reachesPasses: false,
+    note: "R6-审:第一版 DSN 形状正则在这里 19 秒;改成 indexOf/lastIndexOf 后线性",
   },
   {
     label: "多个赋值 + 长值(无空白)",

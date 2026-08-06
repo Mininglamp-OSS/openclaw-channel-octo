@@ -74,29 +74,55 @@ describe("heading / text block", () => {
     expect(body({ card })[0]).toEqual({ type: "TextBlock", text: "正文", wrap: true });
   });
 
-  it("跨截断点的密钥不会因为被切成两半而通过守卫", () => {
+  it("跨截断点的密钥不出现在渲染结果里", () => {
     // 归约管线对超过 REDUCE_INPUT_MAX(4000 字符)的输入会截断,而 text block **没有渲染上限**
     // —— 与摘要(64)、错误(120)、debug 串(512)不同,长文本会整段渲染。于是横跨截断点的密钥
-    // 被切成两半,isSensitive 认不出那个片段,整块照渲。加这道判定前实测:
+    // 被切成两半,isSensitive 认不出那个片段,整块照渲。修好之前实测:
     //
     //     "z"×3990 + " AKIAIOSFODNN7EXAMPLE"  →  渲染 4000 字符,尾部是 `AKIAIOSFO`
     //
     // 偏移量是可选的 —— padding 调一下,几乎整个 token 都能渲染出来。
+    //
+    // **断言的是「密钥不出现」,不是「整块不渲染」。** 这两者不是一回事:安全的截断前缀渲染出来
+    // 也满足不变式,而 `toHaveLength(0)` 会把「整块扣下」钉成唯一正确答案 —— 那比不变式严,
+    // 会把一处本可以放宽的实现选择锁死。这一组正是 LEAK 语料用非等值断言的同一个理由。
     for (const [pad, secret] of [
       [3990, "AKIAIOSFODNN7EXAMPLE"],
       [3985, "AKIAIOSFODNN7EXAMPLE"],   // 偏移可选:切点后移,露出更多
       [3990, "ghp_ABCDEFGHIJ1234567890XY"],
       [3990, "sk-ABCDEFGHIJKLMNOP1234"],
     ] as [number, string][]) {
-      const { card } = buildDisplayCard({ blocks: [{ type: "text", text: `${"z".repeat(pad)} ${secret}` }] });
-      expect(body({ card }), `pad=${pad} ${secret}`).toHaveLength(0);
+      const rendered = buildDisplayCard({ blocks: [{ type: "text", text: `${"z".repeat(pad)} ${secret}` }] });
+      const all = JSON.stringify(rendered.card) + rendered.plain;
+      // 整个密钥、以及它任何 ≥8 字符的前缀片段,都不许出现 —— 后者是"被切成两半"那一类。
+      for (let n = secret.length; n >= 8; n--) {
+        expect(all, `pad=${pad} ${secret} 的前 ${n} 字符出现在渲染结果里`).not.toContain(secret.slice(0, n));
+      }
     }
-    // 反向:这道判定**只在真会截断时**才提前跑。无条件提前跑会把归约后本该安全的内容整块丢掉
-    // —— 下面这条归约后是 `https://slack.com`,必须照常渲染。
+    // 反向:归约后本该安全的内容必须照常渲染 —— 下面这条归约后是 `https://slack.com`。
+    // 曾经这里有一道查**整串**的预检,它会把这类内容整块丢掉;界改成只查被丢掉的那一段之后,
+    // 长文本里带 webhook 的形状也能正常渲染(见 card-render.corpus.ts 的 COST 组)。
     const ok = buildDisplayCard({
       blocks: [{ type: "text", text: "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234" }],
     });
     expect((body(ok)[0] as { text: string }).text).toContain("https://slack.com");
+    const long = buildDisplayCard({
+      blocks: [{ type: "text", text: "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234 " + "word ".repeat(900) }],
+    });
+    expect((body(long)[0] as { text: string }).text, "空白充裕、归约后安全的长文本被整块丢掉")
+      .toContain("https://slack.com");
+  });
+
+  // 这一条钉住 sanitize 把自己的 generic 传进了界里。删掉那个实参、退回缺省的最严档时,
+  // 整个套件依然全绿(子代理评审跑变异发现的),而行为是可观察的:trusted 卡走 generic=false,
+  // 尾部的 git SHA 不该被当成密钥 —— 那正是 generic 这个开关存在的理由。
+  it("界丢掉的那一段按本卡的 generic 判定,而不是一律用最严的一档", () => {
+    const text = "word ".repeat(900) + "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c";
+    const trusted = buildDisplayCard({ trusted: true, blocks: [{ type: "text", text }] });
+    expect(body(trusted), "trusted 卡(generic=false)不该因为尾部 git SHA 被打空").toHaveLength(1);
+    // 反面:不可信卡是 generic=true,长 hex 归它管,整块扣下。
+    const untrusted = buildDisplayCard({ blocks: [{ type: "text", text }] });
+    expect(body(untrusted)).toHaveLength(0);
   });
 
   it("text 内嵌 URL 降级到 scheme://注册域(webhook/隧道/预签名主机都吃)", () => {
