@@ -42,7 +42,10 @@ function secondsToMs(raw: string | number | undefined): number | undefined {
   // rate limiter means, and taking it literally produces back-to-back retries at the exact
   // moment the server just turned us away.
   if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
-  return Math.round(seconds * 1000);
+  // Re-checked after rounding: a hint like 0.0004 is positive but rounds to 0ms, which would
+  // put us straight back on the server with no wait at all.
+  const ms = Math.round(seconds * 1000);
+  return ms > 0 ? ms : undefined;
 }
 
 function retryAfterFromBody(body: string): number | undefined {

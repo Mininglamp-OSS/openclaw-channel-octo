@@ -60,6 +60,8 @@ export class OctoApiError extends Error {
 
 `retryAfterMs` 取值优先级：`Retry-After` 响应头（秒）→ body `error.details.retry_after`（秒）→ 默认 1000ms。
 
+**零与极小值一律视为"没有可用提示"。** `0` 是有限非负数，天真的校验会放它过去，然后退避睡 0ms —— 三次背靠背重试，恰好砸在服务端刚说"停"的那一刻。极小正数同理：`0.0004` 秒经四舍五入也是 0ms。所以换算后要再查一次结果是否 > 0，否则回落默认值。
+
 **解析层保留服务端给的原值，不做上限截断。** 只对垃圾输入做兜底（非数字 / 负数 / HTTP-date 格式 → 回落默认 1000ms）。上限 `MAX_RETRY_AFTER_MS` 是**决策阈值**，只在 §2 用来判断"这次还值不值得等"，不能在解析层就把它 clamp 短 —— clamp 短等于把服务端的"30 秒后再来"改写成"10 秒后再来"，那就是提前重试，正是本 issue 要消掉的行为。
 
 **向后兼容（关键）：** `message` 必须继续是 `Octo API <path> failed (<status>): <text>` 这个格式 —— 现有 `API_FETCH_STATUS_RE` / `httpStatusFromApiFetchError`（`api-fetch.ts:55-73`）从 message 正则解析状态码，`card-progress.ts:408` 与 fork-inherit-md 都依赖它。同时把 `httpStatusFromApiFetchError` 改成**优先读 `err.status`、正则作为 fallback**，让新旧两条路径都对。
@@ -72,10 +74,12 @@ export class OctoApiError extends Error {
 attempt = 0; waited = 0
 loop:
   if callerSignal?.aborted: throw callerSignal.reason      // 进入前先查
-  // 调用方传了 signal 就完全尊重它（它比我们更清楚这次请求该等多久）；
-  // 只有在调用方没表达意见时才补一个默认 deadline。deadline 必须每次尝试重建 ——
+  // 调用方的 signal 优先（它比我们更清楚这次请求该等多久），但仍叠一个硬天花板兜底；
+  // 没传 signal 时用默认 deadline。deadline 必须每次尝试重建 ——
   // 建在循环外会变成跨尝试共享，第 2 次尝试可能一出生就过期。
-  fetchSignal = callerSignal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS)
+  fetchSignal = callerSignal
+    ? AbortSignal.any([callerSignal, AbortSignal.timeout(POST_HARD_CEILING_MS)])
+    : AbortSignal.timeout(DEFAULT_POST_TIMEOUT_MS)
   resp = fetch(..., fetchSignal)
   if resp.ok: return parsed
   err = OctoApiError.from(resp, path)
@@ -91,8 +95,10 @@ loop:
 
 - `MAX_429_RETRIES = 2`（合计最多 3 次尝试）。
 - **抖动只能向上（1.0..1.25），不能向下。** `Retry-After` 的语义是"最早可重试时间"，`0.75×` 会让我们比服务端明确要求的更早再撞一次 —— 那正是这个 issue 要消掉的行为。同理，**服务端给的等待超过 `MAX_RETRY_AFTER_MS = 10_000` 时直接放弃重试，而不是把它 clamp 短**：clamp 短等于提前重试。上限只在这里用来决定"还值不值得等"，解析层不得截断（见 §1）。
-- **`MAX_429_BACKOFF_WAIT_MS = 15_000` 只约束退避等待的累计时长，不是端到端预算 —— 名字要如实。** 端到端兜底靠**每次尝试独立重建的 fetch deadline**：现在 `postJson` 把调用方 signal 原样交给 `fetch`，调用方不传就等于无超时，一个挂住的连接可以永久卡住；补上默认 `DEFAULT_TIMEOUT_MS`（`api-fetch.ts:12` 已有的 30s，与 `:744,895` 同款约定）即可。
-- **不要用 `AbortSignal.any([callerSignal, 内部 deadline])` 求交集。** `/v1/bot/events` 的 long poll 会**故意**要求远超 30s 的超时：`fetchBotEvents`（`:839`）传的是 `eventsPollTimeoutMs(waitSeconds)`，而 `eventWaitSeconds` 上限 30（`config-schema.ts:143,169`）、margin 10s（`api-fetch.ts:26`），最大 **40s**。求交集会在 hold 中途把它砍掉，而这正是上游刻意避免的失败模式 —— 客户端在 hold 中途 abort 会丢弃服务端正要返回的那批事件，把循环退化成超时重试风暴。规则：**调用方给了 signal 就只用它；没给才补默认 30s。**
+- **`MAX_429_BACKOFF_WAIT_MS = 15_000` 只约束退避等待的累计时长，不是端到端预算 —— 名字要如实。** 端到端兜底靠**每次尝试独立重建的 fetch deadline**：改动前 `postJson` 把调用方 signal 原样交给 `fetch`，调用方不传就等于无超时，一个挂住的连接可以永久卡住。deadline 的构造规则见下一条。
+- **调用方的 signal 优先，但仍有一个硬天花板。** `/v1/bot/events` 的 long poll 会**故意**要求远超 30s 的超时：`fetchBotEvents` 传的是 `eventsPollTimeoutMs(waitSeconds)`，而 `eventWaitSeconds` 上限 30（`config-schema.ts:143,169`）、margin 10s（`api-fetch.ts:26`），最大 **40s**。所以**不能**拿默认 30s 去和它求交 —— 在 hold 中途 abort 会丢弃服务端正要返回的那批事件，把循环退化成超时重试风暴，这正是上游刻意避免的。
+  但"调用方给了 signal 就完全不管"也不行：`AbortSignal` 类型分不出对方是否自带 deadline，将来任何一个裸 controller signal 都会让请求无界挂死 —— 而无界挂死正是本设计要消灭的东西。所以规则是 `AbortSignal.any([callerSignal, AbortSignal.timeout(POST_HARD_CEILING_MS)])`，天花板取 **60s**：高于 long poll 的 40s（不砍合法 hold），又给"忘了带 deadline"兜了底。经 `postJson` 的请求没有任何一个有理由跑满一分钟；超过 60s 的两处（媒体下载 300s / 120s）走的是裸 `fetch`，不经这里。
+  调用方没传 signal 时用 `DEFAULT_POST_TIMEOUT_MS`（30s）。
 
 - `sleep` 被 abort 时抛出的错误要把原 `OctoApiError` 挂在 `cause` 上，否则现场只剩一个 `TimeoutError`，丢掉"是被限流"这个诊断语义。
 - `OctoApiError.from()` 读响应头必须**容错**（`resp.headers?.get?.(…)`）：`Response`-like 的 mock 与非标准实现可能没有 `headers`，不能因为读头把一个正常的错误路径变成 `TypeError`。
@@ -133,6 +139,10 @@ loop:
    另外 entry 被 **replacement / finalize / clear** 时必须取消这个定时器，与现有 `entry.flushAbort` 的清理放在一处（`:649`），不留悬挂。
 
 按 `apiUrl` 而不是按 entry：服务端桶是 per-IP 的，同一 `apiUrl` 下所有 session / bot 撞的是同一个桶，按 entry 分别计时等于每个 session 各自去踩一遍。
+
+**冷却门自己要有上限（`MAX_CARD_COOLDOWN_MS = 5 分钟`）。** 解析层刻意保留服务端原值，但冷却门是它唯一的消费方，而影响面是"该后端下整个进程所有 session 的进度帧"。一个 `Retry-After: 86400`（或代理乱填）会让卡片静默停摆一整天 —— 进度帧本来就是可丢弃的，偶尔早回去一次的代价远小于此。超限时 warn 记录服务端原值。
+
+**唤醒要错峰。** 窗口按 `apiUrl` 共享而唤醒按 entry，同后端的多个 session 会在同一刻醒来，正好把一批请求同时怼给刚刚才恢复的桶。到期时刻上叠 0~500ms 的随机错峰把这一下摊开。
 
 **这不是我们在"非目标"里否掉的自限流。** 自限流是插件**猜**服务端还剩多少额度；冷却门只是**遵守服务端明确告知的最早重试时间**，输入完全来自响应本身。
 

@@ -1613,13 +1613,15 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
               (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
             isRefreshingToken = true;
             lastTokenRefreshAt = Date.now();
-            log?.warn?.(`octo: [${account.accountId}] connection rejected — refreshing IM token...`);
             // The reset wraps the whole call, not the callback: run() returns without
             // invoking it when another sequence is already in flight, and a reset that only
             // lives inside the callback would leave this flag stuck on — which silences the
             // watchdog predicate and the cooldown branch for good. Exactly the permanent
             // wedge this change exists to remove.
             try {
+              // Inside the try as well: a host logger that throws would otherwise strand the
+              // flag between raising it and reaching the protection.
+              log?.warn?.(`octo: [${account.accountId}] connection rejected — refreshing IM token...`);
               await reconnectSequencer.run("token-refresh", async () => {
                 try {
                   await socket.disconnectAndWait();

@@ -369,6 +369,9 @@ function clearCooldownTimer(entry: CardEntry): void {
  */
 function armCooldownWake(sessionKey: string, entry: CardEntry, delayMs: number): void {
   if (entry.cooldownTimer) return; // 已排过;重排会让唤醒次数翻倍
+  // 窗口按 apiUrl 共享但唤醒按 entry,所以同后端的多个 session 会在同一刻醒来 —— 正好把一批
+  // 请求同时怼给刚刚才恢复的桶。错峰几百毫秒把这一下摊开。
+  const staggered = delayMs + Math.floor(Math.random() * 500);
   entry.cooldownTimer = setTimeout(() => {
     entry.cooldownTimer = undefined;
     // entry 可能在等待期间被替换。Map 对象身份是本文件既有的 generation fence,
@@ -382,7 +385,7 @@ function armCooldownWake(sessionKey: string, entry: CardEntry, delayMs: number):
       return;
     }
     if (entry.dirty) void flush(sessionKey);
-  }, delayMs);
+  }, staggered);
 }
 
 function scheduleFlush(sessionKey: string, entry: CardEntry): void {
@@ -549,12 +552,16 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
       if (!isCurrentEntry(sessionKey, entry)) return;
       if (gate === false) {
         entry.skip = true;
+        // 这条 session 永久不再发帧了,留着冷却唤醒只会白白持有 entry 到窗口到期。
+        clearCooldownTimer(entry);
         return;
       }
       if (gate === null) {
         // 瞬时探测失败:清 dirty 且不自动重排,避免端点故障期每 ~800ms 一次探测风暴。
         // 累积的 steps 仍在 entry 上,下个工具事件会重新 scheduleFlush 并重探。
         entry.dirty = false;
+        // 同理:本轮不发且不自排,唤醒定时器醒来也只会撞上同一个 gate。
+        clearCooldownTimer(entry);
         return;
       }
       resolveEntryDeliveryMode(entry);
