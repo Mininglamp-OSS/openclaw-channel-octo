@@ -734,9 +734,17 @@ describe("copy block(Action.CopyToClipboard 本地动作)", () => {
     const cjk = buildDisplayCard({ caps: CAPS_WITH_COPY, blocks: [{ type: "copy", text: "中".repeat(1366) }] });
     expect((body(cjk)[0] as { text: string }).text).toContain("4KiB");
     // 不支持复制按钮的客户端走普通 TextBlock —— 那条路径没有复制按钮,不该收到"未渲染复制按钮"。
-    const noCopy = buildDisplayCard({ blocks: [{ type: "copy", text: "中".repeat(1366) }] });
-    expect((body(noCopy)[0] as { type: string }).type).toBe("TextBlock");
-    expect((body(noCopy)[0] as { text: string }).text).not.toContain("未渲染复制按钮");
+    // **两条上限都要覆盖到**:上一版这里只测了 1366 个 CJK 字符,那走的是**字节**路径,于是新加的
+    // 字符判定放错了位置(在能力回退之前)也照样绿。断言与它要守的路径必须对得上。
+    for (const [label, text] of [
+      ["字节路径", "中".repeat(1366)],
+      ["字符路径", "y".repeat(4100)],
+    ] as [string, string][]) {
+      const noCopy = buildDisplayCard({ blocks: [{ type: "copy", text }] });
+      const el = body(noCopy)[0] as { type: string; text: string };
+      expect(el.type, label).toBe("TextBlock");
+      expect(el.text, label).not.toContain("未渲染复制按钮");
+    }
     // 界内的照常给出完整内容,一个字符都不少。
     const ok = buildDisplayCard({ caps: CAPS_WITH_COPY, blocks: [{ type: "copy", text: "x".repeat(3000) }] });
     expect((body(ok)[0] as { type: string }).type).toBe("ActionSet");

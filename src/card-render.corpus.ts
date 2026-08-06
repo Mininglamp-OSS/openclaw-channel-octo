@@ -191,6 +191,29 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
     expect: { grep: "user:hunter2@[::1]" },
     note: "main 上的既有泄漏:IPv6 方括号主机",
   },
+  // 赋值折叠漏掉的一类:值以 SHELL_BREAK 里的字符开头(`(`、`;`、`|`、`&`、`<`、`>`、反引号)。
+  // `(?:SHELL_WORD_ATOM)*` 匹配零个原子,折叠只写出 `NAME=_`,值的其余部分留在串里,跳过循环
+  // 又落回值的第二个词 —— 正是折叠这条改动要关的那个失败。
+  //
+  // **main 上渲染完全相同**,不是本 PR 引入的;本 PR 收窄了这一类而不是扩大它。钉在这里是因为
+  // LEAK 组把 `'…'`/`"…"`/`$'…'` 三种钉成已修,不写这几行,读者会以为整类都关了。
+  // 修法是有的(折叠后跳过的 token 必须**恰好**是 `NAME=_`,否则整串不渲染),但那是扩范围,
+  // 留给独立改动。
+  {
+    input: "PASSPHRASE=(correct horse battery staple) gpg --sign x",
+    expect: { exec: "horse" },
+    note: "R5-P2:值以 `(` 开头 → 折叠退化,程序名落在值的第二个词上。main 同样渲染 `horse`",
+  },
+  {
+    input: "MY_CREDS=;alpha hunter2 charlie ./go",
+    expect: { exec: "hunter2" },
+    note: "R5-P2:值以 `;` 开头,同一成因",
+  },
+  {
+    input: "MY_CREDS=<alpha hunter2 charlie",
+    expect: { exec: "hunter2" },
+    note: "R5-P2:值以 `<` 开头,同一成因",
+  },
   {
     input: "nginx:1.21@sha256:1234abcd",
     expect: { grep: "nginx:1.21@sha256:1234abcd" },
@@ -214,41 +237,91 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
  * **形状要多样。** 回溯代价随输入形状变化极大,只测一种会得出「另外几趟不要紧」的错误结论 ——
  * 这条分支上犯过两次:一次是只测了 `a:b@` + 无点串就断定 schemeless 那几趟免费,一次是只测了
  * 管线本身、没测冒号密集串,于是一个 5.9 秒的回归全绿通过。
+ *
+ * **第三次的形式不同,要单独说:** 空白边界截断落地后,超过上限且**前 4000 字符不含空白**的输入
+ * 在长度判定处就被拒了,一趟正则都不跑。原来那四行长输入(含 main 上 9–11 秒的三行)于是全部
+ * 短路 —— 它们断言的变成了「长度守卫存在」,而不是「那几趟有界」。按本分支自己的数字推算,
+ * R4a 那个三次方回归(6000 字符 5877 ms)在 4000 字符处约 1.7 秒,**低于当时 2000 ms 的预算,
+ * 会绿着通过**。
+ *
+ * 所以每一行都标注 `reachesPasses`,并且**这个标注本身被断言** —— 哪天 REDUCE_INPUT_MAX 动了、
+ * 某行悄悄滑进短路组,测试会直接红,而不是安静地失去覆盖。带空白的长输入是真正压住那几趟的行。
  */
-export const PERF_CORPUS: Array<{ label: string; input: string; note: string }> = [
+export interface PerfRow {
+  label: string;
+  input: string;
+  /** 这一行会不会真的进入归约管线(而不是在长度判定处被拒)。测试会核对它与实际是否一致。 */
+  reachesPasses: boolean;
+  note: string;
+}
+
+export const PERF_CORPUS: PerfRow[] = [
   {
     label: "无点长串 + query",
     input: "a".repeat(100_000) + "?x",
+    reachesPasses: false,
     note: "R1:main 上 read 策略 9311 ms",
   },
   {
     label: "scheme + 长主机",
     input: "http://" + "a".repeat(120_000),
+    reachesPasses: false,
     note: "R1:走第 1 趟 scheme 正则,与上一行代价完全不同",
   },
   {
     label: "userinfo 前缀 + 长串",
     input: "a:b@" + "a".repeat(60_000),
+    reachesPasses: false,
     note: "R1:main 上 exec 策略 3442 ms",
   },
   {
     label: "冒号密集(无空白)",
     input: "a:".repeat(3000),
+    reachesPasses: false,
     note: "R4a:曾在兜底的无界前瞻上跑出 5877 ms。**串里不能有空白** —— 有空白的 `key: val` 只有 1 ms,回溯长度取决于单个 token",
   },
   {
     label: "冒号密集 + 长尾",
     input: "a:".repeat(1000) + "b".repeat(2000),
+    reachesPasses: true,
     note: "R4a:同上,7314 ms",
   },
   {
     label: "压缩 JSON(无空白)",
     input: "{" + Array.from({ length: 180 }, (_, i) => `"k${i}":"v${i}"`).join(",") + "}",
+    reachesPasses: true,
     note: "R4a:模型正常会生成的参数,曾 1247 ms。这一行是「不只是构造串」的证据",
   },
   {
     label: "label selector(无空白)",
     input: Array.from({ length: 250 }, (_, i) => `app${i}:v${i}`).join(","),
+    reachesPasses: true,
     note: "R4a:同上,曾 1272 ms",
+  },
+  // 下面四行**带空白**,所以过得了长度判定、真的跑完整条管线。上面那四行短路的只证明守卫在,
+  // 这四行才是压住回溯代价的。实测 10–18 ms。
+  {
+    label: "空白 + 冒号密集",
+    input: "x " + "a:".repeat(1999),
+    reachesPasses: true,
+    note: "R5:与上面「冒号密集(无空白)」同构,但因为有空白而真的进管线。那一行 0.00 ms,这一行 10 ms",
+  },
+  {
+    label: "空白 + 无点长串",
+    input: "x " + "a".repeat(3990) + "?y",
+    reachesPasses: true,
+    note: "R1 那条 9311 ms 形状的可达版本",
+  },
+  {
+    label: "空白 + userinfo 前缀",
+    input: "x " + "a:b@" + "a".repeat(3980),
+    reachesPasses: true,
+    note: "R1 那条 3442 ms 形状的可达版本,实测最贵的一行(17.5 ms)",
+  },
+  {
+    label: "空白 + scheme",
+    input: "x http://" + "a".repeat(3980),
+    reachesPasses: true,
+    note: "R1:走第 1 趟 scheme 正则,与上面几行代价完全不同",
   },
 ];

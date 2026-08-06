@@ -623,6 +623,7 @@ function utf8Bytes(s: string): number {
  * 所以与普通正文同样脱敏,并按服务端/客户端约定限制为 UTF-8 4KiB。
  */
 function renderCopy(label: string | undefined, text: string, ctx: RenderCtx): Rendered {
+  const canCopy = cardSupports(ctx.caps, "Action.CopyToClipboard") && cardSupports(ctx.caps, "ActionSet");
   // 长度判定必须跑在**原始 text** 上,不能跑在 sanitize 的输出上 —— sanitize 里的
   // reduceUrlsInText 会把超长输入截掉,而这里的契约是字节数。ASCII 下 4000 字符恒 ≤ 4096 字节,
   // 所以下面那条 utf8Bytes 判定再也不会触发:20000 字符会安静地变成 4000 字符塞进复制按钮。
@@ -631,14 +632,22 @@ function renderCopy(label: string | undefined, text: string, ctx: RenderCtx): Re
   // 两条上限的**理由不同,所以提示语也不同**。上一版把两者合并成一句"超过 4KiB",而
   // 4050 个 ASCII 字符就是 4050 字节 —— 合法地在契约内,却被告知超了字节限制,下一个人去查
   // 字节数会什么也查不到。
+  //
+  // **判定的位置和措辞是两件事。** 字符判定必须留在 sanitize 之前(它挡的就是 sanitize 的截断),
+  // 但措辞取决于这条路径**有没有**复制按钮 —— 不支持 Action.CopyToClipboard 的客户端走的是普通
+  // TextBlock,告诉它"未渲染复制按钮"是句没有指涉的话。下面那条字节判定按同一条规则摆:它只约束
+  // 复制按钮,所以整个判定都在回退之后。上一版把这条放在回退之前,违反了本文件自己写下、也自己
+  // 断言过的那条不变量 —— 而断言之所以是绿的,是因为它那个用例走的是字节路径,压根没碰到这里。
   if (text.length > REDUCE_INPUT_MAX) {
-    const msg = `复制内容超过 ${REDUCE_INPUT_MAX} 字符，无法安全脱敏，未渲染复制按钮`;
+    const msg = canCopy
+      ? `复制内容超过 ${REDUCE_INPUT_MAX} 字符，无法安全脱敏，未渲染复制按钮`
+      : `内容超过 ${REDUCE_INPUT_MAX} 字符，无法安全脱敏，未渲染`;
     return { elements: [textBlock(msg)], plainLines: [msg] };
   }
   const cleanText = sanitize(text, ctx.generic);
   if (!cleanText) return EMPTY;
   const cleanLabel = sanitize(label ?? COPY_LABEL_DEFAULT, ctx.generic) ?? COPY_LABEL_DEFAULT;
-  if (!cardSupports(ctx.caps, "Action.CopyToClipboard") || !cardSupports(ctx.caps, "ActionSet")) {
+  if (!canCopy) {
     return {
       elements: [textBlock(cleanText)],
       plainLines: [cleanText],

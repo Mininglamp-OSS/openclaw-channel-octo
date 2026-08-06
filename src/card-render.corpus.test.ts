@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { summarizeToolParams, reduceUrlsInText, sanitizeErrorText } from "./card-render.js";
+import { REDUCE_INPUT_MAX } from "./card-render.js";
 import { LEAK_CORPUS, BENIGN_CORPUS, REWRITE_CORPUS, UNFIXED_CORPUS, PERF_CORPUS, type CorpusRow } from "./card-render.corpus.js";
 
 const PARAM: Record<string, (s: string) => Record<string, unknown>> = {
@@ -69,10 +70,24 @@ describe("摘要管线形状语料", () => {
     }
   });
 
+  // 每一行标注的 reachesPasses 必须与实际一致。空白边界截断落地后,超过上限且前 4000 字符
+  // 不含空白的输入在长度判定处就被拒,一趟正则都不跑 —— 那种行断言的是「守卫存在」,不是
+  // 「那几趟有界」。这条断言让「某行悄悄滑进短路组」变成红,而不是安静地失去覆盖。
+  it("PERF:每行是否真的进入管线,与它的标注一致", () => {
+    for (const { label, input, reachesPasses } of PERF_CORPUS) {
+      const actual = input.length <= REDUCE_INPUT_MAX || /\s/.test(input.slice(0, REDUCE_INPUT_MAX));
+      expect(actual, `${label}:标注 reachesPasses=${reachesPasses},实际 ${actual}`).toBe(reachesPasses);
+    }
+    // 至少要有真正跑完管线的行,否则整组退化成「长度守卫存在」的重复断言。
+    expect(PERF_CORPUS.filter((r) => r.reachesPasses).length).toBeGreaterThanOrEqual(4);
+  });
+
   // 计时断言。**管线和调用方都要测** —— 上一轮只加了管线级断言,而当时的回归住在调用方、
   // 在管线下游,于是 5.9 秒的缺陷全绿通过。
   it("PERF:管线与调用方在所有形状上都有界", () => {
-    const budgetMs = 2000; // 修好后实测每格 20 ms 内;余量留给 CI
+    // 预算要同时满足两头:高于真实代价 × CI 抖动(可达行实测最贵 17.5 ms),且**低于已知回归**
+    // —— R4a 那个三次方在 4000 字符处约 1.7 秒。2000 ms 只满足前一头,那个回归会绿着通过。
+    const budgetMs = 300;
     for (const { label, input, note } of PERF_CORPUS) {
       const entries: Array<[string, () => unknown]> = [
         ["reduceUrlsInText", () => reduceUrlsInText(input)],
