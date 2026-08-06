@@ -154,6 +154,27 @@ to paste a secret in plaintext. Whether to adjust the configuration is up to you
 7. Sends display and submit-interactive cards with negotiated fallback
 8. Polls durable `card_action` events only after an interactive card is sent
 
+### Query strings are never rendered on a card
+
+Anything this plugin renders into a card goes through one URL-reduction step, and
+that step strips the query string. A query string is where callback codes, signed
+URLs, session ids and one-time tokens live, and cards are visible to every member
+of the channel, so the rule has no per-sink exceptions.
+
+Two consequences are worth knowing, because they are not just cosmetic:
+
+- Rich-text blocks may collapse. When more of a string counts as reducible, a
+  display card can fall back to a single text block and lose its formatting.
+- **A value you submitted may be echoed back without its query string.** The
+  status card that records an interactive submission runs the same reduction over
+  the submitted value, so `docs/parser?mode=fast` is frozen into the card as
+  `docs/parser`. The card is no longer a verbatim record of what was submitted.
+
+Where the shape cannot be reduced cleanly — a quote inside the query string, for
+instance — the summary is withheld entirely rather than half-rewritten. A
+partially rewritten command looks sanitized while still carrying its tail, and
+gives the operator no signal that what they are reading has been altered.
+
 ## Architecture
 
 `index.ts` is a standard OpenClaw plugin entry. When loaded:

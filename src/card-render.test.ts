@@ -218,6 +218,30 @@ describe("summarizeToolParams", () => {
     expect(summarizeToolParams("fetch", { url: "https://x.example.com/users/@me" }))
       .toBe("https://example.com");
   });
+  it("单标签主机的 query 段被剥掉(上面几趟都要求主机带点,漏掉这一类)", () => {
+    // 归约:主机/路径保留,query 整段剥掉。
+    expect(summarizeToolParams("read", { file_path: "localhost/reset?code=abc" })).toBe("localhost/reset");
+    expect(summarizeToolParams("read", { file_path: "localhost:8080/api?mode=fast" })).toBe("localhost:8080/api");
+    // 前导必须认引号与 `=` —— 命令行上给 URL 加引号、或挂在 `--url=` 后面都是常态写法。
+    expect(summarizeToolParams("read", { file_path: "'localhost/reset?code=abc'" })).toBe("'localhost/reset'");
+    expect(summarizeToolParams("read", { file_path: "--url=localhost/reset?code=abc" })).toBe("--url=localhost/reset");
+    // 不误伤:普通相对路径、以及不含 `=` 的 shell glob。
+    expect(summarizeToolParams("read", { file_path: "src/index.ts" })).toBe("src/index.ts");
+    expect(summarizeToolParams("read", { file_path: "src/file?.ts" })).toBe("src/file?.ts");
+  });
+  it("归约不掉的 query 形状整串不渲染(结构要求也会在兜底里被抄错)", () => {
+    // query 直接挂在**裸主机**上:路径段两边都必须可选。只有归约放宽、兜底照抄「`?` 前必须
+    // 有 `/`」这条结构要求的话,这条两边都不匹配、原样渲染。
+    expect(summarizeToolParams("read", { file_path: "localhost?code=abc" })).toBe("localhost");
+    // query 里嵌引号 → 归约不改写(半改写会把命令改成另一条),整串不渲染。
+    // `code` 是 OAuth 授权码,等价于 bearer;既不在关键词表里,值也没有高熵形状。
+    // (shell 策略在默认档只渲染程序名,所以这一类的 sink 是 path/query。)
+    expect(summarizeToolParams("grep", { pattern: `'localhost:8080/s?f={"a":1}&code=hunter2'` })).toBe("");
+    // 反向:归约**主动不碰**的纯数字主机,兜底也不能拦 —— query 策略没有程序名可退,
+    // 整串拦掉会让卡片直接空白,看起来像 bug。
+    expect(summarizeToolParams("grep", { pattern: "10/20?ok=yes" })).toBe("10/20?ok=yes");
+    expect(summarizeToolParams("grep", { pattern: "2026-08-06?ok=yes" })).toBe("2026-08-06?ok=yes");
+  });
   it("url 类只保留 scheme://注册域,丢弃 path/query/userinfo 与所有子域", () => {
     expect(summarizeToolParams("fetch", { url: "https://u:p@host.com/a/b?token=sk-secret&x=1" })).toBe(
       "https://host.com",

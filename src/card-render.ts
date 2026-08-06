@@ -255,7 +255,7 @@ function firstString(p: Record<string, unknown>, keys: string[]): string {
 }
 
 /**
- * shell 里能结束一个词的字符,用来给下面的赋值折叠正则划词边界。
+ * shell 里能结束一个词的字符。给下面的赋值折叠正则与两条 URL 正则划边界。
  *
  * `/` 与 `=` 都**不在**集合里:`sed 's/DEPLOY_KEY=v/x/'` 里的赋值属于 sed 脚本文本、不是赋值位;
  * 而排除 `=` 会让 `TOKEN_URL=http://x?a=b` 的值在第二个 `=` 处断开、尾段 `=b` 留在渲染串里。
@@ -403,6 +403,63 @@ const RESIDUAL_USERINFO_RE = new RegExp(
 const SCHEMELESS_HOST_PATH_RE =
   /(^|[^A-Za-z0-9@._/:+-])([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?\/[^\s]+)/g;
 
+/**
+ * URL 相关那几趟的前导集:SHELL_BREAK **再加** `=` 和 `,`。
+ *
+ * 比 SHELL_BREAK 宽是安全的 —— 这几趟只把前导原样回填,不存在「值吞掉下一个起始位置」的问题,
+ * 所以放宽只会多覆盖、不会漏。`=` 是必须的:`curl --url=localhost/reset?code=…` 里 query 前面
+ * 粘的正是 `=`;`,` 则来自 `--conf a=1,b=localhost/x?c=…` 这类逗号分隔的参数列表。
+ */
+const URL_LEAD = `${SHELL_BREAK}=,`;
+
+/**
+ * 无 scheme、**单标签主机**的 `host/path?query`。上面几趟都要求主机带点,这类串一趟都不匹配,
+ * query 会原样渲染(`curl localhost/reset?code=…`)。
+ *
+ * 不放宽主机形状去匹配整串 —— 那样 `src/index.ts` 会被当成 host/path,把普通相对路径毁掉。
+ * 只针对**含 `=` 的 query 段**下手:shell glob(`src/file?.ts`)里不含 `=`,不会被误伤。
+ *
+ * 前导取 URL_LEAD 而不是只认空白:命令行上给 URL **加引号是常态写法**,只认空白时
+ * `curl 'localhost/reset?code=…'` 和 `curl --url=localhost/reset?code=…` 的 query 原样渲染。
+ */
+// query 段止于空白或引号,并且**整段必须干净收尾**:收尾条件要求匹配停在串尾、空白,或一个「后面
+// 就是 SHELL_BREAK 字符或串尾」的闭合引号上 —— 即那个引号确实是**词的结尾**,而不是 query 内部
+// 的引号。
+//
+// 少了这个收尾条件,query 里只要出现一个引号,匹配就在那里断掉、只删前半段,后半段原样渲染:
+//
+//     curl 'localhost:8080/search?filter={"a":1}&code=hunter2'
+//       →  curl 'localhost:8080/search"a":1}&code=hunter2'      ← code= 泄漏
+//
+// 半改写的输出看起来像脱敏过的,却留着尾巴,是最坏的失败模式。修法不是把引号放进集合(那会把
+// 闭合引号连同后面的 `&&echo x` 一起吃掉、把命令改写成另一条),而是**确认不了就不改写** ——
+// 交给 RESIDUAL_QUERY_RE 整串不渲染。与 userinfo 那条走的是同一个判据。
+//
+// `&` 必须留在集合内 —— 多参数 query(`?a=1&b=2`)靠它,排除掉会把 `&b=2` 留在渲染串里。
+const SCHEMELESS_QUERY_RE = new RegExp(
+  `(^|[${URL_LEAD}])((?=[A-Za-z0-9._-]*[A-Za-z])[A-Za-z0-9._-]+(?::\\d+)?(?:\\/[^\\s?]*)?)\\?[^\\s'"]*=[^\\s'"]*(?=$|\\s|['"](?:[${SHELL_BREAK}]|$))`,
+  "g",
+);
+
+/**
+ * 归约后**仍然残留**的单标签 `host/path?…=…` → 摘要整串不渲染(与 RESIDUAL_USERINFO_RE 同理)。
+ *
+ * 路径段两边都是**可选**的。这一条不只是字符类要对齐:如果只有归约放宽、兜底照抄了「`?` 前必须
+ * 有 `/`」这条**结构要求**,`host?query`(query 直接挂在裸主机上,`curl localhost?code=abc`)就会
+ * 两边都不匹配 —— 归约不处理、兜底也不拦,原样渲染。兜底与被兜底者共享盲点时,兜底就不是兜底。
+ *
+ * 字母前瞻与 SCHEMELESS_QUERY_RE 一致。少了它,归约**主动不碰**的纯数字主机(`10/20?ok=yes`、
+ * `2026-08-06?ok=yes`)会被兜底整串拦掉 —— 而 query 策略没有程序名可退,卡片直接空白,看起来
+ * 像 bug。这说明「兜底的字符类必须 ⊇ 归约的」写窄了:两者真正需要的是**归约不肯动的地方,
+ * 兜底也不要拦**;单向的包含关系只覆盖了泄漏方向,没覆盖过度隐藏方向。
+ *
+ * SCHEMELESS_QUERY_RE 只改写能干净收尾的形状;query 里嵌了引号的(JSON 参数、带引号的值、
+ * OAuth 回调里的 `state='…'`)一趟都不匹配,而 `code=`/`sid=`/`refresh=` 这些既不在关键词表里、
+ * 值也没有高熵形状,下游守卫同样抓不住 —— `code` 是 OAuth 授权码,等价于 bearer。
+ */
+const RESIDUAL_QUERY_RE =
+  /(?=[A-Za-z0-9._-]*[A-Za-z])[A-Za-z0-9._-]+(?::\d+)?(?:\/[^\s?]*)?\?[^\s]*=/;
+
 /** 把文本里内嵌的 URI 就地降级为 scheme://注册域(解析失败则整段抹除)。 */
 export function reduceUrlsInText(s: string): string {
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
@@ -422,6 +479,15 @@ export function reduceUrlsInText(s: string): string {
   out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => (
     prefix + (originDomain(`https://${hostAndPath}`) ?? "")
   ));
+  // 5. 单标签主机的 `host/path?query`:上面几趟都要求主机带点,漏掉这一类,query 原样留下。
+  //
+  // 这一趟落在 reduceUrlsInText 里,所以它的另外几个调用方(display card 文本、action label、
+  // reasoning 文本、card-author、card-display-tool)一并生效。代价要说全,别只说样式:
+  // card-blocks.ts 的 noReducibleUrl 会因为更多串算作"可归约"而退到单个 TextBlock(丢富文本
+  // 样式);而 card-action-status.ts 的 neutralizeEcho 跑在**用户提交的输入值**上、结果会被冻结
+  // 到状态卡里 —— `docs/parser?mode=fast` → `docs/parser`,卡片记下的就不再是用户提交的原文。
+  // 这是内容保真的代价,不是样式的代价。见 README 的 scope note。
+  out = out.replace(SCHEMELESS_QUERY_RE, "$1$2");
   return out;
 }
 
@@ -459,6 +525,7 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
   // 归约管线处理不掉的 userinfo 形状 → 整串不渲染。必须放在归约**之后**:能确定是 DSN 的形状
   // 此时已被剥掉 userinfo,不会在这里误伤。
   if (RESIDUAL_USERINFO_RE.test(s)) return "";
+  if (RESIDUAL_QUERY_RE.test(s)) return "";
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
   // + 明确前缀,避免把 git SHA / docker digest / 缓存哈希等正常路径误伤成空。
   const generic = strategy === "query" || strategy === "url";
