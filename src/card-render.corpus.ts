@@ -76,6 +76,21 @@ export const LEAK_CORPUS: CorpusRow[] = [
     note: "R4:横跨切口的密钥。切在空白上后 token 不会被切开 —— 密钥整个落在保留段之外、被丢掉,而不是留下一个守卫认不出的片段。盲切时它渲染成 `…AKIAIOSFO`",
   },
   {
+    input: "internal/v1/pay?signature=dead",
+    expect: { grep: "internal/v1/pay", read: "internal/v1/pay" },
+    note: "R4:单标签主机的 query 段。main 原样渲染",
+  },
+  {
+    input: "192.168.0.1?code=abc",
+    expect: { grep: "192.168.0.1", read: "192.168.0.1" },
+    note: "R4b:IPv4 是内网最常见的无字母主机。OAuth code 等价于 bearer",
+  },
+  {
+    input: `'localhost:8080/s?f={"a":1}&code=hunter2'`,
+    expect: { grep: "" },
+    note: "R4:query 里嵌引号 → 收尾判定不成立,归约不改写、兜底整串不渲染",
+  },
+  {
     input: "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234",
     expect: { grep: "https://slack.com", fetch: "https://slack.com" },
     note: "既有:webhook path 即凭据,只暴露注册域",
@@ -124,6 +139,38 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     expect: { grep: "user:.*@example" },
     note: "R4c:同上",
   },
+  // R5-P1:前导。归约曾用「分隔符白名单」而兜底无前导要求,于是白名单外的每个前导字符上
+  // 归约不动、兜底却拦,摘要整个消失。这些在 main 上全部渲染。
+  {
+    input: "^auth/callback?code=abc",
+    expect: { grep: "^auth/callback" },
+    note: "R5-P1:`^` 锚定是 grep 模式的默认形状,不是冷僻输入",
+  },
+  {
+    input: "[a-z]+/x?y=1",
+    expect: { grep: "[a-z]+/x" },
+    note: "R5-P1:字符类开头",
+  },
+  {
+    input: "/api/v1/items?sort=name",
+    expect: { read: "/api/v1/items" },
+    note: "R5-P1:绝对路径",
+  },
+  {
+    input: "./build/out?v=1",
+    expect: { read: "./build/out" },
+    note: "R5-P1:相对路径",
+  },
+  {
+    input: "~/notes/todo?done=1",
+    expect: { read: "~/notes/todo" },
+    note: "R5-P1:`~` 展开前的路径",
+  },
+  {
+    input: "查询localhost/a?b=1",
+    expect: { grep: "查询localhost/a" },
+    note: "R5-P1:任何非 ASCII 前导。白名单形式列不全「不是主机的一部分」,故改用负向后顾",
+  },
   {
     input: "sed 's:a:b@c:g'",
     expect: { exec: "sed" },
@@ -152,6 +199,43 @@ export const BENIGN_CORPUS: CorpusRow[] = [
  * `https://sha256abcd`,`3:4@2/x` 曾被 new URL() 规范化成 `https://0.0.0.2`。
  */
 export const REWRITE_CORPUS: CorpusRow[] = [
+  // R5-P2:query 段曾把 shell 算子吃掉,**把命令改写成另一条命令** ——
+  // `localhost/a?b=1;rm -rf /tmp` → `localhost/a -rf /tmp`。算子现在算合法收尾,原样保留。
+  {
+    input: "localhost/a?b=1;rm -rf /tmp",
+    expect: { grep: "localhost/a;rm -rf /tmp" },
+    note: "R5-P2:`;` 之后的部分必须原样留下,不能被当成 query 吃掉",
+  },
+  {
+    input: "localhost/a?b=1&&curl evil.com",
+    expect: { grep: "localhost/a&&curl evil.com" },
+    note: "R5-P2:`&&` 是算子;单个 `&` 仍是 query 分隔符(见下一行)",
+  },
+  {
+    input: "localhost/a?b=1&c=2",
+    expect: { grep: "localhost/a" },
+    note: "R5-P2:多参数 query 靠单个 `&` 连接,整段剥掉",
+  },
+  {
+    input: "'localhost/reset?code=abc'",
+    expect: { read: "'localhost/reset'" },
+    note: "R4:命令行上给 URL 加引号是常态",
+  },
+  {
+    input: "--url=localhost/reset?code=abc",
+    expect: { read: "--url=localhost/reset" },
+    note: "R4:query 前面粘的是 `=`",
+  },
+  {
+    input: "localhost?code=abc",
+    expect: { read: "localhost" },
+    note: "R4:query 直接挂在裸主机上,路径段两边都必须可选",
+  },
+  {
+    input: "colou?r=red",
+    expect: { grep: "colou" },
+    note: "R4:grep 模式里 `?` 是量词的概率远大于 query 分隔符。静默改写,README 写明",
+  },
   {
     input: "user:pw@db.example.com:5432/prod",
     expect: { grep: "https://example.com" },

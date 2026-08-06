@@ -154,6 +154,47 @@ to paste a secret in plaintext. Whether to adjust the configuration is up to you
 7. Sends display and submit-interactive cards with negotiated fallback
 8. Polls durable `card_action` events only after an interactive card is sent
 
+### Query strings are stripped from host-shaped values
+
+Anything this plugin renders into a card goes through one URL-reduction step, and
+that step strips the query string off anything it can identify as a host: a
+dotted hostname, a single-label host such as `localhost`, or an IPv4 literal. A
+query string is where callback codes, signed URLs, session ids and one-time
+tokens live, and cards are visible to every member of the channel, so the rule
+applies at every sink rather than only to progress cards.
+
+It is *host-shaped* rather than unconditional, because two shapes are left alone
+on purpose:
+
+- **A bare numeric label** — `8080?code=abc`. Indistinguishable from ordinary
+  prose such as `10/20?ok=yes` or `2026-08-06?ok=yes`, and a `grep` pattern has
+  no program name to fall back to, so withholding renders a blank card that reads
+  as a bug.
+- **A fragment** — `localhost/cb#code=abc` renders in full. Implicit-flow OAuth
+  does return tokens in the fragment, so this is a real gap; closing it would
+  also hit `file.ts#L10` and markdown anchors, so it is left for its own change.
+
+Where the query cannot be terminated cleanly — a quote inside it — the summary is
+withheld rather than half-rewritten. A partially rewritten command looks
+sanitized while still carrying its tail. Shell operators (`;`, `&&`, `|`, `>`)
+*do* terminate it cleanly and are left untouched: `curl localhost/a?b=1;echo done`
+becomes `curl localhost/a;echo done`, not a different command.
+
+Three consequences are worth knowing, because they are not just cosmetic:
+
+- Rich-text blocks may collapse. When more of a string counts as reducible, a
+  display card can fall back to a single text block and lose its formatting.
+- **A value you submitted may be echoed back without its query string.** The
+  status card that records an interactive submission runs the same reduction over
+  the submitted value, so `docs/parser?mode=fast` is frozen into the card as
+  `docs/parser`. The card is no longer a verbatim record of what was submitted.
+- **`?` is read as a query delimiter even where it was a quantifier.** A `grep`
+  pattern of `colou?r=red` renders as `colou`. The rewrite is silent — there is
+  no ellipsis or marker.
+
+The last two are content-fidelity costs, not styling ones. They are the reason
+this lives in its own change rather than riding along with a defect fix.
+
 ### A scheme-less `user:pass@host` is only reduced when the host carries a dot
 
 `postgres://user:pw@host/db` and `user:pw@db.example.com` lose their userinfo, but

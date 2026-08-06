@@ -358,6 +358,84 @@ const SCHEMELESS_HOST_PATH_RE =
   /(^|[^A-Za-z0-9@._/:+-])([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?\/[^\s]+)/g;
 
 /**
+ * 无 scheme、**单标签主机或 IPv4 字面量**的 `host/path?query`。前面几趟都要求主机带点,这类串
+ * 一趟都不匹配,query 会原样渲染(`curl localhost/reset?code=…`)。
+ *
+ * 不放宽主机形状去匹配整串 —— 那样 `src/index.ts` 会被当成 host/path,把普通相对路径毁掉。
+ * 只针对**含 `=` 的 query 段**下手:shell glob(`src/file?.ts`)里不含 `=`,不会被误伤。
+ */
+// 前导用**负向后顾**,不是前导字符白名单。
+//
+// 上一版是 `(^|[白名单])`,而兜底没有任何前导要求 —— 于是每个白名单外的前导字符上,归约不动、
+// 兜底却拦,摘要整个消失。`^`、`[`、`\`、`.`、`~`、`/` 和所有非 ASCII 都在白名单外,也就是说
+// `^` 锚定的 grep 模式、字符类、相对路径、绝对路径全都丢了参数摘要:
+//
+//     ^auth/callback?code=abc   /api/v1/items?sort=name   ./build/out?v=1
+//     [a-z]+/x?y=1              /tmp/session?sid=abc      查询localhost/a?b=1
+//
+// 根因不是兜底缺锚点,而是「分隔符白名单」这个形式本身列不全「不是主机的一部分」。换成对主机
+// 字符类取负向后顾,归约与兜底就在这条轴上**由构造一致**,不再是两张要同步的表。
+const QUERY_LEAD = `(?<![A-Za-z0-9._-])`;
+
+/**
+ * 主机形状前瞻。归约与兜底**共用这一个常量**。
+ *
+ * 含字母,**或**点分四段 IPv4。只要求字母的话,内网/开发环境里最常见的无字母主机 —— IPv4 字面量
+ * —— 既过不了这里、也过不了第 4 趟(那趟要求字母 TLD),于是 query 原样渲染。按本模块自己的论据
+ * (OAuth 授权码等价于 bearer),那正是这一趟要挡的。
+ *
+ * 裸数字单标签(`8080?code=abc`)仍然不碰:它与 `10/20?ok=yes`、`2026-08-06?ok=yes` 这种日期/
+ * 比值散文形状完全一致,而 query 策略没有程序名可退,拦下来就是一张空白卡。
+ */
+const QUERY_HOST_LEAD = `(?:(?=[A-Za-z0-9._-]*[A-Za-z])|(?=\\d{1,3}(?:\\.\\d{1,3}){3}(?:[:/?]|$)))`;
+
+/**
+ * query 段:`key=value`,可由**单个** `&` 连接多段。
+ *
+ * 段内排除 shell 算子。上一版只排除空白和引号,于是 `;`、`&&`、`|`、`>` 被当成 query 的一部分
+ * 吃掉,**把命令改写成了另一条命令**:
+ *
+ *     localhost/a?b=1;rm -rf /tmp     →   localhost/a -rf /tmp
+ *     localhost/a?b=1&&curl evil.com  →   localhost/a evil.com
+ *
+ * 本文件把「改写成另一条命令」列为不可接受的失败模式,并以此为由把引号排除在外 —— 同一条理由
+ * 同样排除这几个算子。`&` 不能整个排掉(多参数 query 靠它),所以写成「段之间只允许单个 `&`」:
+ * `&&` 匹配不上第二段的 `=`,自然落到收尾判定上。
+ */
+const QUERY_ATOM = `[^\\s'";|<>&\`)]*`;
+const QUERY_BODY = `${QUERY_ATOM}=${QUERY_ATOM}(?:&${QUERY_ATOM}=${QUERY_ATOM})*`;
+
+/**
+ * 收尾判定:query 必须**干净收尾** —— 停在串尾、空白、shell 算子,或一个「后面就是 SHELL_BREAK
+ * 或串尾」的闭合引号上(即那个引号确实是词的结尾,而不是 query 内部的引号)。
+ *
+ * 少了它,query 里只要出现一个引号,匹配就在那里断掉、只删前半段,后半段原样渲染 —— 半改写的
+ * 输出看起来像脱敏过的,却留着尾巴。确认不了就不改写,交给 RESIDUAL_QUERY_RE 整串不渲染。
+ *
+ * 算子算合法收尾(而不是交给兜底):`curl localhost/a?b=1;echo done` 的 query 确实在 `;` 处结束,
+ * 剥掉 query、保留 `;echo done` 才是对的;整串不渲染反而丢信息。
+ */
+const QUERY_END = `(?=$|[\\s;|<>&)]|['"](?:[${SHELL_BREAK}]|$))`;
+
+const SCHEMELESS_QUERY_RE = new RegExp(
+  `${QUERY_LEAD}(${QUERY_HOST_LEAD}[A-Za-z0-9._-]+(?::\\d+)?(?:\\/[^\\s?]*)?)\\?${QUERY_BODY}${QUERY_END}`,
+  "g",
+);
+
+/**
+ * 归约后**仍然残留**的 `host/path?…=…` → 摘要整串不渲染。
+ *
+ * 路径段可选:归约要求 `?` 前有 `/` 的话,`host?query` 两边都不匹配 —— 归约不处理、兜底也不拦,
+ * 原样渲染。共享的不是字符类而是**结构要求**,失效方式一样。
+ *
+ * 前导与主机前瞻都与归约**共用常量**。第一版这里没有前导要求而归约有,那条不对称就是上面
+ * QUERY_LEAD 注释里那一整类过度隐藏的来源。
+ */
+const RESIDUAL_QUERY_RE = new RegExp(
+  `${QUERY_LEAD}${QUERY_HOST_LEAD}[A-Za-z0-9._-]+(?::\\d+)?(?:\\/[^\\s?]*)?\\?[^\\s]*=`,
+);
+
+/**
  * 超长输入的截断:**切口只能落在空白上**,切不到就整串不渲染。
  *
  * 上一版是 `s.slice(0, REDUCE_INPUT_MAX)` —— 盲切。它自己就是一条泄漏路径:下面几趟归约靠
@@ -410,6 +488,12 @@ export function reduceUrlsInText(input: string): string {
   out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => (
     prefix + (originDomain(`https://${hostAndPath}`) ?? "")
   ));
+  // 5. 单标签主机 / IPv4 的 `host/path?query`:上面几趟都要求主机带点,漏掉这一类。
+  //
+  // 这一趟落在 reduceUrlsInText 里,所以它的其它调用方(display card 文本、action label、
+  // reasoning 文本、card-author、card-display-tool、card-action-status)一并生效。
+  // 「query 段不渲染」是全局判据,只在进度卡里补上等于把另一半留着。代价见 README。
+  out = out.replace(SCHEMELESS_QUERY_RE, "$1");
   return out;
 }
 
@@ -444,6 +528,8 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
   // + 明确前缀,避免把 git SHA / docker digest / 缓存哈希等正常路径误伤成空。
   const generic = strategy === "query" || strategy === "url";
+  // 归约处理不掉的 query 形状 → 整串不渲染,而不是半改写。
+  if (RESIDUAL_QUERY_RE.test(s)) return "";
   if (!s || isSensitive(s, generic)) return "";
   return s.length > SUMMARY_MAX ? s.slice(0, SUMMARY_MAX) + "…" : s;
 }
