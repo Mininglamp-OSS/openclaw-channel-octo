@@ -787,6 +787,10 @@ function parseBotCardConfig(value: unknown): BotCardConfig | undefined {
       typeof config.reasoning_enabled !== "boolean") {
     return undefined;
   }
+  if (!config.card_enabled &&
+      (config.display_enabled || config.interaction_enabled || config.reasoning_enabled)) {
+    return undefined;
+  }
   const reasoningRef = parseCardTemplateRef(config.reasoning_template_ref);
   // The server guarantees this invariant. Reject a malformed response rather than guessing a
   // policy locally: a permissive normalization could re-enable a card the Bot owner disabled.
