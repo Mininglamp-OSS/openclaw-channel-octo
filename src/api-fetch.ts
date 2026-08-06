@@ -4,6 +4,7 @@
  */
 
 import { ChannelType, MessageType, CARD_INTERACTIVE_PROFILE, CARD_PROFILE, CARD_VERSION, type CardProfile, type MentionEntity, type RichTextBlock, type SendMessageResult, type TargetCandidate } from "./types.js";
+import { OctoApiError } from "./api-error.js";
 import path from "path";
 import { open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -101,6 +102,9 @@ export const API_FETCH_STATUS_RE = /failed \((\d{3})\)/;
  *   as a generic failure.
  */
 export function httpStatusFromApiFetchError(err: unknown): number | undefined {
+  // OctoApiError carries the status as a field. The regex stays for the errors this
+  // module throws without building one, and for anything constructed before it existed.
+  if (err instanceof OctoApiError) return err.status;
   const message = err instanceof Error ? err.message : String(err);
   const match = message.match(API_FETCH_STATUS_RE);
   return match ? Number(match[1]) : undefined;
