@@ -190,107 +190,12 @@ describe("Bug A fix: Exponential backoff grows correctly", () => {
 });
 
 
-describe("Bug B fix: Kicked during cooldown still reconnects", () => {
-  it("channel.ts onError handler reconnects even when cooldown is active", () => {
-    /**
-     * With the fix, the else branch in channel.ts onError reconnects the
-     * bot with current credentials when cooldown is active, instead of
-     * doing nothing and letting the bot die permanently.
-     */
-    let lastTokenRefreshAt = 0;
-    const TOKEN_REFRESH_COOLDOWN_MS = 60_000;
-    let isRefreshingToken = false;
-    let stopped = false;
-    let tokenRefreshCount = 0;
-    let reconnectCount = 0;
-
-    // Simulate the FIXED onError handler from channel.ts
-    function onError(err: Error) {
-      const cooldownElapsed = Date.now() - lastTokenRefreshAt > TOKEN_REFRESH_COOLDOWN_MS;
-      if (cooldownElapsed && !isRefreshingToken && !stopped &&
-          (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
-        isRefreshingToken = true;
-        lastTokenRefreshAt = Date.now();
-        tokenRefreshCount++;
-        // Would do: socket.disconnect() + socket.updateCredentials() + socket.connect()
-        reconnectCount++;
-        isRefreshingToken = false;
-      } else if (!isRefreshingToken && !stopped &&
-          (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
-        // FIX: Cooldown active — skip token refresh but still reconnect
-        // Would do: socket.disconnect() + socket.connect()
-        reconnectCount++;
-      }
-    }
-
-    // First kick — cooldown not active yet, full refresh happens
-    onError(new Error("Kicked by server"));
-    expect(tokenRefreshCount).toBe(1);
-    expect(reconnectCount).toBe(1);
-
-    // Second kick — within 60s cooldown
-    onError(new Error("Kicked by server"));
-
-    // FIX VERIFIED: reconnect still happens (via else branch), just no token refresh
-    expect(tokenRefreshCount).toBe(1); // no new refresh (cooldown active)
-    expect(reconnectCount).toBe(2);    // reconnect DID happen!
-  });
-
-  it("socket reconnects after channel.ts calls disconnect+connect on kick", () => {
-    /**
-     * When CONNACK returns kicked (reasonCode=0), needReconnect is set to false
-     * and the close event won't trigger scheduleReconnect. But channel.ts can
-     * call socket.disconnect() + socket.connect() to revive the bot.
-     */
-    const originalSetTimeout = global.setTimeout;
-    const setTimeoutCalls: { fn: Function; delay: number }[] = [];
-    global.setTimeout = vi.fn((fn: Function, delay?: number) => {
-      setTimeoutCalls.push({ fn, delay: delay ?? 0 });
-      return 999 as any;
-    }) as any;
-
-    mockWsInstances.length = 0;
-    (globalThis as any).__mockWsInstances = mockWsInstances;
-
-    const onError = vi.fn();
-    const socket = new WKSocket({
-      wsUrl: "ws://test:5200",
-      uid: "bot1",
-      token: "tok1",
-      onMessage: vi.fn(),
-      onError,
-    });
-
-    // Initial connection → kicked
-    socket.connect();
-    const ws1 = mockWsInstances[0];
-    ws1.emit("open");
-    ws1.emit("message", buildConnackKicked());
-
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({
-      message: "Kicked by server",
-    }));
-
-    // needReconnect is false after kick, close won't trigger scheduleReconnect
-    setTimeoutCalls.length = 0;
-    ws1.emit("close");
-    expect(setTimeoutCalls.length).toBe(0);
-
-    // FIX: channel.ts calls disconnect + connect → bot reconnects
-    socket.disconnect();
-    socket.connect();
-
-    // Verify a new WebSocket was created (bot is alive!)
-    expect(mockWsInstances.length).toBeGreaterThan(1);
-    const ws2 = mockWsInstances[mockWsInstances.length - 1];
-    expect(ws2).not.toBe(ws1);
-
-    socket.disconnect();
-    global.setTimeout = originalSetTimeout;
-    delete (globalThis as any).__mockWsInstances;
-    vi.restoreAllMocks();
-  });
-});
+// "Kicked during cooldown still reconnects" used to live here as a hand-copied onError with
+// local variables. It reset its refresh flag synchronously, so no amount of exercising it could
+// have caught the real implementation leaving that flag stuck on — the defect a reviewer found
+// by reading the production code instead. Deleted rather than repaired: the behaviour it claimed
+// to protect is covered against real code in reconnect-coordination.test.ts (a deferred
+// reconnect is armed, cancellable, visible, and skipped for a stopped account).
 
 
 describe("Bug C fix: Rapid silent disconnects trigger onError", () => {

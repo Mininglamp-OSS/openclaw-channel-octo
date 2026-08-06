@@ -579,7 +579,7 @@ describe("progress frames under rate limiting", () => {
     const afterFirst429 = api.editCount();
     expect(afterFirst429).toBeGreaterThan(0);
 
-    // Keep the events coming well inside the 5s window: not one of them may reach the wire.
+    // Keep the events coming well inside the 30s window: not one of them may reach the wire.
     await toolEvent(handlers, "cool-1", "t3");
     await toolEvent(handlers, "cool-1", "t4");
     expect(api.editCount()).toBe(afterFirst429);
@@ -743,6 +743,91 @@ describe("progress frames under rate limiting", () => {
     // Frames resume once the window closes; a 4xx that meant "stop" would have skipped
     // the session for good.
     expect(api.acceptedEdits().length).toBeGreaterThan(0);
+  });
+
+  // stale guard 已经挡住了陈旧 entry 的网络副作用,但没清的定时器会让那个 entry 和它的闭包
+  // 一直活到 Retry-After 到期 —— 30s 的窗口就是 30s 的泄漏。
+  // The gate is the only consumer of the server's raw wait, and its blast radius is every
+  // session on that backend. A day-long Retry-After (or a proxy filling the field in) must not
+  // silence progress cards for a day — the frames are discardable, an early retry is not fatal.
+  it("caps an absurd cooldown so the cards do not go dark for a day", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "86400", limitedEdits: 1 });
+    const { handlers } = makeApi();
+    setCardContext("cool-cap", {
+      apiUrl: "https://coolcap.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-cap", "t1");
+    await toolEvent(handlers, "cool-cap", "t2"); // 429 asking for 24h
+    const during = api.editCount();
+
+    await vi.advanceTimersByTimeAsync(6 * 60 * 1000); // past the 5-minute cap
+    expect(api.editCount()).toBe(during + 1);
+  });
+
+  it("cancels the cooldown wake-up when the entry is replaced", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "30", limitedEdits: 1 });
+    const { handlers } = makeApi();
+    setCardContext("cool-8", {
+      apiUrl: "https://cool8.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-8", "t1");
+    await toolEvent(handlers, "cool-8", "t2"); // 429 → 冷却窗口 + 唤醒定时器
+    const during = api.editCount();
+
+    void during;
+    const armed = vi.getTimerCount();
+
+    // 同 sessionKey 的下一个 run 顶掉这个 entry。
+    setCardContext("cool-8", {
+      apiUrl: "https://cool8.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    // 断言的是定时器真的没了。用 editCount 不行:stale guard 本来就会挡住发送,
+    // 那个断言分不清"定时器被取消"和"定时器醒了但被守卫挡回",两种情况都不发帧 ——
+    // 而后者正是要修的泄漏。
+    expect(vi.getTimerCount()).toBeLessThan(armed);
+  });
+
+  it("cancels the cooldown wake-up when the card is finalized", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "30", limitedEdits: 1 });
+    const { handlers } = makeApi();
+    setCardContext("cool-9", {
+      apiUrl: "https://cool9.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-9", "t1");
+    await toolEvent(handlers, "cool-9", "t2"); // 429
+    const armed = vi.getTimerCount();
+    await finalizeCard("cool-9");
+    expect(vi.getTimerCount()).toBeLessThan(armed);
+  });
+
+  it("cancels the cooldown wake-up when the card is cleared", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "30", limitedEdits: 1 });
+    const { handlers } = makeApi();
+    setCardContext("cool-10", {
+      apiUrl: "https://cool10.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-10", "t1");
+    await toolEvent(handlers, "cool-10", "t2"); // 429
+    void api;
+    const armed = vi.getTimerCount();
+
+    clearCard("cool-10");
+    expect(vi.getTimerCount()).toBeLessThan(armed);
   });
 });
 

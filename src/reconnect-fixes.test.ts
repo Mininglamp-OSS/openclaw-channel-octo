@@ -283,30 +283,13 @@ describe("reconnect fixes", () => {
     });
   });
 
-  // ─── Heartbeat lifetime follows the account, not the connection ────────
-
-  describe("heartbeat lifetime", () => {
-    // The beat used to be started from onConnected and cleared from onDisconnected, which
-    // made a completed reconnect the only way it could ever come back — so a reconnect
-    // that never completed left it stopped for good. Connection events no longer touch it;
-    // see heartbeat.test.ts for the loop's own behaviour.
-    it("is untouched by connect and disconnect events", () => {
-      const socket = createSocket();
-      socket.connect();
-      const ws = mockWsInstances[0];
-
-      const intervalSpy = vi.spyOn(globalThis, "setInterval");
-      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
-
-      ws.emit("message", buildConnackPacket(1)); // onConnected
-      ws.emit("close"); // onDisconnected
-
-      // The socket's own ping timer is its business; what matters here is that neither
-      // event reaches into a heartbeat the channel layer now owns for the whole account.
-      expect(intervalSpy.mock.calls.every(([, ms]) => ms !== 30_000)).toBe(true);
-      expect(clearIntervalSpy).not.toHaveBeenCalledWith(undefined);
-    });
-  });
+  // ─── Heartbeat lifetime ────────────────────────────────────────────────
+  //
+  // Nothing to assert here. The beat used to be started from onConnected and cleared from
+  // onDisconnected — a completed reconnect was the only way it could come back, so one that
+  // never completed left it stopped for good. It now belongs to the account for the account's
+  // whole life, and this file has no channel layer to observe that from: heartbeat.test.ts
+  // covers the loop, reconnect-coordination.test.ts covers what the connection events feed.
 
   // ─── Fix #5: Token refresh disconnects before API call ────────────────
 

@@ -211,6 +211,7 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
     clearTimeout(existing.flushTimer);
     existing.flushTimer = undefined;
   }
+  if (existing) clearCooldownTimer(existing);
   existing?.flushAbort?.abort(new Error("card entry replaced"));
   if (collision) {
     if (existing) existing.skip = true;
@@ -319,15 +320,44 @@ function cooldownKey(apiUrl: string): string {
   return apiUrl.replace(/\/+$/, "");
 }
 
+/**
+ * 冷却门自己的上限。
+ *
+ * 解析层刻意保留服务端原值(缩短等待就是提前重试),但这里是唯一的消费方,而且影响面是
+ * 「该后端下整个进程所有 session 的进度帧」。一个 `Retry-After: 86400`(或代理乱填)会让卡片
+ * 静默停摆一整天,代价远大于偶尔早回去一次 —— 进度帧本来就是可丢弃的。
+ */
+const MAX_CARD_COOLDOWN_MS = 5 * 60 * 1000;
+
 function noteRateLimited(apiUrl: string, retryAfterMs: number): void {
+  if (retryAfterMs > MAX_CARD_COOLDOWN_MS) {
+    warn(
+      `server asked progress frames to wait ${retryAfterMs}ms; capping the card cooldown at ` +
+        `${MAX_CARD_COOLDOWN_MS}ms`,
+    );
+  }
+  const capped = Math.min(retryAfterMs, MAX_CARD_COOLDOWN_MS);
   const key = cooldownKey(apiUrl);
   // 单调:并发的另一个 429 若带更短的 retry_after,直接覆盖会把已有冷却**缩短** ——
   // 那等于提前回去撞,正是这次要消掉的行为。
-  rateLimitedUntil.set(key, Math.max(rateLimitedUntil.get(key) ?? 0, Date.now() + retryAfterMs));
+  rateLimitedUntil.set(key, Math.max(rateLimitedUntil.get(key) ?? 0, Date.now() + capped));
 }
 
 function cooldownRemainingMs(apiUrl: string): number {
   return Math.max(0, (rateLimitedUntil.get(cooldownKey(apiUrl)) ?? 0) - Date.now());
+}
+
+/**
+ * 取消冷却唤醒。
+ *
+ * stale guard 已经能阻止陈旧 entry 产生网络副作用,但一个 30s 的 Retry-After 会让被替换掉的
+ * entry 及其闭包多活 30 秒。凡是 entry 走到终点或被顶掉的路径都要调这个。
+ */
+function clearCooldownTimer(entry: CardEntry): void {
+  if (entry.cooldownTimer) {
+    clearTimeout(entry.cooldownTimer);
+    entry.cooldownTimer = undefined;
+  }
 }
 
 /**
@@ -625,6 +655,7 @@ function isTrackedEntry(sessionKey: string, entry: CardEntry): boolean {
 }
 
 function releasePausedCard(sessionKey: string, entry: CardEntry, reason: string): void {
+  clearCooldownTimer(entry);
   if (entry.pausedExpiryTimer) {
     clearTimeout(entry.pausedExpiryTimer);
     entry.pausedExpiryTimer = undefined;
@@ -683,6 +714,7 @@ async function editTrackedCardState(
       clearTimeout(entry.flushTimer);
       entry.flushTimer = undefined;
     }
+    clearCooldownTimer(entry);
     if (!isTrackedEntry(sessionKey, entry) || !entry.messageId) return;
 
     const now = Date.now();
@@ -848,6 +880,7 @@ export async function finalizeCard(
     try { await entry.flushPromise; } catch { /* flush 内部已告警 */ }
   }
   if (entry.flushTimer) clearTimeout(entry.flushTimer);
+  clearCooldownTimer(entry);
   // P1-g:若仍有 running thinking(agent 收尾时最后一次 model_call 之后未再调工具),
   // 用当前时间把它标 done + 算 duration —— 终态帧不留 ⏳。
   endRunningThinking(entry, Date.now());
@@ -930,6 +963,7 @@ export async function finalizeCardWithResponse(
     clearTimeout(entry.flushTimer);
     entry.flushTimer = undefined;
   }
+  clearCooldownTimer(entry);
   endRunningThinking(entry, Date.now());
   if (entry.skip || !entry.messageId || cards.get(sessionKey) !== entry) return false;
   // Registry-authored messages can only be updated with template_ref + state + data.
@@ -945,6 +979,7 @@ export function clearCard(sessionKey: string): void {
   for (const tracked of new Set([entry, paused].filter((item): item is CardEntry => !!item))) {
     if (tracked.flushTimer) clearTimeout(tracked.flushTimer);
     if (tracked.pausedExpiryTimer) clearTimeout(tracked.pausedExpiryTimer);
+    clearCooldownTimer(tracked);
     tracked.flushAbort?.abort(new Error("card entry cleared"));
     tracked.stateEditAbort?.abort(new Error("card entry cleared"));
     tracked.skip = true;
@@ -958,7 +993,7 @@ export function _resetCardProgressForTests(): void {
   for (const e of new Set([...cards.values(), ...pausedCards.values()])) {
     if (e.flushTimer) clearTimeout(e.flushTimer);
     if (e.pausedExpiryTimer) clearTimeout(e.pausedExpiryTimer);
-    if (e.cooldownTimer) clearTimeout(e.cooldownTimer);
+    clearCooldownTimer(e);
     e.flushAbort?.abort(new Error("card progress reset"));
     e.stateEditAbort?.abort(new Error("card progress reset"));
     e.skip = true;

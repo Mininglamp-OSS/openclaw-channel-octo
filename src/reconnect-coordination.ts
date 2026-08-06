@@ -67,3 +67,56 @@ export function buildWatchdogPredicate(deps: {
     !deps.isRefreshingToken() &&
     !deps.hasDeferredReconnect();
 }
+
+export interface DeferredReconnect {
+  /** Arm a reconnect for later, replacing any already-armed one. */
+  schedule(label: string): void;
+  cancel(): void;
+  /** True while one is armed but has not fired — a watchdog input. */
+  isPending(): boolean;
+}
+
+/**
+ * One tracked handle for every reconnect an account defers.
+ *
+ * Two properties matter and neither survives a bare `setTimeout`. It must be cancellable,
+ * so shutting the account down does not leave a reconnect to fire into a stopped account;
+ * and it must be observable, so the watchdog can tell somebody is already on it. A failed
+ * re-register used to schedule nothing at all, which is how an account ended up dark until
+ * the process was restarted.
+ *
+ * Replacing an armed handle is deliberate: both pending actions rebuild the same
+ * connection, and two of them racing produce sockets that kick each other.
+ */
+export function createDeferredReconnect(deps: {
+  isStopped: () => boolean;
+  sequencer: ReconnectSequencer;
+  run: () => Promise<void>;
+  /** Override for tests; production jitters to avoid a synchronised herd. */
+  delayMs?: () => number;
+}): DeferredReconnect {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const delayMs = deps.delayMs ?? (() => 5_000 + Math.floor(Math.random() * 5_000));
+
+  return {
+    schedule(label): void {
+      if (deps.isStopped()) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        // Re-checked here as well as at schedule time: the account can stop during the wait.
+        if (deps.isStopped()) return;
+        void deps.sequencer.run(label, deps.run);
+      }, delayMs());
+    },
+    cancel(): void {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+    isPending(): boolean {
+      return timer !== null;
+    },
+  };
+}

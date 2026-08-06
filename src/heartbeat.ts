@@ -59,6 +59,9 @@ export function createHeartbeatLoop(params: {
         consecutiveFailures = 0;
       })
       .catch((err: unknown) => {
+        // stop() aborts the in-flight beat on purpose. Counting or logging that would make
+        // every clean shutdown look like a failure.
+        if (stopped) return;
         if (err instanceof OctoApiError && err.isRateLimited) {
           // Transient by definition and self-correcting: the next beat is one interval
           // away. Counting it would conflate "the server is busy" with "we are offline".

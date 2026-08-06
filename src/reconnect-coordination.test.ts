@@ -1,6 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { buildWatchdogPredicate, createReconnectSequencer } from "./reconnect-coordination.js";
+import {
+  buildWatchdogPredicate,
+  createDeferredReconnect,
+  createReconnectSequencer,
+} from "./reconnect-coordination.js";
 
 describe("createReconnectSequencer", () => {
   it("reports in-flight for the whole sequence, including across awaits", async () => {
@@ -91,5 +95,90 @@ describe("buildWatchdogPredicate", () => {
     expect(predicate()).toBe(false);
     connecting = false;
     expect(predicate()).toBe(true);
+  });
+});
+
+describe("createDeferredReconnect", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const make = (over: Partial<Parameters<typeof createDeferredReconnect>[0]> = {}) => {
+    const run = vi.fn(async () => {});
+    const sequencer = createReconnectSequencer();
+    const deferred = createDeferredReconnect({
+      isStopped: () => false,
+      sequencer,
+      run,
+      delayMs: () => 1_000,
+      ...over,
+    });
+    return { deferred, run, sequencer };
+  };
+
+  it("runs the sequence after the delay, not before", async () => {
+    const { deferred, run } = make();
+    deferred.schedule("cooldown");
+    await vi.advanceTimersByTimeAsync(999);
+    expect(run).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  // This is the property the outage turned on: something has to be armed, and it has to be
+  // visible to whoever else might step in.
+  it("reports itself as pending only while armed", async () => {
+    const { deferred } = make();
+    expect(deferred.isPending()).toBe(false);
+    deferred.schedule("cooldown");
+    expect(deferred.isPending()).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(deferred.isPending()).toBe(false);
+  });
+
+  it("keeps one handle when scheduled twice", async () => {
+    const { deferred, run } = make();
+    deferred.schedule("a");
+    deferred.schedule("b");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("can be cancelled before it fires", async () => {
+    const { deferred, run } = make();
+    deferred.schedule("cooldown");
+    deferred.cancel();
+    expect(deferred.isPending()).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("does not arm anything for a stopped account", async () => {
+    const { deferred, run } = make({ isStopped: () => true });
+    deferred.schedule("cooldown");
+    expect(deferred.isPending()).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  // Scheduled while running, stopped while waiting: firing anyway would build a connection
+  // for an account that is already shutting down.
+  it("does not run if the account stopped while it waited", async () => {
+    let stopped = false;
+    const { deferred, run } = make({ isStopped: () => stopped });
+    deferred.schedule("cooldown");
+    stopped = true;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("goes through the sequencer so the watchdog sees it", async () => {
+    let release: (() => void) | undefined;
+    const { deferred, sequencer } = make({
+      run: () => new Promise<void>((res) => (release = res)),
+    });
+    deferred.schedule("cooldown");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sequencer.isInFlight()).toBe(true);
+    release?.();
   });
 });

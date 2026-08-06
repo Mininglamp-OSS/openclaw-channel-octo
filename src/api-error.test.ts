@@ -44,6 +44,24 @@ describe("OctoApiError.from", () => {
     );
   });
 
+  // Zero deserves its own line: it is finite and non-negative, so a naive guard lets it
+  // through, and postJson would then retry three times with no wait at all — piling on at
+  // the exact moment the server said stop.
+  it("treats a zero wait as no usable hint", () => {
+    expect(OctoApiError.from(resp(429, { "retry-after": "0" }), "/p", "").retryAfterMs).toBe(
+      DEFAULT_RETRY_AFTER_MS,
+    );
+  });
+
+  it("treats a zero body hint the same way", () => {
+    const err = OctoApiError.from(
+      resp(429),
+      "/p",
+      JSON.stringify({ error: { details: { retry_after: 0 } } }),
+    );
+    expect(err.retryAfterMs).toBe(DEFAULT_RETRY_AFTER_MS);
+  });
+
   it.each(["abc", "-5", "Wed, 21 Oct 2026 07:28:00 GMT", ""])(
     "falls back to the default for the unusable Retry-After %j",
     (raw) => {

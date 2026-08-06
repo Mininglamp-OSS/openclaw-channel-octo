@@ -2516,19 +2516,50 @@ describe("postJson 429 backoff", () => {
     expect(timeoutSpy).toHaveBeenCalledWith(DEFAULT_POST_TIMEOUT_MS);
   });
 
-  // A long poll deliberately asks for a deadline well past the default. Intersecting the
-  // two would cut the hold short and discard the batch the server was about to return.
-  it("uses the caller's signal verbatim rather than intersecting it", async () => {
+  // A long poll deliberately asks for a deadline well past the default, so the caller's own
+  // deadline has to survive — the 30s default must not be layered on top of it and cut a
+  // legitimate 40s hold short.
+  it("does not impose the default deadline on a caller that brought its own", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    global.fetch = vi.fn().mockResolvedValue(ok()) as unknown as typeof fetch;
+    const { DEFAULT_POST_TIMEOUT_MS, postJson } = await import("./api-fetch.js");
+
+    await postJson("https://x.test", "bf", "/p", {}, AbortSignal.timeout(40_000));
+    const defaults = timeoutSpy.mock.calls.filter(([ms]) => ms === DEFAULT_POST_TIMEOUT_MS);
+    expect(defaults).toHaveLength(0);
+  });
+
+  it("keeps a caller signal live well past the default deadline", async () => {
     const callerSignal = AbortSignal.timeout(40_000);
     let seen: AbortSignal | undefined;
     global.fetch = vi.fn(async (_url: string, init: RequestInit) => {
       seen = init.signal as AbortSignal;
       return ok();
     }) as unknown as typeof fetch;
-    const { postJson } = await import("./api-fetch.js");
+    const { DEFAULT_POST_TIMEOUT_MS, postJson } = await import("./api-fetch.js");
 
     await postJson("https://x.test", "bf", "/p", {}, callerSignal);
-    expect(seen).toBe(callerSignal);
+    await vi.advanceTimersByTimeAsync(DEFAULT_POST_TIMEOUT_MS + 5_000);
+    expect(seen?.aborted).toBe(false); // still alive at 35s, as a 40s hold requires
+  });
+
+  // The caller's signal wins for anything under the ceiling — the events long poll asks for
+  // 40s on purpose — but a signal with no deadline of its own must not make the request
+  // unbounded, which is the class of hang this module exists to remove.
+  it("caps even a caller-supplied signal at the hard ceiling", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    global.fetch = vi.fn().mockResolvedValue(ok()) as unknown as typeof fetch;
+    const { POST_HARD_CEILING_MS, postJson } = await import("./api-fetch.js");
+    const bareController = new AbortController();
+
+    await postJson("https://x.test", "bf", "/p", {}, bareController.signal);
+    expect(timeoutSpy).toHaveBeenCalledWith(POST_HARD_CEILING_MS);
+  });
+
+  it("leaves room for a 40s long-poll hold under the ceiling", async () => {
+    const { POST_HARD_CEILING_MS } = await import("./api-fetch.js");
+    // 30s hold + margin must fit, or the ceiling would abort a legitimate hold.
+    expect(POST_HARD_CEILING_MS).toBeGreaterThan(40_000);
   });
 
   it("rebuilds the default deadline for every attempt", async () => {

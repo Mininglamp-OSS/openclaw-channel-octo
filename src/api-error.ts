@@ -38,7 +38,10 @@ function secondsToMs(raw: string | number | undefined): number | undefined {
   // Number("") is 0 and Number(" ") is 0, so guard the empty cases above rather than
   // letting a blank header masquerade as "retry immediately".
   const seconds = typeof raw === "number" ? raw : Number(raw);
-  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  // Zero is rejected along with the negatives: "come back immediately" is not something a
+  // rate limiter means, and taking it literally produces back-to-back retries at the exact
+  // moment the server just turned us away.
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
   return Math.round(seconds * 1000);
 }
 

@@ -187,6 +187,25 @@ describe("createHeartbeatLoop", () => {
     expect(aborted).toBe(true);
   });
 
+  // A clean shutdown aborts the in-flight beat by design; logging that as a failure makes
+  // every normal stop look like a fault in the logs.
+  it("does not report the abort it caused itself", async () => {
+    const send = vi.fn((signal: AbortSignal) =>
+      new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("heartbeat stopped")), {
+          once: true,
+        });
+      }),
+    );
+    const { loop, warns, errors } = make({ send });
+    loop.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    loop.stop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(warns).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+  });
+
   it("stops beating after stop", async () => {
     const send = vi.fn(async () => {});
     const { loop } = make({ send });

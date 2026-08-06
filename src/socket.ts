@@ -735,6 +735,11 @@ export class WKSocket extends EventEmitter {
       // Connect failed
       this.connected = false;
       this.needReconnect = false;
+      // Closed and dropped like the kicked branch above. Leaving an OPEN socket here makes
+      // isConnectingOrConnected() permanently true for a connection that will never carry
+      // traffic, so anything using that predicate to decide whether to step in stays out
+      // forever.
+      if (this.ws) { try { this.ws.close(); } catch { /* ignore */ } this.ws = null; }
       this.opts.onError?.(new Error(`Connect failed: reasonCode=${reasonCode}`));
     }
   }

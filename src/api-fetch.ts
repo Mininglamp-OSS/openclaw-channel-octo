@@ -129,6 +129,16 @@ export const MAX_429_BACKOFF_WAIT_MS = 15_000;
  * hold and discard the batch the server was about to return.
  */
 export const DEFAULT_POST_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
+/**
+ * Absolute ceiling on one POST attempt, applied even when the caller supplied its own signal.
+ *
+ * The caller's signal is honoured as-is for anything under this, because it knows what this
+ * particular request needs — the events long poll deliberately asks for up to 40s and cutting
+ * it short would abort a legitimate hold. But a signal that carries no deadline at all would
+ * otherwise make the request unbounded, which is the class of hang this module is trying to
+ * remove; nothing here has any business running for a full minute.
+ */
+export const POST_HARD_CEILING_MS = 60_000;
 
 /** Sleep that rejects as soon as the caller's signal aborts, preserving `cause`. */
 function backoffSleep(ms: number, signal: AbortSignal | undefined, cause: unknown): Promise<void> {
@@ -169,7 +179,9 @@ export async function postJson<T>(
 
     // Rebuilt per attempt: a deadline created once outside the loop is shared across
     // attempts, so a retry could start on a budget the first attempt already spent.
-    const fetchSignal = signal ?? AbortSignal.timeout(DEFAULT_POST_TIMEOUT_MS);
+    const fetchSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(POST_HARD_CEILING_MS)])
+      : AbortSignal.timeout(DEFAULT_POST_TIMEOUT_MS);
 
     const response = await fetch(url, {
       method: "POST",
