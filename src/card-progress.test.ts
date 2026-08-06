@@ -364,6 +364,41 @@ describe("server-driven Registry reasoning progress", () => {
     });
   });
 
+  it("releases finalize at the progress timeout while the shared profile read continues", async () => {
+    let resolveProfile!: (response: Response) => void;
+    const profileGate = new Promise<Response>((resolve) => { resolveProfile = resolve; });
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes("/card/profile")) return profileGate;
+      throw new Error(`unexpected request: ${url}`);
+    }) as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("profile-timeout", context());
+    const hookContext = { sessionKey: "profile-timeout", runId: "run-1" };
+    handlers.before_agent_run?.({}, hookContext);
+    handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-1" }, hookContext);
+
+    vi.advanceTimersByTime(900);
+    for (let index = 0; index < 10 && vi.mocked(global.fetch).mock.calls.length === 0; index++) {
+      await Promise.resolve();
+    }
+    expect(vi.mocked(global.fetch)).toHaveBeenCalledOnce();
+
+    let finalized = false;
+    const finalizing = finalizeCard("profile-timeout", { success: true }).then(() => {
+      finalized = true;
+    });
+    await vi.advanceTimersByTimeAsync(10_100);
+    await Promise.resolve();
+
+    expect(finalized).toBe(true);
+    expect(vi.mocked(global.fetch).mock.calls.some(([url]) => String(url).includes("/sendMessage")))
+      .toBe(false);
+
+    resolveProfile(Response.json(profile()));
+    await finalizing;
+    for (let index = 0; index < 5; index++) await Promise.resolve();
+  });
+
   it("fails closed when the same sessionKey is replaced by a different Bot identity", async () => {
     const wire = mockFetch();
     global.fetch = wire.fetch as typeof fetch;
