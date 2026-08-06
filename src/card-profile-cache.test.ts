@@ -98,7 +98,7 @@ describe("bot card profile cache", () => {
     await expect(Promise.all([first, second])).resolves.toEqual([profile(true), profile(true)]);
   });
 
-  it("does not let a pre-invalidation response refill the cache", async () => {
+  it("discards a pre-invalidation response and refreshes before resolving the waiting caller", async () => {
     let resolveStale!: (value: CardProfileManifest) => void;
     vi.mocked(getCardProfile)
       .mockReturnValueOnce(new Promise((resolve) => { resolveStale = resolve; }))
@@ -108,10 +108,7 @@ describe("bot card profile cache", () => {
     const staleRead = getBotCardProfile(bot);
     invalidateBotCardProfile(bot);
     resolveStale(profile(false));
-    await expect(staleRead).resolves.toEqual(profile(false));
-    expect(peekBotCardProfile(bot)).toBeUndefined();
-
-    await expect(getBotCardProfile(bot)).resolves.toEqual(profile(true));
+    await expect(staleRead).resolves.toEqual(profile(true));
     expect(peekBotCardProfile(bot)?.config?.display_enabled).toBe(true);
     expect(getCardProfile).toHaveBeenCalledTimes(2);
   });
