@@ -2301,6 +2301,27 @@ describe("getCardProfile server-driven config", () => {
       reasoning_enabled: false,
       reasoning_template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
     },
+    {
+      card_enabled: false,
+      display_enabled: true,
+      interaction_enabled: false,
+      reasoning_enabled: false,
+      reasoning_template_ref: null,
+    },
+    {
+      card_enabled: false,
+      display_enabled: false,
+      interaction_enabled: true,
+      reasoning_enabled: false,
+      reasoning_template_ref: null,
+    },
+    {
+      card_enabled: false,
+      display_enabled: false,
+      interaction_enabled: false,
+      reasoning_enabled: true,
+      reasoning_template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+    },
   ])("fails closed on a missing, malformed, or internally inconsistent config: %j", async (config) => {
     global.fetch = vi.fn().mockResolvedValue(Response.json({
       enabled: true,
