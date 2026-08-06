@@ -193,6 +193,34 @@ describe("summarizeToolParams", () => {
     // 正常长英文 / 纯字母长串不误伤。
     expect(summarizeToolParams("web_search", { query: "how to configure oauth flow correctly" })).toBe("how to configure oauth flow correctly");
   });
+  // 这是本文件唯一一条计时断言。用耗时而不是「输出被截断」来断言,是因为要守的性质就是耗时本身
+  // —— 归约管线里的正则在长串上是二次的,而 summarizeToolParams 由 before_tool_call 同步调用、
+  // 无 try/catch,工具参数又是模型生成的。删掉 SUMMARY_INPUT_MAX 那两行,这条会红。
+  //
+  // 三种形状分别测:回溯代价随输入形状变化很大(`http://` 那条走第 1 趟,无点长串走第 3/4 趟),
+  // 只测一种会得出「另外几趟不要紧」的错误结论。
+  it("超长输入不进归约管线:默认档、所有策略都有无条件上限", () => {
+    const SHAPES: Array<[string, string]> = [
+      ["无点长串 + query", "a".repeat(100_000) + "?x"],
+      ["scheme + 长主机", "http://" + "a".repeat(120_000)],
+      ["userinfo 前缀 + 长串", "a:b@" + "a".repeat(60_000)],
+    ];
+    const CALLS: Array<[string, (s: string) => Record<string, unknown>]> = [
+      ["read", (s) => ({ file_path: s })],
+      ["exec", (s) => ({ command: s })],
+      ["grep", (s) => ({ pattern: s })],
+    ];
+    for (const [shape, input] of SHAPES) {
+      for (const [tool, mk] of CALLS) {
+        const t0 = performance.now();
+        summarizeToolParams(tool, mk(input));
+        const ms = performance.now() - t0;
+        // 修好后实测每格都在几十毫秒内;上限取 2000 ms 是给 CI 留足余量,同时仍能抓住回归
+        // (未设上限时 read × 无点长串实测 9311 ms)。
+        expect(ms, `${tool} / ${shape} 耗时 ${ms.toFixed(0)} ms`).toBeLessThan(2000);
+      }
+    }
+  });
   it("前缀式密钥被前置词字符粘连也隐藏(去词界锚点;两类 sink 都覆盖)", () => {
     // 回归 yujiawei P1:`\b` 词界锚点会被"前面粘一个词字符"绕过 → 明文密钥泄露。
     // query 策略(generic=true):

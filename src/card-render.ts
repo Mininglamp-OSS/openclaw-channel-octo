@@ -112,6 +112,24 @@ export function resolveToolMeta(tool: string): { icon: string; label: string } {
 }
 
 const SUMMARY_MAX = 64;
+/**
+ * 进入 URL 归约管线前的**无条件**输入长度上限。
+ *
+ * 归约管线里的几趟正则在长串上是二次的。实测(本文件当前状态,默认配置,无任何开关):
+ *
+ *     read  {file_path: "a"×50k  + "?x"}   2363 ms
+ *     read  {file_path: "a"×100k + "?x"}   9311 ms      ← 输入 ×2,耗时 ×4
+ *     exec  {command:   "a:b@"   + "a"×60k} 3442 ms
+ *
+ * summarizeToolParams 由 before_tool_call 钩子**同步**调用且没有 try/catch,而工具参数是模型
+ * 生成的 —— 这几秒是整个插件的事件循环被卡住,所有账号、所有群一起停。
+ *
+ * 截断而不是整串丢弃:渲染上限只有 SUMMARY_MAX(64),截断掉的部分本来也不会被渲染,所以下游
+ * 的敏感串守卫仍然跑在「会被渲染的那一段」的完整形态上,判定不受影响。
+ *
+ * 上限必须落在**进管线之前**。放在管线中间或之后等于没设 —— 代价全部发生在管线里。
+ */
+const SUMMARY_INPUT_MAX = 4000;
 
 /**
  * 敏感串守卫模式。群卡片对全体成员可见 —— 摘要一旦命中即整串隐藏(fail-safe:
@@ -328,6 +346,9 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
   }
   if (!v) return "";
   let s = v.replace(/\s+/g, " ").trim();
+  // 无条件先截断,再进归约管线 —— 见 SUMMARY_INPUT_MAX。不按策略分流:二次回溯在 query 策略
+  // (原样返回 pattern)、path 策略、shell 策略上都实测可达。
+  if (s.length > SUMMARY_INPUT_MAX) s = s.slice(0, SUMMARY_INPUT_MAX);
   // 单一 choke point:所有策略统一把内嵌 URL 降级为 scheme://注册域。避免逐 sink 加降级时
   // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
   s = reduceUrlsInText(s).replace(/\s+/g, " ").trim();
