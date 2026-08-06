@@ -71,6 +71,17 @@ function cardText(card: CardEvidence | undefined): string {
   ].filter((value): value is string => typeof value === "string" && value.length > 0).join(" · ");
 }
 
+/**
+ * Assert the card was authored from the Registry reasoning template without
+ * pinning its version. The plugin deliberately trusts whatever version the Bot
+ * catalog advertises (`cd0538a`), so hardcoding one here just goes red the next
+ * time the server rolls the catalog forward — as it did going 0.2.0 → 0.3.0.
+ */
+function expectReasoningTemplateRef(ref: CardEvidence["templateRef"]): void {
+  expect(ref?.id).toBe("ai.reasoning-process");
+  expect(ref?.version).toMatch(/^\d+\.\d+\.\d+$/);
+}
+
 function expectStrictlyIncreasing(values: number[]): void {
   expect(values.length).toBeGreaterThan(0);
   for (let index = 1; index < values.length; index++) {
@@ -258,7 +269,7 @@ async function runLifecycleFlow({
   });
   expect(completed.cards).toHaveLength(1);
   expect(completed.cards[0]?.messageId).toBe(paused.cards[0]?.messageId);
-  expect(completed.cards[0]?.templateRef).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+  expectReasoningTemplateRef(completed.cards[0]?.templateRef);
   expect(completed.cards[0]?.state).toBe("completed");
   expect(completed.cards[0]?.transient).toBe(false);
   expectStrictlyIncreasing(completed.cards[0]?.editCardSeqs ?? []);
@@ -350,7 +361,7 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
       expect(report).toBe("Processed: alpha=7\n");
       expect(completed.cards).toHaveLength(1);
       const text = cardText(completed.cards[0]);
-      expect(completed.cards[0]?.templateRef).toEqual({ id: "ai.reasoning-process", version: "0.2.0" });
+      expectReasoningTemplateRef(completed.cards[0]?.templateRef);
       expect(completed.cards[0]?.state).toBe("completed");
       expect(completed.cards[0]?.transient).toBe(false);
       expectStrictlyIncreasing(completed.cards[0]?.editCardSeqs ?? []);
@@ -371,4 +382,51 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
       ]);
     }
   }, 120_000);
+});
+
+/**
+ * Regression guard for the "every step green but the card says Failed" report.
+ *
+ * The agent delivers its answer with the `message` tool and ends the turn with
+ * no final text. OpenClaw scores that attempt as a success (it counts messaging
+ * delivery evidence in resolveAttemptTrajectoryTerminal), so dispatch resolves
+ * normally — but the plugin's deliver callback never fires, `replySucceeded`
+ * stays false, and finalizeCard drives the card to phase=error.
+ */
+suite("OpenClaw messaging-tool delivery E2E", () => {
+  it("does not mark the card failed when the answer was delivered by the message tool", async () => {
+    expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
+    const marker = randomUUID();
+    const sessionKey = `agent:main:octo-host-e2e:${marker}`;
+
+    await callBridge({ kind: "configure-reasoning", marker, targetUid, sessionKey });
+    const startedAtMs = Date.now();
+    const accepted = await callBridge({ kind: "tool-delivery", marker, targetUid, sessionKey });
+    expect(accepted.kind).toBe("tool-delivery");
+
+    const completed = await waitForEvidence(
+      marker,
+      sessionKey,
+      startedAtMs,
+      (evidence) => evidence.toolCalls.some((call) => call.name === "message") &&
+        evidence.cards.some((card) => card.state === "completed" || card.state === "error"),
+      90_000,
+    );
+
+    const names = completed.toolCalls.map((call) => call.name);
+    expect(names).toEqual(["exec", "message"]);
+    expect(completed.toolCalls[1]?.arguments).toMatchObject({
+      action: "send",
+      target: `user:${targetUid}`,
+    });
+
+    const card = completed.cards.at(-1);
+    const text = cardText(card);
+    // Both tool steps ran clean, so the card must not claim the run failed.
+    expect(text).toContain("exec");
+    expect(text).toContain("message");
+    expect(text).not.toContain("Generation failed");
+    expect(text).not.toContain("Reasoning was interrupted");
+    expect(card?.state).toBe("completed");
+  }, 150_000);
 });
