@@ -292,9 +292,68 @@ function originDomain(rawUrl: string): string | null {
 /** 协议相对 URL(`//host/path`):按 https 处理。 */
 const PROTOCOL_RELATIVE_RE =
   /(^|[^A-Za-z0-9/:])\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?(?:\/[^\s]*)?/g;
-/** 无 scheme 的 userinfo DSN(`user:pass@host[:port][/path]`):userinfo 即明文口令。密码可含 `@`,按最后一个 `@` 分隔主机。 */
-const SCHEMELESS_USERINFO_RE =
-  /\b[A-Za-z0-9._%+-]+:[^\s/]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:\/[^\s]*)?/g;
+/**
+ * userinfo 用户名允许的字符。归约(SCHEMELESS_USERINFO_RE)与兜底(RESIDUAL_USERINFO_RE)
+ * **共用同一个常量,而且共用同一种锚点形式**(负向后顾)。
+ *
+ * 两者一旦在起始位上不同步,兜底就兜不住它本该兜的东西:凡是归约认、兜底不认的起点,归约漏掉的
+ * 形状会直达渲染。所以这里不只统一字符集,连锚点写法也统一。
+ */
+const USERINFO_USER_CHARS = "A-Za-z0-9._%+-";
+
+/**
+ * 无 scheme 的 userinfo DSN(`user:pass@host[:port][/path]`):userinfo 即明文口令。
+ * 密码可含 `@`,按最后一个 `@` 分隔主机。
+ *
+ * 两个主机分支:
+ *  - **带点主机**(`db.example.com`):port/path 可省。
+ *  - **单标签主机**(`localhost`、compose 服务名、k8s 短名):后接 `:端口`、`/路径` 或 `:/路径`
+ *    (rsync/scp 的远端路径形态)。只认带点会让 `psql user:pw@localhost:5432/prod` 一趟都不匹配、
+ *    明文口令原样渲染。
+ *
+ * 这里**不覆盖**既无端口也无路径的裸单标签(`user:pw@localhost`、`guest:pw@rabbitmq`):无条件
+ * 放宽会把 `sed 's:a:b@c:g'`、`docker run -v a:b@c`、`echo 10:30@office` 当成 DSN 改写掉,而
+ * `x:y@z` 本身无法与它们区分 —— 改写会毁命令,放行会泄漏明文口令。第三条路见
+ * RESIDUAL_USERINFO_RE:归约不了的形状**整串不渲染**。所以这条正则只需覆盖「能确定是 DSN」的
+ * 形状,不必、也不该去猜剩下的。
+ *
+ * 用户名可空(`*` 而非 `+`):`redis-cli -u :hunter2@localhost:6379/0` 是「只有口令」的标准 DSN
+ * 形态(Redis 及一切按口令认证的服务),要求用户名非空会让它一趟都不匹配;而且这条不限于单标签,
+ * `psql :hunter2@db.example.com/prod` 一样漏。空匹配用不了 `\b`(空格与 `:` 都是非词字符,中间
+ * 没有词边界),故改用「前面不是 userinfo 字符」的负向后顾。
+ */
+const SCHEMELESS_USERINFO_RE = new RegExp(
+  `(?<![${USERINFO_USER_CHARS}])[${USERINFO_USER_CHARS}]*:[^\\s/]+@`
+  + `(?:[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+(?::\\d+)?(?:\\/[^\\s]*)?`
+  + `|[A-Za-z0-9-]+(?::\\d+(?:\\/[^\\s]*)?|:\\/[^\\s]*|\\/[^\\s]*))`,
+  "g",
+);
+
+/**
+ * 归约后**仍然残留**的 `user:pass@host` 形状 → 摘要整串不渲染。
+ *
+ * SCHEMELESS_USERINFO_RE 只处理能确定是 DSN 的形状;裸单标签主机(`psql user:hunter2@localhost`、
+ * `celery -b guest:guestpw@rabbitmq`、`ftp user:hunter2@ftpserver`)一趟都不匹配,而 `hunter2`
+ * 这类口令既无关键词也无高熵形状,下游守卫同样抓不住 —— 实测明文口令直达群可见卡片。
+ *
+ * 判据不是「这是不是 DSN」(无法判定),而是「归约管线**有没有**处理掉它」:能确定的形状在上面
+ * 几趟里已被剥掉 userinfo、这里不再命中;还留着 `x:y@z` 的,一律不渲染。误伤方向是少显示细节
+ * (`sed 's:a:b@c:g'` 只渲染 `sed`),而不是把命令改写成另一条命令 —— 后者更糟:操作者看不出
+ * 自己看到的是被改过的。
+ *
+ * **兜底的每一个字符类都必须 ⊇ 归约的对应字符类。** 口令段取最宽的 `[^\s]`,而不是照抄归约的
+ * `[^\s/]`:照抄会留下一条缝 —— 归约**因为**某个字符匹配不上的串,兜底也同样匹配不上,于是原样
+ * 渲染。`/` 就在 base64 口令的字母表里,而且不限于裸单标签:`user:pa/ss@db.example.com`、
+ * `user:pa/ss@localhost:5432/prod` 两边都逃掉。用户名同样可空,理由同上。
+ *
+ * 放宽到 `/` 之后必须排掉 `scheme://`,否则 `https://x.test/a:b@c` 会被读成
+ * 「user=`https`、pass=`//x.test/a:b`」而整串隐藏 —— 路径里带 `@` 的 URL 很常见
+ * (`/users/@me`、`/@scope/pkg`)。带 scheme 的串在第 1 趟已经过 `new URL()` 剥掉 userinfo,
+ * 本来就不需要这条兜底;解析失败的那些在同一趟被整段抹除,也不会走到这里。
+ */
+const RESIDUAL_USERINFO_RE = new RegExp(
+  `(?<![${USERINFO_USER_CHARS}])[^\\s:@/]*:(?!\\/\\/)[^\\s]*@`,
+);
 /** 任意无 scheme 的 `host.tld/path`:path 常承载 webhook token、签名或对象凭据。 */
 const SCHEMELESS_HOST_PATH_RE =
   /(^|[^A-Za-z0-9@._/:+-])([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?\/[^\s]+)/g;
@@ -352,6 +411,9 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
   // 单一 choke point:所有策略统一把内嵌 URL 降级为 scheme://注册域。避免逐 sink 加降级时
   // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
   s = reduceUrlsInText(s).replace(/\s+/g, " ").trim();
+  // 归约管线处理不掉的 userinfo 形状 → 整串不渲染。必须放在归约**之后**:能确定是 DSN 的形状
+  // 此时已被剥掉 userinfo,不会在这里误伤。
+  if (RESIDUAL_USERINFO_RE.test(s)) return "";
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
   // + 明确前缀,避免把 git SHA / docker digest / 缓存哈希等正常路径误伤成空。
   const generic = strategy === "query" || strategy === "url";

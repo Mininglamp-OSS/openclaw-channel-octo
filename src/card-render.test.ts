@@ -163,6 +163,46 @@ describe("summarizeToolParams", () => {
     // 不误伤 Windows 盘符路径(无 ://)。
     expect(summarizeToolParams("read", { path: "C:/Users/me/app.ts" })).toBe("…/me/app.ts");
   });
+  // 注:shell 策略在默认档只渲染程序名,所以只有 DSN **本身就是 argv[0]** 时才会经由 shell
+  // 泄漏;path/query 策略则原样返回整个值,是这一类的主要 sink。下面按各自的真实 sink 取样。
+  it("无 scheme 的 userinfo:能确定是 DSN 的剥掉 userinfo", () => {
+    // 单标签主机 + 端口/路径 —— 带点要求会让这一整类一趟都不匹配、明文口令原样渲染。
+    expect(summarizeToolParams("grep", { pattern: "user:hunter2@localhost:5432/prod" }))
+      .toBe("https://localhost");
+    // 只有口令的 DSN(Redis 及一切按口令认证的服务):用户名段必须允许为空。
+    expect(summarizeToolParams("grep", { pattern: ":hunter2@localhost:6379/0" }))
+      .toBe("https://localhost");
+    expect(summarizeToolParams("grep", { pattern: ":hunter2@db.example.com/prod" }))
+      .toBe("https://example.com");
+    // rsync/scp 的 `host:/path` 远端形态。
+    expect(summarizeToolParams("read", { file_path: "user:pw@backup:/data" }))
+      .toBe("https://backup");
+  });
+  it("归约不掉的 userinfo 形状整串不渲染(兜底与归约共用字符集与锚点形式)", () => {
+    // 裸单标签主机:归约**有意不碰**(`sed 's:a:b@c:g'` 无法与之区分),由兜底整串拦下。
+    // 口令既无关键词也无高熵形状,下游守卫抓不住 —— 这些在加兜底前实测全部明文渲染。
+    for (const cmd of [
+      "user:hunter2@localhost",
+      "guest:guestpw@rabbitmq",
+      "user:hunter2@ftpserver",
+    ]) expect(summarizeToolParams("exec", { command: cmd }), cmd).toBe("");
+    // 口令含 `/`(base64 字母表里就有)。照抄归约的 `[^\s/]` 会让两边同时匹配不上 ——
+    // 兜底与被兜底者共享盲点时,兜底只是把同一个洞抄了一遍。最后一条主机还是**带点**的。
+    for (const s of [
+      "user:pa/ss@localhost:5432/prod",
+      "prefix/user:pa/ss@db.example.com",
+    ]) expect(summarizeToolParams("grep", { pattern: s }), s).toBe("");
+    // 起始位必须与归约一致。兜底若用「前导字符类」而归约用负向后顾,`/` 在归约下是合法起点、
+    // 在字符类里却不存在 —— 下面三条在对齐锚点形式前实测全部渲染明文口令。
+    for (const s of [
+      "/user:pass@localhost",
+      "x/user:pass@localhost",
+      "prefix/user:pa/ss@db.example.com",
+    ]) expect(summarizeToolParams("grep", { pattern: s }), s).toBe("");
+    // 反向:`scheme://` 必须排掉,否则路径里带 `@` 的正常 URL 会被整串隐藏。
+    expect(summarizeToolParams("fetch", { url: "https://x.example.com/users/@me" }))
+      .toBe("https://example.com");
+  });
   it("url 类只保留 scheme://注册域,丢弃 path/query/userinfo 与所有子域", () => {
     expect(summarizeToolParams("fetch", { url: "https://u:p@host.com/a/b?token=sk-secret&x=1" })).toBe(
       "https://host.com",
