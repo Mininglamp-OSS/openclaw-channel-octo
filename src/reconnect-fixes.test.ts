@@ -283,63 +283,28 @@ describe("reconnect fixes", () => {
     });
   });
 
-  // ─── Fix #3: Heartbeat timer cleared on disconnect ────────────────────
+  // ─── Heartbeat lifetime follows the account, not the connection ────────
 
-  describe("#3 — heartbeat timer cleared on disconnect", () => {
-    it("should clear heartbeat timer when onDisconnected fires", () => {
-      // This tests the channel-layer pattern: heartbeatTimer cleared in onDisconnected
-      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-      let heartbeatCleared = false;
+  describe("heartbeat lifetime", () => {
+    // The beat used to be started from onConnected and cleared from onDisconnected, which
+    // made a completed reconnect the only way it could ever come back — so a reconnect
+    // that never completed left it stopped for good. Connection events no longer touch it;
+    // see heartbeat.test.ts for the loop's own behaviour.
+    it("is untouched by connect and disconnect events", () => {
+      const socket = createSocket();
+      socket.connect();
+      const ws = mockWsInstances[0];
 
-      const originalClearInterval = global.clearInterval;
-      global.clearInterval = vi.fn((id) => {
-        if (id === heartbeatTimer) heartbeatCleared = true;
-        originalClearInterval(id);
-      }) as any;
+      const intervalSpy = vi.spyOn(globalThis, "setInterval");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
 
-      try {
-        // Simulate startHeartbeat
-        heartbeatTimer = setInterval(() => {}, 60_000);
+      ws.emit("message", buildConnackPacket(1)); // onConnected
+      ws.emit("close"); // onDisconnected
 
-        // Simulate onDisconnected callback
-        if (heartbeatTimer) {
-          clearInterval(heartbeatTimer);
-          heartbeatTimer = null;
-        }
-
-        expect(heartbeatCleared).toBe(true);
-        expect(heartbeatTimer).toBeNull();
-      } finally {
-        global.clearInterval = originalClearInterval;
-      }
-    });
-
-    it("should restart heartbeat timer on connect", () => {
-      // Simulate the onConnected/onDisconnected pattern
-      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-
-      const startHeartbeat = () => {
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
-        heartbeatTimer = setInterval(() => {}, 60_000);
-      };
-
-      // onConnected
-      startHeartbeat();
-      expect(heartbeatTimer).not.toBeNull();
-
-      const firstTimer = heartbeatTimer;
-
-      // onDisconnected
-      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-      expect(heartbeatTimer).toBeNull();
-
-      // onConnected again
-      startHeartbeat();
-      expect(heartbeatTimer).not.toBeNull();
-      expect(heartbeatTimer).not.toBe(firstTimer);
-
-      // Cleanup
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      // The socket's own ping timer is its business; what matters here is that neither
+      // event reaches into a heartbeat the channel layer now owns for the whole account.
+      expect(intervalSpy.mock.calls.every(([, ms]) => ms !== 30_000)).toBe(true);
+      expect(clearIntervalSpy).not.toHaveBeenCalledWith(undefined);
     });
   });
 
@@ -380,70 +345,23 @@ describe("reconnect fixes", () => {
 
   // ─── Fix #6: Heartbeat failure has backoff delay ──────────────────────
 
-  describe("#6 — heartbeat failure backoff delay", () => {
-    it("should delay reconnect after heartbeat failures", async () => {
-      global.setTimeout = originalSetTimeout;
+  // ─── The heartbeat no longer drives reconnects at all ─────────────────
+  //
+  // Two contracts used to live here: a backoff before the heartbeat-triggered reconnect,
+  // and a failure counter reset by a successful connect. Both are gone with the reconnect
+  // they served — a REST beat says nothing about whether the socket is healthy, and using
+  // its failures to tear the socket down attacked a connection that was never the problem.
+  // What replaced them: heartbeat.test.ts covers the counter (429s excluded from it, reset
+  // on success, escalation to a log line and nothing more), and connection-watchdog.test.ts
+  // covers the jittered period that keeps several accounts from waking in lockstep.
 
-      // Simulate the heartbeat failure backoff pattern
-      const start = Date.now();
-      const backoffMs = 3000 + Math.floor(Math.random() * 2000);
-
-      expect(backoffMs).toBeGreaterThanOrEqual(3000);
-      expect(backoffMs).toBeLessThan(5000);
-
-      // Verify pattern is non-zero delay (not immediate reconnect)
-      expect(backoffMs).toBeGreaterThan(0);
-    });
-
-    it("should apply random jitter to avoid thundering herd", () => {
-      const delays = new Set<number>();
-      for (let i = 0; i < 100; i++) {
-        delays.add(3000 + Math.floor(Math.random() * 2000));
-      }
-      // Should produce multiple distinct values (not all the same)
-      expect(delays.size).toBeGreaterThan(1);
-    });
-  });
-
-  // ─── Fix #7: consecutiveHeartbeatFailures reset on connect ────────────
-
-  describe("#7 — consecutiveHeartbeatFailures reset on connect", () => {
-    it("should reset failure counter on successful connection", () => {
-      let consecutiveHeartbeatFailures = 0;
-
-      // Simulate failures building up
-      consecutiveHeartbeatFailures = 2;
-      expect(consecutiveHeartbeatFailures).toBe(2);
-
-      // Simulate onConnected callback
-      consecutiveHeartbeatFailures = 0;
-      expect(consecutiveHeartbeatFailures).toBe(0);
-
-      // Next failure should start from 0
-      consecutiveHeartbeatFailures++;
-      expect(consecutiveHeartbeatFailures).toBe(1);
-    });
-
-    it("should not trigger reconnect at 1 failure after reset", () => {
-      const MAX_HEARTBEAT_FAILURES = 3;
-      let consecutiveHeartbeatFailures = 2;
-
-      // Reset on connect
-      consecutiveHeartbeatFailures = 0;
-
-      // Single failure after reset
-      consecutiveHeartbeatFailures++;
-
-      // Should NOT trigger reconnect
-      expect(consecutiveHeartbeatFailures >= MAX_HEARTBEAT_FAILURES).toBe(false);
-    });
-  });
-
-  // ─── Fix #8: Ping timeout path (covered by #3) ───────────────────────
+  // ─── Fix #8: Ping timeout path ───────────────────────────────────────
 
   describe("#8 — ping timeout calls onDisconnected", () => {
-    it("should fire onDisconnected on ping timeout so channel clears heartbeat", () => {
-      // Verify that the WKSocket ping timeout path calls onDisconnected
+    it("should fire onDisconnected on ping timeout so the account sees the drop", () => {
+      // The callback still matters — it is how the account learns the connection went
+      // away — but it no longer clears a heartbeat: the beat outlives any single
+      // connection now.
       const onDisconnected = vi.fn();
       const socket = createSocket({ onDisconnected });
       socket.connect();
