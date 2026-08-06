@@ -211,55 +211,43 @@ describe("summarizeToolParams", () => {
     // 正常长英文 / 纯字母长串不误伤。
     expect(summarizeToolParams("web_search", { query: "how to configure oauth flow correctly" })).toBe("how to configure oauth flow correctly");
   });
-  // 这两条是本文件仅有的计时断言。用耗时而不是「输出被截断」来断言,是因为要守的性质就是耗时本身
-  // —— 归约管线里的正则在长串上是二次的,而这几个函数都在同步路径上、都没有 try/catch。
+  // 这里原来有两条计时断言,已删除,由 card-render.corpus.test.ts 的 PERF 组接管。
   //
-  // **第一条直接测 reduceUrlsInText,而不是只测它的某一个调用方。** 上一版只测了
-  // summarizeToolParams,于是上限被放进那一个调用方里也能让测试全绿 —— 而另外八个调用方跑的
-  // 还是同一条二次管线,其中 card-action-status 的 neutralizeEcho 输入是**群成员提交的表单值**。
-  // 测调用方测不出上限放错了地方,测管线本身才行。
-  it("归约管线自身有无条件输入上限(不是只有某一个调用方有)", () => {
-    const SHAPES: Array<[string, string]> = [
-      ["无点长串 + query", "a".repeat(100_000) + "?x"],
-      ["scheme + 长主机", "http://" + "a".repeat(120_000)],
-      ["userinfo 前缀 + 长串", "a:b@" + "a".repeat(60_000)],
+  // 删而不是修,是因为它们已经**在断言另一件事而不自知**。它们只用三个不含空白的形状
+  // (`"a"×100000+"?x"`、`"http://"+"a"×120000`、`"a:b@"+"a"×60000`),而空白边界截断落地后,
+  // 这三个都在长度判定处被拒,一趟正则都不跑 —— 十五个格子全部 0.005 ms。它们自己的注释写着
+  // 存在理由是「测调用方测不出上限放错了地方,测管线本身才行」,而那个性质已经不是它们测的了:
+  // 现在测的是「长度守卫存在」,测了两遍。预算还停在 2000 ms,R4a 那个三次方(4000 字符约
+  // 1.7 秒)会绿着通过。
+  //
+  // 留着两套计时断言,本身就是这条分支反复犯的那个错:**第二张表该跟着第一张改而没有跟**。
+  // PERF 组同时覆盖 reduceUrlsInText / sanitizeErrorText / summarizeToolParams 的三个策略
+  // (与删掉这两条的入口完全相同),含这三个形状,并且每行标注 reachesPasses、标注本身被断言。
+
+  // 切点搜索的边界形态。这几条此前一条都没有,而它们正是改动切法时最先坏掉的一批。
+  // 「空白正好在下标 4000」曾经是错的:搜索范围取 REDUCE_INPUT_MAX 而不是 +1,前 4000 字符
+  // 明明已经是一个完整的、token 边界对齐的前缀,却连同整串一起被拒。
+  it("空白边界截断:切点搜索的边界形态", () => {
+    const CASES: Array<[string, string, number]> = [
+      ["空白正好在下标 4000", "a".repeat(4000) + " " + "b".repeat(100), 4000],
+      ["空白在下标 3999", "a".repeat(3999) + " " + "b".repeat(100), 3999],
+      ["长度正好 4000、无空白", "a".repeat(4000), 4000],
+      ["长度 4001、无空白", "a".repeat(4001), 0],
+      ["空白只在下标 0", " " + "a".repeat(4100), 0],
+      ["全是空白", " ".repeat(5000), 4000],
     ];
-    for (const [shape, input] of SHAPES) {
-      for (const [name, run] of [
-        ["reduceUrlsInText", () => reduceUrlsInText(input)],
-        ["sanitizeErrorText", () => sanitizeErrorText(input)],
-      ] as Array<[string, () => unknown]>) {
-        const t0 = performance.now();
-        run();
-        const ms = performance.now() - t0;
-        // 修好后实测每格 20 ms 内;上限 2000 ms 给 CI 留余量,仍能抓住回归(未设上限时
-        // reduceUrlsInText × 无点长串实测 11171 ms,sanitizeErrorText 9452 ms)。
-        expect(ms, `${name} / ${shape} 耗时 ${ms.toFixed(0)} ms`).toBeLessThan(2000);
-      }
+    for (const [label, input, wantLen] of CASES) {
+      expect(reduceUrlsInText(input).length, label).toBe(wantLen);
     }
-  });
-  // 三种形状分别测:回溯代价随输入形状变化很大(`http://` 那条走第 1 趟,无点长串走第 3/4 趟),
-  // 只测一种会得出「另外几趟不要紧」的错误结论。
-  it("超长输入不进归约管线:默认档、所有策略都有无条件上限", () => {
-    const SHAPES: Array<[string, string]> = [
-      ["无点长串 + query", "a".repeat(100_000) + "?x"],
-      ["scheme + 长主机", "http://" + "a".repeat(120_000)],
-      ["userinfo 前缀 + 长串", "a:b@" + "a".repeat(60_000)],
-    ];
-    const CALLS: Array<[string, (s: string) => Record<string, unknown>]> = [
-      ["read", (s) => ({ file_path: s })],
-      ["exec", (s) => ({ command: s })],
-      ["grep", (s) => ({ pattern: s })],
-    ];
-    for (const [shape, input] of SHAPES) {
-      for (const [tool, mk] of CALLS) {
-        const t0 = performance.now();
-        summarizeToolParams(tool, mk(input));
-        const ms = performance.now() - t0;
-        // 修好后实测每格都在几十毫秒内;上限取 2000 ms 是给 CI 留足余量,同时仍能抓住回归
-        // (未设上限时 read × 无点长串实测 9311 ms)。
-        expect(ms, `${tool} / ${shape} 耗时 ${ms.toFixed(0)} ms`).toBeLessThan(2000);
-      }
+    // 返回值长度恒 ≤ 上限 —— 多取的那一个字符只用于**发现**切点,不能进入结果。
+    for (const [, input] of CASES) expect(reduceUrlsInText(input).length).toBeLessThanOrEqual(4000);
+    // 代理对不会被从中间切开。切在空白上时这一条由构造成立,但它是切法改动时最容易回归的一项。
+    const LONE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    for (const input of [
+      "a".repeat(3998) + "\u{1F600}".repeat(60), // 切口落在代理对中间
+      "a".repeat(3990) + " " + "\u{1F600}".repeat(60), // 切口前有空白,emoji 整段落在保留段外
+    ]) {
+      expect(LONE.test(reduceUrlsInText(input)), `${JSON.stringify(input.slice(0, 12))}… 输出里出现孤立代理`).toBe(false);
     }
   });
   it("前缀式密钥被前置词字符粘连也隐藏(去词界锚点;两类 sink 都覆盖)", () => {

@@ -9,12 +9,14 @@
  * 哪些行变了、变成了什么。**期望值不是"应该是什么",而是"现在是什么"** —— 它是行为快照,不是
  * 规范。改动让某一行变了,那不一定是 bug,但必须是有意的:改期望值的同时要能说出为什么。
  *
- * 分组即判据,四类各自的失败方向不同:
+ * 分组即判据,各自的失败方向不同:
  *   - LEAK    凭据必须**不出现**在渲染结果里。这一组变红一律是 bug。
  *   - BENIGN  普通内容不该被误伤成空白。变红是过度隐藏,方向安全但要知情。
+ *   - COST    本 PR **刻意**打空的内容,期望值就是空。每行标注 main 的输出,代价才有面。
  *   - REWRITE 归约改写了内容。**渲染结果里的每个字符都必须来自输入**(scheme 前缀除外)——
  *             凭空造串是本模块声明的最坏失败模式:输出看起来像脱敏过的,操作者却无从知道
  *             自己读到的是被改过的。
+ *   - UNFIXED 本 PR 未改变其行为的形状。期望值 = main 的行为。
  *   - PERF    耗时上限。这些函数都在同步路径上、无 try/catch。
  */
 
@@ -135,14 +137,49 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     note: "既有:高熵检测不套用到 path,否则日常路径频繁空白",
   },
   {
-    input: "a".repeat(4100),
-    expect: { grep: "", read: "" },
-    note: "R5-P0:4000 字符内没有空白可切 → 整串不渲染。认不出结构就不渲染,与本模块其余部分同向;这是空白边界截断的代价,写在这里而不是靠读代码发现",
-  },
-  {
     input: "risk-averse task-force",
     expect: { grep: "risk-averse task-force" },
     note: "既有:前缀式密钥的长度下限不能误伤连字符英文",
+  },
+];
+
+/**
+ * **本 PR 刻意付出的可用性代价。** 这些行在 `main` 上有输出,在这里被整块拒绝。
+ *
+ * 与 BENIGN 的区别:BENIGN 变红是"过度隐藏,方向安全但要知情",这一组**本来就是隐藏的**,
+ * 期望值就是空。它存在的意义是让代价有一个精确的面,而不是一句"超长无空白就不渲染"。
+ *
+ * 为什么需要单独一组:上一轮这条代价只由 BENIGN 里的一行 `"a"×4100` 记录,而 `"a"` 是十六进制
+ * 字符 —— `main` 对它同样返回空(走 isSensitive 的长 hex 分支)。**那一行两边都是空,记录不到
+ * 任何差异,空转了一整轮评审。** 下面每一行都标注了 `main` 的输出,一眼能看出差在哪。
+ *
+ * 最重要的一件事:被拒的不只是"归约不了的怪串",**长 URL 也在里面** —— 而长 URL 恰恰是这条
+ * 管线处理得最好的一类(`main` 上 0.2–0.8 ms 归约成注册域)。看起来该把第 1 趟提到界之上,
+ * 实测不行,原因写在 `reduceUrlsInText` 的注释里(第 1 趟在无 `://` 时是二次的)。
+ *
+ * 未列入(expect 只覆盖工具策略):`sanitizeErrorText("failed to fetch " + 4045 字符预签名 URL)`
+ * 在 `main` 上是 `failed to fetch https://amazonaws.com`,这里是 `failed to fetch`。
+ */
+export const COST_CORPUS: CorpusRow[] = [
+  {
+    input: "https://example.com/" + "z".repeat(4100),
+    expect: { grep: "", read: "" },
+    note: "R5-P1:超长无空白 URL。main → `https://example.com`(0.8 ms,第 1 趟线性)",
+  },
+  {
+    input: "https://s3.amazonaws.com/b/k?X-Amz-Signature=" + "a".repeat(4000),
+    expect: { grep: "", read: "" },
+    note: "R5-P1:预签名 URL,现实形状。main → `https://amazonaws.com`(0.1 ms)",
+  },
+  {
+    input: "z".repeat(4100),
+    expect: { grep: "", read: "" },
+    note: "R5-P2:空白边界截断的代价本体。**必须用非十六进制字符** —— `\"a\"×4100` 在 main 上也是空(isSensitive 长 hex 分支),记录不到差异。main → `\"z\"×64 + \"…\"`",
+  },
+  {
+    input: "zq".repeat(2050),
+    expect: { grep: "", read: "" },
+    note: "R5-P2:同上,展示块形态。main 渲染 4100 字符,这里整块不渲染",
   },
 ];
 
@@ -323,5 +360,35 @@ export const PERF_CORPUS: PerfRow[] = [
     input: "x http://" + "a".repeat(3980),
     reachesPasses: true,
     note: "R1:走第 1 趟 scheme 正则,与上面几行代价完全不同",
+  },
+  // 赋值折叠的对抗形状。它此前一行都没有 —— ASSIGNMENT_VALUE_RE / SHELL_WORD_ATOM 是本 PR 新加的
+  // 正则,而 `SHELL_WORD_ATOM` 是 `(?:A|B|C|D|E)*` 这种嵌套重复,正是灾难性回溯的经典形状。
+  // 这里不回溯的理由是「星号后面没有东西,匹配永远能收尾」,但那是**推理**;这几行把它变成实测。
+  //
+  // 另一件必须记的事:`summarizeShell` 的折叠跑在**未截断的原串**上 —— 它不经过归约那道界。
+  // 所以这几行压住的是 exec 策略自己那条路,不是管线。
+  {
+    label: "赋值值 + 未闭合单引号",
+    input: "x X=" + "'a".repeat(1999),
+    reachesPasses: true,
+    note: "R5-nit:每个 `'a` 都是一个 `'(?:\\\\.|[^'])*'?` 原子,星号要在 2000 个原子上收敛",
+  },
+  {
+    label: "赋值值 + 未闭合双引号",
+    input: "x X=" + '"a'.repeat(1999),
+    reachesPasses: true,
+    note: "R5-nit:同上,双引号分支",
+  },
+  {
+    label: "赋值值 + 未闭合 $( ",
+    input: "x X=" + "$(a".repeat(1332),
+    reachesPasses: true,
+    note: "R5-nit:命令替换分支,原子内还含一层 `[^)]*`",
+  },
+  {
+    label: "多个赋值 + 长值(无空白)",
+    input: "x " + Array.from({ length: 200 }, (_, i) => `V${i}='a'`).join(""),
+    reachesPasses: true,
+    note: "R5-nit:`(^|[SHELL_BREAK])` 前导在同一串上反复命中,测的是匹配次数而不是单次回溯",
   },
 ];

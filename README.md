@@ -185,9 +185,35 @@ by the guards) or dropped entirely, and that a UTF-16 surrogate pair is never
 split.
 
 Text whose first 4000 characters contain no whitespace at all has no safe cut, so
-it is **not rendered**. A single unbroken 4000-character token is not something
-the pipeline can normalise, and not rendering is the same choice the rest of the
-module makes when it cannot identify what it is looking at.
+it is **not rendered**.
+
+That costs real output, and it is worth being exact about how much. It is *not*
+only the unparseable case: **a URL longer than 4000 characters with no whitespace
+is dropped rather than reduced to its registered domain**, which is the module's
+most useful single output. A presigned S3 URL, an Azure SAS URL, or a `data:` URI
+inside an error string all take this path. Measured against `main`:
+
+| input | `main` | here |
+|---|---|---|
+| `"https://example.com/" + "z"×4100` | `https://example.com` | not rendered |
+| `grep` on a 4045-character presigned URL | `https://amazonaws.com` | `""` |
+| `sanitizeErrorText("failed to fetch " + that URL)` | `failed to fetch https://amazonaws.com` | `failed to fetch` |
+
+The obvious repair is to run the first reduction pass — which is `new URL()`-based
+and *shrinks* its input — above the bound, and bound only what is left. **That
+repair does not work, and the reason is worth recording so it is not tried again.**
+The first pass's regex is quadratic whenever the text contains no `://`: measured
+alone, 18 ms at 4000 characters, 415 ms at 20 000, and **10 877 ms at 100 000**.
+Only the shapes that *do* contain `://` are cheap (120 000 characters in 1.25 ms),
+and gating on `input.includes("://")` does not rescue it either — `"a"×100000 + "
+http://x.com"` contains `://` and still takes 10 580 ms, because the backtracking
+happens before the match is reached. Hoisting the pass would restore the same 9–11
+second stall this bound exists to prevent, on a *wider* trigger: any long unbroken
+token, with no URL syntax required.
+
+So the order stands and the cost is paid deliberately. The affected shapes are
+pinned in `COST_CORPUS` in `src/card-render.corpus.ts` rather than left to be
+discovered.
 
 Three sinks apply no render cap of their own, so what the bound does is directly
 visible at them, and each says so:
@@ -202,6 +228,23 @@ visible at them, and each says so:
   value through the same reduction. It carries no separate guard; the
   whitespace-boundary cut is what keeps a credential in that value from being
   split out of the reduction's reach.
+
+Those three are where the bound is *visible*. It is not where the bound *acts* —
+`reduceUrlsInText` has nine callers and the bound is inside it, so every one of
+them changes at long input. Four are worth naming because they change in a way a
+reader would not predict from "long text gets truncated":
+
+- **A rich text block** keeps its per-segment `TextRun` styling only when
+  `reduceUrlsInText(joined) === joined`. Past the bound that equality is
+  necessarily false, so a long rich block degrades to a single `TextBlock` even
+  with no URL in it. That is the safer of the two outputs — it also closes a
+  `card ⊋ plain` divergence `main` has on long rich input, where raw segment text
+  reaches the `TextRun`s — so it is left as is, not repaired.
+- **An authored interactive card** rejects a title over the bound with *"title is
+  required and must not contain sensitive data"*. Refusing is defensible; that
+  message names the wrong cause.
+- **A debug value in a display tool** and **a reasoning step** both yield `""`
+  rather than a truncation.
 
 ## Architecture
 

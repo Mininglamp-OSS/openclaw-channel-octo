@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { summarizeToolParams, reduceUrlsInText, sanitizeErrorText } from "./card-render.js";
 import { REDUCE_INPUT_MAX } from "./card-render.js";
-import { LEAK_CORPUS, BENIGN_CORPUS, REWRITE_CORPUS, UNFIXED_CORPUS, PERF_CORPUS, type CorpusRow } from "./card-render.corpus.js";
+import { LEAK_CORPUS, BENIGN_CORPUS, COST_CORPUS, REWRITE_CORPUS, UNFIXED_CORPUS, PERF_CORPUS, type CorpusRow } from "./card-render.corpus.js";
 
 const PARAM: Record<string, (s: string) => Record<string, unknown>> = {
   grep: (s) => ({ pattern: s }),
@@ -48,6 +48,23 @@ describe("摘要管线形状语料", () => {
     assertRows(BENIGN_CORPUS);
   });
 
+  // 这一组期望值全是空串 —— 但**空不等于记录到了代价**:上一轮那行 `"a"×4100` 在 main 上同样
+  // 是空,两边一致,整行空转。所以除了逐行等值,再断言一次「这一组必须真的和 main 有差异」:
+  // 每行都要在 main 上有非空输出。main 的行为写在各行 note 里,这里断言的是**别再放进一行
+  // 两边都空的**。判据用 main 上不成立、这里成立的性质:输入超过上限且前 4000 字符无空白。
+  it("COST:刻意付出的代价 —— 每一行都必须真的记录到一处差异", () => {
+    assertRows(COST_CORPUS);
+    for (const row of COST_CORPUS) {
+      expect(row.input.length, `${JSON.stringify(row.input.slice(0, 40))} 不超过上限,进不了这一组`)
+        .toBeGreaterThan(REDUCE_INPUT_MAX);
+      expect(/\s/.test(row.input.slice(0, REDUCE_INPUT_MAX)),
+        `${JSON.stringify(row.input.slice(0, 40))} 前 4000 字符含空白,它不会被拒,这一行记录不到代价`).toBe(false);
+      // main 上是空的输入(如全十六进制长串)放进来只会空转 —— 长 hex 是 isSensitive 自己就拦下的。
+      expect(/^[0-9a-fA-F]+$/.test(row.input),
+        `${JSON.stringify(row.input.slice(0, 40))} 是纯十六进制串,main 上同样打空,这一行记录不到差异`).toBe(false);
+    }
+  });
+
   // 这一组断言的是**本 PR 没有改变**这些形状 —— 期望值是 main 的行为,不是"正确"的行为。
   // 前四行在 main 上就是明文泄漏,留给 userinfo 那条后续 PR;放在这里是为了让它们进造串检测。
   it("UNFIXED:留给后续 PR 的形状,本 PR 未改变其行为", () => {
@@ -59,7 +76,7 @@ describe("摘要管线形状语料", () => {
     // 造串检测:去掉归约自己加的 `https://` 前缀后,输出的每个字母数字段都必须在输入里出现过。
     // `nginx:1.21@sha256:1234abcd` → `https://sha256abcd` 这类失败就是被这一条抓住的:
     // `sha256abcd` 是端口在词中间截断后、把没匹配上的尾巴拼上去造出来的,输入里没有。
-    for (const row of [...REWRITE_CORPUS, ...BENIGN_CORPUS, ...UNFIXED_CORPUS]) {
+    for (const row of [...REWRITE_CORPUS, ...BENIGN_CORPUS, ...COST_CORPUS, ...UNFIXED_CORPUS]) {
       for (const [tool] of Object.entries(row.expect)) {
         const got = run(row, tool).replace(/https?:\/\//g, "");
         for (const seg of got.match(/[A-Za-z0-9]{4,}/g) ?? []) {
@@ -97,6 +114,9 @@ describe("摘要管线形状语料", () => {
         ["summarizeToolParams/exec", () => summarizeToolParams("exec", { command: input })],
       ];
       for (const [name, fn] of entries) {
+        // 先跑一次不计时:第一格会背上 JIT 编译的成本,而预算是按稳态代价定的。
+        // 这是为了不必**放宽预算**去容纳一次性开销 —— 预算的下限由已知回归钉着,不能动。
+        fn();
         const t0 = performance.now();
         fn();
         const ms = performance.now() - t0;
