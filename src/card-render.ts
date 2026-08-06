@@ -255,21 +255,66 @@ function firstString(p: Record<string, unknown>, keys: string[]): string {
 }
 
 /**
+ * shell 里能结束一个词的字符,用来给下面的赋值折叠正则划词边界。
+ *
+ * `/` 与 `=` 都**不在**集合里:`sed 's/DEPLOY_KEY=v/x/'` 里的赋值属于 sed 脚本文本、不是赋值位;
+ * 而排除 `=` 会让 `TOKEN_URL=http://x?a=b` 的值在第二个 `=` 处断开、尾段 `=b` 留在渲染串里。
+ */
+const SHELL_BREAK = "\\s'\"(;|&`<>)";
+
+const PROGRAM_TOKEN_RE = /^[A-Za-z0-9_./@:+-]+$/;
+const ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * shell **词**的组成单元。一个词是若干这样的段**拼接**而成的,段与段之间不需要分隔符 ——
+ * `a"b"c'd'` 在 shell 里是一个词,不是四个。写成「段的重复」而不是「段的单选」,引号才能在词的
+ * 任意偏移处生效,而不只是紧跟 `=` 的第 0 位。
+ *
+ * 引号分支都认转义(`(?:\\.|[^'])*`);闭合引号可选(`'?` / `"?`),未闭合时吃到串尾。
+ * `$(…)` 与反引号单列,否则 `(` 和反引号(都在 SHELL_BREAK 里)会把词截断。
+ * 每个分支都至少吃一个字符,不会空转。
+ */
+const SHELL_WORD_ATOM =
+  `'(?:\\\\.|[^'])*'?`               // '…'
+  + `|"(?:\\\\.|[^"])*"?`            // "…"
+  + `|\\$\\((?:\\\\.|[^)])*\\)?`     // $(…) 命令替换
+  + `|\`(?:\\\\.|[^\`])*\`?`         // `…` 命令替换
+  + `|(?:\\\\.|[^${SHELL_BREAK}])+`; // 裸段,含反斜杠转义
+
+const ASSIGNMENT_VALUE_RE = new RegExp(
+  `(^|[${SHELL_BREAK}])([A-Za-z_][A-Za-z0-9_]*)=(?:${SHELL_WORD_ATOM})*`,
+  "g",
+);
+
+/**
+ * 仅用于**定位程序名**:把每个赋值的值折叠成单 token。折叠结果永不进入渲染,所以这里不存在
+ * 误杀问题 —— 折过头最多让程序名取不到、卡片少显示一个词。
+ */
+function foldAssignmentValues(cmd: string): string {
+  return cmd.replace(ASSIGNMENT_VALUE_RE, (_m, lead: string, name: string) => `${lead}${name}=_`);
+}
+
+/**
  * shell:只取程序名。跳过前缀式环境变量赋值(`VAR=value cmd ...`)—— 否则会把密钥值
  * (如 `SLACK_WEBHOOK=https://…`、`MY_CREDS=xxx`)当成程序名原样渲染,且这类变量名多不含
  * token/secret 等关键词,躲过 SECRET_RE。不渲染任何参数。
  *
- * 落定的 program token 再过一层保守形状校验:只接受 `[\w./@:+-]`(程序名/路径的合法字符)。
- * 空白分词无法解析带引号的多词值(`TOKEN="a b" cmd` 会切成 `TOKEN="a`/`b"`/`cmd`,跳过
- * 首个后落在片段 `b"`),含引号/空格/等号等异常字符的 token 一律判为可疑值片段 → 不展示。
+ * 落定的 program token 再过一层保守形状校验:只接受 `[\w./@:+-]`(程序名/路径的合法字符),
+ * 含引号/空格/等号等异常字符的 token 一律判为可疑值片段 → 不展示。
  */
-const PROGRAM_TOKEN_RE = /^[A-Za-z0-9_./@:+-]+$/;
 function summarizeShell(p: Record<string, unknown>): string {
   const cmd = firstString(p, ["command", "cmd"]).trim();
   if (!cmd) return "";
-  const tokens = cmd.split(/\s+/);
+  // 先折叠赋值,再按空白取程序名。直接空白分词会把带引号的多词值切碎,跳过首个片段后落在值的
+  // **第二个**词上,而那个词往往不含异常字符、能通过 PROGRAM_TOKEN_RE:
+  //
+  //     PASSPHRASE='correct horse battery staple' gpg --sign x   →   horse
+  //     MY_CREDS='alpha hunter2 charlie' ./go                    →   hunter2
+  //
+  // 这类变量名(PASSPHRASE/CREDS/DEPLOY_KEY)恰好是 SECRET_RE **没有**的,关键词守卫救不回来。
+  const tokens = foldAssignmentValues(cmd).split(/\s+/);
   let i = 0;
-  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+  while (i < tokens.length && ASSIGNMENT_TOKEN_RE.test(tokens[i])) i++;
   const prog = tokens[i] ?? "";
   return PROGRAM_TOKEN_RE.test(prog) ? prog : "";
 }

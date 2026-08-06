@@ -133,9 +133,24 @@ describe("summarizeToolParams", () => {
     expect(summarizeToolParams("exec", { command: "SLACK_WEBHOOK=https://hooks.slack.com/services/T/B/X curl -X POST" })).toBe("curl");
     expect(summarizeToolParams("bash", { command: "MY_CREDS=abc123 DEPLOY_KEY=xyz ./deploy.sh" })).toBe("./deploy.sh");
   });
-  it("shell 带引号多词环境变量值 → 落在值片段则整体不展示(形状校验)", () => {
-    // 空白分词把 TOKEN="a b" 切成 TOKEN="a / b" —— 落在片段 b",含引号 → 不展示。
-    expect(summarizeToolParams("exec", { command: 'TOKEN="a b" node app.js' })).toBe("");
+  it("shell 带引号的多词赋值值先折叠,程序名不会落在值的中间那个词上", () => {
+    // 不折叠时空白分词会把值切碎,跳过首个片段后落在**第二个**词上 —— 而那个词往往不含异常
+    // 字符、能通过 PROGRAM_TOKEN_RE。加折叠前实测:
+    //   PASSPHRASE='correct horse battery staple' gpg --sign x  →  "horse"
+    //   MY_CREDS='alpha hunter2 charlie' ./go                   →  "hunter2"
+    //   DEPLOY_KEY="one s3cr3tvalue two" ./deploy.sh            →  "s3cr3tvalue"
+    // 这些变量名恰好是 SECRET_RE 没有的,关键词守卫救不回来。
+    expect(summarizeToolParams("exec", { command: "PASSPHRASE='correct horse battery staple' gpg --sign x" }))
+      .toBe("gpg");
+    expect(summarizeToolParams("bash", { command: "MY_CREDS='alpha hunter2 charlie' ./go" })).toBe("./go");
+    expect(summarizeToolParams("exec", { command: 'DEPLOY_KEY="one s3cr3tvalue two" ./deploy.sh' }))
+      .toBe("./deploy.sh");
+    // 两个词的值原本靠「片段带引号」侥幸挡住,折叠后走的是正路。
+    expect(summarizeToolParams("exec", { command: 'TOKEN="a b" node app.js' })).toBe("node");
+    // 值里带转义引号,不能在转义处提前收尾。
+    expect(summarizeToolParams("exec", { command: 'PASSPHRASE="alpha\\" hunter2 x" gpg' })).toBe("gpg");
+    // 拼接词:引号出现在值的中间偏移处也要覆盖(shell 里 `a"b"c` 是一个词)。
+    expect(summarizeToolParams("exec", { command: "MY_CREDS=$'alpha hunter2 x' ./go" })).toBe("./go");
     // 合法程序名/路径不受影响。
     expect(summarizeToolParams("exec", { command: "/usr/bin/python3 x.py" })).toBe("/usr/bin/python3");
   });
