@@ -26,7 +26,7 @@ import {
   type CardTemplateRef,
 } from "./api-fetch.js";
 import { deriveCardCaps } from "./card-caps.js";
-import { renderProgressCard, renderProgressResponseCard, summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState, type CardCaps } from "./card-render.js";
+import { renderProgressCard, renderProgressResponseCard, summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState, type CardCaps, type SummaryDetail } from "./card-render.js";
 import {
   buildReasoningProcessId,
   buildReasoningProcessWireData,
@@ -40,6 +40,11 @@ import { getKnownGroupIds } from "./group-md.js";
 import type { ReasoningCardTemplateMode } from "./config-schema.js";
 
 /** dispatch 侧登记的发送上下文。 */
+/** 配置值 → 摘要档位。**fail-closed**:只认字面 `true`,其余一律 off。 */
+function toSummaryDetail(v: boolean | undefined): SummaryDetail {
+  return v === true ? "additive" : "off";
+}
+
 export interface CardContext {
   apiUrl: string;
   botToken: string;
@@ -49,6 +54,12 @@ export interface CardContext {
   cardProgress?: boolean;
   /** Explicit Registry migration gate. Defaults to experimental with Model B fallback. */
   reasoningCardTemplateMode?: ReasoningCardTemplateMode;
+  /**
+   * **opt-in**:只有显式 `true` 才渲染工具调用的结构化摘要。unset/false → 只渲染程序名(旧行为)。
+   * 进度卡对群内全员可见,而完整命令里的 `curl -u user:pass` / webhook path / 隧道主机名都不是
+   * 关键词守卫能抓的形状 —— 升级不应静默改变暴露面,必须由部署方主动打开。
+   */
+  cardToolDetail?: boolean;
   /** persona-clone 身份;存在则跳过卡片(服务端拒 type-17 OBO)。 */
   onBehalfOf?: string;
   /** OpenClaw reasoning visibility resolved for this turn/session. */
@@ -1312,7 +1323,12 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     entry.steps.push({
       tool: e.toolName,
       status: "running",
-      summary: summarizeToolParams(e.toolName, e.params),
+      // 默认 opt-in。群卡对全员可见,升级不应静默改变暴露面,必须由部署方主动打开。
+      // fail-closed:只有**字面 true** 才放开,任何其它值(undefined、false、配置里写错的字符串)
+      // 一律 off。
+      summary: summarizeToolParams(e.toolName, e.params, {
+        detail: toSummaryDetail(entry.ctx.cardToolDetail),
+      }),
       ...(e.toolCallId ? { toolCallId: e.toolCallId } : {}),
     });
     scheduleFlush(sk!, entry);

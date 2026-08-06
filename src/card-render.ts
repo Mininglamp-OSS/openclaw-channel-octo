@@ -112,6 +112,14 @@ export function resolveToolMeta(tool: string): { icon: string; label: string } {
 }
 
 const SUMMARY_MAX = 64;
+/** 放开档渲染的 token 更多,给更宽的余量(与 ERROR_MAX 对齐),但仍必须有硬上限。 */
+const SUMMARY_DETAILED_MAX = 120;
+/**
+ * 放开档接受的**输入**长度上限(区别于上面的渲染上限)。超过则退回保守摘要,不进分词与分类。
+ * 取 2000 是因为渲染上限只有 120,更长的输入本来也只剩截断,而真实命令(压缩 JSON body、
+ * base64 块)实测都在这个量级以下。
+ */
+const DETAILED_INPUT_MAX = 2000;
 /**
  * 进入 URL 归约管线前的**无条件**输入长度上限。
  *
@@ -217,10 +225,22 @@ function registrableDomain(host: string): string {
  * 工具 → 摘要提取策略(allowlist)。未列出的工具(含 MCP、未知工具)一律**不显示摘要**,
  * 杜绝把任意参数直渲到群卡片的泄露面。
  */
-type SummaryStrategy = "path" | "shell" | "url" | "query";
+type SummaryStrategy = "path" | "shell" | "url" | "query" | "enum";
+/**
+ * 工具参数摘要的档位。
+ *
+ * - `off`      程序名 / 短路径 / 注册域。默认。
+ * - `additive` 只渲染能正面归类为安全的 token,其余 `***`。漏掉一个形状 = 多打一个 `***`,
+ *              残留是**可枚举的两条**(见 summarizeShellAdditive)。
+ *
+ * 刻意**没有**「渲染整条命令、再减掉认出来的危险形状」这一档:那条路径上漏掉一个形状就是一次
+ * 明文泄漏,残留无界 —— 评审无法收敛到「已覆盖」这个结论上。见 summarizeShellAdditive 的说明。
+ */
+export type SummaryDetail = "off" | "additive";
 const SUMMARY_STRATEGY: Record<string, SummaryStrategy> = {
   read: "path", write: "path", edit: "path", apply_patch: "path", ls: "path", find: "path", glob: "path",
-  exec: "shell", bash: "shell", shell: "shell", process: "shell",
+  exec: "shell", bash: "shell", shell: "shell",
+  process: "enum",
   fetch: "url",
   web_search: "query", search: "query", grep: "query",
 };
@@ -262,6 +282,18 @@ function firstString(p: Record<string, unknown>, keys: string[]): string {
  */
 const SHELL_BREAK = "\\s'\"(;|&`<>)";
 
+
+/**
+ * 凭据形状的变量名。关键词必须落在**下划线分段边界**上(`(?:^|_)…(?:_|$)`),而不是子串匹配 ——
+ * 否则 `StrictHostKeyChecking` 里的 `Key` 会命中,把 `ssh -o StrictHostKeyChecking=no` 的值抹掉,
+ * 而那恰恰是运维最需要看见的安全选项。同理 `AUTHOR` 不因含 `AUTH` 而被抹。
+ * 无下划线的连写形式(`APIKEY`)单独列出。
+ */
+const CREDENTIAL_KEYWORDS =
+  "token|secret|password|passwd|pwd|passphrase|credentials?|creds?|key|privkey|apikey|accesskey"
+  + "|apitoken|auth|bearer|session|sessionid|sid|cookie|jwt|otp|salt|signature|pat|pass|refresh";
+
+
 const PROGRAM_TOKEN_RE = /^[A-Za-z0-9_./@:+-]+$/;
 const ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
@@ -292,6 +324,188 @@ const ASSIGNMENT_VALUE_RE = new RegExp(
  */
 function foldAssignmentValues(cmd: string): string {
   return cmd.replace(ASSIGNMENT_VALUE_RE, (_m, lead: string, name: string) => `${lead}${name}=_`);
+}
+
+/* ── 加法 shell 摘要(cardToolDetail: true)────────────────────────────────────────────────
+ *
+ * 这一档**只渲染能正面归类为安全的 token,其余一律 `***`**。它与「渲染整条命令、再把认出来的
+ * 危险形状减掉」的减法思路是相反的判据,而判据的方向决定了失败模式:
+ *
+ *   减法:漏掉一个形状 = **一次明文泄漏**,残留无界
+ *   加法:漏掉一个形状 = **多打一个 `***`**,残留由接受规则界定
+ *
+ * 这不是风格取舍。这个模块此前每一个凭据泄漏类都出在减法路径上;而 `path` / `url` / `enum`
+ * 三个策略一次都没出过,因为它们本来就是加法的(`new URL()` 解析、封闭 enum、与路径同源的
+ * 形状)—— 保证是结构性的,不是靠把危险形状列全。
+ *
+ * 由此,评审要问的问题也换了:不再是「有没有哪个输入能让密文活下来」(搜索空间 = 整个 shell
+ * 语法,无界),而是「有没有哪个 token 被**正面分类进安全类别**却含密文」(搜索空间 = 下面这
+ * 几条接受规则,可枚举)。分词器写错也不会泄漏 —— 分错的 token 归不了类,结果就是 `***`。
+ *
+ * 已知残留(可枚举,README 里逐条写明):
+ *  1. 值粘在单横线 flag 上且形似长 flag(`mysql -pRealPw123`)—— 与 `-verbose` 无法区分。
+ *  2. 密文本身就是一个普通位置参数(`deploy prod hunter2`)—— 与子命令无法区分。
+ * 两条都靠 SECRET_RE / 形状守卫兜底,兜不住就是残留。
+ */
+
+/** 尊重引号与反斜杠的分词。分错只会让 token 归不了类 → `***`,所以这里不需要完美。 */
+function splitShellWords(cmd: string): string[] {
+  const words: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+  let started = false; // 空引号 `''` 也是一个词
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]!;
+    if (quote) {
+      if (c === "\\" && quote === '"') cur += c + (cmd[++i] ?? "");
+      else if (c === quote) quote = null;
+      else cur += c;
+      continue;
+    }
+    if (c === "'" || c === '"') { quote = c; started = true; continue; }
+    if (c === "\\") { cur += cmd[++i] ?? ""; started = true; continue; }
+    if (/\s/.test(c)) { if (cur || started) words.push(cur); cur = ""; started = false; continue; }
+    cur += c;
+  }
+  if (cur || started) words.push(cur);
+  return words;
+}
+
+const MASK = "***";
+/** 控制算子原样保留:它们是结构,不是值,而且决定了下一个词是程序名。 */
+const SHELL_OPERATORS = new Set(["&&", "||", "|", ";", "&", "|&"]);
+/**
+ * `--`(end-of-options)是结构记号,不是值 —— 但它**排在 maskNext 之后**:`cli --token -- x`
+ * 里 `--` 就是 `--token` 收到的那个值,按 shell 语义该抹。结构性只在它不占值位时成立。
+ */
+const END_OF_FLAGS = "--";
+/** 简单标识符:子命令、目标名、镜像 tag 之外的裸词。不含 `=` `:` `@` 等承载凭据的分隔符。 */
+const PLAIN_WORD_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+/** `.` / `..`:当前目录与上级目录,`find . …` 里最常见的操作数。不含任何值。 */
+const CWD_WORD_RE = /^\.{1,2}$/;
+/**
+ * 相对或绝对路径。与 path 策略同源的形状,七轮零泄漏。
+ * 前瞻要求**至少含一个 `/`**:否则这条会吞掉所有裸词,绕过下面裸词分支的长度与高熵检查。
+ */
+const PATH_WORD_RE = /^(?=.*\/)\.{0,2}\/?[A-Za-z0-9._-]*(?:\/[A-Za-z0-9._-]*)*$/;
+/** `--long` / `--long=value`(值仍抹掉)。 */
+const LONG_FLAG_RE = /^--[A-Za-z0-9][A-Za-z0-9-]*$/;
+const FLAG_WITH_VALUE_RE = /^(--?[A-Za-z0-9][A-Za-z0-9-]*)=/;
+/**
+ * 单横线 flag,**只接受 ≤2 字符**。
+ *
+ * 曾经也接受「3–12 位纯小写」,理由是要保住 `-verbose` / `-name` 这类长形式。那是错的:
+ * `-pswordfish`、`-phunterlove`、`-sletmein` 与它们**在形状上完全一致**,于是明文口令被正面
+ * 归类成 flag 名渲染出去 —— 实测 `mysql --password hunter2 -phunterlove mydb` 在加法档渲染
+ * `-phunterlove`,一条明文口令被当作 flag 名渲染了出去。
+ *
+ * 加法模型的规则是「归类不了就抹」,`-xxx` 归类不了。代价是 `-name` / `-jar` / `-xzf` 也变成
+ * `***`(`--long` 不受影响,双横线后不存在粘连值)。这是加法档为「残留可枚举」付的价钱。
+ */
+const SHORT_FLAG_RE = /^-[A-Za-z0-9]{1,2}$/;
+/** 名字像凭据的 flag → 下一个词一定抹掉(`--token X`、`-p X`)。复用赋值名的关键词表。 */
+/**
+ * additive 输出里「已抹掉的值 + 紧邻的名字」。用于把它们排除出敏感串守卫的检测。
+ *
+ * 只匹配以 `***` 收尾的片段,前面可选一个赋值名或 flag 名。加法输出里 `***` 一定是我们自己
+ * 打的(输入里的字面 `***` 也只会被归类成一个普通词,不会造出 `NAME=***` 这种结构),所以
+ * 这里删掉的永远是名字与占位符,不会是任何被渲染的值。
+ */
+const ADDITIVE_MASKED_RE =
+  /(?:[A-Za-z_][A-Za-z0-9_]*(?:\+|\[[^\]]*\])?=|--?[A-Za-z0-9][A-Za-z0-9-]*[= ])?\*\*\*/g;
+
+/**
+ * 名字像凭据的 flag → 下一个词一定抹掉(`--token X`、`-p X`)。
+ *
+ * **必须与 SECRET_ASSIGNMENT_NAME_RE 同源。** 这里原本是手写的第二张表,比赋值名表窄了 14 个
+ * 关键词(`privkey`/`jwt`/`otp`/`signature`/`cookie`/`sid`/`salt`/`pat`/`refresh`/`session`/
+ * `bearer`/`accesskey`/`apitoken`/`sessionid`),于是 `cli --private-key hunter2` 在加法档明文
+ * 渲染,而 `--accesskey` 只是**碰巧**被 SECRET_RE 兜住 —— 两个都藏不藏,操作者无从推断。
+ *
+ * 这是这条 PR 反复出现的同一个形状:**本该互为镜像的第二张表,和第一张不同步**(兜底 vs 归约、
+ * flag 表 vs 赋值名表、长度上限 vs 它保护的递归)。派生而不是重抄,这一类才算封住。
+ * 分段符取 `[-_]`:命令行写 `--private-key`,环境变量写 `PRIVATE_KEY`,是同一个词。
+ */
+const CREDENTIAL_FLAG_RE = new RegExp(
+  `^-{1,2}(?:[A-Za-z0-9]+[-_])*(?:${CREDENTIAL_KEYWORDS})(?:[-_][A-Za-z0-9]+)*$`,
+  "i",
+);
+
+/**
+ * 凭据关键词之后挂着**非关键词**尾段的 flag(`--token-hunter2`)。这种 token 要整个抹掉。
+ * 尾段本身是关键词的(`--refresh-token`、`--api-key`)是正常 flag 名,照常渲染。
+ *
+ * `--api-key` / `--client-secret` / `--private-key` 的关键词落在**末尾**,前缀段是限定词,是
+ * 正常 flag 名;而 `--token-hunter2` 的尾段没有任何理由存在 —— 值粘进 flag 名里正是这个形状。
+ * 光靠下游关键词守卫兜不住:additive 的豁免会把 flag 名整个从探针里删掉,于是 `--tokenhunter2`
+ * 被整串隐藏,`--token-hunter2` 却渲染出来,两者差一个连字符,操作者无从推断。
+ */
+const CREDENTIAL_FLAG_CLEAN_RE = new RegExp(
+  `^-{1,2}(?:[A-Za-z0-9]+[-_])*(?:${CREDENTIAL_KEYWORDS})(?:[-_](?:${CREDENTIAL_KEYWORDS}))*$`,
+  "i",
+);
+
+/** 凭据 flag,但关键词之后挂着**不是关键词**的尾段。`--refresh-token` 的尾段是关键词,正常。 */
+const credentialFlagCarriesValue = (w: string): boolean =>
+  CREDENTIAL_FLAG_RE.test(w) && !CREDENTIAL_FLAG_CLEAN_RE.test(w);
+
+/**
+ * 加法 shell 摘要:程序名 + 子命令 + flag 名 + 归约后的 URL + 路径;其余一律 `***`。
+ * 赋值**不看名字**,一律抹值 —— 加法模型下没有「这个名字像不像凭据」的判断,所以也没有
+ * 「变量名没有凭据暗示就漏」(`FOO=hunter2`)这条残留 —— 加法路径上它不存在。
+ */
+function summarizeShellAdditive(p: Record<string, unknown>): string {
+  const cmd = firstString(p, ["command", "cmd"]).trim();
+  if (!cmd) return "";
+  const out: string[] = [];
+  let expectProgram = true; // 串首,以及每个控制算子之后
+  let maskNext = false;     // 上一个词是凭据形状的 flag
+  for (const w of splitShellWords(cmd)) {
+    if (SHELL_OPERATORS.has(w)) { out.push(w); expectProgram = true; maskNext = false; continue; }
+    if (maskNext) { out.push(MASK); maskNext = false; continue; }
+    if (w === END_OF_FLAGS) { out.push(w); continue; }
+    // 赋值:`NAME=`、`NAME+=`、`NAME[i]=` 都算。值一律不渲染。
+    // 下标内容(`arr[…]`)在加法档同样必须**分类过**才能渲染 —— 它是任意文本,不是结构。
+    // 只放行简单标识符/数字下标,其余连下标一起抹掉。
+    const assign = /^([A-Za-z_][A-Za-z0-9_]*)(\+|\[([^\]]*)\])?=/.exec(w);
+    if (assign) {
+      const [, name, suffix, subscript] = assign;
+      const safeSuffix = !suffix || suffix === "+"
+        || (subscript !== undefined && /^[A-Za-z0-9_]*$/.test(subscript) && subscript.length <= 24);
+      out.push(safeSuffix ? `${name}${suffix ?? ""}=${MASK}` : `${name}=${MASK}`);
+      continue;
+    }
+    if (expectProgram) {
+      // 与下面的操作数分支用**同一组**检查。`expectProgram` 在每个控制算子之后重新置位,
+      // 所以这个分支在命令中段也可达(`sh -c x ; <高熵串>`),少一组检查就是一条绕过路径。
+      expectProgram = false;
+      const safe = (PLAIN_WORD_RE.test(w) && w.length <= 24) || PATH_WORD_RE.test(w) || CWD_WORD_RE.test(w);
+      out.push(safe && !hasGenericSecretShape(w) ? w : MASK);
+      continue;
+    }
+    // URL:解析得动才渲染,并且**必须再过一次高熵形状检测** —— webhook path
+    // (`/services/T../B../XXXX`)与隧道/预签名子域的随机串**本身就是凭据**,它们能通过
+    // `new URL()`,所以"解析成功"不等于"安全"。url 策略一直是这么做的(generic=true),
+    // shell 策略此前没有,于是同一个 Slack webhook 经 fetch 会被降级、经 exec 却整条渲染。
+    if (w.includes("://")) {
+      const u = detailedUrl(w);
+      out.push(u && !hasGenericSecretShape(u) ? u : MASK);
+      continue;
+    }
+    const withValue = FLAG_WITH_VALUE_RE.exec(w);
+    if (withValue) { out.push(`${withValue[1]}=${MASK}`); continue; }
+    if (LONG_FLAG_RE.test(w) || SHORT_FLAG_RE.test(w)) {
+      if (credentialFlagCarriesValue(w)) { out.push(MASK); maskNext = true; continue; }
+      out.push(w);
+      maskNext = CREDENTIAL_FLAG_RE.test(w);
+      continue;
+    }
+    if (CWD_WORD_RE.test(w)) { out.push(w); continue; }
+    if (PATH_WORD_RE.test(w) && !hasGenericSecretShape(w)) { out.push(w); continue; }
+    if (PLAIN_WORD_RE.test(w) && w.length <= 24 && !hasGenericSecretShape(w)) { out.push(w); continue; }
+    out.push(MASK);
+  }
+  return out.join(" ");
 }
 
 /**
@@ -325,6 +539,26 @@ function summarizeShell(p: Record<string, unknown>): string {
  * 场景**主机名本身即密钥**(ngrok 随机子域、预签名 bucket 名)—— 这些随机串不含关键词、躲过
  * SECRET_RE。故只暴露注册域(eTLD+1)。解析失败返回 null(原串可能含 token,调用方丢弃)。
  */
+
+/**
+ * process 的 action 白名单。action 是模型可控字段(上游 processSchema 把它声明为裸
+ * `Type.String()`,枚举只写在 description 里),所以只认枚举值。
+ *
+ * 出处:`node_modules/openclaw/dist/bash-tools.schemas-*.js` 的 processSchema。上游新增 action
+ * 时这里不会报错,只会静默渲染空串 —— 升级后需比对。
+ *
+ * 注意这条**不受 cardToolDetail 控制**:改动前 process 走 shell 策略而 processSchema 没有
+ * command 字段,恒取空串,所以两种模式下渲染 action 都不是暴露面的放大,而是修一个恒空的 bug。
+ */
+const PROCESS_ACTIONS: ReadonlySet<string> = new Set([
+  "list", "poll", "log", "write", "send-keys", "submit", "paste", "kill", "clear", "remove",
+]);
+function summarizeEnum(p: Record<string, unknown>): string {
+  const action = firstString(p, ["action"]).trim();
+  return PROCESS_ACTIONS.has(action) ? action : "";
+}
+
+
 function originDomain(rawUrl: string): string | null {
   try {
     const u = new URL(rawUrl);
@@ -461,78 +695,169 @@ const RESIDUAL_QUERY_RE =
   /(?=[A-Za-z0-9._-]*[A-Za-z])[A-Za-z0-9._-]+(?::\d+)?(?:\/[^\s?]*)?\?[^\s]*=/;
 
 /** 把文本里内嵌的 URI 就地降级为 scheme://注册域(解析失败则整段抹除)。 */
-export function reduceUrlsInText(s: string): string {
+/**
+ * 放开档的 URL 归约:保留 scheme + **完整主机名(含子域)** + path,丢掉 query/fragment。
+ *
+ * 相对 originDomain 放开的是子域与路径 —— 这正是「隧道/预签名场景主机名即密钥」那条防护
+ * 覆盖的面,由 cardToolDetail 显式承担。**userinfo 与 query 仍然永不渲染**:前者是明文口令,
+ * 后者是裸 token 最常见的位置,二者都不影响「看清访问了哪个接口」这个诉求。
+ */
+function detailedUrl(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl);
+    // u.host 不含 userinfo。纯主机 URL 的 pathname 是 "/",直接拼会给卡片留个多余的尾斜杠
+    // (`redis-cli -u redis:6379/`),看着像被截断过。
+    return `${u.protocol}//${u.host}${u.pathname === "/" ? "" : u.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把文本里内嵌的 URI 就地归约(解析失败则整段抹除)。
+ * detailed=false → scheme://注册域;detailed=true → scheme://完整主机/path(仍剥 userinfo/query)。
+ */
+export function reduceUrlsInText(s: string, detailed = false): string {
+  const reduce = detailed ? detailedUrl : originDomain;
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。
-  let out = s.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, (m) => originDomain(m) ?? "");
-  // 2. 协议相对 `//host/path`:补 https 后降级(secret 可能在 path)。
+  let out = s.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, (m) => reduce(m) ?? "");
+  // 2. 协议相对 `//host/path`:补 https 后归约(secret 可能在 path)。
   out = out.replace(PROTOCOL_RELATIVE_RE, (_m, p1: string) => {
     const url = _m.slice(p1.length); // 去掉前导分隔符
-    return p1 + (originDomain(`https:${url}`) ?? "");
+    return p1 + (reduce(`https:${url}`) ?? "");
   });
-  // 3. 无 scheme 的 userinfo DSN(`user:pass@host…`):只留注册域,丢 userinfo/path。
+  // 3. 无 scheme 的 userinfo DSN(`user:pass@host…`):丢 userinfo。detailed 保留主机/path。
   out = out.replace(SCHEMELESS_USERINFO_RE, (m) => {
-    const host = m.slice(m.lastIndexOf("@") + 1).split(/[/:]/)[0];
-    return originDomain(`https://${host}`) ?? "";
+    const rest = m.slice(m.lastIndexOf("@") + 1); // host[:port][/path] 或 host:/path
+    if (!detailed) return originDomain(`https://${rest.split(/[/:]/)[0]}`) ?? "";
+    // `host:/path`(rsync/scp 远端路径)不能过 new URL():空端口会被吃掉,`backup:/data`
+    // 变成 `backup/data`,语义就错了。userinfo 已经落在 rest 之外,保留主机与路径、只丢 query。
+    if (/^[^/:]+:\//.test(rest)) return rest.replace(/\?.*$/, "");
+    return detailedUrl(`https://${rest}`)?.replace(/^https:\/\//, "") ?? "";
   });
-  // 4. 任意无 scheme 的 `host.tld/path`:保留注册域,统一抹掉可能承载凭据的 path。
-  out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => (
-    prefix + (originDomain(`https://${hostAndPath}`) ?? "")
-  ));
+  // 4. 任意无 scheme 的 `host.tld/path`:非 detailed 统一抹掉可能承载凭据的 path。
+  out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => {
+    const reduced = reduce(`https://${hostAndPath}`);
+    if (!reduced) return prefix;
+    return prefix + (detailed ? reduced.replace(/^https:\/\//, "") : reduced);
+  });
   // 5. 单标签主机的 `host/path?query`:上面几趟都要求主机带点,漏掉这一类,query 原样留下。
   //
-  // 这一趟落在 reduceUrlsInText 里,所以它的另外几个调用方(display card 文本、action label、
-  // reasoning 文本、card-author、card-display-tool)一并生效。代价要说全,别只说样式:
-  // card-blocks.ts 的 noReducibleUrl 会因为更多串算作"可归约"而退到单个 TextBlock(丢富文本
-  // 样式);而 card-action-status.ts 的 neutralizeEcho 跑在**用户提交的输入值**上、结果会被冻结
-  // 到状态卡里 —— `docs/parser?mode=fast` → `docs/parser`,卡片记下的就不再是用户提交的原文。
-  // 这是内容保真的代价,不是样式的代价。见 README 的 scope note。
+  // 这一趟**有意不按 detailed 分流**,与 1–4 趟不同。「query 永不渲染」是全局不变量,而
+  // reduceUrlsInText 的另外几个调用方(display card 文本、action label、reasoning 文本、
+  // card-author、card-display-tool)同样群可见 —— 只在进度卡里补上,等于把另一半留着。
+  // 见 README 的 scope note。
   out = out.replace(SCHEMELESS_QUERY_RE, "$1$2");
   return out;
 }
 
-/** url 策略:取 url 参数并降级为注册域。 */
-function summarizeUrl(p: Record<string, unknown>): string {
+/** url 策略:取 url 参数并归约(detailed 保留子域与路径)。 */
+function summarizeUrl(p: Record<string, unknown>, detailed: boolean): string {
   const raw = firstString(p, ["url"]);
   if (!raw) return "";
-  return originDomain(raw) ?? "";
+  return (detailed ? detailedUrl(raw) : originDomain(raw)) ?? "";
 }
 
 /**
  * 从工具参数提取一句人可读摘要 —— 按工具 allowlist 策略取值,未知/MCP 工具不显示,
  * 命中敏感串则整串隐藏,最后折叠空白并截断。群卡片对全员可见,安全优先于信息量。
  */
-export function summarizeToolParams(toolName: string | undefined, params: unknown): string {
+/**
+ * 放开档判定长度上限用的**原始输入**长度。刻意不复用 extractSummary —— 上限的全部意义就是
+ * 不让超长输入进入解析/递归,先解析再量长度等于没设上限。
+ */
+function rawCommandLength(strategy: SummaryStrategy, p: Record<string, unknown>): number {
+  switch (strategy) {
+    case "shell": return firstString(p, ["command", "cmd"]).length;
+    case "path": return firstString(p, ["path", "file_path", "file"]).length;
+    case "url": return firstString(p, ["url"]).length;
+    case "query": return firstString(p, ["query", "pattern"]).length;
+    case "enum": return 0;
+  }
+}
+
+export function summarizeToolParams(
+  toolName: string | undefined,
+  params: unknown,
+  opts: { detail?: SummaryDetail } = {},
+): string {
   if (!toolName || !params || typeof params !== "object") return "";
   const strategy = SUMMARY_STRATEGY[toolName];
   if (!strategy) return ""; // MCP / 未知工具:不渲染任意参数
   const p = params as Record<string, unknown>;
-  let v: string;
+  let detail = opts.detail ?? "off";
+  // 放开档的长度上限在 extractSummary **之前**判定,量的是**原始输入**。放到 sanitizeSummary
+  // 里(晚一个调用帧)等于没设:分词与分类都发生在上游。这条与 SUMMARY_INPUT_MAX 阶段不同、
+  // 目的也不同 —— 那条无条件截断、挡的是归约管线的正则回溯,两条都要留。
+  if (detail !== "off" && rawCommandLength(strategy, p) > DETAILED_INPUT_MAX) detail = "off";
+  const cleaned = sanitizeSummary(extractSummary(strategy, p, detail), strategy, detail);
+  if (cleaned || detail === "off") return cleaned;
+  // 放开后的内容更容易命中关键词/前缀,而脱敏是 fail-safe 整串隐藏 —— 直接返回空会让放开的
+  // 模式比保守模式**信息更少**。退回保守摘要,保证信息量单调不减。
+  return sanitizeSummary(extractSummary(strategy, p, "off"), strategy, "off");
+}
+
+/**
+ * 按策略取原始摘要值。
+ *
+ * 只有 `shell` 需要单独的加法摘要 —— 其余三个策略本来就是加法的(`new URL()` 解析、封闭
+ * enum、与路径同源的形状),放开档只是让它们少丢一点结构,判据不变。
+ */
+function extractSummary(
+  strategy: SummaryStrategy,
+  p: Record<string, unknown>,
+  detail: SummaryDetail,
+): string {
+  const open = detail !== "off";
   switch (strategy) {
-    case "path": v = shortenPath(firstString(p, ["path", "file_path", "file"])); break;
-    case "shell": v = summarizeShell(p); break;
-    case "url": v = summarizeUrl(p); break;
-    case "query": v = firstString(p, ["query", "pattern"]); break;
+    case "path": {
+      const raw = firstString(p, ["path", "file_path", "file"]);
+      return open ? raw : shortenPath(raw);
+    }
+    case "shell": return open ? summarizeShellAdditive(p) : summarizeShell(p);
+    case "enum": return summarizeEnum(p);
+    case "url": return summarizeUrl(p, open);
+    case "query": return firstString(p, ["query", "pattern"]);
   }
+}
+
+/** 摘要清洗管线:折叠空白 → URL 降级 → 敏感串守卫 → 截断。命中守卫返回空串(fail-safe)。 */
+function sanitizeSummary(v: string, strategy: SummaryStrategy, detail: SummaryDetail): string {
   if (!v) return "";
+  const open = detail !== "off";
   let s = v.replace(/\s+/g, " ").trim();
-  // 无条件先截断,再进归约管线 —— 见 SUMMARY_INPUT_MAX。不按策略分流:二次回溯在 query 策略
-  // (原样返回 pattern)、path 策略、shell 策略上都实测可达。
+  // 无条件截断仍在这里(与放开档无关,见 SUMMARY_INPUT_MAX)。渲染上限只有 120/64,截断掉的
+  // 部分本来也不会被渲染,所以守卫仍然跑在"会被渲染的那段"的完整形态上。
   if (s.length > SUMMARY_INPUT_MAX) s = s.slice(0, SUMMARY_INPUT_MAX);
-  // 单一 choke point:所有策略统一把内嵌 URL 降级为 scheme://注册域。避免逐 sink 加降级时
-  // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
-  s = reduceUrlsInText(s).replace(/\s+/g, " ").trim();
-  // 归约管线处理不掉的 userinfo 形状 → 整串不渲染。必须放在归约**之后**:能确定是 DSN 的形状
-  // 此时已被剥掉 userinfo,不会在这里误伤。
+  // 单一 choke point:所有策略统一归约内嵌 URL。避免逐 sink 加处理时漏掉某个策略(query 的
+  // pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。detailed 只放开
+  // 子域与路径,userinfo/query 在任何模式下都不渲染。
+  s = reduceUrlsInText(s, open).replace(/\s+/g, " ").trim();
+  // 归约管线处理不掉的 userinfo 形状 → 整串不渲染(放开档会退回保守摘要)。必须放在归约
+  // **之后**:能确定是 DSN 的形状此时已被剥掉 userinfo,不会误伤。
   if (RESIDUAL_USERINFO_RE.test(s)) return "";
   if (RESIDUAL_QUERY_RE.test(s)) return "";
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
   // + 明确前缀,避免把 git SHA / docker digest / 缓存哈希等正常路径误伤成空。
+  //
+  // 放开档**不**一并打开 generic。实测代价远不止误伤哈希 ——
+  // `/root/.openclaw/workspace/octo-server/modules/bot_api/send.go` 这种普通路径就会命中,
+  // path 策略在放开档等于失效(退回 `…/bot_api/send.go`)。而它要补的洞(`FOO=hunter2` 这类
+  // 名字没有暗示的赋值)在加法路径上根本不存在:加法不看变量名,所有赋值一律抹值。
   const generic = strategy === "query" || strategy === "url";
-  if (!s || isSensitive(s, generic)) return "";
-  return s.length > SUMMARY_MAX ? s.slice(0, SUMMARY_MAX) + "…" : s;
+  // 已抹掉的值及其紧邻的名字(`TOKEN=***`、`--token ***`)不参与守卫检测:值早就是 `***` 了,
+  // 再让**名字**命中 SECRET_RE 只会把整条命令误伤成空、退回程序名 —— 加法档几乎每条带凭据
+  // flag 的命令都会退化成只剩程序名,恰恰丢掉这一档想给的信息。
+  //
+  // 这条豁免之所以安全,理由是加法特有的、不可照搬到任何减法路径:加法输出里的值**按构造**
+  // 已经是 `***`,所以删掉「`***` 及其紧邻的名字」不可能放出任何被渲染的值,能被删掉的只有
+  // 我们已经正面归类为安全的 token。渲染字面值的路径没有这个性质。
+  const probe = open && strategy === "shell" ? s.replace(ADDITIVE_MASKED_RE, " ") : s;
+  if (!s || isSensitive(probe, generic)) return "";
+  const max = open ? SUMMARY_DETAILED_MAX : SUMMARY_MAX;
+  return s.length > max ? s.slice(0, max) + "…" : s;
 }
-
 /** ms → 友好耗时(<1s 用 ms,否则 x.xs)。 */
 export function fmtDuration(ms?: number): string {
   if (typeof ms !== "number") return "";

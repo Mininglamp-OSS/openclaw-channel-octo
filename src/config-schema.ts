@@ -34,6 +34,7 @@ export interface OctoAccountConfig {
   reasoningCardTemplateMode?: ReasoningCardTemplateMode;  // off=Model B, shadow=discover only, experimental=Model A when compatible
   cardDisplay?: boolean;  // false force-disables the display-card tool; true/unset follows server capabilities
   cardInteraction?: boolean;  // false force-disables interactive cards; true/unset follows server capabilities
+  cardToolDetail?: boolean;  // opt-in: true = additive structural summary (unclassifiable tokens masked); false/unset = program name only
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace); if neither resolves, write-secret fails closed (no process.cwd() fallback).
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms). Unset = derived from agents.defaults.timeoutSeconds + 60s buffer (issue #113).
@@ -57,6 +58,7 @@ export interface OctoConfig {
   reasoningCardTemplateMode?: ReasoningCardTemplateMode;  // Top-level Registry migration mode for reasoning cards
   cardDisplay?: boolean;  // Top-level default for the display-card tool
   cardInteraction?: boolean;  // Top-level default for interactive cards
+  cardToolDetail?: boolean;  // Top-level default for tool-step summary detail (opt-in; unset = off)
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret (see OctoAccountConfig)
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms); see OctoAccountConfig
@@ -101,6 +103,9 @@ export const CARD_DISPLAY_DESCRIPTION =
 
 export const CARD_INTERACTION_DESCRIPTION =
   "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value.";
+
+export const CARD_TOOL_DETAIL_DESCRIPTION =
+  "Opt-in. Omitted or false: progress-card tool steps render the program name only, with paths shortened and URLs reduced to their registrable domain. true: render an additive structural summary of each tool call \u2014 program name, subcommands, flag names, reduced URLs and full file paths \u2014 with every assignment value, and every token that cannot be positively classified as safe, replaced by ***. The summary is built by adding back what is recognised rather than by removing what looks dangerous, so a shape the classifier misses becomes another *** instead of a rendered credential. Residuals, enumerated: a positional token renders when it is at most 24 characters and not high-entropy, so a credential used as a bare argument (deploy prod hunter2) reads as a subcommand; a URL that parses renders with host and path, so a tunnel or presigned hostname whose randomness is the credential still appears; a credential-shaped flag masks one following word, so an unquoted multi-word secret keeps everything after its first token; and file paths are expanded rather than shortened, exposing home directories and workspace layout. Keeping that list short costs single-dash flags: only -x and -xy render, since a glued password and a long flag name are the same shape. Progress cards are visible to every member of a group. The process tool renders its action at every level. Per-account values override the top-level value.";
 
 export const EVENT_WAIT_SECONDS_DESCRIPTION =
   "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";
@@ -150,6 +155,7 @@ export const OctoConfigJsonSchema = {
       reasoningCardTemplateMode: REASONING_CARD_TEMPLATE_MODE_SCHEMA,
       cardDisplay: { type: "boolean", description: CARD_DISPLAY_DESCRIPTION },
       cardInteraction: { type: "boolean", description: CARD_INTERACTION_DESCRIPTION },
+      cardToolDetail: { type: "boolean", description: CARD_TOOL_DETAIL_DESCRIPTION },
       onBehalfOf: { type: "string" },
       secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
       dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },
@@ -176,6 +182,7 @@ export const OctoConfigJsonSchema = {
             reasoningCardTemplateMode: REASONING_CARD_TEMPLATE_MODE_SCHEMA,
             cardDisplay: { type: "boolean", description: CARD_DISPLAY_DESCRIPTION },
             cardInteraction: { type: "boolean", description: CARD_INTERACTION_DESCRIPTION },
+            cardToolDetail: { type: "boolean", description: CARD_TOOL_DETAIL_DESCRIPTION },
             onBehalfOf: { type: "string" },
             secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
             dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },

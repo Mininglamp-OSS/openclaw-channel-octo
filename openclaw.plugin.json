@@ -94,6 +94,10 @@
             "type": "boolean",
             "description": "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value."
           },
+          "cardToolDetail": {
+            "type": "boolean",
+            "description": "Opt-in. Omitted or false: progress-card tool steps render the program name only, with paths shortened and URLs reduced to their registrable domain. true: render an additive structural summary of each tool call \u2014 program name, subcommands, flag names, reduced URLs and full file paths \u2014 with every assignment value, and every token that cannot be positively classified as safe, replaced by ***. The summary is built by adding back what is recognised rather than by removing what looks dangerous, so a shape the classifier misses becomes another *** instead of a rendered credential. Residuals, enumerated: a positional token renders when it is at most 24 characters and not high-entropy, so a credential used as a bare argument (deploy prod hunter2) reads as a subcommand; a URL that parses renders with host and path, so a tunnel or presigned hostname whose randomness is the credential still appears; a credential-shaped flag masks one following word, so an unquoted multi-word secret keeps everything after its first token; and file paths are expanded rather than shortened, exposing home directories and workspace layout. Keeping that list short costs single-dash flags: only -x and -xy render, since a glued password and a long flag name are the same shape. Progress cards are visible to every member of a group. The process tool renders its action at every level. Per-account values override the top-level value."
+          },
           "accounts": {
             "type": "object",
             "additionalProperties": {
@@ -167,6 +171,10 @@
                 "cardInteraction": {
                   "type": "boolean",
                   "description": "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value."
+                },
+                "cardToolDetail": {
+                  "type": "boolean",
+                  "description": "Opt-in. Omitted or false: progress-card tool steps render the program name only, with paths shortened and URLs reduced to their registrable domain. true: render an additive structural summary of each tool call \u2014 program name, subcommands, flag names, reduced URLs and full file paths \u2014 with every assignment value, and every token that cannot be positively classified as safe, replaced by ***. The summary is built by adding back what is recognised rather than by removing what looks dangerous, so a shape the classifier misses becomes another *** instead of a rendered credential. Residuals, enumerated: a positional token renders when it is at most 24 characters and not high-entropy, so a credential used as a bare argument (deploy prod hunter2) reads as a subcommand; a URL that parses renders with host and path, so a tunnel or presigned hostname whose randomness is the credential still appears; a credential-shaped flag masks one following word, so an unquoted multi-word secret keeps everything after its first token; and file paths are expanded rather than shortened, exposing home directories and workspace layout. Keeping that list short costs single-dash flags: only -x and -xy render, since a glued password and a long flag name are the same shape. Progress cards are visible to every member of a group. The process tool renders its action at every level. Per-account values override the top-level value."
                 },
                 "onBehalfOf": {
                   "type": "string",

@@ -154,6 +154,163 @@ describe("summarizeToolParams", () => {
     // 合法程序名/路径不受影响。
     expect(summarizeToolParams("exec", { command: "/usr/bin/python3 x.py" })).toBe("/usr/bin/python3");
   });
+  it("process 渲染受控的 action 枚举(其 schema 无 command,shell 策略永远取不到)", () => {
+    expect(summarizeToolParams("process", { action: "poll", sessionId: "s1" })).toBe("poll");
+    expect(summarizeToolParams("process", { action: "send-keys", literal: "secret-passphrase" })).toBe("send-keys");
+    // 白名单外的值一律不渲染:action 是模型可控字段,不能当自由文本 sink。
+    expect(summarizeToolParams("process", { action: "AKIAIOSFODNN7EXAMPLE" })).toBe("");
+    expect(summarizeToolParams("process", { action: "" })).toBe("");
+    expect(summarizeToolParams("process", { sessionId: "s1" })).toBe("");
+  });
+
+  describe("additive 档(cardToolDetail: true)", () => {
+    const A = { detail: "additive" as const };
+
+    it("只渲染能正面归类为安全的 token,其余一律 ***", () => {
+      // 判据是「加回认得出的」而不是「减掉危险的」:漏掉一个形状 = 多打一个 `***`,不是一次泄漏。
+      expect(summarizeToolParams("exec", { command: "npm test -- --coverage" }, A))
+        .toBe("npm test -- --coverage");
+      expect(summarizeToolParams("exec", { command: "go build -o bin/api ./cmd/api" }, A))
+        .toBe("go build -o bin/api ./cmd/api");
+      expect(summarizeToolParams("exec", { command: "git commit -m 'fix: handle empty payload'" }, A))
+        .toBe("git commit -m ***"); // 引号里的字面值认不出 → 抹掉
+      expect(summarizeToolParams("exec", { command: "curl -X POST -H 'Content-Type: application/json' https://api.example.com/v1/users" }, A))
+        .toBe("curl -X POST -H *** https://api.example.com/v1/users");
+      expect(summarizeToolParams("exec", { command: "deploy aB3dE7gH1jK4mN8pQ2rS5tU9vW6xY0zA1bC2dE3f" }, A))
+        .toBe("deploy ***"); // 高熵裸词
+    });
+
+    it("赋值不看名字,一律抹值 —— 所以没有「名字没暗示就漏」这条残留", () => {
+      // 靠变量名猜「像不像凭据」的做法,复数/序数/`+=`/索引形式会逐个漏;
+      // 加法档不猜,`NAME=` 就抹。
+      for (const [cmd, want] of [
+        ["FOO=hunter2 ./deploy", "FOO=*** ./deploy"],
+        ["DEPLOY_KEYS=hunter2 ./release", "DEPLOY_KEYS=*** ./release"],
+        ["ADMIN_PW=hunter2 ./release", "ADMIN_PW=*** ./release"],
+        ["DEPLOY_KEY+=hunter2 ./go", "DEPLOY_KEY+=*** ./go"],
+        ["DEPLOY_KEY[0]=hunter2 ./go", "DEPLOY_KEY[0]=*** ./go"],
+        ["GOOS=linux go build ./cmd/api", "GOOS=*** go build ./cmd/api"],
+      ] as const) {
+        expect(summarizeToolParams("exec", { command: cmd }, A)).toBe(want);
+      }
+    });
+
+    it("靠形状表逐条排查时漏掉过的那些写法,加法档一条都不渲染", () => {
+      for (const cmd of [
+        "DEPLOY_KEY=(hunter2 backup2) ./release",
+        "TOKEN=<(printf hunter2) ./go",
+        "ftp user~name:hunter2@ftpserver",
+        "curl [::1]/reset?code=hunter2",
+        "DEPLOY_KEY=$'hunter2' ./deploy",
+        "curl 'localhost/search?filter={\"a\":1}&code=hunter2'",
+        // 下面两条是「渲染字面命令再减掉危险形状」那条路**按设计关不掉**的,加法档顺手关了 ——
+        // 因为它不需要认出这是密码,只需要认不出它是安全的。
+        "curl -u alice:hunter2 https://api.example.com/v1",
+        "mysql -pRealPw123 appdb",
+      ]) {
+        expect(summarizeToolParams("exec", { command: cmd }, A)).not.toContain("hunter2");
+        expect(summarizeToolParams("exec", { command: cmd }, A)).not.toContain("RealPw123");
+      }
+    });
+
+    it("已知残留:密文本身是一个普通位置参数时仍会渲染", () => {
+      // 与子命令无法区分。钉在这里是为了让残留**可见、可数**。
+      //
+      // 注意此前这里写着「值粘在单横线 flag 上的那条已被 SHORT_FLAG_RE 挡下」——那是错的:
+      // 当时唯一的样例 `mysql -pRealPw123` 恰好落在形状约束**拒绝**的一侧(有大写和数字),
+      // 而 `-pswordfish` 这类全小写的粘连值当时是被放行的。用接受侧的单个样本去支撑覆盖性
+      // 断言不成立。现在单横线 flag 只接受 ≤2 字符,那条形状已封,代价见 README。
+      expect(summarizeToolParams("exec", { command: "deploy prod hunter2" }, A))
+        .toBe("deploy prod hunter2");
+    });
+
+    it("凭据形状的 flag 名会把下一个词抹掉,且 flag 名本身不触发整串隐藏", () => {
+      expect(summarizeToolParams("exec", { command: "deploy --token hunter2 ./go" }, A))
+        .toBe("deploy --token *** ./go");
+      expect(summarizeToolParams("exec", { command: "login --password hunter2" }, A))
+        .toBe("login --password ***");
+    });
+
+    it("单横线 flag 只认 ≤2 字符:粘连值与长 flag 形状相同,无法区分", () => {
+      // 曾经接受「3–12 位纯小写」,于是 `-pswordfish` 被正面归类成 flag 名渲染出去 ——
+      // 一条明文口令被当作 flag 名正面归类、渲染了出去。
+      expect(summarizeToolParams("exec", { command: "mysql -pswordfish mydb" }, A))
+        .toBe("mysql *** mydb");
+      expect(summarizeToolParams("exec", { command: "mysql --password hunter2 -phunterlove mydb" }, A))
+        .toBe("mysql --password *** *** mydb");
+      // 形状表:大小写/数字/长度都不能改变结论,单个样本支撑不了覆盖性断言。
+      for (const glued of ["-pswordfish", "-pRealPw123", "-phunterlove", "-sletmein", "-pverylongsecretvalue"]) {
+        expect(summarizeToolParams("exec", { command: `mysql ${glued} db` }, A)).toBe("mysql *** db");
+      }
+      // 代价:长形式单横线 flag 也变成 ***。`--long` 不受影响。
+      expect(summarizeToolParams("exec", { command: "find . -name x.ts" }, A)).toBe("find . *** x.ts");
+      expect(summarizeToolParams("exec", { command: "ls -la /tmp" }, A)).toBe("ls -la /tmp");
+    });
+
+    it("URL 解析得动 ≠ 安全:webhook path 的随机段仍要过形状检测", () => {
+      // `new URL()` 认得 Slack webhook,但 path 里的随机串**本身就是凭据**。url 策略一直有
+      // 这道检测(generic=true),shell 策略此前没有,于是同一个 URL 经 fetch 降级、经 exec 整条渲染。
+      expect(summarizeToolParams("exec", { command: "curl -X POST https://hooks.slack.com/services/T024BE7LD/B2S5TQ1PL/aBcDeFgHiJkLmNoPqR" }, A))
+        .toBe("curl -X POST ***");
+      // 普通 URL 不受影响。
+      expect(summarizeToolParams("exec", { command: "curl https://api.example.com/v1/users" }, A))
+        .toBe("curl https://api.example.com/v1/users");
+    });
+
+    it("程序名位置与操作数位置用同一组检查", () => {
+      // expectProgram 在每个控制算子之后重新置位,所以这个分支在命令中段也可达;
+      // 当时它既没有长度上限也没有高熵检测,是一条绕过路径。
+      expect(summarizeToolParams("exec", { command: "sh -c x ; AbCdEf0123456789AbCdEf0123456789AbCdEf01" }, A))
+        .toBe("sh -c x ; ***");
+    });
+
+    it("值粘进 flag 名里时,整个 token 抹掉;尾段本身是关键词的仍照常渲染", () => {
+      // `--tokenhunter2` 会被下游关键词守卫整串隐藏,`--token-hunter2` 却渲染 —— 差一个连字符,
+      // 因为加法档的守卫豁免会把 flag 名整个从探针里删掉。操作者无从推断,所以在分类层面堵。
+      expect(summarizeToolParams("exec", { command: "deploy --token-hunter2 run" }, A))
+        .toBe("deploy *** ***");
+      expect(summarizeToolParams("exec", { command: "cli --passphrase-correct run" }, A))
+        .toBe("cli *** ***");
+      // 关键词之后仍是关键词的是正常 flag 名,不能误伤。
+      for (const f of ["--refresh-token", "--api-key", "--client-secret", "--private-key",
+        "--access-key", "--session-cookie", "--otp-secret"]) {
+        expect(summarizeToolParams("exec", { command: `cli ${f} v run` }, A)).toBe(`cli ${f} *** run`);
+      }
+    });
+
+    it("数组下标的内容也必须分类过才能渲染", () => {
+      // 下标是任意文本,不是结构。值抹对了不代表 token 安全。
+      expect(summarizeToolParams("exec", { command: "arr[p@sswOrd]=1 ./go" }, A)).toBe("arr=*** ./go");
+      expect(summarizeToolParams("exec", { command: "arr[0]=1 ./go" }, A)).toBe("arr[0]=*** ./go");
+      expect(summarizeToolParams("exec", { command: "A+=1 ./go" }, A)).toBe("A+=*** ./go");
+    });
+
+    it("凭据 flag 名表与赋值名表同源 —— 遍历关键词,不抽样", () => {
+      // 原本是手写的第二张表,比赋值名表窄 14 个词。抽样测试测不出这种缺口,所以这里**遍历**。
+      const keywords = ["token","secret","password","passwd","pwd","passphrase","credential",
+        "creds","key","privkey","apikey","accesskey","apitoken","auth","bearer","session",
+        "sessionid","sid","cookie","jwt","otp","salt","signature","pat","pass","refresh"];
+      for (const k of keywords) {
+        expect(summarizeToolParams("exec", { command: `cli --${k} hunter2 run` }, A))
+          .toBe(`cli --${k} *** run`);
+      }
+      // 命令行的连字符拼法与环境变量的下划线拼法是同一个词。
+      for (const f of ["--private-key", "--api-key", "--client-secret", "--access-key"]) {
+        expect(summarizeToolParams("exec", { command: `cli ${f} hunter2 run` }, A))
+          .toBe(`cli ${f} *** run`);
+      }
+      // 不能误伤普通 flag。
+      expect(summarizeToolParams("exec", { command: "cli --verbose run" }, A)).toBe("cli --verbose run");
+      expect(summarizeToolParams("exec", { command: "git commit -m x" }, A)).toBe("git commit -m x");
+    });
+
+    it("分词器出错不会泄漏 —— 分错的 token 归不了类,结果是 ***", () => {
+      // 未闭合引号:整段被当成一个词,归不了类 → ***。
+      expect(summarizeToolParams("exec", { command: "gpg -d 'alpha hunter2" }, A))
+        .toBe("gpg -d ***");
+    });
+  });
+
   it("query/shell 策略也降级内嵌 URL(与 url/error 路径对称,单一 choke point)", () => {
     // query 里的 webhook URL:路径段短、无关键词 → isSensitive 抓不到,靠 URL 降级。
     expect(summarizeToolParams("web_search", { query: "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234" })).toBe(

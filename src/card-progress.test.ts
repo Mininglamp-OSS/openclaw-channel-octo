@@ -1599,6 +1599,73 @@ describe("card-progress 状态机 + hook + 节流", () => {
     });
   });
 
+  describe("cardToolDetail 开关", () => {
+    // sessionKey 必须每次调用都不同 —— 只按开关值命名时,同一档位调两次会复用已 finalize 的
+    // 卡片状态,第二次拿到空串,看起来像脱敏把整串隐藏了。
+    let detailCallSeq = 0;
+    async function firstStepText(cardToolDetail: boolean | undefined, command: string) {
+      const { fn, calls } = mockFetch();
+      global.fetch = fn as unknown as typeof fetch;
+      const { handlers } = makeApi();
+      const sessionKey = `detail-${String(cardToolDetail)}-${++detailCallSeq}`;
+      setCardContext(sessionKey, {
+        apiUrl: "https://detail.test",
+        botToken: "bf",
+        channelId: "g1",
+        channelType: ChannelType.Group,
+        ...(cardToolDetail === undefined ? {} : { cardToolDetail }),
+      });
+      handlers.before_tool_call({ toolName: "exec", toolCallId: "t1", params: { command } }, { sessionKey });
+      await vi.advanceTimersByTimeAsync(900);
+      handlers.after_tool_call({ toolName: "exec", toolCallId: "t1", durationMs: 10 }, { sessionKey });
+      await finalizeCard(sessionKey, { success: true });
+      const edit = calls.filter((c) => c.url.includes("/message/edit")).pop();
+      const env = JSON.parse(edit!.body!.content_edit as string);
+      return progressDetailItems(env.card).map(elementText)[0] ?? "";
+    }
+
+    it("未配置时默认只渲染程序名(opt-in)", async () => {
+      // 群卡对全员可见,完整命令里的内联凭据不是关键词守卫能抓的形状,所以升级不得静默放开。
+      const text = await firstStepText(undefined, "npm test -- --coverage");
+      expect(text).toContain("npm");
+      expect(text).not.toContain("--coverage");
+    });
+
+    it("显式 false 同样只渲染程序名", async () => {
+      const text = await firstStepText(false, "npm test -- --coverage");
+      expect(text).toContain("npm");
+      expect(text).not.toContain("--coverage");
+    });
+
+    it("显式 true 渲染加法摘要:可正面归类的 token 保留", async () => {
+      const text = await firstStepText(true, "npm test -- --coverage");
+      expect(text).toContain("npm test -- --coverage"); // 全是可正面归类的 token
+    });
+
+    it("显式 true:认不出的操作数抹成 ***", async () => {
+      // 注意用不含凭据关键词的 flag 名:卡片层还有第二道 isSensitive(card-blocks 的
+      // sanitize),`--token` 这类名字会让**整个 block** 被丢弃,拿到空串。方向是过度隐藏,
+      // 但意味着 summarizeToolParams 层的验证结果到卡片层还会再收紧一次。
+      const text = await firstStepText(true, "deploy --flag alice:hunter2 ./go");
+      expect(text).toContain("--flag");      // flag 名是结构,保留
+      expect(text).not.toContain("hunter2"); // 认不出的操作数抹掉
+    });
+
+    it("显式 true:已知残留 —— 密文就是个普通位置参数时仍会渲染", async () => {
+      // 两条可枚举残留之一(另一条是值粘在单横线 flag 上,`mysql -pRealPw123`)。
+      // 与子命令无法区分,靠 SECRET_RE / 形状守卫兜底,兜不住就是残留。钉在这里是为了让它
+      // 可见、可数 —— README 有同样的说明。
+      const text = await firstStepText(true, "deploy --flag hunter2 ./go");
+      expect(text).toContain("hunter2");
+    });
+
+    it("非法值 fail-closed 到只渲染程序名", async () => {
+      const text = await firstStepText("yes" as unknown as boolean, "npm test -- --coverage");
+      expect(text).toContain("npm");
+      expect(text).not.toContain("--coverage");
+    });
+  });
+
   it("OBO 场景跳过(不发任何请求)", async () => {
     const { fn, calls } = mockFetch();
     global.fetch = fn as unknown as typeof fetch;
@@ -2519,7 +2586,9 @@ describe("card-progress 状态机 + hook + 节流", () => {
     global.fetch = fn as unknown as typeof fetch;
     const { handlers } = makeApi();
 
-    setCardContext("tc", { apiUrl: "https://tc.test", botToken: "bf", channelId: "g1", channelType: ChannelType.Group });
+    // cardToolDetail 显式开启:本用例靠摘要里的参数(`sleep 1` / `sleep 2`)区分并发的 A/B 步骤。
+    // 开关默认 opt-in,不开则两步都渲染成 `sleep`,判别力就没了。
+    setCardContext("tc", { apiUrl: "https://tc.test", botToken: "bf", channelId: "g1", channelType: ChannelType.Group, cardToolDetail: true });
     // 两个并发 exec:A、B 都 running
     handlers.before_tool_call({ toolName: "exec", toolCallId: "A", params: { command: "sleep 1" } }, { sessionKey: "tc" });
     handlers.before_tool_call({ toolName: "exec", toolCallId: "B", params: { command: "sleep 2" } }, { sessionKey: "tc" });
@@ -2532,8 +2601,9 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(edit).toBeTruthy();
     const env = JSON.parse(edit!.body!.content_edit as string);
     const texts = progressDetailItems(env.card).map(elementText);
-    expect(texts[0]).toBe("⌨️ exec: sleep · 50ms"); // A 已完成
-    expect(texts[1]).toBe("⏳ exec: sleep");          // B 仍 running
+    // 放开档的摘要带上参数,A/B 在断言里可区分 —— 串行错标会立刻暴露成 "sleep 2 · 50ms"。
+    expect(texts[0]).toBe("⌨️ exec: sleep 1 · 50ms"); // A 已完成
+    expect(texts[1]).toBe("⏳ exec: sleep 2");          // B 仍 running
   });
 
   it("P2-b(重复投递): toolCallId 命中失败不回退按名匹配,不误标并发步骤", async () => {
@@ -2541,7 +2611,9 @@ describe("card-progress 状态机 + hook + 节流", () => {
     global.fetch = fn as unknown as typeof fetch;
     const { handlers } = makeApi();
 
-    setCardContext("dup", { apiUrl: "https://dup.test", botToken: "bf", channelId: "g1", channelType: ChannelType.Group });
+    // cardToolDetail 显式开启:本用例靠摘要里的参数(`sleep 1` / `sleep 2`)区分并发的 A/B 步骤。
+    // 开关默认 opt-in,不开则两步都渲染成 `sleep`,判别力就没了。
+    setCardContext("dup", { apiUrl: "https://dup.test", botToken: "bf", channelId: "g1", channelType: ChannelType.Group, cardToolDetail: true });
     handlers.before_tool_call({ toolName: "exec", toolCallId: "A", params: { command: "sleep 1" } }, { sessionKey: "dup" });
     handlers.before_tool_call({ toolName: "exec", toolCallId: "B", params: { command: "sleep 2" } }, { sessionKey: "dup" });
     handlers.after_tool_call({ toolName: "exec", toolCallId: "A", durationMs: 50 }, { sessionKey: "dup" }); // A → done
@@ -2553,8 +2625,8 @@ describe("card-progress 状态机 + hook + 节流", () => {
     const edit = calls.filter((c) => c.url.includes("/message/edit")).pop();
     const env = JSON.parse(edit!.body!.content_edit as string);
     const texts = progressDetailItems(env.card).map(elementText);
-    expect(texts[0]).toBe("⌨️ exec: sleep · 50ms"); // A done(只被标一次)
-    expect(texts[1]).toBe("⏳ exec: sleep");          // B 仍 running,未被重复事件误标
+    expect(texts[0]).toBe("⌨️ exec: sleep 1 · 50ms"); // A done(只被标一次)
+    expect(texts[1]).toBe("⏳ exec: sleep 2");          // B 仍 running,未被重复事件误标
   });
 
   it("J1: finalize await 期间下一 run setCardContext,不误删新 run 的 entry", async () => {

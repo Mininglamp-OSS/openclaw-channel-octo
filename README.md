@@ -64,7 +64,7 @@ Bot accounts are stored in `~/.openclaw/openclaw.json` under `channels.octo.acco
 
 Configuration fields per account:
 
-`cardProgress`, `reasoningCardTemplateMode`, `cardDisplay`, and `cardInteraction` may also be set directly under `channels.octo` as defaults for every account. An explicit per-account value overrides the corresponding top-level value.
+`cardProgress`, `reasoningCardTemplateMode`, `cardDisplay`, `cardInteraction`, and `cardToolDetail` may also be set directly under `channels.octo` as defaults for every account. An explicit per-account value overrides the corresponding top-level value.
 
 - `botToken` (required): Bot token. Either a User Bot token from BotFather (`bf_` prefix, full group + thread access) or an App Bot token from the Octo admin console (`app_` prefix, direct-message only — server-enforced).
 - `apiUrl` (required): Octo server REST API base URL (e.g. `https://your-server/api`). The default `http://localhost:8090/api` only works for a local Octo dev server with the standard `/api` mount.
@@ -79,6 +79,37 @@ Configuration fields per account:
   Four `experimental` behaviours are deliberate and worth knowing before you enable it. Template compatibility alone selects Model A, independent of reasoning visibility: a turn that never exposed any reasoning still renders the `ai.reasoning-process` card, with real tool rows under a generic placeholder thought line instead of captured reasoning text (local Model B rendering keeps its plain progress card in that case). Model A never synthesizes tool actions it did not observe, so a reasoning phase that has not yet run a tool is omitted from the frame — its thought text appears once that phase calls one, where Model B shows the phase immediately with a synthetic `think` row; a turn's last reasoning phase usually calls no tool before the model answers, so that closing segment usually never reaches the Model A card at all. Neither mode sends a progress card for a turn that calls no tools at all. Run control (stop/regenerate) is not a card action: the deployed template is expected to render no such controls, and this plugin only ACKs view-scoped `reasoning_stop` / `reasoning_retry` as a defensive no-op for cards already sitting in channels and for catalogs that still advertise them, so those buttons do not perform run control. Finally, if the initial Model A send receives a deterministic template-frame rejection and the advertised Model B profile is compatible, the plugin retries that first frame exactly once as Model B; an existing Model A message never switches wire modes.
 - `cardDisplay` (optional): Set `false` to hide and reject the `octo_send_display_card` tool for this account. Omitted or `true` follows the server card capability gate.
 - `cardInteraction` (optional): Set `false` to hide `octo_send_card` and prevent new interactive-card callback polling for this account. Omitted or `true` follows the server `octo/v2` capability gate.
+- `cardToolDetail` (optional, **opt-in**): Controls how much of each tool call appears on a progress card.
+
+  | value | `exec` tool step renders |
+  |---|---|
+  | omitted / `false` | program name only (`curl`), paths shortened, URLs reduced to the registrable domain |
+  | `true` | **structural summary** — program, subcommands, flag names, reduced URLs and paths; every assignment value and every unclassifiable token becomes `***` |
+
+  ```
+  curl -X POST -H 'Content-Type: application/json' https://api.example.com/v1/users
+    →  curl -X POST -H *** https://api.example.com/v1/users
+
+  deploy --token hunter2 ./go        →  deploy --token *** ./go
+  mount -o rw,passphrase=hunter2 /mnt →  mount -o *** /mnt
+  ```
+
+  **The summary is additive**: a token is rendered only if it can be positively classified as safe — a program name, a subcommand, a flag name, a path, or a URL that survives `new URL()` parsing. Everything else is `***`. This is the opposite of rendering the command and then removing what looks dangerous, and the difference is the *direction it fails*: a shape the classifier does not know becomes another `***` rather than a rendered credential. Assignment values are masked without looking at the variable name at all, so `FOO=hunter2` is covered even though nothing about the name suggests a secret. `curl -u user:pass` and `mysql -pswordfish` are covered for the same reason — the classifier does not need to recognise a password, only to fail to recognise it as safe.
+
+  Its residuals, enumerated — this list is the option's contract, so it is kept complete rather than short:
+
+  1. A credential that is itself an ordinary positional word (`deploy prod hunter2`) cannot be told apart from a subcommand.
+  2. A URL that parses is rendered with its host and path, so a **tunnel or presigned hostname whose randomness is the credential** still appears (`https://a1b2c3d4e5f6.ngrok-free.app/admin/reset`). Webhook paths are caught by the high-entropy check that also runs on the URL, but a short random subdomain is below its threshold. The default level strips subdomains and paths precisely for this, and `true` reopens it.
+  3. A credential-shaped flag masks **one** following word, which is what the shell means by `--password X` — so an unquoted multi-word secret keeps everything after its first token (`--passphrase correct horse battery staple` → `--passphrase *** horse battery staple`). Quoted, the whole value is one word and is masked.
+  4. Residual (1) is not limited to dictionary words: a positional token renders whenever it is ≤24 characters and below the high-entropy threshold, so `deploy prod Xk3Bq7Zp2Lm9Rt4Ns8Wc1Vy` renders too.
+  5. File paths are **expanded, not shortened** — `/home/alice/.ssh/id_rsa` renders in full. That is the stated point of the option, but it makes OS usernames and workspace layout group-visible.
+
+  The cost of keeping residual (1) that short is paid on single-dash flags: only `-x` and `-xy` are rendered, because `-pswordfish` and `-verbose` are the same shape and there is no way to tell a glued password from a long flag name. So `find . -name '*.ts'` renders as `find . *** ***`. `--long` flags are unaffected.
+
+  Two further costs. Any command carrying an unrelated `x:y@z` renders as its program name (`sed 's:a:b@c:g'` → `sed`), as does a query the reducer cannot cleanly terminate. And a *dotted* host DSN is rewritten rather than withheld, so `sed 's:a:b@c.io:g'` renders as `sed 'c.io:g'` — kept because the dotted form is where the genuinely useful DSN lives, but an operator cannot tell the command was altered.
+
+  One change reaches the **default** level and is listed here rather than left to be discovered: the `process` tool renders its `action` (from a closed whitelist) at every level. Before this option existed it rendered nothing at all, because `process` has no `command` field. Output is capped at 120 characters, and an input over 2000 characters falls back to the conservative summary.
+
 - `historyLimit` (optional): Group chat history message limit (default: 20)
 - `dispatchTimeoutMs` (optional): Per-inbound dispatch timeout in milliseconds — an infrastructure backstop that releases the per-group message queue if an upstream dispatch hangs. When unset, it is derived from OpenClaw's `agents.defaults.timeoutSeconds` (600 if unset) as `timeoutSeconds * 1000 + 60000`, so it always fires *after* the agent-run timeout: the agent terminates gracefully first, and this timeout only catches genuinely hung dispatches. Set explicitly only if you need to decouple it from the agent timeout.
 

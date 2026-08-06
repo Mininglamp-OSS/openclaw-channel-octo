@@ -24,6 +24,7 @@ export type ResolvedOctoAccount = {
     reasoningCardTemplateMode?: ReasoningCardTemplateMode;
     cardDisplay?: boolean;  // false disables the display-card tool for this account
     cardInteraction?: boolean;  // false disables interactive authoring and callback polling
+    cardToolDetail?: boolean;  // opt-in: true = additive structural summary of each tool call
     onBehalfOf?: string;  // Persona clone: grantor uid
     secretsFileRoot?: string;  // Jail root for write-secret file writes
     dispatchTimeoutMs?: number;  // Explicit dispatch-timeout override; unset = derive from agents.defaults.timeoutSeconds (issue #113)
@@ -116,6 +117,7 @@ export function resolveOctoAccount(params: {
       reasoningCardTemplateMode: accountConfig.reasoningCardTemplateMode ?? channel.reasoningCardTemplateMode,
       cardDisplay: accountConfig.cardDisplay ?? channel.cardDisplay,
       cardInteraction: accountConfig.cardInteraction ?? channel.cardInteraction,
+      cardToolDetail: accountConfig.cardToolDetail ?? channel.cardToolDetail,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,
       secretsFileRoot: accountConfig.secretsFileRoot ?? channel.secretsFileRoot,
       dispatchTimeoutMs: accountConfig.dispatchTimeoutMs ?? channel.dispatchTimeoutMs,
