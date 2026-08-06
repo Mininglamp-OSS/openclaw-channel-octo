@@ -64,11 +64,12 @@ export async function getBotCardProfile(params: BotCardProfileKey): Promise<Card
 
   const generation = currentGeneration(key);
   const work = getCardProfile(params).then((manifest) => {
-    // A bot_setting_updated event may race this request. Never let the older response refill a
-    // cache that the event already invalidated.
-    if (currentGeneration(key) === generation) {
-      state.cache.set(key, { manifest, expiresAt: Date.now() + CACHE_TTL_MS });
+    // A bot_setting_updated event may race this request. The stale response must not reach the
+    // waiting sender either: join (or start) the current generation's read before resolving.
+    if (currentGeneration(key) !== generation) {
+      return getBotCardProfile(params);
     }
+    state.cache.set(key, { manifest, expiresAt: Date.now() + CACHE_TTL_MS });
     return manifest;
   }).finally(() => {
     if (state.inFlight.get(key) === work) state.inFlight.delete(key);
