@@ -623,16 +623,16 @@ function utf8Bytes(s: string): number {
  * 所以与普通正文同样脱敏,并按服务端/客户端约定限制为 UTF-8 4KiB。
  */
 function renderCopy(label: string | undefined, text: string, ctx: RenderCtx): Rendered {
-  // 超限判定必须跑在**原始 text** 上,不能跑在 sanitize 的输出上,而且两条上限都要判。
+  // 长度判定必须跑在**原始 text** 上,不能跑在 sanitize 的输出上 —— sanitize 里的
+  // reduceUrlsInText 会把超长输入截掉,而这里的契约是字节数。ASCII 下 4000 字符恒 ≤ 4096 字节,
+  // 所以下面那条 utf8Bytes 判定再也不会触发:20000 字符会安静地变成 4000 字符塞进复制按钮。
+  // 复制按钮是读者会直接粘出去用的 sink,给残值比给提示糟得多。
   //
-  // sanitize 里的 reduceUrlsInText 会把输入截到 REDUCE_INPUT_MAX(4000 **字符**),而这里的契约
-  // 是 4096 **字节**。两者一交叉就出两个洞:ASCII 下 4000 字符恒 ≤ 4096 字节,所以 utf8Bytes
-  // 判定再也不会触发 —— 20000 字符的内容会安静地变成 4000 字符塞进复制按钮;而 4050 字符这种
-  // **合法地在 4096 字节契约内**的内容,同样被截成 4000,一样没有提示。
-  //
-  // 复制按钮是读者会直接粘出去用的 sink,给残值比给提示糟得多。所以:要么给全文,要么给提示。
-  if (text.length > REDUCE_INPUT_MAX || utf8Bytes(text) > COPY_TEXT_MAX_BYTES) {
-    const msg = "复制内容超过 4KiB，未渲染复制按钮";
+  // 两条上限的**理由不同,所以提示语也不同**。上一版把两者合并成一句"超过 4KiB",而
+  // 4050 个 ASCII 字符就是 4050 字节 —— 合法地在契约内,却被告知超了字节限制,下一个人去查
+  // 字节数会什么也查不到。
+  if (text.length > REDUCE_INPUT_MAX) {
+    const msg = `复制内容超过 ${REDUCE_INPUT_MAX} 字符，无法安全脱敏，未渲染复制按钮`;
     return { elements: [textBlock(msg)], plainLines: [msg] };
   }
   const cleanText = sanitize(text, ctx.generic);
@@ -644,6 +644,9 @@ function renderCopy(label: string | undefined, text: string, ctx: RenderCtx): Re
       plainLines: [cleanText],
     };
   }
+  // 字节上限只约束**复制按钮**,所以判定留在 cardSupports 回退之后。放到回退之前会让不支持
+  // Action.CopyToClipboard 的客户端也收到"未渲染复制按钮" —— 那条路径走的是普通 TextBlock,
+  // 本来就没有复制按钮,也从来没有字节限制。
   if (utf8Bytes(cleanText) > COPY_TEXT_MAX_BYTES) {
     const msg = "复制内容超过 4KiB，未渲染复制按钮";
     return {

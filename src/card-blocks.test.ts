@@ -718,13 +718,25 @@ describe("copy block(Action.CopyToClipboard 本地动作)", () => {
     // 内容同样被截成 4000。两种情况用户粘出来都是残的,却没有任何提示。
     //
     // 复制按钮是读者会直接拿去用的 sink。要么给全文,要么给提示,不给残值。
-    for (const [label, n] of [["超出字符上限", 4050], ["远超字节上限", 20_000]] as [string, number][]) {
+    // 两条上限的理由不同,提示语也必须不同:4050 个 ASCII 字符**就是 4050 字节**,合法地在
+    // 4KiB 契约内 —— 告诉读者"超过 4KiB"是假话,下一个人去查字节数会什么也查不到。
+    for (const [label, n, want] of [
+      ["超出字符上限", 4050, "字符"],
+      ["远超两条上限", 20_000, "字符"],
+    ] as [string, number, string][]) {
       const r = buildDisplayCard({ caps: CAPS_WITH_COPY, blocks: [{ type: "copy", text: "x".repeat(n) }] });
       const el = body(r)[0] as { type: string; text: string };
       expect(el.type, label).toBe("TextBlock");
-      expect(el.text, label).toContain("4KiB");
+      expect(el.text, label).toContain(want);
       expect(JSON.stringify(r.card), label).not.toContain("Action.CopyToClipboard");
     }
+    // 字节超限但字符数在界内(CJK)仍报 4KiB。
+    const cjk = buildDisplayCard({ caps: CAPS_WITH_COPY, blocks: [{ type: "copy", text: "中".repeat(1366) }] });
+    expect((body(cjk)[0] as { text: string }).text).toContain("4KiB");
+    // 不支持复制按钮的客户端走普通 TextBlock —— 那条路径没有复制按钮,不该收到"未渲染复制按钮"。
+    const noCopy = buildDisplayCard({ blocks: [{ type: "copy", text: "中".repeat(1366) }] });
+    expect((body(noCopy)[0] as { type: string }).type).toBe("TextBlock");
+    expect((body(noCopy)[0] as { text: string }).text).not.toContain("未渲染复制按钮");
     // 界内的照常给出完整内容,一个字符都不少。
     const ok = buildDisplayCard({ caps: CAPS_WITH_COPY, blocks: [{ type: "copy", text: "x".repeat(3000) }] });
     expect((body(ok)[0] as { type: string }).type).toBe("ActionSet");

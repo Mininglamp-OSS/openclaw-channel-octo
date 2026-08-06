@@ -30,8 +30,8 @@ describe("摘要管线形状语料", () => {
     assertRows(LEAK_CORPUS);
     // 除了逐行等值,再断言一次「口令子串不出现」—— 等值断言只能守住已知的输出形态,
     // 这一条守住的是「无论输出变成什么,那几个串都不许在里面」。
-    const SECRETS = ["horse", "hunter2", "s3cr3tvalue", "signature=", "code=abc", "sid=abcdef",
-                     "abcdEFGH1234", "sk-secret"];
+    const SECRETS = ["horse", "hunter2", "s3cr3tvalue", "abcdEFGH1234", "sk-secret",
+                     "AKIA", "hhhhhhhh", "abcdefghij"];
     for (const row of LEAK_CORPUS) {
       for (const [tool] of Object.entries(row.expect)) {
         const got = run(row, tool);

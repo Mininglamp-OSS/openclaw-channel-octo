@@ -154,77 +154,54 @@ to paste a secret in plaintext. Whether to adjust the configuration is up to you
 7. Sends display and submit-interactive cards with negotiated fallback
 8. Polls durable `card_action` events only after an interactive card is sent
 
-### Query strings are stripped from host-shaped values
+### A scheme-less `user:pass@host` is only reduced when the host carries a dot
 
-Anything this plugin renders into a card goes through one URL-reduction step, and
-that step strips the query string off anything it can identify as a host: a
-dotted hostname, a single-label host such as `localhost`, or an IPv4 literal. A
-query string is where callback codes, signed URLs, session ids and one-time
-tokens live, and cards are visible to every member of the channel, so the rule
-applies at every sink rather than only to progress cards.
+`postgres://user:pw@host/db` and `user:pw@db.example.com` lose their userinfo, but
+a single-label host (`user:pw@localhost`), an IPv6 literal (`user:pw@[::1]`), a
+password containing `/` (`user:pa/ss@db.example.com`) and a leading slash
+(`/user:pass@localhost`) all render in full.
 
-It is stated as *host-shaped* rather than unconditionally, because two shapes are
-deliberately left alone and it is better to know which:
-
-- **A bare numeric label** — `8080?code=abc`, `2026?code=abc`. These cannot be
-  told apart from ordinary prose such as `10/20?ok=yes` or `2026-08-06?ok=yes`,
-  and a `grep` pattern has no program name to fall back to, so withholding would
-  render a blank card that reads as a bug.
-- **A fragment** — `localhost/cb#code=abc` renders in full. Implicit-flow OAuth
-  does return tokens in the fragment, so this is a real gap; it predates this
-  option and closing it would also hit `file.ts#L10` and markdown anchors, so it
-  is left for its own change rather than folded in here.
-
-Three consequences are worth knowing, because they are not just cosmetic:
-
-- Rich-text blocks may collapse. When more of a string counts as reducible, a
-  display card can fall back to a single text block and lose its formatting.
-  Text over 4000 characters always takes that fallback, because the reduction
-  step bounds its own input (see below).
-- **A value you submitted may be echoed back without its query string.** The
-  status card that records an interactive submission runs the same reduction over
-  the submitted value, so `docs/parser?mode=fast` is frozen into the card as
-  `docs/parser`. The card is no longer a verbatim record of what was submitted.
-- **`?` is read as a query delimiter even where it was a quantifier.** A `grep`
-  pattern of `colou?r=red` renders as `colou`, and `reports/q3?draft=1.pdf`
-  renders as `reports/q3`. The rewrite is silent — there is no ellipsis or marker.
-
-Where a query string cannot be reduced cleanly — a quote inside it, for instance
-— the summary is withheld entirely rather than half-rewritten. A partially
-rewritten command looks sanitized while still carrying its tail, and gives the
-operator no signal that what they are reading has been altered.
-
-**A scheme-less `user:pass@host` is only reduced when the host carries a dot.**
-`postgres://user:pw@host/db` and `user:pw@db.example.com` lose their userinfo,
-but a single-label host (`user:pw@localhost`), an IPv6 literal
-(`user:pw@[::1]`), a password containing `/` (`user:pa/ss@db.example.com`) and a
-leading slash (`/user:pass@localhost`) all render in full. These are pre-existing
-gaps, not ones this option introduces, and closing them is its own change: the
-shape is genuinely ambiguous — `sed 's:a:b@c:g'` and `user:pw@localhost` are the
-same string to a matcher — so both widening the reduction and adding a
-withhold-everything backstop have, in review, each traded one defect for a worse
-one. They are tracked with their exact current behaviour in
-`src/card-render.corpus.ts` so that whatever closes them cannot silently change
-anything else.
+These are pre-existing gaps and closing them is its own change. The shape is
+genuinely ambiguous — `sed 's:a:b@c:g'` and `user:pw@localhost` are the same
+string to a matcher — so in review both widening the reduction and adding a
+withhold-everything backstop each traded one defect for a worse one. Their exact
+current behaviour is pinned in `src/card-render.corpus.ts` so that whatever
+closes them cannot silently change anything else.
 
 ### The reduction step bounds its own input
 
-It runs on untrusted text — a submitted form value, a display name, tool
-arguments — on synchronous paths with no error boundary, and its passes are
-quadratic, so an unbounded input stalls the plugin's event loop for every account
-at once. The bound is 4000 characters.
+The URL reduction runs on untrusted text — a submitted form value, a display
+name, tool arguments — on synchronous paths with no error boundary, and its
+passes are quadratic, so an unbounded input stalls the plugin's event loop for
+every account at once. The bound is 4000 characters.
 
-Two sinks have no render cap of their own and therefore handle the bound
-explicitly, because truncation there would be observable:
+**The cut lands on whitespace, never inside a token.** That is what makes the
+bound safe rather than merely fast. Several passes locate what they neutralise by
+an anchor — the reduction that removes a `user:pass@host` needs the `@host` to be
+there — so a cut through the middle of a token can remove the anchor and leave
+the credential rendering in the clear. Cutting on whitespace keeps every token
+whole, which also means a secret near the cut is either kept entirely (and caught
+by the guards) or dropped entirely, and that a UTF-16 surrogate pair is never
+split.
 
-- **A display-card text block** longer than 4000 characters is checked for
-  credential shapes *before* truncation, then truncated. Without the first check
-  a secret straddling the cut renders as a fragment the guard no longer
-  recognises.
-- **A copy-to-clipboard block** longer than 4000 characters is refused with the
-  same "over 4 KiB" notice used for the byte limit, rather than silently handing
-  over a truncated value. The reader pastes that content somewhere, so a partial
+Text whose first 4000 characters contain no whitespace at all has no safe cut, so
+it is **not rendered**. A single unbroken 4000-character token is not something
+the pipeline can normalise, and not rendering is the same choice the rest of the
+module makes when it cannot identify what it is looking at.
+
+Three sinks apply no render cap of their own, so what the bound does is directly
+visible at them, and each says so:
+
+- **A display-card text block** renders long text in full; over the bound it is
+  checked for credential shapes before truncation, then truncated.
+- **A copy-to-clipboard block** over the bound is refused rather than truncated,
+  with a message that says *characters* — its other limit, 4 KiB, is a byte limit
+  and gets its own message. A reader pastes that content somewhere, so a partial
   value is worse than an honest refusal.
+- **The status card that echoes an interactive submission** renders the submitted
+  value through the same reduction. It carries no separate guard; the
+  whitespace-boundary cut is what keeps a credential in that value from being
+  split out of the reduction's reach.
 
 ## Architecture
 

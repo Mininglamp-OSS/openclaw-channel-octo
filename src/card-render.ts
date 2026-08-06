@@ -113,7 +113,7 @@ export function resolveToolMeta(tool: string): { icon: string; label: string } {
 
 const SUMMARY_MAX = 64;
 /**
- * `reduceUrlsInText` 的**无条件**输入长度上限。
+ * `reduceUrlsInText` 的输入长度上限。
  *
  * 归约管线里的几趟正则在长串上是二次的。实测(`b1e3def`,默认配置,`"a"×100k + "?x"`):
  *
@@ -131,11 +131,7 @@ const SUMMARY_MAX = 64;
  * 显示名(它自己的文档注释就写着 untrusted),信任边界比「模型生成的工具参数」还低,而且因为
  * summarizeToolParams 已经快了,它成了唯一剩下的那条路,反而更难被发现。
  *
- * 截断而不是整串丢弃:各 sink 的渲染上限分别是 64(摘要)/120(错误、放开档摘要)/512(debug
- * 串)/2000(授权卡文本),都远小于这个值,所以截掉的部分本来就不会被渲染,守卫仍然跑在「会被
- * 渲染的那一段」的完整形态上。唯一可观察的差异在 card-blocks.ts 的 noReducibleUrl:它拿
- * 归约结果与原串比等值,超过上限的串会一律判为"可归约"而退到单个 TextBlock(丢富文本样式)。
- * 那正是它自己注释里写的保守回退方向。
+ * 怎么截断见 boundedForReduction —— 切口必须落在空白上,那是这个上限能否安全存在的前提。
  */
 export const REDUCE_INPUT_MAX = 4000;
 
@@ -362,83 +358,41 @@ const SCHEMELESS_HOST_PATH_RE =
   /(^|[^A-Za-z0-9@._/:+-])([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?\/[^\s]+)/g;
 
 /**
- * URL 相关那几趟的前导集:SHELL_BREAK **再加** `=` 和 `,`。
+ * 超长输入的截断:**切口只能落在空白上**,切不到就整串不渲染。
  *
- * 比 SHELL_BREAK 宽是安全的 —— 这几趟只把前导原样回填,不存在「值吞掉下一个起始位置」的问题,
- * 所以放宽只会多覆盖、不会漏。`=` 是必须的:`curl --url=localhost/reset?code=…` 里 query 前面
- * 粘的正是 `=`;`,` 则来自 `--conf a=1,b=localhost/x?c=…` 这类逗号分隔的参数列表。
+ * 上一版是 `s.slice(0, REDUCE_INPUT_MAX)` —— 盲切。它自己就是一条泄漏路径:下面几趟归约靠
+ * **锚点**定位,而盲切会把锚点切掉,于是本该被归约掉的凭据原样留下。最直接的一例是
+ * SCHEMELESS_USERINFO_RE 要 `@带点主机`:
+ *
+ *     "alice:" + "h"×3995 + "@db.example.com"
+ *       main   https://example.com          ← userinfo 被剥掉
+ *       盲切   alice:hhhhhhhh…              ← 切口落在口令和 @host 之间,归约不匹配
+ *
+ * 而且**不限于没有渲染上限的 sink**:口令本身长时,存活前缀从 offset 0 开始,摘要的 64 字符
+ * 和错误的 120 字符上限都挡不住,进度卡直接渲染凭据。偏移是可选的 —— 任何口令长度都存在一个
+ * 让它整个活下来的填充长度。
+ *
+ * 切在空白上,token 就永远不会被切开,这一类由构造消失。它同时收掉另外两件:
+ *  - 横跨切口的密钥被切成两半、`isSensitive` 认不出那个片段(card-blocks 那道预检因此从承重
+ *    降级为保险);
+ *  - UTF-16 代理对被从中间切开、留下孤立代理。
+ *
+ * **切不到空白 → 返回空串**,而不是退回盲切。一个 4000 字符不含空白的 token 无法安全地截断,
+ * 认不出结构就不渲染,与本模块其余部分同向。调用方对空串已有处理(不渲染该 block / 退回程序名)。
  */
-const URL_LEAD = `${SHELL_BREAK}=,`;
-
-/**
- * 无 scheme、**单标签主机**的 `host/path?query`。上面几趟都要求主机带点,这类串一趟都不匹配,
- * query 会原样渲染(`curl localhost/reset?code=…`)。
- *
- * 不放宽主机形状去匹配整串 —— 那样 `src/index.ts` 会被当成 host/path,把普通相对路径毁掉。
- * 只针对**含 `=` 的 query 段**下手:shell glob(`src/file?.ts`)里不含 `=`,不会被误伤。
- *
- * 前导取 URL_LEAD 而不是只认空白:命令行上给 URL **加引号是常态写法**,只认空白时
- * `curl 'localhost/reset?code=…'` 和 `curl --url=localhost/reset?code=…` 的 query 原样渲染。
- */
-// query 段止于空白或引号,并且**整段必须干净收尾**:收尾条件要求匹配停在串尾、空白,或一个「后面
-// 就是 SHELL_BREAK 字符或串尾」的闭合引号上 —— 即那个引号确实是**词的结尾**,而不是 query 内部
-// 的引号。
-//
-// 少了这个收尾条件,query 里只要出现一个引号,匹配就在那里断掉、只删前半段,后半段原样渲染:
-//
-//     curl 'localhost:8080/search?filter={"a":1}&code=hunter2'
-//       →  curl 'localhost:8080/search"a":1}&code=hunter2'      ← code= 泄漏
-//
-// 半改写的输出看起来像脱敏过的,却留着尾巴,是最坏的失败模式。修法不是把引号放进集合(那会把
-// 闭合引号连同后面的 `&&echo x` 一起吃掉、把命令改写成另一条),而是**确认不了就不改写** ——
-// 交给 RESIDUAL_QUERY_RE 整串不渲染。与 userinfo 那条走的是同一个判据。
-//
-// `&` 必须留在集合内 —— 多参数 query(`?a=1&b=2`)靠它,排除掉会把 `&b=2` 留在渲染串里。
-// 主机形状前瞻。归约与兜底**共用这一个常量** —— 两条一旦分头演化,就是这条 PR 反复出现的
-// 「第二张表和第一张不同步」。
-//
-// 含字母,**或**点分四段 IPv4。只要字母的话,内网/开发环境里最常见的无字母主机 —— IPv4 字面量
-// —— 既过不了这里、也过不了第 4 趟(那趟要求字母 TLD),于是 query 原样渲染:
-//
-//     grep {pattern: "192.168.0.1?code=abc"}   →   192.168.0.1?code=abc
-//     read {file_path: "127.0.0.1?sid=abcdef"} →   127.0.0.1?sid=abcdef
-//
-// 按本分支自己的论据(OAuth 授权码等价于 bearer),这正是这一趟要挡的那类。
-//
-// 裸数字单标签(`8080?code=abc`、`2026?code=abc`)仍然不碰:它们与 `10/20?ok=yes`、
-// `2026-08-06?ok=yes` 这种日期/比值散文在形状上完全一致,而 query 策略没有程序名可退,拦下来
-// 就是一张空白卡。README 里写明这条残留。
-const QUERY_HOST_LEAD = `(?:(?=[A-Za-z0-9._-]*[A-Za-z])|(?=\\d{1,3}(?:\\.\\d{1,3}){3}(?:[:/?]|$)))`;
-const SCHEMELESS_QUERY_RE = new RegExp(
-  `(^|[${URL_LEAD}])(${QUERY_HOST_LEAD}[A-Za-z0-9._-]+(?::\\d+)?(?:\\/[^\\s?]*)?)\\?[^\\s'"]*=[^\\s'"]*(?=$|\\s|['"](?:[${SHELL_BREAK}]|$))`,
-  "g",
-);
-
-/**
- * 归约后**仍然残留**的单标签 `host/path?…=…` → 摘要整串不渲染。
- *
- * 路径段两边都是**可选**的。这一条不只是字符类要对齐:如果只有归约放宽、兜底照抄了「`?` 前必须
- * 有 `/`」这条**结构要求**,`host?query`(query 直接挂在裸主机上,`curl localhost?code=abc`)就会
- * 两边都不匹配 —— 归约不处理、兜底也不拦,原样渲染。兜底与被兜底者共享盲点时,兜底就不是兜底。
- *
- * 字母前瞻与 SCHEMELESS_QUERY_RE 一致。少了它,归约**主动不碰**的纯数字主机(`10/20?ok=yes`、
- * `2026-08-06?ok=yes`)会被兜底整串拦掉 —— 而 query 策略没有程序名可退,卡片直接空白,看起来
- * 像 bug。这说明「兜底的字符类必须 ⊇ 归约的」写窄了:两者真正需要的是**归约不肯动的地方,
- * 兜底也不要拦**;单向的包含关系只覆盖了泄漏方向,没覆盖过度隐藏方向。
- *
- * SCHEMELESS_QUERY_RE 只改写能干净收尾的形状;query 里嵌了引号的(JSON 参数、带引号的值、
- * OAuth 回调里的 `state='…'`)一趟都不匹配,而 `code=`/`sid=`/`refresh=` 这些既不在关键词表里、
- * 值也没有高熵形状,下游守卫同样抓不住 —— `code` 是 OAuth 授权码,等价于 bearer。
- */
-const RESIDUAL_QUERY_RE = new RegExp(
-  `${QUERY_HOST_LEAD}[A-Za-z0-9._-]+(?::\\d+)?(?:\\/[^\\s?]*)?\\?[^\\s]*=`,
-);
+function boundedForReduction(s: string): string | null {
+  if (s.length <= REDUCE_INPUT_MAX) return s;
+  const cut = s.slice(0, REDUCE_INPUT_MAX);
+  const lastSpace = cut.search(/\s\S*$/);
+  return lastSpace >= 0 ? cut.slice(0, lastSpace) : null;
+}
 
 /** 把文本里内嵌的 URI 就地降级为 scheme://注册域(解析失败则整段抹除)。 */
-export function reduceUrlsInText(s: string): string {
-  // 无条件先截断,再进管线 —— 见 REDUCE_INPUT_MAX。这里是这条管线的**唯一**入口,所以上限也
-  // 只该有这一处;放在任何一个调用方里都只挡住那一个调用方。
-  if (s.length > REDUCE_INPUT_MAX) s = s.slice(0, REDUCE_INPUT_MAX);
+export function reduceUrlsInText(input: string): string {
+  // 截断先于管线 —— 这里是这条管线的**唯一**入口,所以上限也只该有这一处;放在任何一个调用方
+  // 里都只挡住那一个调用方。
+  const s = boundedForReduction(input);
+  if (s === null) return "";
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。
   let out = s.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, (m) => originDomain(m) ?? "");
@@ -456,15 +410,6 @@ export function reduceUrlsInText(s: string): string {
   out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => (
     prefix + (originDomain(`https://${hostAndPath}`) ?? "")
   ));
-  // 5. 单标签主机的 `host/path?query`:上面几趟都要求主机带点,漏掉这一类,query 原样留下。
-  //
-  // 这一趟落在 reduceUrlsInText 里,所以它的另外几个调用方(display card 文本、action label、
-  // reasoning 文本、card-author、card-display-tool)一并生效。代价要说全,别只说样式:
-  // card-blocks.ts 的 noReducibleUrl 会因为更多串算作"可归约"而退到单个 TextBlock(丢富文本
-  // 样式);而 card-action-status.ts 的 neutralizeEcho 跑在**用户提交的输入值**上、结果会被冻结
-  // 到状态卡里 —— `docs/parser?mode=fast` → `docs/parser`,卡片记下的就不再是用户提交的原文。
-  // 这是内容保真的代价,不是样式的代价。见 README 的 scope note。
-  out = out.replace(SCHEMELESS_QUERY_RE, "$1$2");
   return out;
 }
 
@@ -496,7 +441,6 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
   // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
   // 输入上限住在 reduceUrlsInText 内部,这里不再重复设界(见 REDUCE_INPUT_MAX)。
   const s = reduceUrlsInText(v.replace(/\s+/g, " ").trim()).replace(/\s+/g, " ").trim();
-  if (RESIDUAL_QUERY_RE.test(s)) return "";
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
   // + 明确前缀,避免把 git SHA / docker digest / 缓存哈希等正常路径误伤成空。
   const generic = strategy === "query" || strategy === "url";

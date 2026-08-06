@@ -53,25 +53,27 @@ export const LEAK_CORPUS: CorpusRow[] = [
     expect: { exec: "gpg" },
     note: "R3:值里有转义引号,不能在转义处提前收尾",
   },
+  // 截断附近的凭据。**这一类此前一行都没有** —— PERF 组只测了截断的耗时,没有任何一组测
+  // 「截断对切口附近的凭据做了什么」,所以一条盲切引入的明文泄漏全绿通过了两个 reviewer。
   {
-    input: "internal/v1/pay?signature=dead",
-    expect: { grep: "internal/v1/pay", read: "internal/v1/pay" },
-    note: "R4:单标签主机的 query 段。main 原样渲染",
+    input: "alice:" + "h".repeat(3995) + "@db.example.com",
+    expect: { grep: "", read: "", exec: "" },
+    note: "R5-P0:盲切会切在口令与 `@host` 之间,归约失去锚点 → main `https://example.com`,盲切 `alice:hhhh…`。口令长时存活前缀从 offset 0 开始,64/120 的渲染上限挡不住",
   },
   {
-    input: "192.168.0.1?code=abc",
-    expect: { grep: "192.168.0.1", read: "192.168.0.1" },
-    note: "R4b:IPv4 字面量是内网最常见的无字母主机。OAuth code 等价于 bearer",
+    input: "user:" + "abcdefghij".repeat(400) + "@db.example.com",
+    expect: { grep: "", read: "", exec: "" },
+    note: "R5-P0:同上,另一种口令构成",
   },
   {
-    input: "127.0.0.1?sid=abcdef",
-    expect: { grep: "127.0.0.1", read: "127.0.0.1" },
-    note: "R4b:同上",
+    input: "z".repeat(3985) + " user:hunter2@db.example.com/prod",
+    expect: { grep: "z".repeat(64) + "…", read: "z".repeat(64) + "…" },
+    note: "R5-P0:切口落在 DSN 之前的那个空格上,DSN 整个在保留段之外 → 被丢掉,不是被切开。盲切会把它切成 `user:hunter2@d` 渲染出去",
   },
   {
-    input: `'localhost:8080/s?f={"a":1}&code=hunter2'`,
-    expect: { grep: "" },
-    note: "R4:query 里嵌引号 → 归约不改写(半改写会把命令改成另一条),整串不渲染",
+    input: "z".repeat(3990) + " AKIAIOSFODNN7EXAMPLE",
+    expect: { grep: "z".repeat(64) + "…", read: "z".repeat(64) + "…" },
+    note: "R4:横跨切口的密钥。切在空白上后 token 不会被切开 —— 密钥整个落在保留段之外、被丢掉,而不是留下一个守卫认不出的片段。盲切时它渲染成 `…AKIAIOSFO`",
   },
   {
     input: "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234",
@@ -110,7 +112,7 @@ export const BENIGN_CORPUS: CorpusRow[] = [
   {
     input: "8080?code=abc",
     expect: { grep: "8080?code=abc" },
-    note: "R4b:裸数字单标签。与上面两行形状一致,无法区分 → 已知残留,README 写明",
+    note: "R4b:裸数字单标签。与上面两行形状一致,无法区分 —— query 剥离那条已移出本分支,这行记录的是移出后的行为",
   },
   {
     input: "email:\\s*\\S+@\\S+",
@@ -133,6 +135,11 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     note: "既有:高熵检测不套用到 path,否则日常路径频繁空白",
   },
   {
+    input: "a".repeat(4100),
+    expect: { grep: "", read: "" },
+    note: "R5-P0:4000 字符内没有空白可切 → 整串不渲染。认不出结构就不渲染,与本模块其余部分同向;这是空白边界截断的代价,写在这里而不是靠读代码发现",
+  },
+  {
     input: "risk-averse task-force",
     expect: { grep: "risk-averse task-force" },
     note: "既有:前缀式密钥的长度下限不能误伤连字符英文",
@@ -145,36 +152,6 @@ export const BENIGN_CORPUS: CorpusRow[] = [
  * `https://sha256abcd`,`3:4@2/x` 曾被 new URL() 规范化成 `https://0.0.0.2`。
  */
 export const REWRITE_CORPUS: CorpusRow[] = [
-  {
-    input: "'localhost/reset?code=abc'",
-    expect: { read: "'localhost/reset'" },
-    note: "R4:命令行上给 URL 加引号是常态,前导集必须认引号",
-  },
-  {
-    input: "--url=localhost/reset?code=abc",
-    expect: { read: "--url=localhost/reset" },
-    note: "R4:query 前面粘的是 `=`",
-  },
-  {
-    input: "localhost?code=abc",
-    expect: { read: "localhost" },
-    note: "R4:query 直接挂在裸主机上,路径段两边都必须可选",
-  },
-  {
-    input: "1.2.3.4?rev=5",
-    expect: { grep: "1.2.3.4" },
-    note: "R4b 新增代价:四段数字版本号(.NET 程序集版本)与 IPv4 无法区分。README 写明",
-  },
-  {
-    input: "colou?r=red",
-    expect: { grep: "colou" },
-    note: "R4:grep 模式里 `?` 是量词的概率远大于 query 分隔符。静默改写,README 写明",
-  },
-  {
-    input: "reports/q3?draft=1.pdf",
-    expect: { read: "reports/q3" },
-    note: "R4:同上,文件名形态",
-  },
   {
     input: "user:pw@db.example.com:5432/prod",
     expect: { grep: "https://example.com" },
