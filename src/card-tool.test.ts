@@ -41,6 +41,13 @@ function setup(): void {
     inputs: ["Input.Text"],
     actions: ["Action.OpenUrl", "Action.ToggleVisibility", "Action.CopyToClipboard"],
     limits: { max_nodes: 20, max_depth: 8, max_payload_bytes: 16384 },
+    config: {
+      card_enabled: true,
+      display_enabled: true,
+      interaction_enabled: true,
+      reasoning_enabled: false,
+      reasoning_template_ref: null,
+    },
   });
   vi.mocked(sendCardMessage).mockResolvedValue({ message_id: "m1" } as never);
   vi.mocked(sendMessage).mockResolvedValue({ message_id: "fallback" } as never);
@@ -65,7 +72,7 @@ describe("octo_send_card", () => {
     setup();
   });
 
-  it("cardInteraction:false 时 discovery 不暴露工具", () => {
+  it("本地 cardInteraction:false 已弃用，discovery 不再读取它", () => {
     vi.mocked(resolveOctoAccount).mockReturnValue({
       accountId: "default",
       enabled: true,
@@ -78,7 +85,8 @@ describe("octo_send_card", () => {
         cardInteraction: false,
       },
     } as never);
-    expect(createInteractiveCardTool({ cfg, agentAccountId: "default", deliveryContext } as never)).toEqual([]);
+    expect(createInteractiveCardTool({ cfg, agentAccountId: "default", deliveryContext } as never))
+      .toHaveLength(1);
   });
 
   it("cfg 缺失、非 Octo 会话、无可用账号时不暴露工具", () => {
@@ -106,7 +114,7 @@ describe("octo_send_card", () => {
     vi.mocked(resolveOctoAccount).mockImplementation(({ accountId }: { accountId: string }) => ({
       accountId, enabled: true, configured: true, config: { botToken: "tok", cardInteraction: false },
     } as never));
-    expect(createInteractiveCardTool({ cfg } as never)).toEqual([]);
+    expect(createInteractiveCardTool({ cfg } as never)).toHaveLength(1);
 
     vi.mocked(listOctoAccountIds).mockImplementation(() => { throw new Error("bad config"); });
     expect(createInteractiveCardTool({ cfg } as never)).toEqual([]);
@@ -399,7 +407,7 @@ describe("octo_send_card", () => {
     }));
   });
 
-  it("execute 热更新 cardInteraction:false 或账号失效时拒绝副作用", async () => {
+  it("execute 忽略本地 cardInteraction:false，仍以服务端配置为准", async () => {
     const current = tool();
     vi.mocked(resolveOctoAccount).mockReturnValue({
       accountId: "default",
@@ -415,7 +423,36 @@ describe("octo_send_card", () => {
     } as never);
     expect((await current.execute("disabled", {
       title: "确认", buttons: [{ id: "ok", label: "确定" }],
-    })).content[0].text).toMatch(/disabled/i);
+    })).details).toEqual(expect.objectContaining({ sent: true, message_id: "m1" }));
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("服务端 interaction_enabled=false 时拒绝副作用，不降级发送文本", async () => {
+    vi.mocked(getCardProfile).mockResolvedValue({
+      available: true,
+      enabled: true,
+      profiles: ["octo/v1", "octo/v2"],
+      card_version: "1.5",
+      config: {
+        card_enabled: true,
+        display_enabled: true,
+        interaction_enabled: false,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
+    });
+
+    const result = await tool().execute("server-disabled", {
+      title: "确认", buttons: [{ id: "ok", label: "确定" }],
+    });
+
+    expect(result.content[0].text).toMatch(/disabled|plain text/i);
+    expect(sendCardMessage).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("execute 仍拒绝已失效账号", async () => {
+    const current = tool();
 
     vi.mocked(resolveOctoAccount).mockReturnValue({
       accountId: "default", enabled: false, configured: false, config: {},

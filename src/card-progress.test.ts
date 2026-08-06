@@ -105,6 +105,13 @@ function registryProfile(version = "0.2.0"): Record<string, unknown> {
   return {
     enabled: true,
     profiles: ["octo/v1", "octo/v2"],
+    config: {
+      card_enabled: true,
+      display_enabled: true,
+      interaction_enabled: true,
+      reasoning_enabled: true,
+      reasoning_template_ref: { id: "ai.reasoning-process", version },
+    },
     templating: {
       supported: true,
       wire: "template-ref/v1",
@@ -469,6 +476,105 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(payload).not.toHaveProperty("card");
   });
 
+  it("服务端 reasoning_enabled=false 时不发送任何推理进度卡", async () => {
+    const profile = registryProfile("0.3.0");
+    profile.config = {
+      card_enabled: true,
+      display_enabled: true,
+      interaction_enabled: true,
+      reasoning_enabled: false,
+      reasoning_template_ref: null,
+    };
+    const { fn, calls } = mockFetch({ profile });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "server-reasoning-disabled", runId: "run-1" };
+
+    setCardContext(hookCtx.sessionKey, {
+      apiUrl: "https://server-reasoning-disabled.test",
+      botToken: "bot-a",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      reasoningVisibility: "stream",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.model_call_started({ callId: "call-1" }, hookCtx);
+    recordCardReasoning(hookCtx.sessionKey, "先核对服务端配置。", { snapshot: true });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    expect(calls.some((call) => call.url.includes("/card/profile"))).toBe(true);
+    expect(calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+  });
+
+  it("reasoning ref 缺失或不在 catalog 时 fail closed，不发送 Model B", async () => {
+    for (const profile of [
+      {
+        ...registryProfile("0.3.0"),
+        config: {
+          card_enabled: true,
+          display_enabled: true,
+          interaction_enabled: true,
+          reasoning_enabled: true,
+          reasoning_template_ref: null,
+        },
+      },
+      {
+        ...registryProfile("0.3.0"),
+        config: {
+          card_enabled: true,
+          display_enabled: true,
+          interaction_enabled: true,
+          reasoning_enabled: true,
+          reasoning_template_ref: { id: "ai.reasoning-process", version: "9.9.9" },
+        },
+      },
+    ]) {
+      _resetCardProgressForTests();
+      const { fn, calls } = mockFetch({ profile });
+      global.fetch = fn as unknown as typeof fetch;
+      const { handlers } = makeApi();
+      const sessionKey = `invalid-server-ref-${String((profile.config as { reasoning_template_ref: unknown }).reasoning_template_ref)}`;
+      setCardContext(sessionKey, {
+        apiUrl: `https://${sessionKey}.test`,
+        botToken: "bot-a",
+        channelId: "g",
+        channelType: ChannelType.Group,
+      });
+      handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, { sessionKey });
+      await vi.advanceTimersByTimeAsync(900);
+
+      expect(calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+    }
+  });
+
+  it("忽略本地 cardProgress/reasoningCardTemplateMode，按服务端有效配置发送 Registry 模板", async () => {
+    const { fn, calls } = mockFetch({ profile: registryProfile("0.3.0") });
+    global.fetch = fn as unknown as typeof fetch;
+    const { handlers } = makeApi();
+    const hookCtx = { sessionKey: "server-policy-over-local", runId: "run-1" };
+
+    setCardContext(hookCtx.sessionKey, {
+      apiUrl: "https://server-policy-over-local.test",
+      botToken: "bot-a",
+      channelId: "g",
+      channelType: ChannelType.Group,
+      cardProgress: false,
+      reasoningCardTemplateMode: "off",
+      reasoningVisibility: "stream",
+    });
+    handlers.before_agent_run({}, hookCtx);
+    handlers.model_call_started({ callId: "call-1" }, hookCtx);
+    recordCardReasoning(hookCtx.sessionKey, "服务端配置是唯一策略来源。", { snapshot: true });
+    handlers.before_tool_call({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const sends = calls.filter((call) => call.url.includes("/sendMessage"));
+    expect(sends).toHaveLength(1);
+    expect(sends[0]?.body?.payload).toHaveProperty("template_ref.version", "0.3.0");
+    expect(sends[0]?.body?.payload).not.toHaveProperty("card");
+  });
+
   it("shadow 模式只验证 manifest，仍发送 Model B 完整卡", async () => {
     const { fn, calls } = mockFetch({
       profile: {
@@ -674,7 +780,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
     expect(appliedSeqs).toEqual([...appliedSeqs].sort((a, b) => a - b));
   });
 
-  it("Model A 首帧被确定性拒绝时，在同一 flush 内仅回退一次兼容的 Model B", async () => {
+  it("Registry 首帧被确定性拒绝时也绝不回退本地 Model B", async () => {
     const calls: Array<{ url: string; body: Record<string, unknown> | undefined }> = [];
     global.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: string }) => {
       const target = String(url);
@@ -693,7 +799,7 @@ describe("card-progress 状态机 + hook + 节流", () => {
             text: async () => '{"code":"card_invalid"}',
           };
         }
-        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "fallback-card" }) };
+        return { ok: true, status: 200, text: async () => JSON.stringify({ message_id: "must-not-send-model-b" }) };
       }
       return { ok: true, status: 200, text: async () => "" };
     }) as unknown as typeof fetch;
@@ -711,16 +817,13 @@ describe("card-progress 状态机 + hook + 节流", () => {
     await vi.advanceTimersByTimeAsync(900);
 
     const sends = calls.filter((call) => call.url.includes("/sendMessage"));
-    expect(sends).toHaveLength(2);
+    expect(sends).toHaveLength(1);
     expect(sends[0]?.body?.payload).toHaveProperty("template_ref.version", "0.3.0");
-    expect(sends[1]?.body?.payload).toHaveProperty("card");
-    expect(sends[1]?.body?.payload).not.toHaveProperty("template_ref");
+    expect(sends.some((send) => Object.hasOwn(send.body?.payload ?? {}, "card"))).toBe(false);
 
     markCardAnswering(sessionKey);
     await vi.advanceTimersByTimeAsync(900);
-    const edit = calls.find((call) => call.url.includes("/message/edit"))?.body;
-    expect(edit).toHaveProperty("content_edit");
-    expect(edit).not.toHaveProperty("template_ref");
+    expect(calls.some((call) => call.url.includes("/message/edit"))).toBe(false);
   });
 
   it.each([

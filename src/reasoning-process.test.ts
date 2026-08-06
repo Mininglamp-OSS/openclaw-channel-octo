@@ -226,6 +226,32 @@ describe("reasoning process template discovery", () => {
     }
   });
 
+  it("selects the exact server-configured ref when the catalog advertises multiple compatible versions", () => {
+    expect(selectReasoningProcessTemplate({
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [template("0.2.0"), template("0.3.0")],
+    }, { id: "ai.reasoning-process", version: "0.3.0" })).toEqual({
+      id: "ai.reasoning-process",
+      version: "0.3.0",
+    });
+  });
+
+  it("fails closed when the configured ref is absent, malformed, or points at an incompatible entry", () => {
+    const incompatible = { ...template("0.3.0"), views: template("0.3.0").views.slice(0, 2) };
+    const templating = {
+      supported: true,
+      wire: "template-ref/v1",
+      templates: [template("0.2.0"), incompatible],
+    };
+
+    expect(selectReasoningProcessTemplate(templating, null)).toBeNull();
+    expect(selectReasoningProcessTemplate(templating, { id: "ai.reasoning-process", version: "0.4.0" }))
+      .toBeNull();
+    expect(selectReasoningProcessTemplate(templating, { id: "ai.reasoning-process", version: "0.3.0" }))
+      .toBeNull();
+  });
+
   it("selects the sole compatible version when another advertised version has incompatible views", () => {
     const incompatible = { ...template("0.2.0"), views: template("0.2.0").views.slice(0, 2) };
     expect(selectReasoningProcessTemplate({

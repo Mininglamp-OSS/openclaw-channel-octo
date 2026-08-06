@@ -2241,3 +2241,84 @@ describe("eventsPollTimeoutMs", () => {
     expect(eventsPollTimeoutMs(30) - 30_000).toBeGreaterThanOrEqual(5_000);
   });
 });
+
+describe("getCardProfile server-driven config", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("parses the effective per-bot card config without changing existing capability fields", async () => {
+    global.fetch = vi.fn().mockResolvedValue(Response.json({
+      enabled: true,
+      card_version: "1.5",
+      profiles: ["octo/v1", "octo/v2"],
+      elements: ["TextBlock"],
+      config: {
+        card_enabled: true,
+        display_enabled: true,
+        interaction_enabled: false,
+        reasoning_enabled: true,
+        reasoning_template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+      },
+    })) as typeof fetch;
+
+    const { getCardProfile } = await import("./api-fetch.js");
+    const profile = await getCardProfile({ apiUrl: "https://api.test", botToken: "bot-a" });
+
+    expect(profile).toMatchObject({
+      available: true,
+      enabled: true,
+      card_version: "1.5",
+      profiles: ["octo/v1", "octo/v2"],
+      elements: ["TextBlock"],
+      config: {
+        card_enabled: true,
+        display_enabled: true,
+        interaction_enabled: false,
+        reasoning_enabled: true,
+        reasoning_template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+      },
+    });
+  });
+
+  it.each([
+    null,
+    {},
+    {
+      card_enabled: true,
+      display_enabled: true,
+      interaction_enabled: true,
+      reasoning_enabled: true,
+      reasoning_template_ref: null,
+    },
+    {
+      card_enabled: true,
+      display_enabled: true,
+      interaction_enabled: true,
+      reasoning_enabled: false,
+      reasoning_template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+    },
+  ])("fails closed on a missing, malformed, or internally inconsistent config: %j", async (config) => {
+    global.fetch = vi.fn().mockResolvedValue(Response.json({
+      enabled: true,
+      profiles: ["octo/v1", "octo/v2"],
+      config,
+    })) as typeof fetch;
+
+    const { getCardProfile } = await import("./api-fetch.js");
+    const profile = await getCardProfile({ apiUrl: "https://api.test", botToken: "bot-a" });
+
+    expect(profile.config).toBeUndefined();
+  });
+
+  it("propagates a profile 500 instead of caching it as a disabled policy", async () => {
+    global.fetch = vi.fn().mockResolvedValue(new Response("internal", { status: 500 })) as typeof fetch;
+
+    const { getCardProfile } = await import("./api-fetch.js");
+    await expect(getCardProfile({ apiUrl: "https://api.test", botToken: "bot-a" }))
+      .rejects.toThrow(/card\/profile failed \(500\)/);
+  });
+});
