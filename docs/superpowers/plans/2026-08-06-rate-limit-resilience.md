@@ -49,7 +49,10 @@
 
 **Interfaces:**
 - Consumes: 无（最底层）。
-- Produces: `class OctoApiError extends Error`，字段 `status: number`、`path: string`、`body: string`、`retryAfterMs: number`、`rateLimitScope?: string`、`rateLimitRemaining?: string`，getter `isRateLimited: boolean`；静态 `OctoApiError.from(resp: ResponseLike, path: string, body: string): OctoApiError`。常量 `DEFAULT_RETRY_AFTER_MS = 1_000`。
+- Produces: `class OctoApiError extends Error`，字段 `status: number`、`path: string`、`body: string`、`retryAfterMs: number`、`rateLimitScope?: string`、`rateLimitRemaining?: string`，getter `isRateLimited: boolean`；静态 `OctoApiError.from(resp: ResponseLike, path: string, body: string): OctoApiError`。常量 `DEFAULT_RETRY_AFTER_MS = 1_000`、`MAX_ERROR_BODY_CHARS = 500`。
+
+> `body` 要截断到 `MAX_ERROR_BODY_CHARS`：错误体会进日志和 `message`，一个返回整页 HTML 的网关能把单条日志顶到几十 KB。截断只影响展示，`status` / `retryAfterMs` 都是从头或已解析的 JSON 里取的，不受影响。
+
 
 - [ ] **Step 1: 写失败测试**
 
@@ -172,6 +175,14 @@ Expected: FAIL — `Cannot find module './api-error.js'`
 /** Fallback wait when the server rate-limits without a usable hint. */
 export const DEFAULT_RETRY_AFTER_MS = 1_000;
 
+/**
+ * Cap on the response body kept for the message and the logs. A gateway answering
+ * with a full HTML error page would otherwise put tens of KB into a single log line.
+ * Truncation is cosmetic: the status comes from the response and the retry hint from
+ * the headers or the already-parsed JSON.
+ */
+export const MAX_ERROR_BODY_CHARS = 500;
+
 /** The subset of `Response` this module reads, so tests and non-standard bodies both fit. */
 export interface ResponseLike {
   status: number;
@@ -241,10 +252,13 @@ export class OctoApiError extends Error {
   }
 
   static from(resp: ResponseLike, path: string, body: string): OctoApiError {
+    const text = body || resp.statusText || "";
     return new OctoApiError({
       status: resp.status,
       path,
-      body: body || resp.statusText || "",
+      body: text.length > MAX_ERROR_BODY_CHARS ? `${text.slice(0, MAX_ERROR_BODY_CHARS)}…` : text,
+      // Parsed from the untruncated body: a retry hint sitting past the cap must not
+      // be lost to a display concern.
       retryAfterMs:
         secondsToMs(header(resp, "Retry-After")) ??
         retryAfterFromBody(body) ??
@@ -452,6 +466,12 @@ export const MAX_429_BACKOFF_WAIT_MS = 15_000;
 ```ts
 /** Sleep that rejects as soon as the caller's signal aborts, preserving `cause`. */
 function backoffSleep(ms: number, signal: AbortSignal | undefined, cause: unknown): Promise<void> {
+  // Checked before arming anything: an abort that landed between the fetch returning
+  // and this call would otherwise be missed entirely, and we would serve the full wait
+  // (under fake timers, forever).
+  if (signal?.aborted) {
+    return Promise.reject(new Error("aborted while backing off from a rate limit", { cause }));
+  }
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
@@ -461,7 +481,7 @@ function backoffSleep(ms: number, signal: AbortSignal | undefined, cause: unknow
       clearTimeout(timer);
       // Surface the rate limiting as the cause; without it the site of failure
       // only shows a generic abort and the 429 diagnosis is lost.
-      reject(new Error(`aborted while backing off from a rate limit`, { cause }));
+      reject(new Error("aborted while backing off from a rate limit", { cause }));
     };
     signal?.addEventListener("abort", onAbort, { once: true });
   });
@@ -561,7 +581,7 @@ git commit -m "feat(api): back off once per call on 429, never earlier than Retr
 
 - [ ] **Step 1: 写失败测试**
 
-追加到 `src/api-fetch.test.ts`：
+追加到 `src/api-fetch.test.ts`（**沿用该文件顶部已有的 vitest import，不要重复 import**）：
 
 ```ts
 describe("callers that opt out of the shared 429 backoff", () => {
@@ -572,33 +592,50 @@ describe("callers that opt out of the shared 429 backoff", () => {
   });
 
   // Each of these has its own cadence — a periodic beat, a discardable hint, or a
-  // poller with outcome-based pacing — so a hidden sleep inside the call is wrong.
+  // sequential loop that paces itself — so a hidden sleep inside the call is wrong.
   it.each([
     ["sendHeartbeat", () => sendHeartbeat({ apiUrl: "https://x.test", botToken: "bf" })],
-    ["sendTyping", () => sendTyping({ apiUrl: "https://x.test", botToken: "bf", channelId: "g", channelType: 2 })],
-    ["sendReadReceipt", () => sendReadReceipt({ apiUrl: "https://x.test", botToken: "bf", channelId: "g", channelType: 2, messageIds: ["1"] })],
-    ["fetchBotEvents", () => fetchBotEvents({ apiUrl: "https://x.test", botToken: "bf", cursor: 0 })],
-    ["ackBotEvent", () => ackBotEvent({ apiUrl: "https://x.test", botToken: "bf", eventId: "e1" })],
+    ["sendTyping", () => sendTyping({ apiUrl: "https://x.test", botToken: "bf", channelId: "g", channelType: ChannelType.Group })],
+    ["sendReadReceipt", () => sendReadReceipt({ apiUrl: "https://x.test", botToken: "bf", channelId: "g", channelType: ChannelType.Group, messageIds: ["1"] })],
+    ["fetchBotEvents", () => fetchBotEvents({ apiUrl: "https://x.test", botToken: "bf", sinceEventId: 0 })],
+    ["ackBotEvent", () => ackBotEvent({ apiUrl: "https://x.test", botToken: "bf", eventId: 1 })],
   ])("%s issues exactly one request on 429", async (_name, call) => {
     const fetchMock = vi.fn().mockResolvedValue(rateLimited());
     global.fetch = fetchMock as unknown as typeof fetch;
     await expect(call()).rejects.toMatchObject({ status: 429 });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  // The long poll asks for far more than the default deadline; capping it would abort
+  // mid-hold and throw away the batch the server was about to return.
+  it("leaves a 30s hold's 40s deadline intact", async () => {
+    let seen: AbortSignal | undefined;
+    global.fetch = vi.fn(async (_u: string, init: RequestInit) => {
+      seen = init.signal as AbortSignal;
+      return { ok: true, status: 200, headers: { get: () => null }, text: async () => "{}" };
+    }) as unknown as typeof fetch;
+    await fetchBotEvents({ apiUrl: "https://x.test", botToken: "bf", sinceEventId: 0, waitSeconds: 30 });
+    // 40s = 30s hold + EVENTS_POLL_WAIT_MARGIN_MS; assert it is not the 30s default by
+    // advancing past 30s under fake timers and checking the signal has not aborted.
+    expect(seen?.aborted).toBe(false);
+  });
 });
 ```
 
-追加到 `src/events-poll.test.ts`（沿用该文件已有的 poller 搭建方式）：
+在 `src/events-poll.test.ts` 追加（沿用该文件已有的 poller 搭建方式）：
 
 ```ts
 // The poller decides whether the server really held by measuring elapsed time around
 // the whole request. A backoff sleep inside the request inflates that measurement, so
 // an empty fast return would read as an honoured hold and re-poll at 0ms — the hot loop
 // the outcome-based pacing exists to prevent.
-it("keeps a 429 from inflating the measured hold", async () => {
-  // 断言：429 时只发一次请求，且下一次 tick 的间隔走错误退避（≥ intervalMs），不是 0ms。
+it("does not let a 429 inflate the measured hold", async () => {
+  // waitSeconds=4(阈值 2000ms)。让 /v1/bot/events 恒返 429 且响应立即。
+  // 断言:每个 tick 只有一次 fetch(内部没重试),且下一次 tick 的间隔走错误退避
+  // (≥ intervalMs),不是 0ms —— 在 intervalMs 内推进时间不应看到第二次请求。
 });
 ```
+
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -620,12 +657,21 @@ Expected: FAIL —— 现在这五个都会重试到 3 次
 
 `sendTyping`（`:816`）与 `sendReadReceipt`（`:831`）同样加 `{ retryOn429: false }`，注释写"discardable hint, retrying only adds pressure"。
 
-`fetchBotEvents`（`:779`）与 `ackBotEvent`（`:799`）加 `{ retryOn429: false }`，注释：
+`fetchBotEvents`（`:779`）加 `{ retryOn429: false }`，注释：
 
 ```ts
   // The poll loop paces itself from the outcome of each request, including an
   // exponential backoff on errors. It also infers "did the server hold?" from the
-  // elapsed time, which a sleep inside this call would corrupt.
+  // elapsed time around this call, which a sleep inside it would corrupt.
+```
+
+`ackBotEvent`（`:851`）加 `{ retryOn429: false }`，注释（**理由与 fetch 不同**）：
+
+```ts
+  // An ack runs inside the loop's sequential drain and its failure is only logged —
+  // it never becomes a poll outcome, so nothing downstream would pace a retry. A sleep
+  // here would just stall the events queued behind this one. The cursor is persisted
+  // before the ack, so a lost ack costs at most one redelivery.
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -874,34 +920,115 @@ git commit -m "feat(heartbeat): extract a loop that cannot reach the socket"
 
 **Interfaces:**
 - Consumes: 无。
-- Produces: `WKSocket` 新增 `isConnectingOrConnected(): boolean`、`hasPendingReconnect(): boolean`；常量 `CONNECT_DEADLINE_MS = 15_000`。
+- Produces: `WKSocket` 新增三个只读访问器 —— `isConnected(): boolean`（读 private `connected`，**CONNACK 成功之后**才为真）、`isConnectingOrConnected(): boolean`（readyState 为 CONNECTING/OPEN）、`hasPendingReconnect(): boolean`；导出常量 `export const CONNECT_DEADLINE_MS = 15_000`。
 
-- [ ] **Step 1: 写失败测试**
+> **两个连接谓词不是一回事，别混用。**`isConnected()` 回答"握手完成、可以正常收发了吗"—— 心跳用它，否则在 OPEN 但未 CONNACK 的窗口里会发出一个谎报在线的心跳。`isConnectingOrConnected()` 回答"有人正在建连吗"—— 监督者用它，避免插手一次正在进行的建连。
 
-追加到 `src/reconnect-fixes.test.ts`：
+- [ ] **Step 1: 先扩展 harness，再写测试**
+
+`src/reconnect-fixes.test.ts:7-42` 已有 `vi.mock("ws")` 的 `MockWS` 与真实 `WKSocket`。它的 `readyState` 硬编码为 1、且只有 `static OPEN = 1` —— 要测 CONNECTING 必须先扩展它。**只做加法**，现有 20 多个用例默认行为不变：
 
 ```ts
-// 建连全程（CONNECTING → OPEN → CONNACK）都要有 deadline。connected 只在 CONNACK 之后
-// 才置真、心跳定时器也只在那时才起，所以卡在这两段里都不会有 close 事件、也不会有 ping
-// 超时把连接救回来 —— 没有 deadline 就是永久挂住。
-it("closes a connection stuck before CONNACK", async () => {
-  // 用一个永不 open 的假 WebSocket 起 socket.connect()，推进 CONNECT_DEADLINE_MS，
-  // 断言 close 被调用、且随后排了重连。
-});
-
-it("closes a connection that opened but never got CONNACK", async () => {
-  // 假 WebSocket 触发 open 后不回 CONNACK，推进 CONNECT_DEADLINE_MS，断言同上。
-});
-
-// 旧 socket 的 deadline 到点时不得关掉刚建好的新连接。
-it("does not let a stale connect deadline close a newer socket", async () => { /* ... */ });
-
-// hasPendingReconnect 是 watchdog 的谓词之一。定时器触发后若句柄仍非 null，
-// 谓词会永久为真，watchdog 被永久哑掉。
-it("reports no pending reconnect once the timer has fired", async () => { /* ... */ });
-
-it("reports CONNECTING as connecting-or-connected", async () => { /* ... */ });
+  class MockWS {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    binaryType = "arraybuffer";
+    readyState = 1;          // defaults to OPEN so existing tests are unaffected
+    closed = false;
+    // ... 其余不变 ...
+    close() {
+      this.closed = true;
+      this.readyState = 3;   // CLOSED, so isConnectingOrConnected() goes false
+      queueMicrotask(() => this.emit("close"));
+    }
+  }
 ```
+
+追加用例：
+
+```ts
+describe("connection build-up deadline", () => {
+  // connected、心跳定时器、稳定计时器全都只在 CONNACK 之后才起，所以卡在 CONNACK 之前
+  // 既不会有 close 事件、也不会有 ping 超时把连接救回来 —— 没有 deadline 就是永久挂住，
+  // 而监督者的 isConnectingOrConnected() 谓词恰好会拒绝救这一种。
+  it("closes a socket that never leaves CONNECTING", async () => {
+    vi.useFakeTimers();
+    const instances: any[] = [];
+    (globalThis as any).__mockWsInstances = instances;
+    const socket = new WKSocket({ wsUrl: "ws://x", uid: "u", token: "t", onMessage: () => {} });
+    socket.connect();
+    instances[0].readyState = 0; // CONNECTING: never opens
+    expect(socket.isConnectingOrConnected()).toBe(true);
+    await vi.advanceTimersByTimeAsync(CONNECT_DEADLINE_MS + 1);
+    expect(instances[0].closed).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("closes a socket that opened but never got CONNACK", async () => {
+    vi.useFakeTimers();
+    const instances: any[] = [];
+    (globalThis as any).__mockWsInstances = instances;
+    const socket = new WKSocket({ wsUrl: "ws://x", uid: "u", token: "t", onMessage: () => {} });
+    socket.connect();
+    instances[0].emit("open");          // sends CONNECT, then silence
+    expect(socket.isConnected()).toBe(false);
+    await vi.advanceTimersByTimeAsync(CONNECT_DEADLINE_MS + 1);
+    expect(instances[0].closed).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("clears the deadline on a successful CONNACK", async () => {
+    vi.useFakeTimers();
+    const instances: any[] = [];
+    (globalThis as any).__mockWsInstances = instances;
+    const socket = new WKSocket({ wsUrl: "ws://x", uid: "u", token: "t", onMessage: () => {} });
+    socket.connect();
+    instances[0].emit("open");
+    instances[0].emit("message", buildConnackPacket(1));
+    expect(socket.isConnected()).toBe(true);
+    await vi.advanceTimersByTimeAsync(CONNECT_DEADLINE_MS + 1);
+    expect(instances[0].closed).toBe(false); // no stale deadline fired
+    vi.useRealTimers();
+  });
+
+  // 旧 socket 的 deadline 到点时不得关掉刚建好的新连接。
+  it("does not let a stale deadline close a newer socket", async () => {
+    vi.useFakeTimers();
+    const instances: any[] = [];
+    (globalThis as any).__mockWsInstances = instances;
+    const socket = new WKSocket({ wsUrl: "ws://x", uid: "u", token: "t", onMessage: () => {} });
+    socket.connect();                     // instances[0]
+    socket.connect();                     // instances[1] replaces it
+    instances[1].emit("open");
+    instances[1].emit("message", buildConnackPacket(1));
+    await vi.advanceTimersByTimeAsync(CONNECT_DEADLINE_MS + 1);
+    expect(instances[1].closed).toBe(false);
+    vi.useRealTimers();
+  });
+});
+
+describe("reconnect handle bookkeeping", () => {
+  // hasPendingReconnect 是监督者的谓词之一。定时器触发后若句柄仍非 null,
+  // 谓词永久为真,监督者被永久哑掉 —— 这是本次要修的既存 bug。
+  it("reports no pending reconnect once the timer has fired", async () => {
+    vi.useFakeTimers();
+    const instances: any[] = [];
+    (globalThis as any).__mockWsInstances = instances;
+    const socket = new WKSocket({ wsUrl: "ws://x", uid: "u", token: "t", onMessage: () => {} });
+    socket.connect();
+    instances[0].emit("open");
+    instances[0].emit("message", buildConnackPacket(1));
+    instances[0].emit("close");                  // triggers scheduleReconnect
+    expect(socket.hasPendingReconnect()).toBe(true);
+    await vi.advanceTimersByTimeAsync(70_000);   // past the capped backoff
+    expect(socket.hasPendingReconnect()).toBe(false);
+    vi.useRealTimers();
+  });
+});
+```
+
+`CONNECT_DEADLINE_MS` 从 `./socket.js` import —— 这是它必须 `export` 的原因，别在测试里复制字面量。
+
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -974,13 +1101,30 @@ const CONNECT_DEADLINE_MS = 15_000;
     }, delay);
 ```
 
-新增两个公开访问器（放在 `disconnectAndWait` 之后）：
+新增三个公开访问器（放在 `disconnectAndWait` 之后）：
 
 ```ts
-  /** True while a socket exists and is either connecting or open. */
+  /**
+   * True only after a successful CONNACK — i.e. the connection can actually carry
+   * traffic. Distinct from isConnectingOrConnected(): between `open` and CONNACK the
+   * socket is OPEN but unusable, and anything that reports liveness must not treat
+   * that window as connected.
+   */
+  isConnected(): boolean {
+    return this.connected;
+  }
+
+  /**
+   * True while a socket exists and is either connecting or open — "somebody is already
+   * building this connection, stay out of the way".
+   *
+   * Compared against the WHATWG numeric readyState values rather than the ws class's
+   * static properties: the class is mocked in tests, and a mock that omits a static
+   * would silently make this predicate wrong instead of failing loudly.
+   */
   isConnectingOrConnected(): boolean {
     const state = this.ws?.readyState;
-    return state === WebSocket.CONNECTING || state === WebSocket.OPEN;
+    return state === 0 /* CONNECTING */ || state === 1 /* OPEN */;
   }
 
   /** True while a backoff reconnect is scheduled but has not fired. */
@@ -1178,20 +1322,82 @@ git commit -m "feat(socket): add a supervisor that revives a stranded connection
 
 - [ ] **Step 1: 写失败测试**
 
-追加到 `src/reconnect-fixes.test.ts`：
+`channel.ts` 的 `registerBot` 是个大闭包，整体起账号太重。这三条改测**导出的谓词形状**而非整条闭包 —— 把谓词与序列包装器的行为抽成可测单元：在 `channel.ts` 里 `export` 两个 test-only 工厂（前缀 `_`，与本仓已有 test-only helper 的惯例一致），供测试直接驱动：
 
 ```ts
-// 重连序列执行中这个状态今天在代码里没有任何表示。cooldown 回调先把自己的句柄置 null，
-// 再 await disconnectAndWait()，而后者同步清掉 ws、needReconnect 和 socket 的重连定时器 ——
-// 那个 await 期间所有「有人在管重连」的迹象都消失了，监督者会并发建第二条连接。
-it("keeps the watchdog out while a reconnect sequence is mid-await", async () => { /* ... */ });
-
-it("re-checks stopped after each await in a reconnect sequence", async () => { /* ... */ });
-
-// registerBot 在限流风暴里同样会 429。此前 catch 只打一行日志就结束，留下
-// needReconnect=false、无定时器、心跳已停 —— 进程活着但永久假死。
-it("schedules a reconnect after a failed re-register", async () => { /* ... */ });
+// channel.ts —— test-only exports，生产路径也用这两个，不是测试专用的第二实现
+export function _createReconnectSequencer(): {
+  run: (label: string, fn: () => Promise<void>) => Promise<void>;
+  isInFlight: () => boolean;
+}
+export function _buildWatchdogPredicate(deps: {
+  isStopped: () => boolean;
+  isReconnectInFlight: () => boolean;
+  isConnectingOrConnected: () => boolean;
+  hasPendingReconnect: () => boolean;
+  isRefreshingToken: () => boolean;
+  hasCooldownTimer: () => boolean;
+}): () => boolean
 ```
+
+测试：
+
+```ts
+describe("watchdog predicate", () => {
+  const deps = (over: Partial<Parameters<typeof _buildWatchdogPredicate>[0]> = {}) =>
+    _buildWatchdogPredicate({
+      isStopped: () => false,
+      isReconnectInFlight: () => false,
+      isConnectingOrConnected: () => false,
+      hasPendingReconnect: () => false,
+      isRefreshingToken: () => false,
+      hasCooldownTimer: () => false,
+      ...over,
+    });
+
+  it("says yes only when nobody at all is managing the connection", () => {
+    expect(deps()()).toBe(true);
+  });
+
+  // 每一项单独足以否决。cooldown 回调那一项最不直观:它先把自己的句柄置 null,
+  // 再 await disconnectAndWait() —— 而后者同步清掉 ws、needReconnect 和 socket 的
+  // 重连定时器,所以那个 await 期间其余四项全部放行,只有 reconnectInFlight 挡得住。
+  it.each([
+    ["stopped", { isStopped: () => true }],
+    ["a sequence mid-await", { isReconnectInFlight: () => true }],
+    ["a socket already connecting", { isConnectingOrConnected: () => true }],
+    ["a scheduled backoff", { hasPendingReconnect: () => true }],
+    ["a token refresh", { isRefreshingToken: () => true }],
+    ["a queued cooldown", { hasCooldownTimer: () => true }],
+  ])("says no while there is %s", (_name, over) => {
+    expect(deps(over)()).toBe(false);
+  });
+});
+
+describe("reconnect sequencer", () => {
+  it("runs one sequence at a time and reports in-flight while awaiting", async () => {
+    const seq = _createReconnectSequencer();
+    let release: (() => void) | undefined;
+    const first = seq.run("a", () => new Promise<void>((res) => { release = res; }));
+    expect(seq.isInFlight()).toBe(true);
+    const second = vi.fn(async () => {});
+    await seq.run("b", second);
+    expect(second).not.toHaveBeenCalled();   // rejected while one is in flight
+    release?.();
+    await first;
+    expect(seq.isInFlight()).toBe(false);
+  });
+
+  it("clears the flag even when the sequence throws", async () => {
+    const seq = _createReconnectSequencer();
+    await seq.run("boom", async () => { throw new Error("x"); });
+    expect(seq.isInFlight()).toBe(false);
+  });
+});
+```
+
+对 `registerBot` 失败后必须留下可取消的重连这条，在 `src/channel.test.ts` 里按该文件已有的账号启动方式断言：`registerBot` 第二次调用抛 429 后，**存在一个待执行的重连定时器**（用 `vi.getTimerCount()` 的增量，或注入的时钟），且 cleanup 能把它清掉 —— 关键是不能再出现"无人持有的裸 setTimeout"。
+
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -1220,7 +1426,7 @@ import { createConnectionWatchdog } from "./connection-watchdog.js";
         accountId: account.accountId,
         send: (signal) =>
           sendHeartbeat({ apiUrl: account.config.apiUrl, botToken: account.config.botToken!, signal }),
-        isConnected: () => socket.isConnectingOrConnected(),
+        isConnected: () => socket.isConnected(),
         log,
       });
 
@@ -1272,29 +1478,38 @@ import { createConnectionWatchdog } from "./connection-watchdog.js";
               // and the socket's own timer had been cleared, so nothing was left to try
               // again. Under a rate-limit storm /v1/bot/register is exactly as likely to
               // fail as the call that got us here.
-              if (!stopped) {
-                const retryMs = 5_000 + Math.floor(Math.random() * 5_000);
-                setTimeout(() => {
-                  if (!stopped) socket.connect();
-                }, retryMs);
-              }
+              //
+              // Reuses the tracked cooldown timer rather than a bare setTimeout: an
+              // untracked timer is invisible to the watchdog predicate and to cleanup,
+              // which is the same class of defect this task exists to remove.
+              scheduleTrackedReconnect("post-register-retry");
             }
 ```
 
-cooldown 分支的回调包进 `runReconnectSequence("cooldown", ...)`，并在 `await` 之后补 `stopped` 复查：
+新增一个共用的排程器（与 `runReconnectSequence` 放在一起），cooldown 分支与这里都用它：
 
 ```ts
-            cooldownReconnectTimer = setTimeout(() => {
-              cooldownReconnectTimer = null;
-              void runReconnectSequence("cooldown", async () => {
-                if (stopped) return;
-                await socket.disconnectAndWait();
-                if (stopped) return; // the account can stop while we wait above
-                socket.stopReconnectTimer();
-                socket.connect();
-              });
-            }, backoffMs);
+      const scheduleTrackedReconnect = (label: string): void => {
+        if (stopped) return;
+        // One tracked handle for every deferred reconnect. Replacing an existing one is
+        // deliberate — two pending reconnects would race and kick each other (the
+        // failure this handle was originally introduced to stop).
+        if (cooldownReconnectTimer) clearTimeout(cooldownReconnectTimer);
+        const backoffMs = 5_000 + Math.floor(Math.random() * 5_000);
+        cooldownReconnectTimer = setTimeout(() => {
+          cooldownReconnectTimer = null;
+          void runReconnectSequence(label, async () => {
+            if (stopped) return;
+            await socket.disconnectAndWait();
+            if (stopped) return; // the account can stop while we wait above
+            socket.stopReconnectTimer();
+            socket.connect();
+          });
+        }, backoffMs);
+      };
 ```
+
+cooldown 分支（`:1668-1680`）整体替换为 `scheduleTrackedReconnect("cooldown")`；cleanup 里加 `if (cooldownReconnectTimer) clearTimeout(cooldownReconnectTimer);`（若尚未有）。
 
 `socket.connect()`（`:1685`）之后加 `heartbeat.start(); watchdog.start();`；cleanup（`:1689-1700`）里加 `heartbeat.stop(); watchdog.stop();`。
 
@@ -1315,46 +1530,66 @@ git commit -m "fix(channel): keep the beat off the socket and leave no unmanaged
 ### Task 8: `card-progress.ts` —— 退出 429 重试 + 冷却门
 
 **Files:**
-- Modify: `src/card-progress.ts:407-418`（`isRetryableRegistryEditError`）、`:435-448`（`editTemplateCardWithRetry`）、`:452-653`（`runFlush` 前置冷却检查、429 记冷却）、`:364-371`（`scheduleFlush` 旁加到期唤醒）
+- Modify: `src/card-progress.ts:122-150`（共享状态加 `rateLimitedUntil`）、`:407-418`（`isRetryableRegistryEditError`）、`:435-448`（`editTemplateCardWithRetry`）、`:452-653`（`runFlush` 冷却检查 / 429 记冷却 / `finally` 重排条件）、`CardEntry` 类型加 `cooldownTimer`
+- Modify: `src/api-fetch.ts:417,533,574,626`（四个卡片 wrapper 加 `retryOn429?: boolean` 并透传）
 - Test: `src/card-progress.test.ts`
 
 **Interfaces:**
 - Consumes: Task 1 的 `OctoApiError`、Task 2 的 `opts.retryOn429`。
-- Produces: 模块内部的 `rateLimitedUntil: Map<string, number>` 与 `noteRateLimited(apiUrl, retryAfterMs)` / `cooldownRemainingMs(apiUrl)`（仅本文件用，测试通过公开行为断言）。
+- Produces: `sendCardMessage` / `sendTemplateCardMessage` / `editCardMessage` / `editTemplateCardMessage` 的 params 各多一个可选 `retryOn429?: boolean`（默认 `true`，行为不变）；`CardProgressSharedState.rateLimitedUntil: Map<string, number>`。
+
 
 - [ ] **Step 1: 写失败测试**
 
 修 `:879-918` 与 `:2659-2681` 两处 mock（**两处都缺 `headers`，postJson 一读 `Retry-After` 就 `TypeError`**），给失败响应加 `headers: { get: () => null }`；并把 `:879` 的 `it.each([429, 503])` 拆成两个 `it` —— 429 与 503 的路径已经分岔。
 
-新增：
+新增（**语义统一为"暂缓 + 到期发最新"，没有"永久丢帧"这回事**）：
 
 ```ts
 describe("progress frames under rate limiting", () => {
-  // 进度帧是可丢弃的中间帧。在 flush 里睡着等退避会占住单飞位、把后面的帧一起拖住，
-  // 代价大于收益 —— 丢掉这一帧、等下一个事件重渲染更划算。
-  it("sends a rate-limited transient frame exactly once and does not disable the card", async () => { /* ... */ });
+  // 进度帧不在 flush 里睡着等退避 —— 那会占住单飞位把后面的帧一起拖住。
+  // 但也不能就地丢掉:429 的那一帧要被暂缓,窗口结束时连同最新状态一起发出。
+  it("issues exactly one edit for a rate-limited frame and keeps the card enabled", async () => {
+    // 断言:该次 flush 只发一次 /message/edit;entry 未被 skip(后续仍能发)。
+  });
 
-  it("drops the frame when no further event arrives", async () => { /* ... */ });
+  it("sends the held frame when the window expires, with no further events", async () => {
+    // 429(retry_after 1s) → 不再有任何事件 → advanceTimersByTimeAsync(1500)
+    // → 断言又发出一次 edit,内容是 429 当时那一帧的最新状态。
+  });
 
-  it("renders the next frame normally once a new event arrives", async () => { /* ... */ });
+  it("emits nothing while the window is open, however many events arrive", async () => {
+    // 429 后连续投 5 个工具事件、每个之间推进 800ms(合计 < retry_after)
+    // → 断言窗口内 /message/edit 调用数没有增加。
+  });
 
-  // 光不重试还不够：只要事件持续到来，去抖 flush 会每 ~800ms 发一个新 edit，
-  // 正好在服务端刚给出的冷却窗口里反复撞。
-  it("emits no transient edit inside the cooldown window", async () => { /* ... */ });
+  it("coalesces the held frames into a single send at expiry", async () => {
+    // 同上但推进过 retry_after → 断言只多出 1 次 edit(不是 5 次),
+    // 且 payload 反映最后一个事件的状态。
+  });
 
-  it("sends only the newest frame when the window expires", async () => { /* ... */ });
+  it("does not shorten an open window with a smaller retry_after", async () => {
+    // 先 retry_after=5,再让另一个 session 拿到 retry_after=1
+    // → 推进 2s,断言仍无发送(5s 的窗口没被缩短)。
+  });
 
-  it("wakes up at expiry even with no further events", async () => { /* ... */ });
+  it("shares the window across sessions on one backend, trailing slash included", async () => {
+    // sessionA 用 https://x.test 撞 429;sessionB 用 https://x.test/ 发帧
+    // → 断言 sessionB 在窗口内也不发。
+  });
 
-  it("does not shorten an existing cooldown with a smaller retry_after", async () => { /* ... */ });
+  it("lets a finalize frame through inside the window", async () => {
+    // 窗口内 finalize → 断言照发(终态必须落地),且走默认退避(429 时会重试)。
+  });
 
-  it("shares the cooldown across sessions on the same apiUrl, trailing slash included", async () => { /* ... */ });
-
-  it("lets a finalize frame through inside the window", async () => { /* ... */ });
-
-  it("still retries a network failure and a 5xx", async () => { /* ... */ });
+  it("still retries a network failure and a 5xx locally", async () => {
+    // 守住 isRetryableRegistryEditError 去掉 429 之后没连带改坏其它分支。
+  });
 });
 ```
+
+**必改的两处既有用例**：`:879-918` 与 `:2659-2681` 的失败响应 mock 都是 `{ok:false, status, statusText, text}` 形状、**没有 `headers`**，`OctoApiError.from` 读 `Retry-After` 时虽有容错但仍应补 `headers: { get: () => null }` 让 mock 贴近真实 `Response`；并且 `:879` 的 `it.each([429, 503])` 必须拆成两个 `it` —— 429 走"暂缓 + 到期发"，503 走本地重试，两条路径的调用时序已经不同，不能再共用一个调用计数断言。
+
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -1373,17 +1608,40 @@ Expected: FAIL —— 429 仍本地重试、无冷却门；补了 `headers` 的�
     (semanticStatus !== undefined && semanticStatus >= 500) || errorCode === "err.shared.internal";
 ```
 
-模块内加冷却门：
+模块内加冷却门。**必须挂进 `CardProgressSharedState`（`:122-150`），不能是模块局部变量** —— OpenClaw 分别加载 bundled channel 与 embedded runtime 两个模块实例，模块局部的 Map 会在两个实例间裂开，冷却门就只对其中一半生效：
 
 ```ts
-/**
- * Earliest time each backend will accept another progress frame, keyed by API URL.
- *
- * Keyed per URL rather than per card because the server's bucket is per source IP:
- * every session and every bot pointed at one backend shares it, so timing them
- * separately would just have each of them rediscover the same limit.
- */
-const rateLimitedUntil = new Map<string, number>();
+// 在 CardProgressSharedState 类型里加一行
+type CardProgressSharedState = {
+  cards: Map<string, CardEntry>;
+  pausedCards: Map<string, CardEntry>;
+  profileCache: Map<string, CachedCardProfile>;
+  capsCache: Map<string, CardCaps>;
+  /**
+   * Earliest time each backend will accept another progress frame, keyed by API URL.
+   *
+   * Keyed per URL rather than per card because the server's bucket is per source IP:
+   * every session and every bot pointed at one backend shares it, so timing them
+   * separately would just have each of them rediscover the same limit.
+   */
+  rateLimitedUntil: Map<string, number>;
+};
+```
+
+`getCardProgressSharedState()` 的 `created` 里加 `rateLimitedUntil: new Map()`，并在返回既有对象那条路径上做**惰性补齐**（同一进程里两个实例是同一份构建，但若将来 key 复用而结构演进，缺字段会直接崩）：
+
+```ts
+  const existing = root[CARD_PROGRESS_STATE_KEY] as CardProgressSharedState | undefined;
+  if (existing) {
+    existing.rateLimitedUntil ??= new Map();
+    return existing;
+  }
+```
+
+然后：
+
+```ts
+const rateLimitedUntil = sharedState.rateLimitedUntil;
 
 const cooldownKey = (apiUrl: string): string => apiUrl.replace(/\/+$/, "");
 
@@ -1400,33 +1658,87 @@ function cooldownRemainingMs(apiUrl: string): number {
 }
 ```
 
-`runFlush` 在 transient 发送前检查，并在到期时唤醒：
+到期唤醒单独成函数，把三件必须做对的事写死：
 
 ```ts
+/**
+ * Arm the single wake-up that ends a cooldown for this entry.
+ *
+ * Returning from a flush without this would mean the frame only ever goes out when
+ * some later event happens to arrive; leaning on the debounce instead would re-enter
+ * the flush every 800ms for the whole window just to be turned away again.
+ */
+function armCooldownWake(sessionKey: string, entry: CardEntry, delayMs: number): void {
+  if (entry.cooldownTimer) return; // already armed; re-arming would multiply wake-ups
+  entry.cooldownTimer = setTimeout(() => {
+    entry.cooldownTimer = undefined;
+    // The entry may have been replaced while we waited. Map identity is this file's
+    // existing generation fence; a stale entry must not cause network side effects.
+    if (!isCurrentEntry(sessionKey, entry)) return;
+    const remaining = cooldownRemainingMs(entry.ctx.apiUrl);
+    if (remaining > 0) {
+      // The window was extended by a later 429 after this timer was armed. Waking now
+      // would send before the server said we could, so re-arm to the new deadline.
+      armCooldownWake(sessionKey, entry, remaining);
+      return;
+    }
+    if (entry.dirty) void flush(sessionKey);
+  }, delayMs);
+}
+```
+
+`runFlush` 在 gate 之后、发送之前检查：
+
+```ts
+    // Progress frames are discardable, but hammering inside the window the server just
+    // named is exactly the behaviour this change exists to remove. Hold the newest state
+    // and come back when the window ends.
     const cooldown = cooldownRemainingMs(entry.ctx.apiUrl);
     if (cooldown > 0) {
-      // Keep dirty so the newest state still goes out, and arm a single wake-up: a
-      // bare return would never come back without another event, while leaning on the
-      // debounce would spin every 800ms for the whole window.
-      if (!entry.cooldownTimer) {
-        entry.cooldownTimer = setTimeout(() => {
-          entry.cooldownTimer = undefined;
-          // Re-read: the window may have been extended after this timer was armed,
-          // in which case waking now would send early.
-          if (cooldownRemainingMs(entry.ctx.apiUrl) > 0) { /* re-arm below */ }
-          if (!isCurrentEntry(sessionKey, entry)) return; // stale entry, stay out
-          if (entry.dirty) void flush(sessionKey);
-        }, cooldown);
-      }
+      entry.dirty = true; // keep the newest state pending; the wake-up will send it
+      armCooldownWake(sessionKey, entry, cooldown);
       return;
     }
 ```
 
-`CardEntry` 加 `cooldownTimer?: ReturnType<typeof setTimeout>`，并在 `runFlush` 的 `finally`（`:649` 旁）与 entry 被替换 / finalize / clear 的地方 `clearTimeout` 它。
+`CardEntry` 加 `cooldownTimer?: ReturnType<typeof setTimeout>`。
 
-429 捕获处（`:639` 的 catch）加 `if (err instanceof OctoApiError && err.isRateLimited) noteRateLimited(entry.ctx.apiUrl, err.retryAfterMs);`。
+**`runFlush` 的 `finally`（`:648-653`）不得取消 `cooldownTimer`** —— 那是唯一的唤醒者，取消它就回到"没有新事件就永不醒"。同时该 `finally` 里的 `scheduleFlush` 重排要在冷却期内跳过，否则 800ms 去抖会空转整个窗口：
 
-transient 发送与占位首帧的 `postJson` 传 `{ retryOn429: false }` —— 通过 `editEntryProgress` / send 调用链把 `retryOn429` 透传到 `api-fetch` 的对应函数。
+```ts
+  } finally {
+    if (entry.flushAbort === abort) entry.flushAbort = undefined;
+    entry.inFlight = false;
+    // 冷却期内不排 debounce:唤醒定时器已经负责窗口结束后的那一次发送,
+    // 再排一个 800ms 的只会在整个窗口里反复进来又被挡回。
+    if (entry.dirty && !entry.skip && cards.get(sessionKey) === entry &&
+        cooldownRemainingMs(entry.ctx.apiUrl) === 0) {
+      scheduleFlush(sessionKey, entry);
+    }
+  }
+```
+
+只有 entry 被 **replacement / finalize / clear** 时才 `clearTimeout(entry.cooldownTimer)` —— 找到该文件里清理 `flushTimer` / `pausedCards` 的那几处，同址补上。
+
+429 捕获处（`:639` 的 catch）加：
+
+```ts
+    if (err instanceof OctoApiError && err.isRateLimited) {
+      noteRateLimited(entry.ctx.apiUrl, err.retryAfterMs);
+      // Re-mark dirty and arm the wake-up so this frame is *held*, not lost. dirty was
+      // cleared at :566 before the send, so without this the frame that actually hit the
+      // limit would be the one frame nobody ever retries — and the card would sit on a
+      // stale state until some later event happened to arrive. Holding it makes the rule
+      // uniform: a rate-limited frame always goes out when the window ends.
+      if (isCurrentEntry(sessionKey, entry)) {
+        entry.dirty = true;
+        armCooldownWake(sessionKey, entry, cooldownRemainingMs(entry.ctx.apiUrl));
+      }
+    }
+```
+
+**`retryOn429` 的透传要改 API wrapper 的签名**（这是 Task 8 必须一并改 `src/api-fetch.ts` 的原因）：给 `sendCardMessage`（`:417`）、`sendTemplateCardMessage`（`:533`）、`editCardMessage`（`:574`）、`editTemplateCardMessage`（`:626`）四个的 params 各加 `retryOn429?: boolean`，并在其内部 `postJson` 调用的最后传 `{ retryOn429: params.retryOn429 ?? true }`。card-progress 的占位首帧 send 与 `transient: true` 编辑传 `false`；finalize / 终态帧不传（走默认 `true`）。
+
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -1480,8 +1792,16 @@ git commit -m "test(socket): retire the assertions that pinned the beat to the c
 
 ## Self-Review
 
-**Spec coverage** —— spec 的每节都能指到任务：§1→T1、§2→T2+T3、§3→T8、§4→T4+T7、§5→T6+T7、§6 三个前置修复→T5(两个)+T7(第三个)、§7 数据流→贯穿、测试策略→各任务的测试步骤 + T9、兼容性三条行为变化→T2(deadline)、T8(丢帧)、T9(旧契约)。
+**Spec coverage** —— spec 的每节都能指到任务：§1→T1、§2→T2+T3、§3→T8、§4→T4+T7、§5→T6+T7、§6 三个前置修复→T5(前两个)+T7(第三个)、§7 数据流→贯穿、测试策略→各任务的测试步骤 + T9、兼容性三条行为变化→T2(deadline)、T8(暂缓+到期发)、T9(旧契约)。spec §1 提到的 body 截断在 T1 定为 `MAX_ERROR_BODY_CHARS = 500`。
 
-**Placeholder scan** —— Task 5/7/8 的部分测试用例只给了意图与断言目标、没给完整代码（涉及假 `WebSocket` 与 card-progress 既有 harness 的搭建，需就地参照同文件已有写法）。**这是本计划已知的粗糙处**：执行到那三个任务时先读同文件邻近用例的搭建方式，再把用例补全，不要照着注释硬猜。其余步骤均为可直接执行的实码。
+**Placeholder scan** —— 无占位测试。原先 Task 5/7/8 的空壳用例已补：T5 复用 `reconnect-fixes.test.ts:7-42` 已有的 MockWS（并明确列出对它的**加法式**扩展：`static CONNECTING`、`close()` 里置 `readyState = 3`）；T7 改为测两个导出的可测单元（谓词与序列包装器）而不是硬起整条 `registerBot` 闭包；T8 的每条用例都写清了输入时序与断言目标。T8 与 T9 的少数用例仍是"时序 + 断言目标"而非完整代码，因为要贴合 `card-progress.test.ts` 的 `makeApi()` / `setCardContext()` harness —— 执行时先读同文件邻近用例再落笔。
 
-**Type consistency** —— `OctoApiError.from(resp, path, body)` 三参在 T1 定义、T2 与 T8 按此调用；`isConnectingOrConnected()` / `hasPendingReconnect()` 在 T5 定义、T7 使用；`createHeartbeatLoop` 的 `send: (signal) => Promise<void>` 与 T3 改造后的 `sendHeartbeat({..., signal})` 对齐；`createConnectionWatchdog` 的 `reconnect` 返回 `void | Promise<void>`，T7 传的是返回 `Promise<void>` 的 `runReconnectSequence`，兼容。
+**Type consistency** ——
+- `OctoApiError.from(resp, path, body)` 三参在 T1 定义，T2 与 T8 按此调用。
+- **两个连接谓词不混用**：`isConnected()`（CONNACK 之后）给心跳，`isConnectingOrConnected()`（CONNECTING/OPEN）给监督者，均在 T5 定义、T7 使用。
+- `createHeartbeatLoop` 的 `send: (signal) => Promise<void>` 与 T3 改造后的 `sendHeartbeat({..., signal})` 对齐。
+- `createConnectionWatchdog` 的 `reconnect: () => void | Promise<void>`，T7 传返回 `Promise<void>` 的序列，兼容。
+- T3 的测试用真实签名：`fetchBotEvents({ sinceEventId: number })`、`ackBotEvent({ eventId: number })`。
+- T8 的四个卡片 wrapper 新增 `retryOn429?: boolean`，与 T2 的 `opts.retryOn429` 同名同义。
+- `CONNECT_DEADLINE_MS` 在 T5 `export`，测试 import 而非复制字面量。
+
