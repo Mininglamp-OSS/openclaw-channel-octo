@@ -181,70 +181,7 @@ describe("summarizeToolParams", () => {
   });
   // 注:shell 策略在默认档只渲染程序名,所以只有 DSN **本身就是 argv[0]** 时才会经由 shell
   // 泄漏;path/query 策略则原样返回整个值,是这一类的主要 sink。下面按各自的真实 sink 取样。
-  it("无 scheme 的 userinfo:能确定是 DSN 的剥掉 userinfo", () => {
-    // 单标签主机 + 端口/路径 —— 带点要求会让这一整类一趟都不匹配、明文口令原样渲染。
-    expect(summarizeToolParams("grep", { pattern: "user:hunter2@localhost:5432/prod" }))
-      .toBe("https://localhost");
-    // 只有口令的 DSN(Redis 及一切按口令认证的服务):用户名段必须允许为空。
-    expect(summarizeToolParams("grep", { pattern: ":hunter2@localhost:6379/0" }))
-      .toBe("https://localhost");
-    expect(summarizeToolParams("grep", { pattern: ":hunter2@db.example.com/prod" }))
-      .toBe("https://example.com");
-    // rsync/scp 的 `host:/path` 远端形态。
-    expect(summarizeToolParams("read", { file_path: "user:pw@backup:/data" }))
-      .toBe("https://backup");
-  });
-  it("归约不掉的 userinfo 形状整串不渲染(兜底与归约共用字符集与锚点形式)", () => {
-    // 裸单标签主机:归约**有意不碰**(`sed 's:a:b@c:g'` 无法与之区分),由兜底整串拦下。
-    // 口令既无关键词也无高熵形状,下游守卫抓不住 —— 这些在加兜底前实测全部明文渲染。
-    for (const cmd of [
-      "user:hunter2@localhost",
-      "guest:guestpw@rabbitmq",
-      "user:hunter2@ftpserver",
-    ]) expect(summarizeToolParams("exec", { command: cmd }), cmd).toBe("");
-    // 口令含 `/`(base64 字母表里就有)。照抄归约的 `[^\s/]` 会让两边同时匹配不上 ——
-    // 兜底与被兜底者共享盲点时,兜底只是把同一个洞抄了一遍。最后一条主机还是**带点**的。
-    for (const s of [
-      "user:pa/ss@localhost:5432/prod",
-      "prefix/user:pa/ss@db.example.com",
-    ]) expect(summarizeToolParams("grep", { pattern: s }), s).toBe("");
-    // 起始位必须与归约一致。兜底若用「前导字符类」而归约用负向后顾,`/` 在归约下是合法起点、
-    // 在字符类里却不存在 —— 下面三条在对齐锚点形式前实测全部渲染明文口令。
-    for (const s of [
-      "/user:pass@localhost",
-      "x/user:pass@localhost",
-      "prefix/user:pa/ss@db.example.com",
-    ]) expect(summarizeToolParams("grep", { pattern: s }), s).toBe("");
-    // 反向:兜底不能把普通搜索模式打成空白。query/path 没有程序名可退,拦下来就是一张空白卡 ——
-    // RESIDUAL_QUERY_RE 的注释早就写明了这个危险并加了豁免,这条当时没加对应的。
-    // 判据两条:`@` 后必须是主机形状(`\S+`、`b"}` 都不是);口令段必须含字母数字(`.*` 不是口令)。
-    for (const s of [
-      "email:\\s*\\S+@\\S+",
-      '{"host":"a@b"}',
-      "user:.*@example",
-      "TODO:.*@alice",
-    ]) expect(summarizeToolParams("grep", { pattern: s }), s).toBe(s);
-    // 但**字符集**不收窄 —— 收窄会让「归约匹配不上的串兜底也匹配不上」的缝重新出现。
-    // 加的是「至少一个字母数字」的存在性要求,口令里多一个元字符不会让它失效:
-    expect(summarizeToolParams("grep", { pattern: "user:p*ss@localhost" })).toBe("");
-    // 反向:`scheme://` 必须排掉,否则路径里带 `@` 的正常 URL 会被整串隐藏。
-    expect(summarizeToolParams("fetch", { url: "https://x.example.com/users/@me" }))
-      .toBe("https://example.com");
-  });
-  it("归约不得造出输入里没有的字符串:端口在词边界收尾、单标签主机须含字母", () => {
-    // 端口分支若能匹配更长 token 的**数字前缀**,匹配会在词中间结束,尾巴被拼到替换结果后面。
-    // digest 固定的容器引用是最常见的形状 —— 加约束前实测 `https://sha256abcd`,输入里没有这个串。
-    expect(summarizeToolParams("grep", { pattern: "nginx:1.21@sha256:1234abcd" })).toBe("");
-    expect(summarizeToolParams("grep", { pattern: "repo/app:v2@sha256:9f8e/x" })).toBe("");
-    // 纯数字单标签主机会被 new URL() 按整数 IPv4 规范化:`2` → `0.0.0.2`,同样是凭空造串。
-    expect(summarizeToolParams("grep", { pattern: "3:4@2/x" })).toBe("");
-    expect(summarizeToolParams("read", { file_path: "t:1@2/3" })).toBe("");
-    // 不匹配 ≠ 放行:两条都落到兜底整串不渲染(上面四条断言的 "" 就是兜底给的)。
-    // 能确定的 DSN 仍照常剥 userinfo —— 收紧的是改写条件,不是覆盖面。
-    expect(summarizeToolParams("grep", { pattern: "user:hunter2@localhost:5432/prod" }))
-      .toBe("https://localhost");
-  });
-  it("单标签主机的 query 段被剥掉(上面几趟都要求主机带点,漏掉这一类)", () => {
+        it("单标签主机的 query 段被剥掉(上面几趟都要求主机带点,漏掉这一类)", () => {
     // 归约:主机/路径保留,query 整段剥掉。
     expect(summarizeToolParams("read", { file_path: "localhost/reset?code=abc" })).toBe("localhost/reset");
     expect(summarizeToolParams("read", { file_path: "localhost:8080/api?mode=fast" })).toBe("localhost:8080/api");

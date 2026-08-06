@@ -137,7 +137,7 @@ const SUMMARY_MAX = 64;
  * 归约结果与原串比等值,超过上限的串会一律判为"可归约"而退到单个 TextBlock(丢富文本样式)。
  * 那正是它自己注释里写的保守回退方向。
  */
-const REDUCE_INPUT_MAX = 4000;
+export const REDUCE_INPUT_MAX = 4000;
 
 /**
  * 敏感串守卫模式。群卡片对全体成员可见 —— 摘要一旦命中即整串隐藏(fail-safe:
@@ -346,111 +346,17 @@ function originDomain(rawUrl: string): string | null {
 const PROTOCOL_RELATIVE_RE =
   /(^|[^A-Za-z0-9/:])\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?(?:\/[^\s]*)?/g;
 /**
- * userinfo 用户名允许的字符。归约(SCHEMELESS_USERINFO_RE)与兜底(RESIDUAL_USERINFO_RE)
- * **共用同一个常量,而且共用同一种锚点形式**(负向后顾)。
- *
- * 两者一旦在起始位上不同步,兜底就兜不住它本该兜的东西:凡是归约认、兜底不认的起点,归约漏掉的
- * 形状会直达渲染。所以这里不只统一字符集,连锚点写法也统一。
- */
-const USERINFO_USER_CHARS = "A-Za-z0-9._%+-";
-
-/**
  * 无 scheme 的 userinfo DSN(`user:pass@host[:port][/path]`):userinfo 即明文口令。
  * 密码可含 `@`,按最后一个 `@` 分隔主机。
  *
- * 两个主机分支:
- *  - **带点主机**(`db.example.com`):port/path 可省。
- *  - **单标签主机**(`localhost`、compose 服务名、k8s 短名):后接 `:端口`、`/路径` 或 `:/路径`
- *    (rsync/scp 的远端路径形态)。只认带点会让 `psql user:pw@localhost:5432/prod` 一趟都不匹配、
- *    明文口令原样渲染。
- *
- * 这里**不覆盖**既无端口也无路径的裸单标签(`user:pw@localhost`、`guest:pw@rabbitmq`):无条件
- * 放宽会把 `sed 's:a:b@c:g'`、`docker run -v a:b@c`、`echo 10:30@office` 当成 DSN 改写掉,而
- * `x:y@z` 本身无法与它们区分 —— 改写会毁命令,放行会泄漏明文口令。第三条路见
- * RESIDUAL_USERINFO_RE:归约不了的形状**整串不渲染**。所以这条正则只需覆盖「能确定是 DSN」的
- * 形状,不必、也不该去猜剩下的。
- *
- * 用户名可空(`*` 而非 `+`):`redis-cli -u :hunter2@localhost:6379/0` 是「只有口令」的标准 DSN
- * 形态(Redis 及一切按口令认证的服务),要求用户名非空会让它一趟都不匹配;而且这条不限于单标签,
- * `psql :hunter2@db.example.com/prod` 一样漏。空匹配用不了 `\b`(空格与 `:` 都是非词字符,中间
- * 没有词边界),故改用「前面不是 userinfo 字符」的负向后顾。
+ * **只覆盖带点主机。** 单标签主机(`localhost`、compose 服务名)与配套的 fail-closed 兜底
+ * 曾经在这条分支上,四轮评审里两次把缺陷改成了更糟的缺陷 —— 放宽归约会把
+ * `nginx:1.21@sha256:…` 改写成输入里不存在的 `https://sha256abcd`,收紧兜底又会让一个尾随
+ * 逗号或引号整条绕过它。那一对已经摘出去单独评审(见 PR 说明),这里保持 main 的形状不变。
  */
-// 单标签分支上有两个约束,都是为了「宁可不改写,也不要造出输入里没有的字符串」:
-//
-//  1. **端口必须在词边界收尾**(`(?!${HOST_TOKEN_CHARS})`)。少了它,`:\d+` 会匹配一个更长
-//     token 的**数字前缀**,匹配在词中间结束,没匹配上的尾巴被原样拼到替换结果后面:
-//
-//         nginx:1.21@sha256:1234abcd   →   https://sha256abcd     ← 输入里没有这个串
-//         repo/app:v2@sha256:9f8e/x    →   repo/https://sha256f8e/x
-//
-//     digest 固定的容器引用是最常见的形状。
-//
-//  2. **单标签主机必须含字母**。纯数字主机会被 `new URL()` 按整数 IPv4 规范化,`2` 变成
-//     `0.0.0.2`,同样是凭空造串:
-//
-//         3:4@2/x   →   https://0.0.0.2
-//         t:1@2/3   →   https://0.0.0.2
-//
-// 两条都不匹配的形状不是"放行",而是落到 RESIDUAL_USERINFO_RE 整串不渲染 —— 归约只处理能确定
-// 的形状,确定不了的宁可不显示,也绝不半改写。这正是本文件反复强调的那条:半改写的输出看起来
-// 像脱敏过的,操作者没有任何信号知道自己读到的是被改过的内容。
-const HOST_TOKEN_CHARS = "[0-9A-Za-z_.-]";
-const SCHEMELESS_USERINFO_RE = new RegExp(
-  `(?<![${USERINFO_USER_CHARS}])[${USERINFO_USER_CHARS}]*:[^\\s/]+@`
-  + `(?:[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+(?::\\d+(?!${HOST_TOKEN_CHARS}))?(?:\\/[^\\s]*)?`
-  + `|(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z0-9-]+`
-  + `(?::\\d+(?!${HOST_TOKEN_CHARS})(?:\\/[^\\s]*)?|:\\/[^\\s]*|\\/[^\\s]*))`,
-  "g",
-);
+const SCHEMELESS_USERINFO_RE =
+  /\b[A-Za-z0-9._%+-]+:[^\s/]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:\/[^\s]*)?/g;
 
-/**
- * 归约后**仍然残留**的 `user:pass@host` 形状 → 摘要整串不渲染。
- *
- * SCHEMELESS_USERINFO_RE 只处理能确定是 DSN 的形状;裸单标签主机(`psql user:hunter2@localhost`、
- * `celery -b guest:guestpw@rabbitmq`、`ftp user:hunter2@ftpserver`)一趟都不匹配,而 `hunter2`
- * 这类口令既无关键词也无高熵形状,下游守卫同样抓不住 —— 实测明文口令直达群可见卡片。
- *
- * 判据不是「这是不是 DSN」(无法判定),而是「归约管线**有没有**处理掉它」:能确定的形状在上面
- * 几趟里已被剥掉 userinfo、这里不再命中;还留着 `x:y@z` 的,一律不渲染。误伤方向是少显示细节
- * (`sed 's:a:b@c:g'` 只渲染 `sed`),而不是把命令改写成另一条命令 —— 后者更糟:操作者看不出
- * 自己看到的是被改过的。
- *
- * **兜底的每一个字符类都必须 ⊇ 归约的对应字符类。** 口令段取最宽的 `[^\s]`,而不是照抄归约的
- * `[^\s/]`:照抄会留下一条缝 —— 归约**因为**某个字符匹配不上的串,兜底也同样匹配不上,于是原样
- * 渲染。`/` 就在 base64 口令的字母表里,而且不限于裸单标签:`user:pa/ss@db.example.com`、
- * `user:pa/ss@localhost:5432/prod` 两边都逃掉。用户名同样可空,理由同上。
- *
- * 放宽到 `/` 之后必须排掉 `scheme://`,否则 `https://x.test/a:b@c` 会被读成
- * 「user=`https`、pass=`//x.test/a:b`」而整串隐藏 —— 路径里带 `@` 的 URL 很常见
- * (`/users/@me`、`/@scope/pkg`)。带 scheme 的串在第 1 趟已经过 `new URL()` 剥掉 userinfo,
- * 本来就不需要这条兜底;解析失败的那些在同一趟被整段抹除,也不会走到这里。
- */
-// 两个收窄,方向与上面那条**相反**:这里要挡的不是泄漏,是过度隐藏。
-//
-// 这条兜底命中即整串不渲染,而 query/path 两个策略**没有程序名可退**,卡片直接空白 —— 看起来
-// 就像 bug。RESIDUAL_QUERY_RE 的注释里已经把这个危险写清楚了,并为此加了字母前瞻;这条当时没加
-// 对应的豁免,于是下面这些普通搜索模式在 main 上正常渲染、在这条分支上全变成空:
-//
-//     grep {pattern: "email:\s*\S+@\S+"}   grep {pattern: '{"host":"a@b"}'}
-//     grep {pattern: "user:.*@example"}    grep {pattern: "TODO:.*@alice"}
-//
-// 又是「本该互为镜像的第二张表和第一张不同步」—— 这次两张表还是同一个 commit 里写的。
-//
-//  1. **`@` 之后必须是主机形状**,且必须在词边界收尾。`\S+`、`b"}` 都不是主机。
-//  2. **口令段必须含至少一个字母数字**。`.*` / `.+` / `[^@]*` 这类纯正则元字符的"口令"不是
-//     真凭据:一个没有任何字母数字的口令既不值得保护,也不可能是 base64/十六进制密钥。
-//
-// 注意口令段的**字符集**没有收窄,仍是最宽的 `[^\s]` —— 收窄字符集会让「归约因为某个字符匹配
-// 不上的串,兜底也同样匹配不上」的缝重新出现(`user:pa/ss@host` 就是这么漏的)。这里加的是
-// 「至少要有一个字母数字」的存在性要求,它不会因为口令里多了某个字符而失效,所以 `p*ss`、
-// `pa/ss`、`h#nter2` 一律照旧withheld。
-//
-// 剩下仍会被误伤的:`from:me@x to:you`、`meeting at 10:30@office` —— 口令有字母数字、`@` 后是
-// 合法主机形状,与 `guest:guestpw@rabbitmq` 在形状上完全一致,无法区分。README 里写明。
-const RESIDUAL_USERINFO_RE = new RegExp(
-  `(?<![${USERINFO_USER_CHARS}])[^\\s:@/]*:(?!\\/\\/)(?=[^\\s]*[A-Za-z0-9][^\\s]*@)[^\\s]*@`
-  + `[A-Za-z0-9](?:${HOST_TOKEN_CHARS}*[A-Za-z0-9])?(?![^\\s:/])`,
-);
 /** 任意无 scheme 的 `host.tld/path`:path 常承载 webhook token、签名或对象凭据。 */
 const SCHEMELESS_HOST_PATH_RE =
   /(^|[^A-Za-z0-9@._/:+-])([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?\/[^\s]+)/g;
@@ -509,7 +415,7 @@ const SCHEMELESS_QUERY_RE = new RegExp(
 );
 
 /**
- * 归约后**仍然残留**的单标签 `host/path?…=…` → 摘要整串不渲染(与 RESIDUAL_USERINFO_RE 同理)。
+ * 归约后**仍然残留**的单标签 `host/path?…=…` → 摘要整串不渲染。
  *
  * 路径段两边都是**可选**的。这一条不只是字符类要对齐:如果只有归约放宽、兜底照抄了「`?` 前必须
  * 有 `/`」这条**结构要求**,`host?query`(query 直接挂在裸主机上,`curl localhost?code=abc`)就会
@@ -590,9 +496,6 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
   // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
   // 输入上限住在 reduceUrlsInText 内部,这里不再重复设界(见 REDUCE_INPUT_MAX)。
   const s = reduceUrlsInText(v.replace(/\s+/g, " ").trim()).replace(/\s+/g, " ").trim();
-  // 归约管线处理不掉的 userinfo 形状 → 整串不渲染。必须放在归约**之后**:能确定是 DSN 的形状
-  // 此时已被剥掉 userinfo,不会在这里误伤。
-  if (RESIDUAL_USERINFO_RE.test(s)) return "";
   if (RESIDUAL_QUERY_RE.test(s)) return "";
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
   // + 明确前缀,避免把 git SHA / docker digest / 缓存哈希等正常路径误伤成空。

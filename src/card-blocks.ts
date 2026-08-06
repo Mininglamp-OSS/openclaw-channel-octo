@@ -13,7 +13,7 @@
  * 纯函数、无副作用、无 I/O —— hook 进度卡与 agent 展示卡工具共享这一层。
  */
 
-import { cardSupports, isSensitive, reduceUrlsInText, type CardCaps } from "./card-render.js";
+import { cardSupports, isSensitive, reduceUrlsInText, REDUCE_INPUT_MAX, type CardCaps } from "./card-render.js";
 import { cardFitsLimits } from "./card-limits.js";
 import { CARD_VERSION } from "./types.js";
 
@@ -136,6 +136,19 @@ export interface BuildDisplayCardResult {
 function sanitize(text: string, generic = true): string | null {
   let s = text.replace(/\s+/g, " ").trim();
   if (!s) return null;
+  // 超长输入:守卫要**先跑在未截断的原串上**。reduceUrlsInText 对超过 REDUCE_INPUT_MAX 的输入
+  // 会截断(那是它的二次回溯性能界),而这个 sink **没有渲染上限** —— 与摘要(64)、错误(120)、
+  // debug 串(512)不同,一段长文本会整段渲染。于是横跨截断点的密钥被切成两半,`isSensitive`
+  // 认不出那个片段,整块照渲:
+  //
+  //     "z"×3990 + " AKIAIOSFODNN7EXAMPLE"   →  渲染 4000 字符,尾部是 `AKIAIOSFO`
+  //
+  // 偏移量是可选的,padding 调一下几乎整个 token 都能渲染出来。
+  //
+  // 判定**只在真会截断时**才提前跑。无条件提前跑是错的:归约的全部意义就是把危险形状变安全,
+  // 提前判会把 `https://hooks.slack.com/services/T../B../XXXX`(归约后是 `https://slack.com`)
+  // 这类本该正常渲染的内容整块丢掉。截断不发生时不存在盲区,也就不需要这一步。
+  if (s.length > REDUCE_INPUT_MAX && isSensitive(s, generic)) return null;
   s = reduceUrlsInText(s).replace(/\s+/g, " ").trim();
   if (!s) return null;
   if (isSensitive(s, generic)) return null;
@@ -610,6 +623,18 @@ function utf8Bytes(s: string): number {
  * 所以与普通正文同样脱敏,并按服务端/客户端约定限制为 UTF-8 4KiB。
  */
 function renderCopy(label: string | undefined, text: string, ctx: RenderCtx): Rendered {
+  // 超限判定必须跑在**原始 text** 上,不能跑在 sanitize 的输出上,而且两条上限都要判。
+  //
+  // sanitize 里的 reduceUrlsInText 会把输入截到 REDUCE_INPUT_MAX(4000 **字符**),而这里的契约
+  // 是 4096 **字节**。两者一交叉就出两个洞:ASCII 下 4000 字符恒 ≤ 4096 字节,所以 utf8Bytes
+  // 判定再也不会触发 —— 20000 字符的内容会安静地变成 4000 字符塞进复制按钮;而 4050 字符这种
+  // **合法地在 4096 字节契约内**的内容,同样被截成 4000,一样没有提示。
+  //
+  // 复制按钮是读者会直接粘出去用的 sink,给残值比给提示糟得多。所以:要么给全文,要么给提示。
+  if (text.length > REDUCE_INPUT_MAX || utf8Bytes(text) > COPY_TEXT_MAX_BYTES) {
+    const msg = "复制内容超过 4KiB，未渲染复制按钮";
+    return { elements: [textBlock(msg)], plainLines: [msg] };
+  }
   const cleanText = sanitize(text, ctx.generic);
   if (!cleanText) return EMPTY;
   const cleanLabel = sanitize(label ?? COPY_LABEL_DEFAULT, ctx.generic) ?? COPY_LABEL_DEFAULT;

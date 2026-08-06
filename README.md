@@ -189,21 +189,42 @@ Three consequences are worth knowing, because they are not just cosmetic:
   pattern of `colou?r=red` renders as `colou`, and `reports/q3?draft=1.pdf`
   renders as `reports/q3`. The rewrite is silent — there is no ellipsis or marker.
 
-Where the shape cannot be reduced cleanly — a quote inside the query string, a
-`user:pass@host` whose host is not identifiable, a port that would end in the
-middle of a token — the summary is withheld entirely rather than half-rewritten.
-A partially rewritten command looks sanitized while still carrying its tail, and
-gives the operator no signal that what they are reading has been altered. That
-withholding is deliberately blunt, and it costs some ordinary search patterns:
-`from:me@x to:you` and `meeting at 10:30@office` render nothing, because they are
-the same shape as `guest:guestpw@rabbitmq`. Patterns whose "password" carries no
-alphanumeric character (`user:.*@example`) or whose host is not host-shaped
-(`email:\s*\S+@\S+`) are exempted and render normally.
+Where a query string cannot be reduced cleanly — a quote inside it, for instance
+— the summary is withheld entirely rather than half-rewritten. A partially
+rewritten command looks sanitized while still carrying its tail, and gives the
+operator no signal that what they are reading has been altered.
 
-The reduction step bounds its own input at 4000 characters. It runs on untrusted
-text — a submitted form value, a display name, tool arguments — on synchronous
-paths with no error boundary, and its passes are quadratic, so an unbounded input
-stalls the plugin's event loop for every account at once.
+**A scheme-less `user:pass@host` is only reduced when the host carries a dot.**
+`postgres://user:pw@host/db` and `user:pw@db.example.com` lose their userinfo,
+but a single-label host (`user:pw@localhost`), an IPv6 literal
+(`user:pw@[::1]`), a password containing `/` (`user:pa/ss@db.example.com`) and a
+leading slash (`/user:pass@localhost`) all render in full. These are pre-existing
+gaps, not ones this option introduces, and closing them is its own change: the
+shape is genuinely ambiguous — `sed 's:a:b@c:g'` and `user:pw@localhost` are the
+same string to a matcher — so both widening the reduction and adding a
+withhold-everything backstop have, in review, each traded one defect for a worse
+one. They are tracked with their exact current behaviour in
+`src/card-render.corpus.ts` so that whatever closes them cannot silently change
+anything else.
+
+### The reduction step bounds its own input
+
+It runs on untrusted text — a submitted form value, a display name, tool
+arguments — on synchronous paths with no error boundary, and its passes are
+quadratic, so an unbounded input stalls the plugin's event loop for every account
+at once. The bound is 4000 characters.
+
+Two sinks have no render cap of their own and therefore handle the bound
+explicitly, because truncation there would be observable:
+
+- **A display-card text block** longer than 4000 characters is checked for
+  credential shapes *before* truncation, then truncated. Without the first check
+  a secret straddling the cut renders as a fragment the guard no longer
+  recognises.
+- **A copy-to-clipboard block** longer than 4000 characters is refused with the
+  same "over 4 KiB" notice used for the byte limit, rather than silently handing
+  over a truncated value. The reader pastes that content somewhere, so a partial
+  value is worse than an honest refusal.
 
 ## Architecture
 
