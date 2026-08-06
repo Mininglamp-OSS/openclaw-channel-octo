@@ -494,3 +494,255 @@ describe("server-driven Registry reasoning progress", () => {
       .not.toContain("private thought");
   });
 });
+
+describe("progress frames under rate limiting", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetCardProgressForTests();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  /** Fetch stub whose /message/edit answers 429 for the first `limitedEdits` calls. */
+  function makeRateLimitedApi(opts: { retryAfter?: string; limitedEdits?: number } = {}) {
+    const retryAfter = opts.retryAfter ?? "5";
+    const limitedEdits = opts.limitedEdits ?? Number.POSITIVE_INFINITY;
+    const edits: string[] = [];
+    let editCalls = 0;
+    global.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/card/profile")) {
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ enabled: true }) };
+      }
+      if (u.includes("/sendMessage")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          text: async () => JSON.stringify({ message_id: "card-1" }),
+        };
+      }
+      if (u.includes("/message/edit")) {
+        editCalls++;
+        if (editCalls <= limitedEdits) {
+          return {
+            ok: false,
+            status: 429,
+            statusText: "too many",
+            headers: {
+              get: (n: string) => (n.toLowerCase() === "retry-after" ? retryAfter : null),
+            },
+            text: async () => "rate limited",
+          };
+        }
+        edits.push(String(init?.body ?? ""));
+        return { ok: true, status: 200, headers: { get: () => null }, text: async () => "" };
+      }
+      return { ok: true, status: 200, headers: { get: () => null }, text: async () => "" };
+    }) as unknown as typeof fetch;
+    return {
+      editCount: () => editCalls,
+      acceptedEdits: () => edits,
+    };
+  }
+
+  /** Drive one tool event through the debounced flush. */
+  async function toolEvent(
+    handlers: Record<string, (e: unknown, c: unknown) => unknown>,
+    sessionKey: string,
+    id: string,
+  ) {
+    handlers.before_tool_call!({ toolName: "read", toolCallId: id }, { sessionKey });
+    await vi.advanceTimersByTimeAsync(900);
+    handlers.after_tool_call!({ toolName: "read", toolCallId: id, result: {} }, { sessionKey });
+    await vi.advanceTimersByTimeAsync(900);
+  }
+
+  it("stops probing for the whole window the server named", async () => {
+    // 30s 窗口远长于后面四个事件合计的 7.2s,断言的是"窗口内一次都不发"。
+    const api = makeRateLimitedApi({ retryAfter: "30" });
+    const { handlers } = makeApi();
+    setCardContext("cool-1", {
+      apiUrl: "https://cool1.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+
+    await toolEvent(handlers, "cool-1", "t1"); // sends the placeholder
+    await toolEvent(handlers, "cool-1", "t2"); // first edit → 429, arms the cooldown
+    const afterFirst429 = api.editCount();
+    expect(afterFirst429).toBeGreaterThan(0);
+
+    // Keep the events coming well inside the 5s window: not one of them may reach the wire.
+    await toolEvent(handlers, "cool-1", "t3");
+    await toolEvent(handlers, "cool-1", "t4");
+    expect(api.editCount()).toBe(afterFirst429);
+  });
+
+  // The frame that hit the limit is held, not lost: dirty was already cleared before the
+  // send, so without the hold it would be the one frame nobody ever retries.
+  it("sends the held frame when the window expires, with no further events", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "2", limitedEdits: 1 });
+    const { handlers } = makeApi();
+    setCardContext("cool-2", {
+      apiUrl: "https://cool2.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+
+    await toolEvent(handlers, "cool-2", "t1");
+    await toolEvent(handlers, "cool-2", "t2"); // 429
+    const during = api.editCount();
+
+    await vi.advanceTimersByTimeAsync(2_500); // past the window, no new events at all
+    expect(api.editCount()).toBe(during + 1);
+    expect(api.acceptedEdits()).toHaveLength(1);
+  });
+
+  it("coalesces everything that piled up into a single send at expiry", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "30", limitedEdits: 1 });
+    const { handlers } = makeApi();
+    setCardContext("cool-3", {
+      apiUrl: "https://cool3.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+
+    await toolEvent(handlers, "cool-3", "t1");
+    await toolEvent(handlers, "cool-3", "t2"); // 429
+    const during = api.editCount();
+    for (const id of ["t3", "t4", "t5"]) await toolEvent(handlers, "cool-3", id);
+    expect(api.editCount()).toBe(during); // still nothing
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(api.editCount()).toBe(during + 1); // one frame, not three
+  });
+
+  // A later 429 carrying a shorter wait must not pull the deadline back in.
+  it("does not shorten an open window with a smaller retry_after", async () => {
+    let retryAfter = "6";
+    const edits: number[] = [];
+    let editCalls = 0;
+    global.fetch = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/card/profile")) {
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ enabled: true }) };
+      }
+      if (u.includes("/sendMessage")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          text: async () => JSON.stringify({ message_id: "card-1" }),
+        };
+      }
+      if (u.includes("/message/edit")) {
+        editCalls++;
+        edits.push(Date.now());
+        return {
+          ok: false,
+          status: 429,
+          statusText: "too many",
+          headers: { get: (n: string) => (n.toLowerCase() === "retry-after" ? retryAfter : null) },
+          text: async () => "rate limited",
+        };
+      }
+      return { ok: true, status: 200, headers: { get: () => null }, text: async () => "" };
+    }) as unknown as typeof fetch;
+
+    const { handlers } = makeApi();
+    setCardContext("cool-4", {
+      apiUrl: "https://cool4.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-4", "t1");
+    await toolEvent(handlers, "cool-4", "t2"); // 429 with retry_after 6 → window opens
+    const after6 = editCalls;
+
+    // A second bot on the same backend gets a 1s wait; the 6s window must survive it.
+    retryAfter = "1";
+    setCardContext("cool-4b", {
+      apiUrl: "https://cool4.test",
+      botToken: "bf",
+      channelId: "g2",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-4b", "s1");
+
+    await vi.advanceTimersByTimeAsync(2_000); // past 1s, nowhere near 6s
+    expect(editCalls).toBe(after6);
+  });
+
+  it("shares the window across sessions on one backend, trailing slash and all", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "30" });
+    const { handlers } = makeApi();
+    setCardContext("cool-5a", {
+      apiUrl: "https://cool5.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-5a", "t1");
+    await toolEvent(handlers, "cool-5a", "t2"); // 429 on https://cool5.test
+    const during = api.editCount();
+
+    // Same backend written with a trailing slash: it is one bucket on the server, so it
+    // has to be one bucket here too.
+    setCardContext("cool-5b", {
+      apiUrl: "https://cool5.test/",
+      botToken: "bf",
+      channelId: "g2",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-5b", "s1");
+    await toolEvent(handlers, "cool-5b", "s2");
+    expect(api.editCount()).toBe(during);
+  });
+
+  it("lets a finalize frame through inside the window", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "30", limitedEdits: 1 });
+    const { handlers } = makeApi();
+    setCardContext("cool-6", {
+      apiUrl: "https://cool6.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-6", "t1");
+    await toolEvent(handlers, "cool-6", "t2"); // 429
+    const during = api.editCount();
+
+    // Terminal state has to land; it is not a discardable intermediate frame.
+    await finalizeCard("cool-6");
+    expect(api.editCount()).toBeGreaterThan(during);
+  });
+
+  it("keeps the card enabled — a 429 is not a permanent rejection", async () => {
+    const api = makeRateLimitedApi({ retryAfter: "1", limitedEdits: 1 });
+    const { handlers } = makeApi();
+    setCardContext("cool-7", {
+      apiUrl: "https://cool7.test",
+      botToken: "bf",
+      channelId: "g",
+      channelType: ChannelType.Group,
+    });
+    await toolEvent(handlers, "cool-7", "t1");
+    await toolEvent(handlers, "cool-7", "t2"); // 429
+    await vi.advanceTimersByTimeAsync(1_500);
+    await toolEvent(handlers, "cool-7", "t3");
+    // Frames resume once the window closes; a 4xx that meant "stop" would have skipped
+    // the session for good.
+    expect(api.acceptedEdits().length).toBeGreaterThan(0);
+  });
+});
+

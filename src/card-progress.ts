@@ -22,6 +22,7 @@ import {
   type CardProfileManifest,
   type CardTemplateRef,
 } from "./api-fetch.js";
+import { OctoApiError } from "./api-error.js";
 import {
   _resetBotCardProfileCacheForTests,
   getBotCardProfile,
@@ -94,6 +95,8 @@ interface CardEntry {
   templateEditPromise?: Promise<boolean>;
   /** paused 卡的有界回收定时器。 */
   pausedExpiryTimer?: ReturnType<typeof setTimeout>;
+  /** 限流冷却期结束后把最新一帧发出去的一次性唤醒定时器;见 armCooldownWake。 */
+  cooldownTimer?: ReturnType<typeof setTimeout>;
   /** replacement/clear 时主动取消 profile/send/edit,缩小 stale side-effect 窗口。 */
   flushAbort?: AbortController;
   /** Server-selected ref, pinned for every frame of a Registry-authored message. */
@@ -117,6 +120,13 @@ interface CardEntry {
 type CardProgressSharedState = {
   cards: Map<string, CardEntry>;
   pausedCards: Map<string, CardEntry>;
+  /**
+   * 每个后端最早可以再发进度帧的时刻,按 apiUrl 归集。
+   *
+   * 按 URL 而不是按卡:服务端的桶是按来源 IP 的,同一后端下所有 session、所有 bot 撞的是
+   * 同一个桶,分别计时只会让每个 session 各自去把同一个限制重新踩一遍。
+   */
+  rateLimitedUntil: Map<string, number>;
 };
 
 /**
@@ -129,10 +139,15 @@ const CARD_PROGRESS_STATE_KEY = Symbol.for("openclaw.octo.card-progress-state.v1
 function getCardProgressSharedState(): CardProgressSharedState {
   const root = process as unknown as Record<PropertyKey, unknown>;
   const existing = root[CARD_PROGRESS_STATE_KEY] as CardProgressSharedState | undefined;
-  if (existing) return existing;
+  if (existing) {
+    // 惰性补齐:同一进程内两个实例跑的是同一份构建,但 key 复用而结构演进时缺字段会直接崩。
+    existing.rateLimitedUntil ??= new Map();
+    return existing;
+  }
   const created: CardProgressSharedState = {
     cards: new Map(),
     pausedCards: new Map(),
+    rateLimitedUntil: new Map(),
   };
   root[CARD_PROGRESS_STATE_KEY] = created;
   return created;
@@ -297,6 +312,49 @@ function resolveEntryDeliveryMode(entry: CardEntry): void {
   entry.skip = true;
 }
 
+const rateLimitedUntil = sharedState.rateLimitedUntil;
+
+/** 与 postJson 拼 URL 时同款去尾斜杠,否则同一后端会落进两个桶、冷却门形同虚设。 */
+function cooldownKey(apiUrl: string): string {
+  return apiUrl.replace(/\/+$/, "");
+}
+
+function noteRateLimited(apiUrl: string, retryAfterMs: number): void {
+  const key = cooldownKey(apiUrl);
+  // 单调:并发的另一个 429 若带更短的 retry_after,直接覆盖会把已有冷却**缩短** ——
+  // 那等于提前回去撞,正是这次要消掉的行为。
+  rateLimitedUntil.set(key, Math.max(rateLimitedUntil.get(key) ?? 0, Date.now() + retryAfterMs));
+}
+
+function cooldownRemainingMs(apiUrl: string): number {
+  return Math.max(0, (rateLimitedUntil.get(cooldownKey(apiUrl)) ?? 0) - Date.now());
+}
+
+/**
+ * 排一次(且仅一次)冷却结束后的唤醒。
+ *
+ * 冷却期内直接 return 会让这一帧只能等下一个事件才可能发出;而靠 800ms 去抖反复进来,
+ * 又会在整个窗口里空转。所以留一个精确到到期时刻的定时器,并且回调必须:
+ * 先清自己的句柄、校验 entry 仍有效、重读可能已被延长的 deadline。
+ */
+function armCooldownWake(sessionKey: string, entry: CardEntry, delayMs: number): void {
+  if (entry.cooldownTimer) return; // 已排过;重排会让唤醒次数翻倍
+  entry.cooldownTimer = setTimeout(() => {
+    entry.cooldownTimer = undefined;
+    // entry 可能在等待期间被替换。Map 对象身份是本文件既有的 generation fence,
+    // stale entry 绝不能继续产生网络副作用。
+    if (!isCurrentEntry(sessionKey, entry)) return;
+    const remaining = cooldownRemainingMs(entry.ctx.apiUrl);
+    if (remaining > 0) {
+      // 窗口在本定时器排好之后被后续 429 延长了。此刻醒来就发等于提前回去撞,
+      // 所以只把自己重排到新的截止时刻。
+      armCooldownWake(sessionKey, entry, remaining);
+      return;
+    }
+    if (entry.dirty) void flush(sessionKey);
+  }, delayMs);
+}
+
 function scheduleFlush(sessionKey: string, entry: CardEntry): void {
   entry.dirty = true;
   if (entry.flushTimer) return;
@@ -332,7 +390,9 @@ function isRetryableRegistryEditError(error: unknown): boolean {
   if (transportStatus === undefined && /^octo: /.test(message)) return false;
   const semanticStatus = semanticHttpStatusFromApiError(error);
   const errorCode = errorCodeFromApiError(error);
-  return transportStatus === undefined || transportStatus === 429 || transportStatus >= 500 ||
+  // 429 归 postJson 那一处退避管,而进度帧对它整体弃权:在这里按 100/250ms 重试是无视
+  // 服务端给的等待时间空转,叠上 postJson 的重试后单帧最坏九次请求。限流由冷却门处理。
+  return transportStatus === undefined || transportStatus >= 500 ||
     (semanticStatus !== undefined && semanticStatus >= 500) || errorCode === "err.shared.internal";
 }
 
@@ -470,6 +530,14 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
       resolveEntryDeliveryMode(entry);
     }
 
+    // 进度帧可以丢,但在服务端刚点名的窗口里反复撞不行。留住最新状态,等窗口结束再发。
+    const cooldown = cooldownRemainingMs(entry.ctx.apiUrl);
+    if (cooldown > 0) {
+      entry.dirty = true; // 唤醒定时器会把最新状态发出去
+      armCooldownWake(sessionKey, entry, cooldown);
+      return;
+    }
+
     entry.dirty = false;
     const state = entryProgressState(sessionKey, entry);
     if (!entry.messageId) {
@@ -524,11 +592,26 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         errorCodeFromApiError(err) !== "err.shared.internal") {
       entry.skip = true;
     }
+    if (err instanceof OctoApiError && err.isRateLimited) {
+      noteRateLimited(entry.ctx.apiUrl, err.retryAfterMs);
+      // 重新标脏并排唤醒,让这一帧被**暂缓**而不是丢掉:dirty 在发送前已被清,否则真正撞上
+      // 限流的这一帧会成为唯一没人重试的一帧,卡片停在旧状态直到下一个事件恰好到来。
+      // 暂缓让规则统一 —— 被限流的帧总会在窗口结束时带着最新状态发出。
+      if (isCurrentEntry(sessionKey, entry)) {
+        entry.dirty = true;
+        armCooldownWake(sessionKey, entry, cooldownRemainingMs(entry.ctx.apiUrl));
+      }
+    }
   } finally {
     if (entry.flushAbort === abort) entry.flushAbort = undefined;
     entry.inFlight = false;
     // 期间有新帧 → 再刷。entry 已被 finalize/clear 删除时不再重排,避免悬挂定时器。
-    if (entry.dirty && !entry.skip && cards.get(sessionKey) === entry) scheduleFlush(sessionKey, entry);
+    // 冷却期内不排 debounce:唤醒定时器已负责窗口结束后的那一次发送,再排一个 800ms 的
+    // 只会在整个窗口里反复进来又被挡回。
+    if (entry.dirty && !entry.skip && cards.get(sessionKey) === entry &&
+        cooldownRemainingMs(entry.ctx.apiUrl) === 0) {
+      scheduleFlush(sessionKey, entry);
+    }
   }
 }
 
@@ -875,6 +958,7 @@ export function _resetCardProgressForTests(): void {
   for (const e of new Set([...cards.values(), ...pausedCards.values()])) {
     if (e.flushTimer) clearTimeout(e.flushTimer);
     if (e.pausedExpiryTimer) clearTimeout(e.pausedExpiryTimer);
+    if (e.cooldownTimer) clearTimeout(e.cooldownTimer);
     e.flushAbort?.abort(new Error("card progress reset"));
     e.stateEditAbort?.abort(new Error("card progress reset"));
     e.skip = true;
@@ -882,6 +966,8 @@ export function _resetCardProgressForTests(): void {
   cards.clear();
   pausedCards.clear();
   _resetBotCardProfileCacheForTests();
+  // 否则一个测试撞出的冷却窗口会静默让后面的测试全都不发帧。
+  rateLimitedUntil.clear();
 }
 
 /**
