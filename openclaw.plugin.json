@@ -52,6 +52,12 @@
             "type": "number",
             "minimum": 500
           },
+          "eventWaitSeconds": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 30,
+            "description": "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value."
+          },
           "heartbeatIntervalMs": {
             "type": "number",
             "minimum": 5000
@@ -119,6 +125,12 @@
                 "pollIntervalMs": {
                   "type": "number",
                   "minimum": 500
+                },
+                "eventWaitSeconds": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 30,
+                  "description": "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value."
                 },
                 "heartbeatIntervalMs": {
                   "type": "number",

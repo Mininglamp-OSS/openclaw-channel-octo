@@ -886,7 +886,9 @@ describe("uploadFileToPresignedUrl", () => {
 });
 
 // --- fetchUserInfo ---
-import { fetchUserInfo } from "./api-fetch.js";
+import { fetchUserInfo,
+  eventsPollTimeoutMs,
+} from "./api-fetch.js";
 
 describe("fetchUserInfo", () => {
   it("returns user info on success", async () => {
@@ -2215,5 +2217,27 @@ describe("#138 — send functions reject empty channelId", () => {
       content: "hi",
     });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("eventsPollTimeoutMs", () => {
+  it("不长轮询时用固定的空闲上限", () => {
+    expect(eventsPollTimeoutMs()).toBe(10_000);
+    expect(eventsPollTimeoutMs(0)).toBe(10_000);
+    expect(eventsPollTimeoutMs(-5)).toBe(10_000);
+  });
+
+  it("长轮询时的超时必须严格大于 hold —— 客户端不能先于服务端超时", () => {
+    // Aborting mid-hold throws away the batch the server was about to return and turns the
+    // poll loop into a timeout/retry storm that is strictly worse than short polling.
+    for (const wait of [1, 5, 25, 30]) {
+      expect(eventsPollTimeoutMs(wait)).toBeGreaterThan(wait * 1000);
+    }
+  });
+
+  it("30s 上限（服务端 clamp 值）下仍留有足够余量", () => {
+    // Must cover the server rounding its final BLPOP chunk up to a whole second, plus
+    // ordinary network jitter.
+    expect(eventsPollTimeoutMs(30) - 30_000).toBeGreaterThanOrEqual(5_000);
   });
 });

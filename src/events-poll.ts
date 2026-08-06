@@ -3,12 +3,26 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { normalizeAccountId } from "./account-id.js";
-import { ackBotEvent, fetchBotEvents } from "./api-fetch.js";
+import {
+  ackBotEvent,
+  eventsPollTimeoutMs,
+  fetchBotEvents,
+  MAX_EVENT_WAIT_SECONDS,
+  MIN_EVENT_WAIT_SECONDS,
+} from "./api-fetch.js";
 import { CHANNEL_ID } from "./constants.js";
 import { parseCardAction, type CardAction } from "./card-action.js";
 
 const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_LIMIT = 50;
+/** Ceiling for the error backoff in long-poll mode. */
+const MAX_ERROR_BACKOFF_MS = 30_000;
+/**
+ * How much of the requested hold a response must have consumed for the server to count as
+ * "actually holding". Well below 1 so ordinary jitter, or a hold ended early by a real event
+ * arriving, is not mistaken for a non-holding server.
+ */
+const HELD_FRACTION = 0.5;
 
 export interface EventCursorStore {
   load(): Promise<number>;
@@ -52,6 +66,15 @@ export interface EventPollerOptions {
   onCardAction: (action: CardAction) => void | Promise<void>;
   intervalMs?: number;
   limit?: number;
+  /**
+   * Seconds to let the server hold an empty queue open (its `wait` parameter).
+   *
+   * Unset or 0 keeps the historical short-poll loop: one read per `intervalMs`. When set, the
+   * server supplies the pacing — it only answers early once an event lands — so the loop stops
+   * adding `intervalMs` of dead time between reads, which would otherwise eat much of the
+   * latency the hold just bought.
+   */
+  waitSeconds?: number;
   ack?: boolean;
   log?: { info?: (message: string) => void; error?: (message: string) => void };
 }
@@ -75,29 +98,99 @@ export function requestCardEventPolling(accountId: string): void {
 }
 
 /**
- * Start one non-overlapping short-poll loop. Cursor persistence happens before ack so a process
- * crash can at worst replay an action; it cannot acknowledge an event that it forgot locally.
+ * Start one non-overlapping poll loop, short-polling by default and long-polling when
+ * `waitSeconds` is set. Cursor persistence happens before ack so a process crash can at worst
+ * replay an action; it cannot acknowledge an event that it forgot locally.
  */
 export function startEventPoller(options: EventPollerOptions): EventPoller {
   const intervalMs = Math.max(500, Math.floor(options.intervalMs ?? DEFAULT_INTERVAL_MS));
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? DEFAULT_LIMIT)));
+  // Clamp at runtime, not just in the JSON schema: a host that surfaces the schema advisorily
+  // rather than enforcing it would otherwise let eventWaitSeconds: 3600 through, yielding a
+  // ~3610s client timeout against a server that clamps its own `wait` to 30s.
+  //
+  // The lower bound matters just as much and is less obvious: a hold shorter than
+  // MIN_EVENT_WAIT_SECONDS makes idle traffic *worse* than the short polling it replaces, and
+  // narrows the "did the server hold?" guard below a normal slow RTT, so a non-holding server
+  // gets misread as holding. Raise rather than reject — the operator asked for long polling and
+  // gets the shortest hold that actually delivers it. `Math.round` so 0.5 does not silently
+  // become 0 (which would disable the feature with no signal at all).
+  const requestedWait = options.waitSeconds ?? 0;
+  const waitSeconds =
+    requestedWait > 0
+      ? Math.min(MAX_EVENT_WAIT_SECONDS, Math.max(MIN_EVENT_WAIT_SECONDS, Math.round(requestedWait)))
+      : 0;
+  if (requestedWait > 0 && waitSeconds !== Math.round(requestedWait)) {
+    options.log?.info?.(
+      `octo: eventWaitSeconds ${requestedWait} clamped to ${waitSeconds} ` +
+        `(valid range ${MIN_EVENT_WAIT_SECONDS}-${MAX_EVENT_WAIT_SECONDS}; 0 disables long polling)`,
+    );
+  }
   let cursor = 0;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // Tracks the in-flight request so stop() can cut a hold short. Without this the loop is a
+  // single sequential chain, so a stop during a 25s hold would keep the account busy for the
+  // rest of that hold instead of shutting down.
+  let inFlight: AbortController | undefined;
+  let consecutiveErrors = 0;
 
-  const schedule = (): void => {
+  const schedule = (delayMs: number): void => {
     if (stopped) return;
-    timer = setTimeout(() => void tick(), intervalMs);
+    timer = setTimeout(() => void tick(), Math.max(0, delayMs));
+  };
+
+  /**
+   * Pace the next tick from what this one actually did.
+   *
+   * Long polling delegates pacing to the server — but only while the server is really holding.
+   * Rescheduling at 0ms unconditionally (the first version of this) turns any fast return into a
+   * hot loop: an older server that ignores `wait`, any 4xx/5xx, a connection refusal, or a proxy
+   * closing the hold early all come back in one RTT, and the loop re-fires immediately, forever.
+   * Measured at ~800 req/s against an immediately-erroring server — the opposite of the traffic
+   * reduction this feature exists for, at exactly the moment the server can least absorb it.
+   *
+   * So: only a hold that was genuinely honoured earns an immediate re-poll.
+   */
+  const nextDelayMs = (
+    outcome: "batch" | "empty" | "error",
+    requestMs: number,
+  ): number => {
+    if (waitSeconds === 0) return intervalMs; // short poll: unchanged, always paced
+    if (outcome === "error") {
+      // Never hammer an unhealthy server. Exponential, capped, reset on any success.
+      consecutiveErrors += 1;
+      return Math.min(MAX_ERROR_BACKOFF_MS, intervalMs * 2 ** (consecutiveErrors - 1));
+    }
+    consecutiveErrors = 0;
+    // Events in hand: drain immediately, there may be more behind them.
+    if (outcome === "batch") return 0;
+    // Empty, and the server clearly did not hold for anything like the time we asked for — it is
+    // not participating in the long poll (old server, proxy, or an error page). Fall back to
+    // client-side pacing rather than spinning.
+    if (requestMs < waitSeconds * 1000 * HELD_FRACTION) return intervalMs;
+    // Empty after a real hold: the server did its job, go straight back in.
+    return 0;
   };
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
+    const startedAt = Date.now();
+    let outcome: "batch" | "empty" | "error" = "empty";
     try {
+      const controller = new AbortController();
+      inFlight = controller;
+      const timeoutSignal = AbortSignal.timeout(eventsPollTimeoutMs(waitSeconds));
       const events = await fetchBotEvents({
         apiUrl: options.apiUrl,
         botToken: options.botToken,
         sinceEventId: cursor,
         limit,
+        ...(waitSeconds > 0 ? { waitSeconds } : {}),
+        // Combine both reasons to give up: the ordinary per-request timeout, and an explicit
+        // stop. Passing a signal suppresses the default timeout inside fetchBotEvents, so the
+        // timeout has to be supplied here rather than relying on it.
+        signal: AbortSignal.any([controller.signal, timeoutSignal]),
       });
       // Validate ids *before* sorting: a non-integer event_id makes numeric-subtraction comparison
       // return NaN, which leaves the sort order unspecified and can drop a valid interleaved event.
@@ -133,17 +226,32 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
           }
         }
       }
+      // Classify from forward progress, not from response size. `ordered` is what actually
+      // advances the cursor (:filtered by isSafeInteger + > cursor), and every element of it is
+      // assigned to `cursor` below. A response that is non-empty but entirely undrainable —
+      // event ids outside the IEEE-754 safe range, or a persisted cursor ahead of what the
+      // server returns after a store reset — would otherwise be classified "batch", reschedule
+      // at 0ms, and re-issue the identical request forever. Reproduced at ~430 req/s before
+      // this line was corrected; it falls through to "empty" and is paced by intervalMs now,
+      // which is the right treatment for a server that is not making progress for us.
+      outcome = ordered.length > 0 ? "batch" : "empty";
       if (events.length > 0) {
         options.log?.info?.(
           `octo: event poll batch events=${events.length} card_actions=${cardActions} cursor=${cursor}`,
         );
       }
     } catch (error) {
-      options.log?.error?.(
-        `octo: event poll failed at cursor=${cursor}: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      outcome = "error";
+      // A stop() mid-hold aborts the request on purpose; reporting that as a poll failure would
+      // put a spurious error in the log on every clean shutdown.
+      if (!stopped) {
+        options.log?.error?.(
+          `octo: event poll failed at cursor=${cursor}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     } finally {
-      schedule();
+      inFlight = undefined;
+      schedule(nextDelayMs(outcome, Date.now() - startedAt));
     }
   };
 
@@ -151,14 +259,16 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
     .then((loaded) => {
       cursor = Number.isSafeInteger(loaded) && loaded >= 0 ? loaded : 0;
       options.log?.info?.(`octo: card event poller ready at cursor=${cursor}`);
-      schedule();
+      // First tick keeps the pre-existing timing: short polling waits one interval before its
+      // first read, long polling starts immediately.
+      schedule(waitSeconds > 0 ? 0 : intervalMs);
     })
     .catch((error) => {
       options.log?.error?.(
         `octo: event cursor load failed, starting from zero: ${error instanceof Error ? error.message : String(error)}`,
       );
       cursor = 0;
-      schedule();
+      schedule(waitSeconds > 0 ? 0 : intervalMs);
     });
 
   return {
@@ -166,6 +276,9 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
     stop(): void {
       stopped = true;
       if (timer) clearTimeout(timer);
+      // Cut a hold short rather than waiting it out. Set `stopped` first so the abort is
+      // classified as a shutdown, not a poll failure.
+      inFlight?.abort();
     },
     cursor(): number {
       return cursor;
