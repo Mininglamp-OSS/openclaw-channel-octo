@@ -408,6 +408,10 @@ async function editEntryProgress(params: {
         ...(params.transient && !TERMINAL_TEMPLATE_STATES.has(data.state)
           ? { transient: true }
           : {}),
+        // A transient frame opts out of the shared 429 backoff. It is discardable, and
+        // sleeping inside the call would hold entry.inFlight for the whole wait, blocking
+        // the frames behind it. Rate limiting is handled by the cooldown gate instead.
+        ...(params.transient ? { retryOn429: false } : {}),
         signal: params.signal,
       });
       return true;
@@ -484,6 +488,11 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         templateRef: entry.templateRef,
         state: data.state,
         data,
+        // The placeholder frame is part of the debounced flush path, so it opts out of the
+        // shared 429 backoff for the same reason the transient edits do: a sleep here holds
+        // entry.inFlight and stalls every frame queued behind it. Rate limiting for progress
+        // frames is handled by the cooldown gate instead.
+        retryOn429: false,
         signal,
       });
       entry.messageId = res?.message_id;
