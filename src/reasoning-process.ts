@@ -100,15 +100,21 @@ const REQUIRED_VIEWS = [
  * `.octospec/tasks/cardtmpl-runtime-catalog-overlay/brief.md` D13/E1d and
  * `.octospec/tasks/cardtmpl-reasoning-schema-successor/brief.md` D5: the catalog advertises one
  * new-send version, and multiple compatible entries without an explicit preference capability
- * fail closed to Model B rather than reintroducing a local semver policy.
+ * fail closed rather than reintroducing a local semver policy.
  * A duplicated id/version also remains ambiguous even if only one copy has compatible views:
  * `template_ref` cannot identify which copy the server would resolve.
  */
 export function selectReasoningProcessTemplate(
   templating: CardTemplatingCapability | undefined,
+  configuredRef?: CardTemplateRef | null,
 ): CardTemplateRef | null {
-  if (!templating?.supported || templating.wire !== TEMPLATE_WIRE) return null;
-  const claimed = templating.templates.filter((template) => template.id === REASONING_TEMPLATE_ID);
+  if (!templating?.supported || templating.wire !== TEMPLATE_WIRE || configuredRef === null) return null;
+  if (configuredRef !== undefined &&
+      (configuredRef.id !== REASONING_TEMPLATE_ID || !configuredRef.version ||
+       configuredRef.version.trim() !== configuredRef.version)) return null;
+  const claimed = templating.templates.filter((template) =>
+    template.id === REASONING_TEMPLATE_ID &&
+    (configuredRef === undefined || template.version === configuredRef.version));
   const compatible = claimed.filter((template) => {
     if (!template.version || template.version.trim() !== template.version) return false;
     return REQUIRED_VIEWS.every((required) => {

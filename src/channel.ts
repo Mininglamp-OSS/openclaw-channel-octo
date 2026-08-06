@@ -1544,10 +1544,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         });
         log?.info?.(`octo: [${account.accountId}] card_action poller started`);
       };
-      if (account.config.cardInteraction !== false) {
-        setCardEventPollStarter(account.accountId, startCardEventPoller);
-        if (process.env.OCTO_CARD_POLL_FORCE === "1") startCardEventPoller();
-      }
+      // The poller remains lazy, but every card-profile consumer may now start it so
+      // bot_setting_updated can invalidate that Bot's cached policy even when interactions are
+      // currently disabled. Local cardInteraction is deprecated and no longer gates events.
+      setCardEventPollStarter(account.accountId, startCardEventPoller);
+      if (process.env.OCTO_CARD_POLL_FORCE === "1") startCardEventPoller();
 
       // 6. Connect WebSocket — pure real-time
       const socket = new WKSocket({

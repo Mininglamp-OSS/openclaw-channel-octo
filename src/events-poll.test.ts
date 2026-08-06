@@ -348,6 +348,20 @@ describe("event poller", () => {
     requestCardEventPolling("bot-a");
     expect(starter).toHaveBeenCalledOnce();
   });
+
+  it("channel 与 agent runtime 的独立模块实例共享懒启动器", async () => {
+    vi.resetModules();
+    const channelRuntime = await import("./events-poll.js");
+    const starter = vi.fn();
+    channelRuntime.setCardEventPollStarter("Cross-Loader-Bot", starter);
+
+    vi.resetModules();
+    const agentRuntime = await import("./events-poll.js");
+    agentRuntime.requestCardEventPolling("cross-loader-bot");
+
+    expect(starter).toHaveBeenCalledOnce();
+    agentRuntime.setCardEventPollStarter("cross-loader-bot", undefined);
+  });
 });
 
 describe("file event cursor store", () => {

@@ -1,54 +1,56 @@
 /**
- * 波 B —— InteractiveCard(=17) 进度卡状态机 + hook 驱动 + 节流。
+ * Registry reasoning InteractiveCard(=17) 进度状态机 + hook 驱动 + 节流。
  *
  * 架构(见 .context 计划):
  *   - dispatch(`inbound.ts`)在 run 开始 `setCardContext(sessionKey, ctx)` 存发送上下文
  *     (apiUrl/botToken/channel/onBehalfOf),`finally` 里 `finalizeCard(sessionKey, success)`。
  *   - 本模块订阅 hook(before/after_tool_call、model_call_started),用 `ctx.sessionKey`
- *     查 Map:首个工具事件懒发占位卡 → 后续就地 `editCardMessage`,节流合帧。
+ *     查 Map:首个工具事件懒发占位卡 → 后续就地 `editTemplateCardMessage`,节流合帧。
  *   - sessions_yield 将已发出的卡移入 pausedCards；后续 lifecycle run 继续编辑同一张卡。
  *   - `sessionKey` 桥接 dispatch 与 hook(H1 实证一致)。Map 只含 octo dispatch 登记的
  *     session → hook 查不到即 return,**天然过滤**非 octo run,无需 messageProvider 判断。
  *
- * 决策:关联键 sessionKey;单写者(dispatch per-group 串行)→ 不传 card_seq;卡仅进度/
- * 状态(C2,答案走文本);OBO(persona-clone)场景跳过(服务端拒 type-17 OBO,Decision 2b)。
+ * 决策:关联键 sessionKey;Registry 编辑用单调 card_seq 串行提交;卡仅承载进度/状态
+ * (C2,答案走文本);OBO(persona-clone)场景跳过(服务端拒 type-17 OBO,Decision 2b)。
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { ChannelType, CARD_PROFILE, CARD_VERSION } from "./types.js";
+import { ChannelType } from "./types.js";
 import {
-  editCardMessage,
   editTemplateCardMessage,
-  getCardProfile,
   httpStatusFromApiFetchError,
-  sendCardMessage,
   sendTemplateCardMessage,
   type CardProfileManifest,
   type CardTemplateRef,
 } from "./api-fetch.js";
-import { deriveCardCaps } from "./card-caps.js";
-import { renderProgressCard, renderProgressResponseCard, summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState, type CardCaps } from "./card-render.js";
+import {
+  _resetBotCardProfileCacheForTests,
+  getBotCardProfile,
+  peekBotCardProfile,
+} from "./card-profile-cache.js";
+import { summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState } from "./card-render.js";
 import {
   buildReasoningProcessId,
   buildReasoningProcessWireData,
-  renderReasoningProcessCard,
   selectReasoningProcessTemplate,
   summarizeToolResult,
 } from "./reasoning-process.js";
 import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.js";
 import { collapseParentScope, parentGroupOf, resolveOutboundTarget } from "./target.js";
 import { getKnownGroupIds } from "./group-md.js";
-import type { ReasoningCardTemplateMode } from "./config-schema.js";
+import { requestCardEventPolling } from "./events-poll.js";
 
 /** dispatch 侧登记的发送上下文。 */
 export interface CardContext {
+  /** Account owning this Bot credential; used only to lazily start its config-event poller. */
+  accountId?: string;
   apiUrl: string;
   botToken: string;
   channelId: string;
   channelType: ChannelType;
-  /** false force-disables automatic progress cards for this account/session. */
+  /** @deprecated Ignored. Server config.reasoning_enabled is authoritative. */
   cardProgress?: boolean;
-  /** Explicit Registry migration gate. Defaults to experimental with Model B fallback. */
-  reasoningCardTemplateMode?: ReasoningCardTemplateMode;
+  /** @deprecated Ignored. Server config.reasoning_template_ref is authoritative. */
+  reasoningCardTemplateMode?: "off" | "shadow" | "experimental";
   /** persona-clone 身份;存在则跳过卡片(服务端拒 type-17 OBO)。 */
   onBehalfOf?: string;
   /** OpenClaw reasoning visibility resolved for this turn/session. */
@@ -88,17 +90,15 @@ interface CardEntry {
   /** paused/resuming/done 跨-run edit 的串行尾指针。 */
   stateEditPromise?: Promise<void>;
   stateEditAbort?: AbortController;
-  /** All Model A edits share this tail so card_seq reservation order equals wire order. */
-  modelAEditPromise?: Promise<boolean>;
+  /** All Registry edits share this tail so card_seq reservation order equals wire order. */
+  templateEditPromise?: Promise<boolean>;
   /** paused 卡的有界回收定时器。 */
   pausedExpiryTimer?: ReturnType<typeof setTimeout>;
   /** replacement/clear 时主动取消 profile/send/edit,缩小 stale side-effect 窗口。 */
   flushAbort?: AbortController;
-  /** Pinned once before the first send; one message must never switch wire modes. */
-  deliveryMode?: "model-a" | "model-b";
-  /** Manifest-selected ref, pinned for every frame of a Model A message. */
+  /** Server-selected ref, pinned for every frame of a Registry-authored message. */
   templateRef?: CardTemplateRef;
-  /** Next positive CAS value for a Model A edit. */
+  /** Next positive CAS value for a Registry edit. */
   nextCardSeq: number;
   /** Stable for every frame, including paused continuation runs. */
   reasoningId?: string;
@@ -114,16 +114,9 @@ interface CardEntry {
   deliveredByTool?: boolean;
 }
 
-type CachedCardProfile = {
-  manifest: CardProfileManifest;
-  expiresAt: number;
-};
-
 type CardProgressSharedState = {
   cards: Map<string, CardEntry>;
   pausedCards: Map<string, CardEntry>;
-  profileCache: Map<string, CachedCardProfile>;
-  capsCache: Map<string, CardCaps>;
 };
 
 /**
@@ -140,8 +133,6 @@ function getCardProgressSharedState(): CardProgressSharedState {
   const created: CardProgressSharedState = {
     cards: new Map(),
     pausedCards: new Map(),
-    profileCache: new Map(),
-    capsCache: new Map(),
   };
   root[CARD_PROGRESS_STATE_KEY] = created;
   return created;
@@ -158,19 +149,8 @@ const cards = sharedState.cards;
  */
 const pausedCards = sharedState.pausedCards;
 
-/** Short-lived bot-scoped profile cache; expiry lets new messages observe catalog rollouts. */
-const profileCache = sharedState.profileCache;
-
-/**
- * D12 能力(elements/limits 派生的渲染 caps)缓存,key = apiUrl(部署级,同 gate)。gateEnabled
- * 探测 manifest 时一并填充;渲染时按元素以及节点/深度/字节上限裁剪。旧部署无这些字段 → caps 为空 → 渲染
- * 走保守默认(等同今天行为)。
- */
-const capsCache = sharedState.capsCache;
-
 const FLUSH_DEBOUNCE_MS = 800;
 const EDIT_TIMEOUT_MS = 10_000;
-const PROFILE_CACHE_TTL_MS = 60_000;
 const REGISTRY_EDIT_RETRY_DELAYS_MS = [100, 250] as const;
 /** Registry 契约里必须进修订历史的终态帧。 */
 const TERMINAL_TEMPLATE_STATES = new Set(["completed", "stopped", "error"]);
@@ -194,11 +174,6 @@ const dbg: (msg: string) => void = process.env.OCTO_CARD_DEBUG
  */
 function contextIdentity(ctx: CardContext): string {
   return JSON.stringify([ctx.apiUrl, ctx.channelId, ctx.channelType, ctx.onBehalfOf ?? "", ctx.botToken]);
-}
-
-/** Profile enabled/catalog facts are authorized by botToken, not shared by an apiUrl deployment. */
-function profileCacheKey(ctx: CardContext): string {
-  return JSON.stringify([ctx.apiUrl, ctx.botToken]);
 }
 
 /**
@@ -237,33 +212,22 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
     dirty: false,
     inFlight: false,
     nextCardSeq: 1,
-    // Account config is a per-session narrowing decision. Keep it out of the
-    // bot-scoped profile cache and apiUrl-keyed deployment render-caps cache.
-    skip: collision || !!ctx.onBehalfOf || ctx.cardProgress === false,
+    skip: collision || !!ctx.onBehalfOf,
   });
   dbg(`context set session=${sessionKey} channel=${ctx.channelId} obo=${!!ctx.onBehalfOf} collision=${collision}`);
 }
 
 /**
- * 是否允许发卡:D12 manifest 优先,端点未部署(available:false)则回退 env 开关。
+ * 是否允许发卡：只接受 profile 中服务端已计算好的 per-Bot reasoning policy 与精确模板 ref。
  * 返回值三态:`true`=启用,`false`=**明确禁用**(可永久 skip 本 session),
  * `null`=**瞬时探测失败**(5xx/网络,不缓存、不 skip,下次 flush 重探)。
  */
 async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<boolean | null> {
-  const cacheKey = profileCacheKey(ctx);
-  const cached = profileCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return profileEnabledForContext(ctx, cached.manifest);
-  if (cached) profileCache.delete(cacheKey);
   try {
-    const m = await getCardProfile({ apiUrl: ctx.apiUrl, botToken: ctx.botToken, signal });
-    // 能力清单是部署级事实(与 enabled 无关),探到就缓存供渲染裁剪。
-    capsCache.set(ctx.apiUrl, deriveCardCaps(m));
-    // Profile 来自带 botToken 的请求，其中 enabled/templating 都是 Bot 级事实。
-    profileCache.set(cacheKey, {
-      manifest: m,
-      expiresAt: Date.now() + PROFILE_CACHE_TTL_MS,
-    });
-    return profileEnabledForContext(ctx, m);
+    if (ctx.accountId) requestCardEventPolling(ctx.accountId);
+    const m = await getBotCardProfile({ apiUrl: ctx.apiUrl, botToken: ctx.botToken });
+    if (signal?.aborted) throw signal.reason;
+    return !!reasoningTemplateForProfile(m);
   } catch (err: unknown) {
     // 瞬时失败(5xx/网络抖动)不缓存、不 skip —— 否则一次抖动会让该 apiUrl(缓存)或
     // 该 session(skip)的卡片进度永久关闭。返回 null,下次 flush(仍在 !messageId 期间)重探。
@@ -272,50 +236,13 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
   }
 }
 
-function baseProfileEnabled(manifest: CardProfileManifest): boolean {
-  return manifest.available
-    ? manifest.enabled
-    : process.env.OCTO_CARD_MESSAGE_ENABLED === "1";
+function reasoningTemplateForProfile(manifest: CardProfileManifest): CardTemplateRef | null {
+  if (!manifest.available || manifest.config?.reasoning_enabled !== true) return null;
+  return selectReasoningProcessTemplate(
+    manifest.templating,
+    manifest.config.reasoning_template_ref,
+  );
 }
-
-function modelBProfileCompatible(manifest: CardProfileManifest): boolean {
-  if (!manifest.available) return true;
-  if (Array.isArray(manifest.profiles) && manifest.profiles.length > 0 &&
-      !manifest.profiles.includes(CARD_PROFILE)) {
-    dbg(`gate: profile ${CARD_PROFILE} not advertised (${manifest.profiles.join(",")}) → disabled`);
-    return false;
-  }
-  if (typeof manifest.card_version === "string" && manifest.card_version !== CARD_VERSION) {
-    dbg(`gate: card_version ${manifest.card_version} != ${CARD_VERSION} → disabled`);
-    return false;
-  }
-  if (Array.isArray(manifest.elements) && !manifest.elements.includes("TextBlock")) {
-    // Model B 的所有安全降级最终都依赖 TextBlock。显式空数组或缺 TextBlock 是权威不支持。
-    dbg("gate: TextBlock not advertised → disabled");
-    return false;
-  }
-  return true;
-}
-
-function modelBEnabledForContext(manifest: CardProfileManifest): boolean {
-  return baseProfileEnabled(manifest) && modelBProfileCompatible(manifest);
-}
-
-function profileEnabledForContext(ctx: CardContext, manifest: CardProfileManifest): boolean {
-  const enabled = baseProfileEnabled(manifest);
-  if (!enabled) return false;
-  const registryCompatible = (ctx.reasoningCardTemplateMode ?? "experimental") === "experimental" &&
-    !!selectReasoningProcessTemplate(manifest.templating);
-  // Model A 由 Registry 模板自己的 wire/views 契约协商，不依赖 Model B 的 Adaptive Card
-  // profile/card_version/elements。仅在实际走 Model B 时应用下面的渲染兼容 gate。
-  return registryCompatible || modelBProfileCompatible(manifest);
-}
-
-const TEMPLATE_FRAME_REJECTION_STATUSES = new Set([400, 404, 422]);
-const CARD_INVALID_ERROR_CODES = new Set([
-  "card_invalid",
-  "err.server.bot_api.card_invalid",
-]);
 
 function apiErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -330,35 +257,16 @@ function errorCodeFromApiError(error: unknown): string | undefined {
   return apiErrorMessage(error).match(/"code"\s*:\s*"([^"]+)"/)?.[1];
 }
 
-function canFallbackFirstFrameToModelB(entry: CardEntry, error: unknown): boolean {
-  const transportStatus = httpStatusFromApiFetchError(error);
-  const semanticStatus = semanticHttpStatusFromApiError(error);
-  const errorCode = errorCodeFromApiError(error);
-  // 第二次 send 只能发生在服务端明确拒绝模板帧时。408/冲突/限流/5xx 都可能是
-  // 已提交或瞬时失败，不能因为外层 transport 400 就切到 Model B 造成孤儿卡。
-  if (transportStatus === undefined || !TEMPLATE_FRAME_REJECTION_STATUSES.has(transportStatus)) return false;
-  if (semanticStatus !== undefined && !TEMPLATE_FRAME_REJECTION_STATUSES.has(semanticStatus)) return false;
-  if (errorCode !== undefined && !CARD_INVALID_ERROR_CODES.has(errorCode)) return false;
-  const manifest = profileCache.get(profileCacheKey(entry.ctx))?.manifest;
-  return !!manifest && modelBEnabledForContext(manifest);
-}
-
 function resolveEntryDeliveryMode(entry: CardEntry): void {
-  if (entry.deliveryMode) return;
-  const requested = entry.ctx.reasoningCardTemplateMode ?? "experimental";
-  const templateRef = selectReasoningProcessTemplate(
-    profileCache.get(profileCacheKey(entry.ctx))?.manifest.templating,
-  );
-  if (requested === "shadow") {
-    dbg(`Registry shadow discovery compatible=${!!templateRef}`);
-  }
-  if (requested === "experimental" && templateRef) {
-    entry.deliveryMode = "model-a";
+  if (entry.templateRef) return;
+  const profile = peekBotCardProfile(entry.ctx);
+  const templateRef = profile ? reasoningTemplateForProfile(profile) : null;
+  if (templateRef) {
     entry.templateRef = templateRef;
     dbg(`selected Registry reasoning template ${templateRef.id}@${templateRef.version}`);
     return;
   }
-  entry.deliveryMode = "model-b";
+  entry.skip = true;
 }
 
 function scheduleFlush(sessionKey: string, entry: CardEntry): void {
@@ -385,23 +293,6 @@ function entryProgressState(
     ...(opts.elapsedMs !== undefined ? { elapsedMs: opts.elapsedMs } : {}),
     ...(opts.errorText ? { errorText: opts.errorText } : {}),
   };
-}
-
-function usesReasoningProcessContract(entry: CardEntry): boolean {
-  const reasoningVisible = entry.ctx.reasoningVisibility === "on" ||
-    entry.ctx.reasoningVisibility === "stream";
-  return reasoningVisible && entry.steps.some((step) => !!step.thought?.trim());
-}
-
-function renderEntryProgress(
-  sessionKey: string,
-  entry: CardEntry,
-  state: CardProgressState,
-): { card: Record<string, unknown>; plain: string } {
-  const caps = capsCache.get(entry.ctx.apiUrl);
-  return usesReasoningProcessContract(entry)
-    ? renderReasoningProcessCard(state, caps)
-    : renderProgressCard(state, caps);
 }
 
 function isRetryableRegistryEditError(error: unknown): boolean {
@@ -457,12 +348,11 @@ async function editEntryProgress(params: {
   const { entry, state } = params;
   const messageId = entry.messageId;
   if (!messageId) return false;
-  if (entry.deliveryMode === "model-a") {
-    const data = buildReasoningProcessWireData(state);
-    const templateRef = entry.templateRef;
-    if (!data || !templateRef) return false;
-    const previous = entry.modelAEditPromise;
-    const work = (async (): Promise<boolean> => {
+  const data = buildReasoningProcessWireData(state);
+  const templateRef = entry.templateRef;
+  if (!data || !templateRef) return false;
+  const previous = entry.templateEditPromise;
+  const work = (async (): Promise<boolean> => {
       // Match the two sibling serialisation tails in this file (`:641` state transitions,
       // `:735` finalize): a queue is for ordering, so a predecessor's failure must not take
       // the edit behind it down with it before that edit has even reserved a card_seq.
@@ -471,7 +361,7 @@ async function editEntryProgress(params: {
       }
       if (entry.skip) return false;
       if (params.signal.aborted) throw params.signal.reason;
-      // Reserve inside the single Model A queue: reservation order now equals request order, so
+      // Reserve inside the single Registry queue: reservation order now equals request order, so
       // a later CAS value cannot commit before an earlier one and make it stale on arrival.
       const cardSeq = entry.nextCardSeq++;
       await editTemplateCardWithRetry({
@@ -493,30 +383,13 @@ async function editEntryProgress(params: {
         signal: params.signal,
       });
       return true;
-    })();
-    entry.modelAEditPromise = work;
-    try {
-      return await work;
-    } finally {
-      if (entry.modelAEditPromise === work) entry.modelAEditPromise = undefined;
-    }
+  })();
+  entry.templateEditPromise = work;
+  try {
+    return await work;
+  } finally {
+    if (entry.templateEditPromise === work) entry.templateEditPromise = undefined;
   }
-
-  const { card, plain } = renderEntryProgress(params.sessionKey, entry, state);
-  if (!Array.isArray(card.body) || card.body.length === 0) return false;
-  await editCardMessage({
-    apiUrl: entry.ctx.apiUrl,
-    botToken: entry.ctx.botToken,
-    messageId,
-    channelId: entry.ctx.channelId,
-    channelType: entry.ctx.channelType,
-    card,
-    plain,
-    ...(params.transient ? { transient: true } : {}),
-    ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
-    signal: params.signal,
-  });
-  return true;
 }
 
 async function flush(sessionKey: string): Promise<void> {
@@ -569,53 +442,22 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     const state = entryProgressState(sessionKey, entry);
     if (!entry.messageId) {
       if (!isCurrentEntry(sessionKey, entry)) return;
-      let res;
-      if (entry.deliveryMode === "model-a") {
-        const data = buildReasoningProcessWireData(state);
-        if (!data) {
-          dbg("model-a first frame deferred: no phases with actions yet");
-          return;
-        }
-        if (!entry.templateRef) return;
-        try {
-          res = await sendTemplateCardMessage({
-            apiUrl: entry.ctx.apiUrl,
-            botToken: entry.ctx.botToken,
-            channelId: entry.ctx.channelId,
-            channelType: entry.ctx.channelType,
-            templateRef: entry.templateRef,
-            state: data.state,
-            data,
-            signal,
-          });
-        } catch (error) {
-          if (!canFallbackFirstFrameToModelB(entry, error) || !isCurrentEntry(sessionKey, entry)) {
-            throw error;
-          }
-          warn(`model-a first frame rejected; retrying once with model-b: ${apiErrorMessage(error)}`);
-          entry.deliveryMode = "model-b";
-          entry.templateRef = undefined;
-        }
+      const data = buildReasoningProcessWireData(state);
+      if (!data) {
+        dbg("Registry first frame deferred: no phases with actions yet");
+        return;
       }
-
-      if (entry.deliveryMode === "model-b") {
-        const { card, plain } = renderEntryProgress(sessionKey, entry, state);
-        if (!Array.isArray(card.body) || card.body.length === 0) {
-          warn("rendered card cannot fit negotiated capabilities/limits; disabling for session");
-          entry.skip = true;
-          return;
-        }
-        res = await sendCardMessage({
-          apiUrl: entry.ctx.apiUrl,
-          botToken: entry.ctx.botToken,
-          channelId: entry.ctx.channelId,
-          channelType: entry.ctx.channelType,
-          card,
-          plain,
-          ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
-          signal,
-        });
-      }
+      if (!entry.templateRef) return;
+      const res = await sendTemplateCardMessage({
+        apiUrl: entry.ctx.apiUrl,
+        botToken: entry.ctx.botToken,
+        channelId: entry.ctx.channelId,
+        channelType: entry.ctx.channelType,
+        templateRef: entry.templateRef,
+        state: data.state,
+        data,
+        signal,
+      });
       entry.messageId = res?.message_id;
       if (!isCurrentEntry(sessionKey, entry)) return;
       if (!entry.messageId) {
@@ -743,15 +585,12 @@ async function editTrackedCardState(
       });
       dbg(`transitioned session=${sessionKey} phase=${phase}`);
     } catch (err: unknown) {
-      // Same policy as runFlush (`:569`): only a deterministic 4xx is worth giving up on. A 5xx
+      // Same policy as runFlush: only a deterministic 4xx is worth giving up on. A 5xx
       // or timeout that merely outlasted REGISTRY_EDIT_RETRY_DELAYS_MS must not be terminal —
       // the next edit takes a fresh nextCardSeq, still strictly greater than the server's last
-      // commit, so retrying stays CAS-safe. Model B never set skip here and recovers on the next
-      // transition; Model A giving up made it the only mode a transient blip could freeze.
-      if (entry.deliveryMode === "model-a") {
-        const status = httpStatusFromApiFetchError(err);
-        if (status !== undefined && status >= 400 && status < 500 && status !== 429) entry.skip = true;
-      }
+      // commit, so retrying stays CAS-safe.
+      const status = httpStatusFromApiFetchError(err);
+      if (status !== undefined && status >= 400 && status < 500 && status !== 429) entry.skip = true;
       if (!abort.signal.aborted) {
         warn(`state transition failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -974,39 +813,9 @@ export async function finalizeCardWithResponse(
   endRunningThinking(entry, Date.now());
   if (entry.skip || !entry.messageId || cards.get(sessionKey) !== entry) return false;
   // Registry-authored messages can only be updated with template_ref + state + data.
-  // The final answer remains on the normal text path for Model A.
-  if (entry.deliveryMode === "model-a") return false;
-
-  const rendered = renderProgressResponseCard({
-    phase: "done",
-    steps: entry.steps,
-    elapsedMs: Date.now() - entry.startedAt,
-  }, responseText, capsCache.get(entry.ctx.apiUrl));
-  if (!rendered) return false;
-
-  // Freeze late hook/debounce activity while the terminal edit is in flight so
-  // no stale transient frame can overwrite the merged response afterward.
-  entry.skip = true;
-  try {
-    await editCardMessage({
-      apiUrl: entry.ctx.apiUrl,
-      botToken: entry.ctx.botToken,
-      messageId: entry.messageId,
-      channelId: entry.ctx.channelId,
-      channelType: entry.ctx.channelType,
-      card: rendered.card,
-      plain: rendered.plain,
-      ...(entry.ctx.onBehalfOf ? { onBehalfOf: entry.ctx.onBehalfOf } : {}),
-      signal: AbortSignal.timeout(EDIT_TIMEOUT_MS),
-    });
-    if (cards.get(sessionKey) === entry) cards.delete(sessionKey);
-    dbg(`merged final response session=${sessionKey} steps=${entry.steps.length}`);
-    return true;
-  } catch (err: unknown) {
-    if (cards.get(sessionKey) === entry) entry.skip = false;
-    warn(`final response merge failed: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
+  // The final answer remains on the normal text path.
+  void responseText;
+  return false;
 }
 
 /** 硬清理(不发收尾帧),用于异常兜底。 */
@@ -1035,8 +844,7 @@ export function _resetCardProgressForTests(): void {
   }
   cards.clear();
   pausedCards.clear();
-  profileCache.clear();
-  capsCache.clear();
+  _resetBotCardProfileCacheForTests();
 }
 
 /**

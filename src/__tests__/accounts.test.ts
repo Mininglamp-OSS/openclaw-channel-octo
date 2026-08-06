@@ -27,8 +27,8 @@ function buildCfg(accounts: Record<string, unknown>): unknown {
 }
 
 describe("resolveOctoAccount", () => {
-  describe("card feature switch inheritance", () => {
-    it("inherits top-level card switches when the account omits them", () => {
+  describe("server-owned card policy", () => {
+    it("does not copy legacy local card switches into the resolved account", () => {
       const cfg = {
         channels: {
           octo: {
@@ -44,61 +44,9 @@ describe("resolveOctoAccount", () => {
 
       const account = resolveOctoAccount({ cfg: cfg as never, accountId: MIXED_CASE_ID });
 
-      expect(account.config.cardProgress).toBe(false);
-      expect(account.config.cardDisplay).toBe(false);
-      expect(account.config.cardInteraction).toBe(false);
-    });
-
-    it("allows an account true to override a top-level false", () => {
-      const cfg = {
-        channels: {
-          octo: {
-            cardProgress: false,
-            cardDisplay: false,
-            cardInteraction: false,
-            accounts: {
-              [MIXED_CASE_ID]: {
-                botToken: "bf_cards_enable",
-                cardProgress: true,
-                cardDisplay: true,
-                cardInteraction: true,
-              },
-            },
-          },
-        },
-      };
-
-      const account = resolveOctoAccount({ cfg: cfg as never, accountId: MIXED_CASE_ID });
-
-      expect(account.config.cardProgress).toBe(true);
-      expect(account.config.cardDisplay).toBe(true);
-      expect(account.config.cardInteraction).toBe(true);
-    });
-
-    it("allows an account false to override a top-level true", () => {
-      const cfg = {
-        channels: {
-          octo: {
-            cardProgress: true,
-            cardDisplay: true,
-            cardInteraction: true,
-            accounts: {
-              [MIXED_CASE_ID]: {
-                botToken: "bf_cards_disable",
-                cardProgress: false,
-                cardDisplay: false,
-                cardInteraction: false,
-              },
-            },
-          },
-        },
-      };
-
-      const account = resolveOctoAccount({ cfg: cfg as never, accountId: MIXED_CASE_ID });
-
-      expect(account.config.cardProgress).toBe(false);
-      expect(account.config.cardDisplay).toBe(false);
-      expect(account.config.cardInteraction).toBe(false);
+      expect(account.config).not.toHaveProperty("cardProgress");
+      expect(account.config).not.toHaveProperty("cardDisplay");
+      expect(account.config).not.toHaveProperty("cardInteraction");
     });
   });
 

@@ -505,6 +505,15 @@ export interface CardTemplateRef {
   version: string;
 }
 
+/** Effective per-bot card policy returned by GET /v1/bot/card/profile. */
+export interface BotCardConfig {
+  card_enabled: boolean;
+  display_enabled: boolean;
+  interaction_enabled: boolean;
+  reasoning_enabled: boolean;
+  reasoning_template_ref: CardTemplateRef | null;
+}
+
 export interface CardTemplateViewCapability {
   name: string;
   states: string[];
@@ -693,12 +702,11 @@ export async function editTemplateCardMessage(params: {
  */
 export interface CardProfileManifest {
   /**
-   * D12 manifest 端点是否**已部署并响应**（非 404）。
-   * `false` 表示端点尚未上线（PR-D 未落地）—— 调用方应回退到 adapter 侧 config
-   * 显式开关决定是否发卡,**不可**把它等同于「服务端明确关闭」。
+   * D12 manifest 端点是否**已部署并响应**（非 404）。`false` 时所有卡片能力 fail
+   * closed；插件不再使用本地开关或本地推理卡模板兜底。
    */
   available: boolean;
-  /** 卡片消息是否启用（OCTO_CARD_MESSAGE_ENABLED）。禁用时 server 仍返 200 + manifest。 */
+  /** 兼容保留的 manifest 总闸；实际发送使用 `config` 中服务端已 AND 的有效值。 */
   enabled: boolean;
   /** 支持的 profile 列表，如 `["octo/v1"]`（P2 增 `"octo/v2"`）。 */
   profiles?: string[];
@@ -721,6 +729,8 @@ export interface CardProfileManifest {
   limits?: Record<string, unknown>;
   /** Optional Registry template-ref/v1 capability and explicit Bot catalog. */
   templating?: CardTemplatingCapability;
+  /** Effective per-bot policy. Each feature flag already includes the server's global gate. */
+  config?: BotCardConfig;
 }
 
 function stringArray(value: unknown): string[] {
@@ -756,14 +766,51 @@ function parseTemplatingCapability(value: unknown): CardTemplatingCapability | u
   };
 }
 
+function parseCardTemplateRef(value: unknown): CardTemplateRef | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const ref = value as Record<string, unknown>;
+  if (Object.keys(ref).length !== 2 ||
+      typeof ref.id !== "string" || !ref.id || ref.id.trim() !== ref.id ||
+      typeof ref.version !== "string" || !ref.version || ref.version.trim() !== ref.version) {
+    return undefined;
+  }
+  return { id: ref.id, version: ref.version };
+}
+
+function parseBotCardConfig(value: unknown): BotCardConfig | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const config = value as Record<string, unknown>;
+  if (typeof config.card_enabled !== "boolean" ||
+      typeof config.display_enabled !== "boolean" ||
+      typeof config.interaction_enabled !== "boolean" ||
+      typeof config.reasoning_enabled !== "boolean") {
+    return undefined;
+  }
+  const reasoningRef = parseCardTemplateRef(config.reasoning_template_ref);
+  // The server guarantees this invariant. Reject a malformed response rather than guessing a
+  // policy locally: a permissive normalization could re-enable a card the Bot owner disabled.
+  if (reasoningRef === undefined ||
+      (config.reasoning_enabled && reasoningRef === null) ||
+      (!config.reasoning_enabled && reasoningRef !== null)) {
+    return undefined;
+  }
+  return {
+    card_enabled: config.card_enabled,
+    display_enabled: config.display_enabled,
+    interaction_enabled: config.interaction_enabled,
+    reasoning_enabled: config.reasoning_enabled,
+    reasoning_template_ref: reasoningRef,
+  };
+}
+
 /**
  * GET /v1/bot/card/profile — D12 能力发现。发卡前 feature-detect，避免用发送试探
  * （一个 400 无法区分「disabled」与「invalid」）。
  *
- * 返回 `available` 区分两种「不发」语义（避免 gate 死锁）:
- *   - 端点未部署（404）→ `{ available:false }`：调用方回退 adapter config 显式开关，
- *     **不可**当作服务端明确关闭（octo-server PR-D 上线前 R2 未落地即此情形）。
- *   - 端点已部署但 `enabled:false` → `{ available:true, enabled:false }`：服务端明确关，不发。
+ * 返回 `available` 区分端点未部署与已部署；两者都由调用方 fail closed：
+ *   - 端点未部署（404）→ `{ available:false }`。
+ *   - 端点已部署但缺失/非法 `config` → `{ available:true }` 且无 `config`。
  * 传输 / 5xx 抛错，交由调用方重试节奏处理。
  */
 export async function getCardProfile(params: {
@@ -777,8 +824,7 @@ export async function getCardProfile(params: {
     headers: { Authorization: `Bearer ${params.botToken}` },
     signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
   });
-  // 端点尚未部署（PR-D 未落地）→ available:false，调用方回退 config 显式开关，
-  // 不可当作「服务端明确关闭」硬降级不发。
+  // 端点尚未部署时 fail closed；不使用本地开关猜测服务端 Bot 策略。
   if (resp.status === 404) return { available: false, enabled: false };
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
@@ -788,6 +834,7 @@ export async function getCardProfile(params: {
   const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
   if (!raw || typeof raw !== "object") return { available: true, enabled: false };
   const templating = parseTemplatingCapability(raw.templating);
+  const config = parseBotCardConfig(raw.config);
   return {
     available: true,
     // 兼容布尔与 1/0 序列化(与本仓 GroupMember.robot / getMentionPref 的 flag 惯例一致)。
@@ -799,6 +846,7 @@ export async function getCardProfile(params: {
     ...(Array.isArray(raw.actions) ? { actions: (raw.actions as unknown[]).filter((e): e is string => typeof e === "string") } : {}),
     ...(raw.limits && typeof raw.limits === "object" ? { limits: raw.limits as Record<string, unknown> } : {}),
     ...(templating ? { templating } : {}),
+    ...(config ? { config } : {}),
   };
 }
 

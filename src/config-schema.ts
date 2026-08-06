@@ -7,6 +7,7 @@
  * not fail validation today.
  */
 export type ForkCommandScope = "owner-mentioned" | "any-mentioned" | "owner-only" | "any";
+/** @deprecated Kept only so older openclaw.json files still type-check; runtime ignores it. */
 export type ReasoningCardTemplateMode = "off" | "shadow" | "experimental";
 
 /** Per-command configuration (top-level only; not per-account in v1). */
@@ -30,10 +31,14 @@ export interface OctoAccountConfig {
   botUid?: string;
   historyLimit?: number;  // 群聊历史消息条数限制（默认20）
   historyPromptTemplate?: string;  // Template for group history context injection
-  cardProgress?: boolean;  // false force-disables automatic progress cards; true/unset follows server capabilities
-  reasoningCardTemplateMode?: ReasoningCardTemplateMode;  // off=Model B, shadow=discover only, experimental=Model A when compatible
-  cardDisplay?: boolean;  // false force-disables the display-card tool; true/unset follows server capabilities
-  cardInteraction?: boolean;  // false force-disables interactive cards; true/unset follows server capabilities
+  /** @deprecated Ignored; the server's per-Bot card config is authoritative. */
+  cardProgress?: boolean;
+  /** @deprecated Ignored; the server's reasoning_enabled/template_ref is authoritative. */
+  reasoningCardTemplateMode?: ReasoningCardTemplateMode;
+  /** @deprecated Ignored; the server's per-Bot display_enabled is authoritative. */
+  cardDisplay?: boolean;
+  /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
+  cardInteraction?: boolean;
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace); if neither resolves, write-secret fails closed (no process.cwd() fallback).
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms). Unset = derived from agents.defaults.timeoutSeconds + 60s buffer (issue #113).
@@ -53,10 +58,14 @@ export interface OctoConfig {
   botUid?: string;
   historyLimit?: number;  // 群聊历史消息条数限制（默认20）
   historyPromptTemplate?: string;  // Template for group history context injection
-  cardProgress?: boolean;  // Top-level default for automatic progress cards
-  reasoningCardTemplateMode?: ReasoningCardTemplateMode;  // Top-level Registry migration mode for reasoning cards
-  cardDisplay?: boolean;  // Top-level default for the display-card tool
-  cardInteraction?: boolean;  // Top-level default for interactive cards
+  /** @deprecated Ignored; the server's per-Bot card config is authoritative. */
+  cardProgress?: boolean;
+  /** @deprecated Ignored; the server's reasoning_enabled/template_ref is authoritative. */
+  reasoningCardTemplateMode?: ReasoningCardTemplateMode;
+  /** @deprecated Ignored; the server's per-Bot display_enabled is authoritative. */
+  cardDisplay?: boolean;
+  /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
+  cardInteraction?: boolean;
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret (see OctoAccountConfig)
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms); see OctoAccountConfig
@@ -82,25 +91,6 @@ export const SECRETS_FILE_ROOT_DESCRIPTION =
 // fires strictly after OpenClaw core's own agent-run timeout.
 export const DISPATCH_TIMEOUT_MS_DESCRIPTION =
   "Per-inbound dispatch timeout in milliseconds (infrastructure backstop that releases the per-group queue when an upstream dispatch hangs). When unset, derived from agents.defaults.timeoutSeconds (default 600) as timeoutSeconds*1000 + 60000, so it always fires after the agent-run timeout. Set explicitly only when you need to decouple it from the agent timeout.";
-
-export const CARD_PROGRESS_DESCRIPTION =
-  "When omitted or true, follow the server card capability gate; false force-disables automatic progress cards. Per-account values override the top-level value.";
-
-export const REASONING_CARD_TEMPLATE_MODE_DESCRIPTION =
-  "Registry migration mode for automatic reasoning progress cards. off keeps local Model B rendering, shadow validates discovery while still sending Model B, and experimental sends Model A when exactly one compatible Bot-catalog template is advertised, using its manifest version unchanged; zero or multiple compatible entries fall back to Model B because catalog order is not a preference signal. A rejected experimental first frame retries once as Model B only for a deterministic card-invalid response; timeouts, conflicts, and transient/server errors do not trigger that fallback. Defaults to experimental; per-account values override the top-level value.";
-
-const REASONING_CARD_TEMPLATE_MODE_SCHEMA = {
-  type: "string" as const,
-  enum: ["off", "shadow", "experimental"] as const,
-  default: "experimental" as const,
-  description: REASONING_CARD_TEMPLATE_MODE_DESCRIPTION,
-};
-
-export const CARD_DISPLAY_DESCRIPTION =
-  "When omitted or true, follow the server card capability gate; false force-disables the octo_send_display_card tool. Per-account values override the top-level value.";
-
-export const CARD_INTERACTION_DESCRIPTION =
-  "When omitted or true, follow the server octo/v2 card capability gate; false force-disables the octo_send_card tool and new interactive callback polling. Per-account values override the top-level value.";
 
 export const EVENT_WAIT_SECONDS_DESCRIPTION =
   "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";
@@ -146,10 +136,6 @@ export const OctoConfigJsonSchema = {
       botUid: { type: "string" },
       historyLimit: { type: "number", minimum: 1, maximum: 100 },
       historyPromptTemplate: { type: "string" },
-      cardProgress: { type: "boolean", description: CARD_PROGRESS_DESCRIPTION },
-      reasoningCardTemplateMode: REASONING_CARD_TEMPLATE_MODE_SCHEMA,
-      cardDisplay: { type: "boolean", description: CARD_DISPLAY_DESCRIPTION },
-      cardInteraction: { type: "boolean", description: CARD_INTERACTION_DESCRIPTION },
       onBehalfOf: { type: "string" },
       secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
       dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },
@@ -172,10 +158,6 @@ export const OctoConfigJsonSchema = {
             botUid: { type: "string" },
             historyLimit: { type: "number", minimum: 1, maximum: 100 },
             historyPromptTemplate: { type: "string" },
-            cardProgress: { type: "boolean", description: CARD_PROGRESS_DESCRIPTION },
-            reasoningCardTemplateMode: REASONING_CARD_TEMPLATE_MODE_SCHEMA,
-            cardDisplay: { type: "boolean", description: CARD_DISPLAY_DESCRIPTION },
-            cardInteraction: { type: "boolean", description: CARD_INTERACTION_DESCRIPTION },
             onBehalfOf: { type: "string" },
             secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
             dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },

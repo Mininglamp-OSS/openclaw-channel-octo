@@ -84,4 +84,35 @@ describe("bot card profile cache", () => {
     await expect(getBotCardProfile(bot)).resolves.toEqual(profile(true));
     expect(getCardProfile).toHaveBeenCalledTimes(2);
   });
+
+  it("deduplicates concurrent reads for the same Bot", async () => {
+    let resolveRead!: (value: CardProfileManifest) => void;
+    vi.mocked(getCardProfile).mockReturnValue(new Promise((resolve) => { resolveRead = resolve; }));
+    const bot = { apiUrl: "https://api.test", botToken: "bot-a" };
+
+    const first = getBotCardProfile(bot);
+    const second = getBotCardProfile(bot);
+    expect(getCardProfile).toHaveBeenCalledTimes(1);
+
+    resolveRead(profile(true));
+    await expect(Promise.all([first, second])).resolves.toEqual([profile(true), profile(true)]);
+  });
+
+  it("does not let a pre-invalidation response refill the cache", async () => {
+    let resolveStale!: (value: CardProfileManifest) => void;
+    vi.mocked(getCardProfile)
+      .mockReturnValueOnce(new Promise((resolve) => { resolveStale = resolve; }))
+      .mockResolvedValueOnce(profile(true));
+    const bot = { apiUrl: "https://api.test", botToken: "bot-a" };
+
+    const staleRead = getBotCardProfile(bot);
+    invalidateBotCardProfile(bot);
+    resolveStale(profile(false));
+    await expect(staleRead).resolves.toEqual(profile(false));
+    expect(peekBotCardProfile(bot)).toBeUndefined();
+
+    await expect(getBotCardProfile(bot)).resolves.toEqual(profile(true));
+    expect(peekBotCardProfile(bot)?.config?.display_enabled).toBe(true);
+    expect(getCardProfile).toHaveBeenCalledTimes(2);
+  });
 });

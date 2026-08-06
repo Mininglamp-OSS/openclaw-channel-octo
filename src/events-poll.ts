@@ -12,6 +12,7 @@ import {
 } from "./api-fetch.js";
 import { CHANNEL_ID } from "./constants.js";
 import { parseCardAction, type CardAction } from "./card-action.js";
+import { invalidateBotCardProfile } from "./card-profile-cache.js";
 
 const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_LIMIT = 50;
@@ -85,7 +86,20 @@ export interface EventPoller {
   cursor(): number;
 }
 
-const pollStarters = new Map<string, () => void>();
+const POLL_STARTERS_STATE_KEY = Symbol.for("openclaw.octo.card-event-poll-starters.v1");
+
+function getPollStarters(): Map<string, () => void> {
+  const root = process as unknown as Record<PropertyKey, unknown>;
+  const existing = root[POLL_STARTERS_STATE_KEY] as Map<string, () => void> | undefined;
+  if (existing) return existing;
+  const created = new Map<string, () => void>();
+  root[POLL_STARTERS_STATE_KEY] = created;
+  return created;
+}
+
+// Channel and embedded agent runtimes may load separate module instances. Keep the lazy starters
+// process-shared so any profile consumer can activate the owning account's event poller.
+const pollStarters = getPollStarters();
 
 export function setCardEventPollStarter(accountId: string, starter: (() => void) | undefined): void {
   const id = normalizeAccountId(accountId);
@@ -207,6 +221,10 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
         if (action) {
           cardActions += 1;
           await options.onCardAction(action);
+        }
+        if (event.event_type === "bot_setting_updated" &&
+            event.event_data?.scope === "bot_setting") {
+          invalidateBotCardProfile({ apiUrl: options.apiUrl, botToken: options.botToken });
         }
 
         await options.cursorStore.save(event.event_id);

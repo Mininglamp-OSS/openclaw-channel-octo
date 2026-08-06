@@ -338,7 +338,7 @@ describe("getCardProfile (D12 feature-detect)", () => {
     });
   });
 
-  it("404(端点未部署)→ available:false(调用方回退 config)", async () => {
+  it("404(端点未部署)→ available:false（调用方 fail closed）", async () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 404,
