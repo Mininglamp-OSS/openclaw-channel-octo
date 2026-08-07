@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CARD_VERSION } from "./types.js";
+import { CARD_VERSION, MessageType } from "./types.js";
 import type { CardTemplateRef, CardTemplatingCapability } from "./api-fetch.js";
 import { cardFitsLimits } from "./card-limits.js";
 import {
@@ -97,8 +97,9 @@ const INTERNAL_CONTEXT_MARKER_RE =
  * 为 16384 的部署,24 KB 就已经越界。越界的代价不是内容变短,而是 400 → entry.skip → 整个
  * session 没有卡片。
  *
- * 6000 runes ≈ 18 KB CJK,留足余量;单 phase 仍可用满其版本上限,只有多个长 phase 同时出现时
- * 才开始裁剪。裁剪方向与 trimForRender 一致:**留最近的**,旧 phase 的思考先让位。
+ * 6000 runes 只是进入最终序列化预算前的粗上限,不是字节安全证明:CJK 本身就约 18 KB。
+ * 真正的发送上限由下面的 template payload UTF-8 预算负责。这里仍保留单 phase 可用满版本
+ * 上限、多个长 phase 才开始裁剪的体验约束,裁剪方向与 trimForRender 一致:**留最近的**。
  */
 const PHASES_THOUGHT_TOTAL_MAX = 6_000;
 
@@ -127,6 +128,70 @@ function budgetPhaseThoughts(
   return out;
 }
 
+const TEMPLATE_PAYLOAD_MAX_FALLBACK = 16_384;
+
+export interface ReasoningTemplatePayloadLimits {
+  templateRef: CardTemplateRef;
+  maxPayloadBytes?: number;
+}
+
+function templatePayloadBytes(data: ReasoningProcessData, templateRef: CardTemplateRef): number {
+  return new TextEncoder().encode(JSON.stringify({
+    type: MessageType.InteractiveCard,
+    template_ref: templateRef,
+    state: data.state,
+    data,
+  })).byteLength;
+}
+
+/**
+ * 按服务端 advertise 的完整 type-17 template payload UTF-8 上限裁剪。逐字段 rune clamp 只守
+ * schema,无法守总字节数;这里每次都量实际 wire shape,所以 template ref、actions、错误字段与
+ * CJK 的多字节成本全部进入同一预算。旧 phase 先让位,当前 phase 最后才动。
+ */
+function budgetTemplatePayload(
+  data: ReasoningProcessData,
+  limits: ReasoningTemplatePayloadLimits,
+): ReasoningProcessData | null {
+  const advertised = limits.maxPayloadBytes;
+  const maxPayloadBytes = typeof advertised === "number" && Number.isFinite(advertised) && advertised > 0
+    ? Math.floor(advertised)
+    : TEMPLATE_PAYLOAD_MAX_FALLBACK;
+  if (templatePayloadBytes(data, limits.templateRef) <= maxPayloadBytes) return data;
+
+  const out: ReasoningProcessData = {
+    ...data,
+    phases: data.phases.map((phase) => ({ ...phase })),
+  };
+  for (const phase of out.phases) {
+    const original = [...phase.thought];
+    phase.thought = NO_THOUGHT_WIRE_LABEL;
+    if (templatePayloadBytes(out, limits.templateRef) > maxPayloadBytes) continue;
+
+    // 当前 phase 已经足以把 payload 压进预算;二分找还能保留的最大前缀。
+    let low = 1;
+    let high = Math.max(0, original.length - 1);
+    let best = 0;
+    while (low <= high) {
+      const keep = Math.floor((low + high) / 2);
+      phase.thought = original.slice(0, keep).join("") + "…";
+      if (templatePayloadBytes(out, limits.templateRef) <= maxPayloadBytes) {
+        best = keep;
+        low = keep + 1;
+      } else {
+        high = keep - 1;
+      }
+    }
+    phase.thought = best > 0
+      ? original.slice(0, best).join("") + "…"
+      : NO_THOUGHT_WIRE_LABEL;
+    return out;
+  }
+
+  // 连每个 phase 的契约最小占位都装不下时,宁可不发,也不要用确定性 400 让 session 永久 skip。
+  return templatePayloadBytes(out, limits.templateRef) <= maxPayloadBytes ? out : null;
+}
+
 /**
  * 其余字段的契约上限(0.2.0 起至 0.4.0 一致,0.4.0 只放开了 thought)。同样取自 handoff 产物。
  * 留一个字符给截断用的 "…"。
@@ -134,7 +199,7 @@ function budgetPhaseThoughts(
 const TIMER_TEXT_MAX = 128 - 1;
 const ACTION_DETAIL_MAX = 192 - 1;
 const ERROR_MESSAGE_MAX = 121 - 1;
-const REASONING_ID_CONTRACT_MAX = 512;
+const REASONING_ID_CONTRACT_MAX = 512 - 1;
 
 /**
  * 按**码点**截断。契约的 maxLength 按 rune 计,而 JS slice 按 UTF-16 码元切 —— 后者会把代理对
@@ -601,6 +666,7 @@ const NO_THOUGHT_WIRE_LABEL = "—";
 export function buildReasoningProcessWireData(
   state: CardProgressState,
   templateVersion?: string,
+  payloadLimits?: ReasoningTemplatePayloadLimits,
 ): ReasoningProcessData | null {
   // 按**服务端选中的版本**收口。这是唯一知道版本的地方,也是唯一必须守契约的地方:超限是
   // 确定性 400,而 4xx 置 entry.skip —— 首帧被拒则整个 session 没有卡片,中途 edit 被拒则用户
@@ -622,7 +688,7 @@ export function buildReasoningProcessWireData(
   // 逐字段 clamp 之后再收一次总量 —— trimForRender 决定了留几个 phase,总量只能在它之后算。
   data.phases = budgetPhaseThoughts(data.phases);
   // timerText 在失败轮次上会带上清洗后的错误详情,实测 error 135 / expired 138 runes,超过契约 128。
-  return {
+  const bounded = {
     ...data,
     timerText: clampRunes(data.timerText, TIMER_TEXT_MAX),
     // 这两个此前靠「另一个模块的常量刚好等于契约上限」成立,零余量:改动 ERROR_MAX 或
@@ -630,6 +696,7 @@ export function buildReasoningProcessWireData(
     ...(data.errorMessage === undefined ? {} : { errorMessage: clampRunes(data.errorMessage, ERROR_MESSAGE_MAX) }),
     reasoningId: clampRunes(data.reasoningId, REASONING_ID_CONTRACT_MAX),
   };
+  return payloadLimits ? budgetTemplatePayload(bounded, payloadLimits) : bounded;
 }
 
 function textBlock(text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {

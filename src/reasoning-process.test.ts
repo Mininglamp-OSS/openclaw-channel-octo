@@ -722,6 +722,15 @@ describe("wire data budgets total thought across phases", () => {
   };
   const totalRunes = (data: ReturnType<typeof buildReasoningProcessWireData>): number =>
     data!.phases.reduce((sum, phase) => sum + [...phase.thought].length, 0);
+  const templatePayloadBytes = (
+    data: NonNullable<ReturnType<typeof buildReasoningProcessWireData>>,
+    templateRef: { id: string; version: string },
+  ): number => new TextEncoder().encode(JSON.stringify({
+    type: 17,
+    template_ref: templateRef,
+    state: data.state,
+    data,
+  })).byteLength;
 
   it("keeps six maxed-out phases inside a total budget on 0.4.0", () => {
     const data = buildReasoningProcessWireData(manyPhases(3_500, 6), "0.4.0");
@@ -753,15 +762,40 @@ describe("wire data budgets total thought across phases", () => {
     );
 
     expect(data).not.toBeNull();
-    const payload = {
-      type: 17,
-      template_ref: templateRef,
-      state: data!.state,
-      data,
-    };
-    expect(new TextEncoder().encode(JSON.stringify(payload)).byteLength)
-      .toBeLessThanOrEqual(maxPayloadBytes);
+    expect(templatePayloadBytes(data!, templateRef)).toBeLessThanOrEqual(maxPayloadBytes);
     expect([...data!.phases.at(-1)!.thought].length)
       .toBeGreaterThan([...data!.phases[0]!.thought].length);
+  });
+
+  it("uses a conservative byte fallback when the manifest omits the limit", () => {
+    const templateRef = { id: "ai.reasoning-process", version: "0.4.0" };
+    const data = buildReasoningProcessWireData(
+      manyPhases(3_500, 6, "界"),
+      templateRef.version,
+      { templateRef },
+    );
+
+    expect(data).not.toBeNull();
+    expect(templatePayloadBytes(data!, templateRef)).toBeLessThanOrEqual(16_384);
+  });
+
+  it("does not trim a template payload that already fits", () => {
+    const templateRef = { id: "ai.reasoning-process", version: "0.4.0" };
+    const input = manyPhases(500, 1);
+    const unbounded = buildReasoningProcessWireData(input, templateRef.version);
+    const bounded = buildReasoningProcessWireData(input, templateRef.version, {
+      templateRef,
+      maxPayloadBytes: 524_288,
+    });
+
+    expect(bounded).toEqual(unbounded);
+  });
+
+  it("returns null instead of sending a payload whose minimum wire shape cannot fit", () => {
+    const templateRef = { id: "ai.reasoning-process", version: "0.4.0" };
+    expect(buildReasoningProcessWireData(manyPhases(1, 1), templateRef.version, {
+      templateRef,
+      maxPayloadBytes: 1,
+    })).toBeNull();
   });
 });

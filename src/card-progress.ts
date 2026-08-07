@@ -28,6 +28,7 @@ import {
   getBotCardProfile,
   peekBotCardProfile,
 } from "./card-profile-cache.js";
+import { deriveCardCaps } from "./card-caps.js";
 import { summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState } from "./card-render.js";
 import {
   HOST_NO_SUMMARY_PLACEHOLDER,
@@ -102,6 +103,8 @@ interface CardEntry {
   flushAbort?: AbortController;
   /** Server-selected ref, pinned for every frame of a Registry-authored message. */
   templateRef?: CardTemplateRef;
+  /** Server-advertised complete type-17 payload limit, pinned with the selected template ref. */
+  maxPayloadBytes?: number;
   /** Next positive CAS value for a Registry edit. */
   nextCardSeq: number;
   /** Stable for every frame, including paused continuation runs. */
@@ -395,6 +398,7 @@ function resolveEntryDeliveryMode(entry: CardEntry): void {
     : { ref: null as null, reason: "no-profile" as const };
   if (outcome.ref) {
     entry.templateRef = outcome.ref;
+    entry.maxPayloadBytes = deriveCardCaps(profile!).maxPayloadBytes;
     dbg(`selected Registry reasoning template ${outcome.ref.id}@${outcome.ref.version}`);
     return;
   }
@@ -559,8 +563,13 @@ async function editEntryProgress(params: {
   const { entry, state } = params;
   const messageId = entry.messageId;
   if (!messageId) return false;
-  const data = buildReasoningProcessWireData(state, entry.templateRef?.version);
   const templateRef = entry.templateRef;
+  const data = templateRef
+    ? buildReasoningProcessWireData(state, templateRef.version, {
+        templateRef,
+        maxPayloadBytes: entry.maxPayloadBytes,
+      })
+    : null;
   if (!data || !templateRef) return false;
   const previous = entry.templateEditPromise;
   const work = (async (): Promise<boolean> => {
@@ -696,12 +705,15 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     const state = entryProgressState(sessionKey, entry);
     if (!entry.messageId) {
       if (!isCurrentEntry(sessionKey, entry)) return;
-      const data = buildReasoningProcessWireData(state, entry.templateRef?.version);
+      if (!entry.templateRef) return;
+      const data = buildReasoningProcessWireData(state, entry.templateRef.version, {
+        templateRef: entry.templateRef,
+        maxPayloadBytes: entry.maxPayloadBytes,
+      });
       if (!data) {
-        dbg("Registry first frame deferred: no phases with actions yet");
+        dbg("Registry first frame deferred: no phases with actions or payload exceeds the minimum wire size");
         return;
       }
-      if (!entry.templateRef) return;
       const res = await sendTemplateCardMessage({
         apiUrl: entry.ctx.apiUrl,
         botToken: entry.ctx.botToken,
