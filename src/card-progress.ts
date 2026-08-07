@@ -271,7 +271,12 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
     if (ctx.accountId) requestCardEventPolling(ctx.accountId);
     const m = await getBotCardProfileForCaller(ctx, signal);
     if (signal?.aborted) throw signal.reason;
-    return !!reasoningTemplateForProfile(m);
+    const outcome = reasoningTemplateForProfile(m);
+    // 成因必须在这里报:调用方拿到 false 就 `entry.skip = true` 并 return,永远走不到
+    // resolveEntryDeliveryMode —— 那边的同款日志只是 profile 在 gate 与 resolve 之间被
+    // 失效时的兜底。不报的话,「卡片没了」在运维手上没有任何线索。
+    if (!outcome.ref) logReasoningTemplateSkip(outcome.reason);
+    return !!outcome.ref;
   } catch (err: unknown) {
     // 探测自己被限流时,把窗口记下来 —— 否则后续每个工具事件都会再探一次,而这条路径打的
     // 正是刚刚拒绝我们的那个桶。
@@ -285,12 +290,44 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
   }
 }
 
-function reasoningTemplateForProfile(manifest: CardProfileManifest): CardTemplateRef | null {
-  if (!manifest.available || manifest.config?.reasoning_enabled !== true) return null;
-  return selectReasoningProcessTemplate(
+/**
+ * 没有可用模板时为什么没有 —— 卡片会因此完全不发,而这几种成因在现象上**完全一样**
+ * (卡片凭空消失)。#204 之后这一点比以前严重:模板不可用曾经退回本地渲染,用户至少看得见
+ * 进度;现在是彻底没卡,运维手上没有任何线索。
+ */
+type ReasoningTemplateSkipReason =
+  /** profile 还没探到(首帧前 gate 失败/被取消)。 */
+  | "no-profile"
+  /** 端点未部署(available:false)。 */
+  | "endpoint-unavailable"
+  /** 服务端为该 bot 关掉了推理卡(config.reasoning_enabled !== true)—— 配置如此,不是故障。 */
+  | "reasoning-disabled"
+  /**
+   * 服务端说开着,但 templating/ref 与本消费者的契约不匹配。这是**契约不一致**,不是正常状态:
+   * selectReasoningProcessTemplate 把十余种不兼容原因收敛成一个 null,所以只能报到这一层。
+   */
+  | "template-incompatible";
+
+/**
+ * 「卡片为什么没有」的唯一线索。`template-incompatible` 用 warn:服务端说推理卡开着,我们却
+ * 用不了它广告的模板 —— 契约不一致,该被看见。其余是正常配置状态,走 dbg 不刷日志。
+ */
+function logReasoningTemplateSkip(reason: ReasoningTemplateSkipReason): void {
+  const message = `no reasoning template; progress card skipped (${reason})`;
+  if (reason === "template-incompatible") warn(message);
+  else dbg(message);
+}
+
+function reasoningTemplateForProfile(
+  manifest: CardProfileManifest,
+): { ref: CardTemplateRef } | { ref: null; reason: ReasoningTemplateSkipReason } {
+  if (!manifest.available) return { ref: null, reason: "endpoint-unavailable" };
+  if (manifest.config?.reasoning_enabled !== true) return { ref: null, reason: "reasoning-disabled" };
+  const ref = selectReasoningProcessTemplate(
     manifest.templating,
     manifest.config.reasoning_template_ref,
   );
+  return ref ? { ref } : { ref: null, reason: "template-incompatible" };
 }
 
 function apiErrorMessage(error: unknown): string {
@@ -309,12 +346,16 @@ function errorCodeFromApiError(error: unknown): string | undefined {
 function resolveEntryDeliveryMode(entry: CardEntry): void {
   if (entry.templateRef) return;
   const profile = peekBotCardProfile(entry.ctx);
-  const templateRef = profile ? reasoningTemplateForProfile(profile) : null;
-  if (templateRef) {
-    entry.templateRef = templateRef;
-    dbg(`selected Registry reasoning template ${templateRef.id}@${templateRef.version}`);
+  const outcome = profile
+    ? reasoningTemplateForProfile(profile)
+    : { ref: null as null, reason: "no-profile" as const };
+  if (outcome.ref) {
+    entry.templateRef = outcome.ref;
+    dbg(`selected Registry reasoning template ${outcome.ref.id}@${outcome.ref.version}`);
     return;
   }
+  // gate 已经报过成因了;这里只在 profile 于 gate 与 resolve 之间被失效时兜底。
+  logReasoningTemplateSkip(outcome.reason);
   entry.skip = true;
 }
 

@@ -206,6 +206,40 @@ describe("server-driven Registry reasoning progress", () => {
     expect(wire.calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
   });
 
+  /**
+   * 卡片完全不发时,这几种成因在现象上一模一样(卡片凭空消失)。#204 之后更严重:模板不可用
+   * 曾经退回本地渲染,用户至少看得见进度;现在没有任何输出。所以「服务端关掉了」与「服务端说
+   * 开着但模板用不了」必须在日志上可区分 —— 后者是契约不一致,该走 warn 被看见;前者是正常
+   * 配置状态,不该刷日志。
+   *
+   * 两种成因分成两个用例:profile 按 bot 缓存,同一个 botToken 复用同一份缓存,写在一个用例里
+   * 第二半会读到第一半的 profile(实测两次都报 reasoning-disabled)。
+   */
+  it("keeps a server-disabled reasoning card out of the warn log", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wire = mockFetch({ profile: profile({ reasoningEnabled: false }) });
+    global.fetch = wire.fetch as typeof fetch;
+    setCardContext("reason-disabled", context());
+    await triggerFirstFrame(makeApi(), "reason-disabled");
+
+    expect(wire.calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+    // 正常配置状态,不该刷 warn。
+    expect(warnSpy.mock.calls.flat().join("\n")).toBe("");
+  });
+
+  it("warns with the reason when the server enables reasoning but its template is unusable", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wire = mockFetch({ profile: profile({ configuredVersion: "9.9.9" }) });
+    global.fetch = wire.fetch as typeof fetch;
+    setCardContext("reason-incompatible", context());
+    await triggerFirstFrame(makeApi(), "reason-incompatible");
+
+    expect(wire.calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+    const warned = warnSpy.mock.calls.flat().join("\n");
+    expect(warned).toContain("progress card skipped");
+    expect(warned).toContain("template-incompatible");
+  });
+
   it.each([
     profile({ configuredVersion: null }),
     profile({ configuredVersion: "9.9.9" }),
