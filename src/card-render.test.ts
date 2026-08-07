@@ -10,6 +10,7 @@ import {
   reduceUrlsInText,
   collapseForReduction,
   boundedForReduction,
+  REDUCE_INPUT_MAX,
   fmtDuration,
   stepLine,
   cardSupports,
@@ -977,14 +978,41 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
   // 界丢掉的那一段要过一遍守卫,但**喂给守卫的量本身必须有界** —— 守卫里的正则不保证线性
   // (JWT 那条在无点长串上是二次的:单块 120 KB 实测 5548 ms)。这里断言的是那条规则的
   // **可观察形式**,不是耗时:切口之后 TAIL_SCAN_MAX 以内的凭据仍然让整串扣下,以外的不再。
-  it("尾部扫描到 TAIL_SCAN_MAX 为止", () => {
+  // **界只加在 JWT 那一条上,不加在整个守卫上。** 上一版对整个守卫设界,理由是「守卫里的正则
+  // 不保证线性」—— 那句话是对的,但它只对**一条**成立。逐条实测(64 KB):SECRET_RE 0.07 ms、
+  // 11 条前缀正则各 ≤0.02 ms、长 hex 0.14 ms、高熵 0.41 ms、**JWT 分钟级**。为了那一条把其余
+  // 全部关在 4000 字符之外,泄漏了 main 会扣下的凭据(见下一条)。
+  it("线性档看完整条尾巴,不受 TAIL_SCAN_MAX 限制", () => {
     const kept = "word ".repeat(800).trim();          // 3999 字符,切口落在这里
-    const near = `${kept} ${"pad ".repeat(200)}AKIAIOSFODNN7EXAMPLE`;   // 密钥在尾巴第 ~800 位
-    const far  = `${kept} ${"pad ".repeat(1200)}AKIAIOSFODNN7EXAMPLE`;  // 密钥在尾巴第 ~4800 位
-    expect(reduceUrlsInText(near), "扫描窗口内的凭据应让整串扣下").toBe("");
-    expect(reduceUrlsInText(far), "扫描窗口外的凭据不再连累前面那段").toBe(kept);
-    // 但被放弃的只是"因为远处有东西连近处也不显示";远处那段本来就渲染不出来。
-    expect(reduceUrlsInText(far)).not.toContain("AKIA");
+    for (const [pads, where] of [[200, "尾巴第 ~800 位"], [1200, "尾巴第 ~4800 位"]] as [number, string][]) {
+      const s = `${kept} ${"pad ".repeat(pads)}AKIAIOSFODNN7EXAMPLE`;
+      expect(reduceUrlsInText(s), `AKIA 在${where}(TAIL_SCAN_MAX 之外)没有让整串扣下`).toBe("");
+    }
+    // 但线性档也不是无界的:尾巴收进 RAW_INPUT_MAX,再远就够不着了。这是可以说出口的边界。
+    const beyond = `${kept} ${"pad ".repeat(20_000)}AKIAIOSFODNN7EXAMPLE`;
+    expect(reduceUrlsInText(beyond), "RAW_INPUT_MAX 之外仍然够不着,这是已知边界").toBe(kept);
+    expect(reduceUrlsInText(beyond)).not.toContain("AKIA");
+  });
+
+  it("有界档(JWT)才是收窄到 TAIL_SCAN_MAX 的那一条", () => {
+    const kept = "word ".repeat(800).trim();
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij";
+    const near = `${kept} ${"pad ".repeat(200)}${jwt}`;
+    const far  = `${kept} ${"pad ".repeat(1200)}${jwt}`;
+    expect(reduceUrlsInText(near), "窗口内的 JWT 应让整串扣下").toBe("");
+    expect(reduceUrlsInText(far), "窗口外的 JWT 不再连累前面那段").toBe(kept);
+    // 被放弃的只是"因为远处有东西连近处也不显示";远处那段本来就渲染不出来。
+    expect(reduceUrlsInText(far)).not.toContain("eyJ");
+  });
+
+  it("切口之后的关键词仍然压得住 kept 里守卫抓不住的凭据", () => {
+    // 这是收窄整个守卫时漏掉的那个前提:「渲染的永远只有 kept,而 kept 自己要过守卫」——
+    // 只在守卫抓得住 kept 里的东西时成立。`alice:hunter2@localhost` 是本仓 UNFIXED_CORPUS
+    // 记着的、守卫**抓不住**的形状,当时压住它的只有 4000 字符之外那个 `token`。
+    const leaky = "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + " token";
+    expect(leaky.length).toBeGreaterThan(8000);
+    expect(sanitizeErrorText(leaky)).toBe("");
+    expect(summarizeToolParams("grep", { pattern: leaky })).toBe("");
   });
 
   it("折叠空白之前先把原串收进 RAW_INPUT_MAX", () => {
@@ -1029,6 +1057,24 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
     expect(summarizeToolParams("exec", { command: few })).toBe("docker");
     // 4000 字符以上的单 token 不可能是程序名,切不出空白就整条返回空。
     expect(summarizeToolParams("exec", { command: "x".repeat(5000) })).toBe("");
+  });
+
+  it("扫描窗口的末端与切口用同一条边界约定(max + 1)", () => {
+    // cutOnWhitespace 特意搜 `max + 1`,好让空白正好落在 max 那一位时也找得到;tailScanWindow
+    // 当初漏了这个 `+1`,于是空白恰好落在窗口末端的输入被判成"没有空白"→ fail closed。
+    // 方向安全,但这条 PR 的论点就是两条截断规则同源不会分岔 —— 边界约定正是它们唯一还在
+    // 分岔的地方,评审点出来的。
+    const kept = "word ".repeat(800).trim();          // 3999 字符,切口落在这里
+    const at = (spaceIndex: number) => {
+      const gap = spaceIndex - kept.length - 1;       // kept + " " + "y"×gap + " ok"
+      return boundedForReduction(`${kept} ${"y".repeat(gap)} ok`);
+    };
+    // 末端是**延长窗口**的末端:第一段窗口 [kept, kept+max) 之后还要再找 max+1 个字符,
+    // 所以临界点在 kept + 2×max,不是 kept + max。
+    const windowEnd = kept.length + 2 * REDUCE_INPUT_MAX;
+    expect(at(windowEnd - 1), "窗口内的空白").not.toBeNull();
+    expect(at(windowEnd), "空白正好落在窗口末端 —— 少了 +1 就在这里判成无空白").not.toBeNull();
+    expect(at(windowEnd + 1), "空白确实在窗口之外,fail closed 是对的").toBeNull();
   });
 
   it("尾部扫描窗口的末端也只能落在空白上", () => {

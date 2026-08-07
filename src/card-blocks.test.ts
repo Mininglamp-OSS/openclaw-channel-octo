@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildDisplayCard, validateDisplayBlocks, type DisplayBlock } from "./card-blocks.js";
+import { buildDisplayCard, validateDisplayBlocks, REDUCE_BUDGET_PER_CARD, type DisplayBlock } from "./card-blocks.js";
 import type { CardCaps } from "./card-render.js";
 
 /**
@@ -1027,12 +1027,22 @@ describe("单卡片归约预算", () => {
     expect(first?.text).not.toContain("脱敏预算");
 
     // 单块看不出差别 —— RAW_INPUT_MAX 已经把折叠后长度压到 ≤64 KiB,按原长计费也进得来。
-    // 差别在**多块**:按原长计,两块 64 KiB 就超 120000;按 min(长度, 4000) 计,能进 30 块。
+    // 差别在**多块**:按原长计,两块 64 KiB 就超 120000,只进得去 1 块。
+    //
+    // 一块 100 KB 现在收三笔,每笔约 4000,因为它确实被扫了三次 ≤4000 的量:折叠那一步的尾部
+    // 扫描、归约本身、归约那一步的尾部扫描(窗口末端要对齐空白,所以每笔略多于 4000)。
+    // 120000 / ~12005 → **9 块**。上一版能进 20 块,是因为两次尾部扫描一分钱没收 ——
+    // 而那正是 200 块 14.8 秒(main 14.6 秒,两边持平)那个洞的来源。
     const big = "word ".repeat(20_000);              // 100 KB → 折叠后被 RAW_INPUT_MAX 截到 64 KiB
-    const bigCard = buildDisplayCard({ blocks: mk(20, big) });
-    expect(body(bigCard), "多个大块被按原长收费饿死了").toHaveLength(20);
-    // 同上:个数分不清"没少"和"少了一个 + 提示补位"。
-    expect(JSON.stringify(bigCard), "有大块被打掉,提示补上了元素位").not.toContain("脱敏预算");
+    const fit = buildDisplayCard({ blocks: mk(9, big) });
+    expect(body(fit), "多个大块被按原长收费饿死了").toHaveLength(9);
+    expect(JSON.stringify(fit), "9 块就该刚好装下").not.toContain("脱敏预算");
+    // 按原长计费的话两块就超预算,只进得去 1 块 —— 这才是这条测试要挡的那个改法。
+    expect(2 * big.length, "按原长计,两块就该超预算").toBeGreaterThan(REDUCE_BUDGET_PER_CARD);
+    // **两侧都要钉。** 上面那条只挡"多收",少收一分钱它照样绿(反向验证时把尾部扫描的计价
+    // 改成扣 0,它没红)。第 10 块必须超出去 —— 这一条挡的是"少收"。
+    expect(JSON.stringify(buildDisplayCard({ blocks: mk(10, big) })), "第 10 块也装下了,尾部扫描的账没收")
+      .toContain("脱敏预算");
   });
 
   // renderRich 曾在 sanitize 之外又跑一遍整条管线,于是 rich 的实际代价是 text 的两倍
@@ -1108,7 +1118,45 @@ describe("单卡片归约预算", () => {
   });
 });
 
+describe("展开按钮标签与摘要去重", () => {
+  it("actionLabel 与摘要相同就不重复显示,不同才采纳", () => {
+    const at = (summary: string, actionLabel: string) => {
+      const { card } = buildDisplayCard({
+        caps: FULL_CAPS,
+        blocks: [{ type: "collapsible", summary, actionLabel, blocks: [{ type: "text", text: "x" }] }],
+      });
+      return JSON.stringify(card);
+    };
+    expect(at("Build failed", "Build failed"), "标签与摘要相同,不该再显示一遍").toContain("展开");
+    expect(at("Build failed", "查看详情")).toContain("查看详情");
+    // 比的是**原文**摘要:空白差异会让两者判不相等,于是采纳 actionLabel。记录这个行为,
+    // 它是摘要重排那次改动带进来的,之前既没断言也没写进说明。
+    expect(at("Build  failed", "Build failed"), "空白差异让去重判不相等 —— 已知行为")
+      .toContain("Build failed");
+  });
+});
+
 describe("预算耗尽之后不再做工", () => {
+  it("空白密集 + 无点 base64 尾巴:计价按扫描量,整卡有界", () => {
+    // 评审复现的形状。折叠后每块只剩 `b0 x`,按折叠后长度计费就是 4 块钱,200 块也耗不尽预算 ——
+    // 可每块仍把 7800 字符的无点 base64 喂进二次方的 JWT 正则。实测 main 14609 ms / 修复前
+    // 14793 ms(**两边持平**,预算对它完全没生效),按扫描量计价之后 372 ms。
+    // 阈值 3000:远低于失效时的量级,又给足 CI 抖动。
+    const blocks = Array.from({ length: 200 }, (_, i) => ({
+      type: "text" as const,
+      text: `b${i} x` + " ".repeat(65_535) + "eyJ".repeat(2600) + " tailend zzz",
+    }));
+    buildDisplayCard({ blocks });
+    const t0 = performance.now();
+    const { card } = buildDisplayCard({ blocks });
+    const ms = performance.now() - t0;
+    // 前提:预算必须真的触发,否则这条测的只是"这台机器快"。
+    expect(JSON.stringify({ card }), "预算没触发,这个形状又白嫖了").toContain("脱敏预算");
+    expect(body({ card }).length, "200 块全渲染出来了,预算没起作用").toBeLessThan(40);
+    expect(ms, `200 块 × 空白密集+无点 base64 耗时 ${ms.toFixed(0)} ms`).toBeLessThan(3000);
+  });
+
+
   it("代价不随块数增长 —— 耗尽之后每块仍要折叠一次是白付的", () => {
     // 计费跑在折叠**之后**,所以耗尽之后不早退的话,每个块还要付一次最多 64 KiB 的折叠。
     // 用**比值**而不是绝对毫秒:机器快慢不影响它,而缺陷的信号非常清楚 ——

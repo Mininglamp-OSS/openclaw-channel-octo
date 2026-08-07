@@ -31,6 +31,14 @@ export interface CorpusRow {
 /** 凭据必须不出现在结果里。 */
 export const LEAK_CORPUS: CorpusRow[] = [
   {
+    // R7:收窄尾部扫描时漏掉的那个前提。守卫抓不住单标签 userinfo(见 UNFIXED_CORPUS),
+    // 当时压住整串的只有 4000 字符之外那个 `token` —— 把整个守卫收进 TAIL_SCAN_MAX 之后,
+    // 这三个 sink 全部渲染出明文口令。现在只有 JWT 那一档收窄,关键词档看完整条尾巴。
+    input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + " token",
+    expect: { grep: "", read: "", exec: "" },
+    note: "R7:切口之外的关键词必须仍然压得住 kept 里守卫认不出的凭据",
+  },
+  {
     input: "PASSPHRASE='correct horse battery staple' gpg --sign x",
     expect: { exec: "gpg" },
     note: "R3:空白分词把带引号的多词值切碎,程序名落在值的第二个词上 → main 渲染 `horse`",

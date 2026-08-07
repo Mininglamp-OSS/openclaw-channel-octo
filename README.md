@@ -154,13 +154,13 @@ passes are quadratic, so an unbounded input stalls the plugin's event loop for
 every account at once. The bound is 4000 characters.
 
 **One bound is not enough, because the pipeline is not the only thing that scales
-with input.** Three other limits sit around it, each closing a path that the
+with input.** Four other limits sit around it, each closing a path that the
 4000-character bound does not reach:
 
 | limit | what it bounds | why the 4000-character bound misses it |
 |---|---|---|
 | `RAW_INPUT_MAX` (64 KiB) | the whitespace collapse each caller runs first | it runs *before* the bound — 32–92 ms per MB by shape, uncapped |
-| `TAIL_SCAN_MAX` (4000) | how much of the discarded tail the guard reads | the guard sees the whole remainder, and its regexes are not all linear |
+| `TAIL_SCAN_MAX` (4000) | how much of the discarded tail the **JWT** pattern reads | it is the one guard pattern that is not linear |
 | `REDUCE_BUDGET_PER_CARD` (120 000) | one card's total across all blocks | per-call and per-block-count limits say nothing about the sum |
 | the `exec` summary's own cut (4000) | picking the program name out of a command | it runs *above* the pipeline, so the 4000-character bound never sees it |
 
@@ -182,25 +182,88 @@ process, median of 5:
 Ordinary input is unchanged — the bounds cost nothing on anything a person would
 actually send.
 
-**The per-card budget bounds characters, not time.** It admits
-`120 000 / 4 000 = 30` reductions, and a reduction's cost varies by roughly 500×
-with shape: 0.42 ms for prose, 29 ms for a 4 000-character unbroken lowercase run
-(the reduction's first pass is quadratic when it finds no `://`, and that is
-inside the 4 000-character bound, unchanged by this work). So the worst card is
-about **0.9 seconds**, not the "hundreds of milliseconds" an earlier revision of
-this section claimed — and about **1.8 seconds** for a card made entirely of rich
-segments, which run the pipeline twice while the budget charges once. Both are
-well below the 5.4 seconds the same card cost before, but neither is a number to
-round down in the telling.
+**The per-card budget charges for what is scanned, not for what survives.** An
+earlier revision charged `min(collapsed length, 4000)` *after* collapsing, which
+priced this shape at four characters a block:
 
-The tail-scan limit is the one that changes a stated rule, so it is worth saying
-plainly: **a credential more than 4000 characters past the cut no longer causes
-the safe content before it to be withheld.** It cannot cause that credential to
-render — only the kept prefix renders, and it faces the guard on its own. What is
-given up is the outer layer of fail-closed, "something far away looks wrong, so
-hide what is near too". That layer cost 5.5 seconds of stalled event loop on a
-single 120 KB block, because the guard's JWT pattern is quadratic on text with no
-dots in it, and every `eyJ` in the input is another starting position.
+```
+`b${i} x` + " "×65535 + "eyJ"×2600 + " tailend zzz"
+```
+
+It collapses to `b0 x`, so 200 of them never exhausted a 120 000 budget — while
+each still fed 7 800 characters of dotless base64 to the quadratic JWT pattern.
+Measured at 14 793 ms against 14 609 ms before any of this work: **the budget did
+nothing at all for the shape it exists to bound**, and the ceiling documented here
+was fiction. Charging by scanned length brings it to 372 ms.
+
+The charge is metered on the predicate itself. Every scan site already receives
+the caller's predicate — that plumbing exists so the tail guard cannot drift from
+the downstream one — so wrapping it meters all of them at once with no new
+plumbing. Only the bounded (JWT) half is charged; the linear half is capped at
+64 KiB per call and costs 0.74 ms there, which is not worth accounting for. When
+the budget runs out the predicate returns "sensitive", so exhaustion fails closed
+by construction rather than by a separate check.
+
+**The budget still bounds characters, not time.** A reduction's cost varies by
+roughly 500× with shape: 0.42 ms for prose, 29 ms for a 4 000-character unbroken
+lowercase run (the reduction's first pass is quadratic when it finds no `://`,
+inside the 4 000-character bound and unchanged by this work). So the worst card is
+about **0.9 seconds**, not the "hundreds of milliseconds" an earlier revision
+claimed — and about **1.8 seconds** for a card made entirely of rich segments,
+which run the pipeline twice while the budget charges once. Both are well below
+the 5.4 seconds the same card cost before, but neither is a number to round down
+in the telling.
+
+**The tail-scan limit is bounded by cost, not by offset — and the first version
+of it got that wrong in a way worth recording.**
+
+It originally narrowed the *whole* guard to 4000 characters, justified like this:
+a credential further away than that no longer withholds the safe content before
+it, but *it cannot cause that credential to render — only the kept prefix renders,
+and it faces the guard on its own*. The second clause is false, and this repo
+documents why in its own corpus: `UNFIXED_CORPUS` records `user:hunter2@localhost`
+as a shape the guard does **not** catch — single-label userinfo is neither reduced
+(the pass needs a dotted host) nor matched by any pattern. So the kept prefix can
+hold a plaintext password and pass the guard cleanly; the only thing withholding
+it was the keyword further down the string. Narrowing the guard rendered it:
+
+```
+"alice:hunter2@localhost " + "word "×900 + "pad "×1300 + " token"
+```
+withheld entirely before, rendered password-first afterwards, on all three
+group-visible sinks.
+
+Measurement says the narrowing was never needed in that form. Timed per detector
+on 64 KB of the adversarial shape:
+
+| detector | 4 000 | 8 000 | 32 000 | 64 000 |
+|---|---|---|---|---|
+| keyword (`SECRET_RE`) | 0.01 ms | 0.01 | 0.03 | 0.07 |
+| 11 known-prefix patterns | ≤0.01 ms | ≤0.01 | ≤0.01 | ≤0.02 |
+| long hex | 0.02 ms | 0.03 | 0.07 | 0.14 |
+| generic entropy run | 0.03 ms | 0.05 | 0.19 | 0.41 |
+| **JWT** | **19.5 ms** | **80.1** | **1 229.5** | minutes |
+
+**One** pattern is non-linear. So the guard splits by cost: the linear half reads
+the whole discarded tail, exactly as before this work; `TAIL_SCAN_MAX` applies to
+the JWT pattern alone. The rule that remains is much narrower and can be stated
+without a false clause: *a **JWT** more than 4000 characters past the cut no
+longer withholds the content before it* — and a JWT that far out does not render
+either, since only the kept prefix renders.
+
+The linear half is not unbounded: the tail it reads is capped at `RAW_INPUT_MAX`,
+so a keyword more than 64 KiB past the cut still does not reach back. That is a
+16× wider window than before and covers realistic logs, but it is a boundary, and
+naming it is the point.
+
+Making the JWT pattern itself linear was tried and abandoned; the note lives at
+`JWT_RE` so the next person does not repeat it. Emulating a possessive quantifier
+with a lookahead capture and backreference is semantically equivalent (verified on
+8 cases plus 20 000 randomised strings) and **only twice as fast — still cleanly
+quadratic**, because the cost is the *number of starting positions*, not
+backtracking within one. A genuinely linear version means hand-writing a
+dot-anchored scanner to replace a regex, and on this branch, hand-written second
+implementations of an existing rule are where the bugs have come from.
 
 `RAW_INPUT_MAX` **is not output-neutral**, and an earlier revision of this section
 claimed it was. That claim then justified truncating at exactly 64 KiB with no

@@ -13,7 +13,7 @@
  * 纯函数、无副作用、无 I/O —— hook 进度卡与 agent 展示卡工具共享这一层。
  */
 
-import { cardSupports, collapseForReduction, isSensitive, reduceUrlsInText, REDUCE_INPUT_MAX, type CardCaps } from "./card-render.js";
+import { cardSupports, collapseForReduction, isSensitive, reduceUrlsInText, sensitivePredicate, REDUCE_INPUT_MAX, type CardCaps, type SensitivePredicate } from "./card-render.js";
 import { cardFitsLimits } from "./card-limits.js";
 import { CARD_VERSION } from "./types.js";
 
@@ -154,7 +154,7 @@ export interface BuildDisplayCardResult {
  * 由界自己截掉、由 RAW_INPUT_MAX 挡住,不该按原长收费,否则一个超长块会独吞预算,而它今天
  * 是能正常渲染的。
  */
-const REDUCE_BUDGET_PER_CARD = 120_000;
+export const REDUCE_BUDGET_PER_CARD = 120_000;
 
 /**
  * 群卡片全员可见 → 与 summarizeToolParams/sanitizeErrorText 同套:
@@ -175,17 +175,37 @@ function sanitize(text: string, ctx: RenderCtx): string | null {
   // 于是耗尽之后每个块仍要付一次最多 64 KiB 的折叠:实测 200 个 120 KB 块里有 170 个是白付的,
   // 元素数从第 30 块起就钉死在 31,耗时却还在线性往上走(54 → 265 ms)。
   if (ctx.reduce.exhausted) return null;
-  const sensitiveHere = (t: string) => isSensitive(t, generic);
-  // **谓词从第一步就要带上。** 折叠自己在 RAW_INPUT_MAX 处截断,被截掉的那一段要过同一道守卫 ——
-  // 上一版这里是不带谓词的 `collapseForReduction(text)`,于是 64 KiB 之外那个压住凭据的关键词
-  // 被无声丢掉,`user:hunter2@localhost …… token` 在 main 上渲染 `""`,在这里渲染出口令。
+  const plain = sensitivePredicate(generic);
+  // **计价的是被扫描的量,不是活下来的量。**
   //
-  // 说清楚哪一半是有观测的:红的是**尾部扫描存在**(上面那条断言),不是**传的是调用方那个谓词**。
-  // 后者今天没有可观测差异,而且是可证的:缺省谓词取 `isSensitive(_, true)`,它是本模块所有
-  // 谓词里最严的一档(generic=true 在 false 之上多加长 hex/高熵;错误文本那道还多一条构建哈希
-  // 豁免)。所以漏传只会**多藏**,不会漏。传它是为了让两步不可能分岔 —— 哪天某个调用方的谓词
-  // 变得比缺省宽,这里就不必再想起来改。反向验证时它是绿的,如实记在这里,不假装它被覆盖了。
-  let s = collapseForReduction(text, sensitiveHere);
+  // 上一版按折叠后长度计费,而计费又跑在折叠**之后**。于是这个形状整条路白嫖:
+  //
+  //     `b${i} x` + " "×65535 + "eyJ"×2600 + " tailend zzz"
+  //
+  // 折叠后只剩 `b0 x`,收 4 块钱,200 块也耗不尽 12 万的预算 —— 可每一块仍然把 7800 字符的
+  // 无点 base64 喂进了二次方的 JWT 正则。实测 200 块 14793 ms(main 14609 ms),**两边持平**,
+  // 也就是说这条预算对它自己要挡的那个形状完全没生效,而 README 还写着 0.9 秒的天花板。
+  //
+  // 现在在**谓词上计量**:所有扫描点都已经穿过谓词(这正是当初把谓词铺到每一层的用处),
+  // 包一层就自动覆盖全部调用点,不用再铺一遍管道。只对有界档计价 —— 线性档每次 ≤64 KiB、
+  // 实测 0.74 ms,200 块合计 ~100 ms,不值得为它记账。预算耗尽时谓词直接返回 true,
+  // fail-closed 方向天生正确:没钱再查了,就当它敏感。
+  const metered: SensitivePredicate = {
+    linear: plain.linear,
+    bounded: (t) => {
+      if (t.length > ctx.reduce.left) {
+        ctx.reduce.exhausted = true;
+        return true;
+      }
+      ctx.reduce.left -= t.length;
+      return plain.bounded(t);
+    },
+    all: (t) => metered.linear(t) || metered.bounded(t),
+  };
+  // 传 metered 的只有下面这两个管线函数,而它们把谓词**只**用在尾部扫描上 —— 所以计价口径是
+  // 「尾巴扫了多少」。本函数自己那道下游守卫用 plain,不计价:它的输入按构造 ≤4000,已经被
+  // 下面那笔 min(长度, 4000) 计过一次了,再收一次会让正常卡片的容量直接减半。
+  let s = collapseForReduction(text, metered);
   if (!s) return null;
   const cost = Math.min(s.length, REDUCE_INPUT_MAX);
   if (cost > ctx.reduce.left) {
@@ -206,9 +226,9 @@ function sanitize(text: string, ctx: RenderCtx): string | null {
   //     "https://hooks.slack.com/services/T../B../XXXX " + "word "×900
   //
   // 这种空白充裕、归约后完全安全的内容被整块丢掉(main 渲染 4517 字符)。
-  s = collapseForReduction(reduceUrlsInText(s, sensitiveHere), sensitiveHere);
+  s = collapseForReduction(reduceUrlsInText(s, metered), metered);
   if (!s) return null;
-  if (sensitiveHere(s)) return null;
+  if (plain.all(s)) return null;
   return s;
 }
 
@@ -620,6 +640,10 @@ function renderCollapsibleWithSummary(
   // `[cleanSummary, ...]`,于是折叠态那一行标签在 plain 里变成空行 —— 而 plain 是每张卡都要
   // 附带的兜底正文,摘要正是它最不能丢的一行。当时的测试只数元素个数,一路绿着。
   const summaryPlain = summaryRendered.plainLines;
+  // 去重比的是**原文**摘要,不是清洗后的。上一版比 cleanSummary,而摘要重排之后 cleanSummary
+  // 一度是空串,于是 actionLabel 永远"不等于摘要"、永远被采纳。比原文的代价是空白差异会让两者
+  // 判不相等(`"Build  failed"` vs `"Build failed"` → 展开按钮显示 actionLabel 而不是「展开」),
+  // 那是可用性上的小事,而且 rawExpandLabel 仍然要过 sanitize,不是泄漏面。有断言钉着。
   const dedupeAgainst = summarySegments ? summarySegments.map((seg) => seg.text).join("") : summary;
   const rawExpandLabel = expandLabel ?? (actionLabel && actionLabel !== dedupeAgainst ? actionLabel : "展开");
   const cleanExpandLabel = sanitize(rawExpandLabel, ctx) ?? "展开";
