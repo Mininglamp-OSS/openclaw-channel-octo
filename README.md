@@ -214,68 +214,24 @@ which run the pipeline twice while the budget charges once. Both are well below
 the 5.4 seconds the same card cost before, but neither is a number to round down
 in the telling.
 
-**The tail scan is bounded by cost, and the premise that makes a bound safe was
-false for three rounds. Fixing the premise is what closed it.**
+**The tail-scan limit is bounded by cost, not by offset — and the first version
+of it got that wrong in a way worth recording.**
 
-The bound started as a limit on the *whole* guard, justified like this: a
-credential further away than the limit no longer withholds the safe content before
+It originally narrowed the *whole* guard to 4000 characters, justified like this:
+a credential further away than that no longer withholds the safe content before
 it, but *it cannot cause that credential to render — only the kept prefix renders,
-and it faces the guard on its own*.
-
-The second clause was false, and this repo documented why in its own corpus.
-`UNFIXED_CORPUS` recorded `user:hunter2@localhost` as a shape the guard does not
-catch: single-label userinfo was neither reduced (the pass required a dotted host)
-nor matched by any detector. So the kept prefix could hold a plaintext password and
-pass the guard cleanly, and the only thing withholding it was a keyword further
-down the string. Narrowing the guard rendered it:
+and it faces the guard on its own*. The second clause is false, and this repo
+documents why in its own corpus: `UNFIXED_CORPUS` records `user:hunter2@localhost`
+as a shape the guard does **not** catch — single-label userinfo is neither reduced
+(the pass needs a dotted host) nor matched by any pattern. So the kept prefix can
+hold a plaintext password and pass the guard cleanly; the only thing withholding
+it was the keyword further down the string. Narrowing the guard rendered it:
 
 ```
 "alice:hunter2@localhost " + "word "×900 + "pad "×1300 + " token"
 ```
 withheld entirely before, rendered password-first afterwards, on all three
 group-visible sinks.
-
-That was fixed by narrowing the bound to the JWT pattern alone — and the leak
-narrowed with it rather than closing. A short, low-entropy JWT past the window
-(`eyJabcdefgh.abcdefgh.abc`, which the entropy detector cannot see and `JWT_RE`
-exists precisely to catch) reproduced it at 9 748 characters, and the same keyword
-shape reproduced it at 136 KB once the linear tier's own cap was passed. **Any
-reach limit leaks while the premise is false** — the limit only sets the price.
-Three narrowings, three reproductions.
-
-So the premise is now closed instead. The reduction pass handles the four shapes
-that were in `UNFIXED_CORPUS` — single-label hosts, a leading `/`, a `/` inside the
-password, and bracketed IPv6 — so `user:hunter2@localhost` reduces to
-`https://localhost` and the password never reaches the output. The clause *"only
-the kept prefix renders, and it faces a guard that can vet it"* is true for the
-first time, and a reach bound rests on something real.
-
-Relaxing that pass is where this branch has historically broken things, so both
-known failure modes are pinned by sentinels that stay in the corpus:
-
-- **Cutting mid-token fabricates.** `nginx:1.21@sha256:1234abcd` once matched
-  through `…@sha256:1234`, and the unmatched `abcd` was concatenated onto the
-  replacement to produce `https://sha256abcd`, a string not in the input. The match
-  must now end on a token boundary.
-- **All-numeric single labels get normalised.** `new URL("https://2")` rewrites the
-  host to `0.0.0.2` — also absent from the input, and invisible to the corpus's
-  fabrication check, which looks for alphanumeric runs of 4+ and finds none in
-  `0.0.0.2`. Single-label hosts must contain a letter; dotted hosts and IPv4 take a
-  different branch.
-
-The password segment is capped at 256 characters, which is a cost bound rather than
-a semantic one: allowing `/` inside it turned `a:b/c/a:b/c/…` with no `@` into a
-quadratic scan (5.0 / 74.9 / 1 245.8 ms at 4 K / 16 K / 64 K, against a flat 0.1 ms
-before), because every start position scanned to the end of the token. Capped, it
-is 1.3 / 4.7 / 17.5 ms. A DSN whose password exceeds 256 characters is not reduced;
-at that length it is a high-entropy run and the guard is what catches it.
-
-Two false positives come with the relaxation, recorded in `REWRITE_CORPUS` rather
-than absorbed silently: `at 10:30@venue` renders as `at https://venue`, and
-`com.foo:bar:1.0@jar` as `https://jar`. Neither fabricates — every character comes
-from the input — and both render less, not more. They are unavoidable in kind:
-`user:.*@example` (a grep pattern) and `user:hunter2@example` (a credential) are the
-same shape, and any rule that renders the first renders the second.
 
 Measurement says the narrowing was never needed in that form. Timed per detector
 on 64 KB of the adversarial shape:
@@ -290,15 +246,15 @@ on 64 KB of the adversarial shape:
 
 **One** pattern is non-linear. So the guard splits by cost: the linear half reads
 the whole discarded tail, exactly as before this work; `TAIL_SCAN_MAX` applies to
-the JWT pattern alone. The rule that remains: *a **JWT** more than
-4000 characters past the cut no longer withholds the content before it*, and the
-linear half reads the whole tail up to `RAW_INPUT_MAX`, so a keyword more than
-64 KiB past the cut does not reach back either.
+the JWT pattern alone. The rule that remains is much narrower and can be stated
+without a false clause: *a **JWT** more than 4000 characters past the cut no
+longer withholds the content before it* — and a JWT that far out does not render
+either, since only the kept prefix renders.
 
-Both of those are now bounds on *how much extra fail-closed you get*, not on
-whether a credential can render — that question is settled upstream, by the
-reduction pass, before the tail scan is consulted at all. Stating them was
-previously a way of naming a leak; it is now a description of a limit.
+The linear half is not unbounded: the tail it reads is capped at `RAW_INPUT_MAX`,
+so a keyword more than 64 KiB past the cut still does not reach back. That is a
+16× wider window than before and covers realistic logs, but it is a boundary, and
+naming it is the point.
 
 Making the JWT pattern itself linear was tried and abandoned; the note lives at
 `JWT_RE` so the next person does not repeat it. Emulating a possessive quantifier
