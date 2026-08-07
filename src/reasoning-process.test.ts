@@ -98,14 +98,24 @@ describe("ai.reasoning-process successor-compatible contract", () => {
       timerText: "6.0s · stopped at phase 1",
       collapsedSummary: "Kept 1 phase from before the stop",
     });
+    // 终态一律折叠(与 Model B 的 renderProgressCard 一致):失败卡默认收起,
+    // collapsedSummary 的 "open to see the steps so far" 才有意义 —— 展开时它永不显示。
     expect(buildReasoningProcessData(state({ phase: "error", errorText: "provider timeout" }))).toMatchObject({
       state: "error",
       statusLabel: "Failed",
       statusTone: "Attention",
-      traceExpanded: true,
-      traceCollapsed: false,
+      traceExpanded: false,
+      traceCollapsed: true,
+      collapsedSummary: "Interrupted · open to see the steps so far",
       errorTitle: "Generation failed",
       errorMessage: "provider timeout",
+    });
+    // expired 走同一条 error 契约状态,同样折叠。
+    expect(buildReasoningProcessData(state({ phase: "expired" }))).toMatchObject({
+      state: "error",
+      traceExpanded: false,
+      traceCollapsed: true,
+      errorMessage: "Timed out waiting for the background task.",
     });
   });
 
@@ -441,5 +451,37 @@ describe("reasoning process Adaptive Card", () => {
     expect(trace).toMatchObject({ id: "trace_panel", isVisible: true });
     expect(JSON.stringify(card)).not.toContain("ActionSet");
     expect(JSON.stringify(card)).not.toContain("Action.ToggleVisibility");
+  });
+
+  /**
+   * A terminal card is collapsed by default, and the error block lives inside `trace_panel`. The
+   * reason therefore has to ride in an always-visible element or a failed run renders as a bare
+   * `Failed` badge with no cause — the regression `renderProgressCard` avoids by putting the reason
+   * in its header. Asserted against the body elements outside `trace_panel`, i.e. what the reader
+   * sees before clicking anything.
+   */
+  it("keeps the failure reason visible on a collapsed error card", () => {
+    const { card } = renderReasoningProcessCard(
+      state({ phase: "error", errorText: "provider timeout" }),
+      caps,
+    );
+    const body = card.body as Array<Record<string, unknown>>;
+    const withoutTrace = JSON.stringify(body.filter((item) => item.id !== "trace_panel"));
+
+    expect(body.find((item) => item.id === "trace_panel")).toMatchObject({ isVisible: false });
+    expect(withoutTrace).toContain("provider timeout");
+    // The collapsed summary is the default presentation of the outcome, so it must not badge a
+    // failure with the success glyph.
+    expect(withoutTrace).toContain("⚠");
+    expect(withoutTrace).not.toContain("✓");
+  });
+
+  it("labels an expired wait distinctly from an interrupted run", () => {
+    const { card } = renderReasoningProcessCard(state({ phase: "expired" }), caps);
+    const body = card.body as Array<Record<string, unknown>>;
+    const withoutTrace = JSON.stringify(body.filter((item) => item.id !== "trace_panel"));
+
+    expect(withoutTrace).toContain("Wait timed out");
+    expect(withoutTrace).not.toContain("Interrupted");
   });
 });
