@@ -77,24 +77,62 @@ const NO_SUMMARY_THOUGHT = "Reasoned without a visible summary";
  */
 const REDACTED_THOUGHT = "Reasoning hidden — matched a redaction rule";
 /**
- * Per-phase cap on rendered reasoning text. 280 (a tweet) cut real thinking mid-sentence: Anthropic
- * returns a raw chain of thought rather than a summary, so a single phase routinely runs past it and
- * the reader lost the part that says what the model was about to do.
- *
- * 1200 is still a hard cap, not "unbounded", and capture is separately bounded by
- * MAX_REASONING_CAPTURE (4000) in card-progress.ts, which this stays below.
- *
- * The bound that actually governs this value is the **server template's** `phases[].thought`
- * constraint, validated on every send: a value over it is a deterministic 400, and a 4xx sets
- * `entry.skip` — the card disappears for the rest of the session rather than degrading. There is no
- * local fallback left to absorb that (renderReasoningProcessCard has no production caller after
- * #204). So this constant may only exceed a published version's cap once the server raises it.
- *
- * Do not justify a value here by `cardFitsLimits`: it is a pure predicate, and on a miss
- * renderReasoningProcessCard discards the whole reasoning layout rather than trimming trailing
- * blocks — and that path is dead code anyway.
+ * 其余字段的契约上限(0.2.0 起至 0.4.0 一致,0.4.0 只放开了 thought)。同样取自 handoff 产物。
+ * 留一个字符给截断用的 "…"。
  */
-const THOUGHT_MAX = 1200;
+const TIMER_TEXT_MAX = 128 - 1;
+const ACTION_DETAIL_MAX = 192 - 1;
+
+/**
+ * 按**码点**截断。契约的 maxLength 按 rune 计,而 JS slice 按 UTF-16 码元切 —— 后者会把代理对
+ * 切断留下孤立代理(渲染成 �),码点计数也与契约不一致。
+ */
+function clampRunes(text: string, max: number): string {
+  const runes = [...text];
+  return runes.length > max ? runes.slice(0, max).join("") + "…" : text;
+}
+
+/**
+ * `phases[].thought` 的 maxLength,按已发布模板版本。数字取自服务端 handoff 产物
+ * `pkg/cardtmpl/ai_reasoning_process/handoff/ai.reasoning-process@<v>/contract/data.schema.json`
+ * (0.4.0 见 octo-server#712)。
+ *
+ * 未列出的版本按 THOUGHT_CONTRACT_MAX_DEFAULT 处理 —— **保守方向**:新版本上线而这张表没更新时,
+ * 卡片内容变短,但永不因超限被拒。超限的代价不是截断而是 400 → entry.skip → 整个 session 没有卡片,
+ * 所以宁可少显示。0.4.0 的 schema 自己写明「producer 侧仍应自行截断到不超过此值」。
+ */
+const THOUGHT_CONTRACT_MAX_BY_VERSION: Readonly<Record<string, number>> = {
+  "0.1.0": 281,
+  "0.2.0": 281,
+  "0.3.0": 281,
+  "0.4.0": 4001,
+};
+const THOUGHT_CONTRACT_MAX_DEFAULT = 281;
+const THOUGHT_CONTRACT_MAX_WIDEST = Math.max(
+  ...Object.values(THOUGHT_CONTRACT_MAX_BY_VERSION),
+  THOUGHT_CONTRACT_MAX_DEFAULT,
+);
+
+/** 该版本允许的思考文本渲染上限(留一个字符给截断用的 "…")。 */
+function thoughtMaxForVersion(version: string | undefined): number {
+  const contractMax = (version ? THOUGHT_CONTRACT_MAX_BY_VERSION[version] : undefined)
+    ?? THOUGHT_CONTRACT_MAX_DEFAULT;
+  return contractMax - 1;
+}
+
+/**
+ * Per-phase ceiling used while sanitizing. This is the widest bound any published template version
+ * allows minus one (the truncation appends "…"), NOT the bound that gets enforced — the template the
+ * server actually selected decides that, and it is applied at the wire boundary by
+ * `buildReasoningProcessWireData`. Keeping this generous means a deployment on a newer template is
+ * not silently capped to an older version's bound.
+ *
+ * Why the wire boundary and not here: the selected `templateRef.version` is only known there.
+ * Sanitizing is version-independent; conforming to a contract is not.
+ *
+ * Capture is separately bounded by MAX_REASONING_CAPTURE (4000) in card-progress.ts.
+ */
+const THOUGHT_MAX = THOUGHT_CONTRACT_MAX_WIDEST - 1;
 const TOOL_NAME_MAX = 80;
 const MAX_RENDERED_PHASES = 6;
 const MAX_RENDERED_ACTIONS = 12;
@@ -258,6 +296,15 @@ export function resolveReasoningThought(text: string | undefined): ReasoningThou
     .trim();
   // Whitespace-only input carries no reasoning; it is not something we withheld.
   if (!normalized) return { kind: "none", text: "" };
+  // 内部上下文标记必须在**剥离占位句之前**检查:剥离会把拼接进标记内部的占位句去掉、
+  // 让标记重新拼合不上,从而绕过这道检查(实测 `<<<BEGIN_OPENCLAW_INTERNAL_` + 占位句 +
+  // `CONTEXT>>> …` 会被判成 text 并原样渲染)。可达性窄(需要模型输出被这样构造),但改的成本为零。
+  if (normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
+      normalized.includes("<<<END_OPENCLAW_INTERNAL_CONTEXT>>>") ||
+      normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_") ||
+      normalized.includes("_CONTEXT>>>")) {
+    return { kind: "redacted", text: REDACTED_THOUGHT };
+  }
   // 包含式而非全等:recordCardReasoning 在非 snapshot 时会拼接(`previous + text`),而一个
   // `__thinking__` 步骤可能收到两次 model call 的文本(有些 host 从不投递 model_call_ended)。
   // 一旦占位句和别的文本相邻,全等就失效,值会被判成 `text`,把宿主的诊断句原样渲染到群卡上 ——
@@ -266,10 +313,6 @@ export function resolveReasoningThought(text: string | undefined): ReasoningThou
     const rest = normalized.split(HOST_NO_SUMMARY_PLACEHOLDER).join(" ").replace(/\s+/g, " ").trim();
     if (!rest) return { kind: "no-summary", text: NO_SUMMARY_THOUGHT };
     normalized = rest;
-  }
-  if (normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
-      normalized.includes("<<<END_OPENCLAW_INTERNAL_CONTEXT>>>")) {
-    return { kind: "redacted", text: REDACTED_THOUGHT };
   }
   normalized = reduceUrlsInText(normalized).replace(/\s+/g, " ").trim();
   // Empty after URL reduction means the whole thought was a URL we downgraded away: withheld, not
@@ -492,13 +535,29 @@ function trimForRender(data: ReasoningProcessData): ReasoningProcessData {
 const NO_THOUGHT_WIRE_LABEL = "—";
 
 /** Build bounded Registry data without inventing synthetic tool actions for empty model calls. */
-export function buildReasoningProcessWireData(state: CardProgressState): ReasoningProcessData | null {
+export function buildReasoningProcessWireData(
+  state: CardProgressState,
+  templateVersion?: string,
+): ReasoningProcessData | null {
+  // 按**服务端选中的版本**收口。这是唯一知道版本的地方,也是唯一必须守契约的地方:超限是
+  // 确定性 400,而 4xx 置 entry.skip —— 首帧被拒则整个 session 没有卡片,中途 edit 被拒则用户
+  // 正在看的卡冻结在进行中、永远到不了终态。
+  const thoughtMax = thoughtMaxForVersion(templateVersion);
   const phases = phasesFromSteps(state.steps, { synthesizeEmptyActions: false })
     .filter((phase) => phase.actions.length > 0)
-    // 空 thought 违反契约的 minLength:1 —— 见 NO_THOUGHT_WIRE_LABEL。
-    .map((phase) => (phase.thought ? phase : { ...phase, thought: NO_THOUGHT_WIRE_LABEL }));
+    .map((phase) => ({
+      // 空 thought 违反契约的 minLength:1 —— 见 NO_THOUGHT_WIRE_LABEL。
+      thought: clampRunes(phase.thought || NO_THOUGHT_WIRE_LABEL, thoughtMax),
+      // detail 此前完全没有长度上限,一个长工具摘要就能超过契约的 192。
+      actions: phase.actions.map((action) => ({
+        ...action,
+        detail: clampRunes(action.detail, ACTION_DETAIL_MAX),
+      })),
+    }));
   if (phases.length === 0) return null;
-  return trimForRender(buildReasoningProcessDataWithPhases(state, phases));
+  const data = trimForRender(buildReasoningProcessDataWithPhases(state, phases));
+  // timerText 在失败轮次上会带上清洗后的错误详情,实测 error 135 / expired 138 runes,超过契约 128。
+  return { ...data, timerText: clampRunes(data.timerText, TIMER_TEXT_MAX) };
 }
 
 function textBlock(text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {

@@ -541,7 +541,7 @@ async function editEntryProgress(params: {
   const { entry, state } = params;
   const messageId = entry.messageId;
   if (!messageId) return false;
-  const data = buildReasoningProcessWireData(state);
+  const data = buildReasoningProcessWireData(state, entry.templateRef?.version);
   const templateRef = entry.templateRef;
   if (!data || !templateRef) return false;
   const previous = entry.templateEditPromise;
@@ -678,7 +678,7 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     const state = entryProgressState(sessionKey, entry);
     if (!entry.messageId) {
       if (!isCurrentEntry(sessionKey, entry)) return;
-      const data = buildReasoningProcessWireData(state);
+      const data = buildReasoningProcessWireData(state, entry.templateRef?.version);
       if (!data) {
         dbg("Registry first frame deferred: no phases with actions yet");
         return;
@@ -1130,6 +1130,17 @@ function endRunningThinking(entry: CardEntry, now: number): void {
 
 const MAX_REASONING_CAPTURE = 4_000;
 
+/** 该 session 最近的 __thinking__ 步骤是否已经捕获到文本(用于避免 snapshot 冲掉它)。 */
+function hasCapturedReasoning(sessionKey: string): boolean {
+  const entry = cards.get(sessionKey);
+  if (!entry) return false;
+  for (let index = entry.steps.length - 1; index >= 0; index--) {
+    const step = entry.steps[index];
+    if (step?.tool === "__thinking__") return !!step.thought?.trim();
+  }
+  return false;
+}
+
 /** Capture OpenClaw's user-visible reasoning lane without sending it as a normal message. */
 export function recordCardReasoning(
   sessionKey: string,
@@ -1417,19 +1428,29 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     // 「压根没推理」—— 四态区分在只经由本车道可见的 provider 上就白做了。宿主在别处会为这种
     // block 合成一句英文占位,这里用同一个常量对齐,让下游 resolveReasoningThought 归类为
     // no-summary。
-    const thought = message.content
+    const blocks = message.content
       .map((part) => asRecord(part))
-      .filter((part) => part?.type === "thinking")
-      .map((part) => {
-        const text = typeof part!.thinking === "string" ? part!.thinking : "";
-        if (text.trim()) return text;
-        const signature = part!.thinkingSignature;
-        return typeof signature === "string" && signature.trim() ? HOST_NO_SUMMARY_PLACEHOLDER : "";
-      })
-      .filter(Boolean)
+      .filter((part) => part?.type === "thinking");
+    const realText = blocks
+      .map((part) => (typeof part!.thinking === "string" ? part!.thinking : ""))
+      .filter((text) => text.trim())
       .join("\n")
       .trim();
-    if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
+    if (realText) {
+      recordCardReasoning(sk!, realText, { snapshot: true });
+      return;
+    }
+    // 全是「签名有、文本空」的 block 时才代入占位句,否则这条车道会把「推理了但拿不到内容」
+    // 退化成「压根没推理」,四态区分在只经由本车道可见的 provider 上就白做了。
+    //
+    // 但 snapshot 是**无条件替换**:若流式车道已经捕获到真实文本,直接替换会把它冲掉,把一个
+    // 我们本来拿到了推理的 phase 报成「没有可见摘要」。本车道的存在前提是流式车道什么都没给,
+    // 所以只在该步骤尚无捕获时才代入。
+    const signed = blocks.some((part) =>
+      typeof part!.thinkingSignature === "string" && String(part!.thinkingSignature).trim());
+    if (signed && !hasCapturedReasoning(sk!)) {
+      recordCardReasoning(sk!, HOST_NO_SUMMARY_PLACEHOLDER, { snapshot: true });
+    }
   });
 
   api.on("after_tool_call", (event: unknown, ctx: unknown) => {

@@ -410,10 +410,17 @@ describe("reasoning detail sanitization", () => {
     // mid-sentence, losing the part that says what the model was about to do next. 600 chars now
     // survive intact; the cap is still hard, so 2000 is truncated with an ellipsis.
     expect(sanitizeReasoningThought("x".repeat(600))).toBe("x".repeat(600));
-    // 精确钉住:`<= 1201` 对 [600,1200] 区间内任何上限都成立,起不到锚定作用。
-    const long = sanitizeReasoningThought("x".repeat(2000));
-    expect(long.length).toBe(1201);
-    expect(long.endsWith("…")).toBe(true);
+    // 长度类断言必须用自然语言:长重复串会被 isSensitive 当成高熵串整段抹掉(实测返回 43 字符的
+    // REDACTED_THOUGHT),那样测的就不是截断而是脱敏。
+    const prose = (runes: number): string => {
+      const unit = "I need to check the runtime before answering. ";
+      return unit.repeat(Math.ceil(runes / unit.length)).slice(0, runes);
+    };
+    // sanitize 用「已发布版本里最宽的上限」,按版本收口在 wire 边界(见下方 describe)。
+    expect(sanitizeReasoningThought(prose(2000))).toBe(prose(2000));
+    // 注意还有第三道上限:reduceUrlsInText 入口的 REDUCE_INPUT_MAX = 4000 会先按空白边界切,
+    // 所以 sanitize 这一层的 "…" 截断在 4000 上永不可达 —— 只断言不超过那道界。
+    expect([...sanitizeReasoningThought(prose(5000))].length).toBeLessThanOrEqual(4000);
   });
 
   /**
@@ -587,5 +594,72 @@ describe("reasoning process Adaptive Card", () => {
 
     expect(withoutTrace).toContain("Wait timed out");
     expect(withoutTrace).not.toContain("Interrupted");
+  });
+});
+
+/**
+ * 契约收口按**服务端选中的版本**做,不是一个模块常量。超限的代价不是内容变短,而是确定性 400 →
+ * entry.skip:首帧被拒则整个 session 没有卡片,中途 edit 被拒则用户正在看的卡冻结在进行中。
+ * 数字取自服务端 handoff 的 data.schema.json(0.4.0 见 octo-server#712)。
+ */
+describe("wire data clamps to the selected template version", () => {
+  const withThought = (thought: string, summary = "npm"): CardProgressState => ({
+    reasoningId: "r", phase: "tool", elapsedMs: 5_000,
+    steps: [
+      { tool: "__thinking__", status: "done", modelCallId: "c1", thought },
+      { tool: "exec", status: "done", toolCallId: "t1", summary, resultSummary: "exit 0" },
+    ],
+  });
+  const runes = (s: string | undefined): number => [...String(s)].length;
+  /** 自然语言:长重复串会被 isSensitive 判成高熵串整段抹掉(长 CJK 实测也会),测不到截断。 */
+  const prose = (n: number): string => {
+    const unit = "I need to check the runtime before answering. ";
+    return unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+  };
+
+  it.each(["0.2.0", "0.3.0"])("caps thought at the %s bound of 281", (version) => {
+    const data = buildReasoningProcessWireData(withThought(prose(5_000)), version);
+    expect(runes(data!.phases[0]!.thought)).toBe(281);
+  });
+
+  it("lets 0.4.0 through to its wider bound", () => {
+    const data = buildReasoningProcessWireData(withThought(prose(5_000)), "0.4.0");
+    const n = runes(data!.phases[0]!.thought);
+    // 断言的是「版本门起作用」+「不越契约」,不钉死具体数字:上游还有一道
+    // REDUCE_INPUT_MAX = 4000(card-render.ts),它先按空白边界切,所以实际发不到 4001。
+    // 也就是说 0.4.0 放开的那 1 个字符余量已被那道界吃掉。
+    expect(n).toBeGreaterThan(281);
+    expect(n).toBeLessThanOrEqual(4001);
+  });
+
+  it.each([
+    ["未列出的新版本", "9.9.9"],
+    ["版本未知", undefined],
+  ])("falls back to the conservative bound when %s", (_label, version) => {
+    // 保守方向:表没更新时内容变短,但永不因超限被拒。
+    const data = buildReasoningProcessWireData(withThought(prose(5_000)), version);
+    expect(runes(data!.phases[0]!.thought)).toBe(281);
+  });
+
+  it("caps timerText, which carries the sanitized error detail on a failed turn", () => {
+    // #202 把清洗后的失败原因折进了 timerText,实测 error 135 / expired 138 runes,超过契约 128。
+    const state = withThought("核对输入。");
+    for (const phase of ["error", "expired"] as const) {
+      const data = buildReasoningProcessWireData({ ...state, phase, errorText: "x".repeat(400) }, "0.3.0");
+      expect(runes(data!.timerText)).toBeLessThanOrEqual(128);
+    }
+  });
+
+  it("caps actions[].detail, which had no length bound at all", () => {
+    const data = buildReasoningProcessWireData(withThought("核对输入。", "x".repeat(500)), "0.3.0");
+    expect(runes(data!.phases[0]!.actions[0]!.detail)).toBeLessThanOrEqual(192);
+  });
+
+  it("truncates by code point so a surrogate pair is never split", () => {
+    const data = buildReasoningProcessWireData(withThought("🙂".repeat(1_000)), "0.3.0");
+    const thought = data!.phases[0]!.thought;
+    expect(runes(thought)).toBeLessThanOrEqual(281);
+    // 孤立代理会渲染成 �。按码点切之后不该出现。
+    expect(/[\uD800-\uDFFF]/.test(thought.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, ""))).toBe(false);
   });
 });

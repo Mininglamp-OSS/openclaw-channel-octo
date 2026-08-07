@@ -913,3 +913,94 @@ describe("progress frames under rate limiting", () => {
     expect(vi.getTimerCount()).toBeLessThan(armed);
   });
 });
+
+/**
+ * llm_output 车道:宿主持久化的 lastAssistant 快照。它存在的前提是**流式车道什么都没给**
+ * (见 card-progress.ts 该 hook 上方注释)。评审指出整个 hook 此前没有任何测试 —— 把它整块
+ * revert 掉套件仍然全绿,而它正是上一轮那个覆盖回归所在的位置。
+ */
+describe("llm_output reasoning capture lane", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetCardProgressForTests();
+  });
+
+  afterEach(() => {
+    _resetCardProgressForTests();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    global.fetch = originalFetch;
+  });
+
+  const thinking = (thought: string, signature?: string) => ({
+    type: "thinking",
+    ...(thought ? { thinking: thought } : { thinking: "" }),
+    ...(signature ? { thinkingSignature: signature } : {}),
+  });
+
+  async function cardThought(
+    setup: (handlers: Record<string, Hook>, ctx: { sessionKey: string; runId?: string }) => void,
+  ): Promise<string> {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "llm-lane-" + Math.random().toString(36).slice(2, 8);
+    setCardContext(sessionKey, context({ reasoningVisibility: "stream" }));
+    const hookCtx = { sessionKey, runId: "run-1" };
+    handlers.before_agent_run?.({}, hookCtx);
+    handlers.model_call_started?.({ callId: "model-1" }, hookCtx);
+    setup(handlers, hookCtx);
+    handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    const sent = wire.calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as
+      { data?: { phases?: Array<{ thought: string }> } } | undefined;
+    return sent?.data?.phases?.[0]?.thought ?? "";
+  }
+
+  it("records real thinking text from the snapshot", async () => {
+    expect(await cardThought((handlers, ctx) => {
+      handlers.llm_output?.({ lastAssistant: { role: "assistant", content: [thinking("Checking the reducer.")] } }, ctx);
+    })).toBe("Checking the reducer.");
+  });
+
+  it("reports a signed block with no text as reasoned-without-summary", async () => {
+    // 否则这条车道会把「推理了但拿不到内容」退化成「压根没推理」。
+    expect(await cardThought((handlers, ctx) => {
+      handlers.llm_output?.({ lastAssistant: { role: "assistant", content: [thinking("", "sig-abc")] } }, ctx);
+    })).toBe("Reasoned without a visible summary");
+  });
+
+  it("does not let a signed empty snapshot clobber text the streaming lane already captured", async () => {
+    // snapshot 是无条件替换。上一轮的回归:Anthropic 的 redacted_thinking 作为最后一个 block 时,
+    // 会把已经捕获到的真实推理冲成「没有可见摘要」。
+    expect(await cardThought((handlers, ctx) => {
+      recordCardReasoning(ctx.sessionKey, "Checking the reducer.");
+      handlers.llm_output?.({ lastAssistant: { role: "assistant", content: [thinking("", "sig-abc")] } }, ctx);
+    })).toBe("Checking the reducer.");
+  });
+
+  it("keeps real text when the snapshot mixes it with a signed empty block", async () => {
+    expect(await cardThought((handlers, ctx) => {
+      handlers.llm_output?.({
+        lastAssistant: { role: "assistant", content: [thinking("", "sig-abc"), thinking("Checking the reducer.")] },
+      }, ctx);
+    })).toBe("Checking the reducer.");
+  });
+
+  it("ignores the snapshot when reasoning visibility is off", async () => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("llm-lane-off", context({ reasoningVisibility: "off" }));
+    const hookCtx = { sessionKey: "llm-lane-off", runId: "run-1" };
+    handlers.before_agent_run?.({}, hookCtx);
+    handlers.model_call_started?.({ callId: "model-1" }, hookCtx);
+    handlers.llm_output?.({ lastAssistant: { role: "assistant", content: [thinking("private thought")] } }, hookCtx);
+    handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(JSON.stringify(wire.calls.find((call) => call.url.includes("/sendMessage"))?.body))
+      .not.toContain("private thought");
+  });
+});

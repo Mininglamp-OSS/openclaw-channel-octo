@@ -12,15 +12,23 @@ import type { CardProgressState } from "./card-render.js";
  * phases — `renderReasoningProcessCard` has no production caller — so a schema violation is a
  * total loss of the feature, not a degraded render.
  *
- * The constraints below are transcribed from
- * `octo-card-forge/cards/ai.reasoning-process/contract/data.schema.json`. They are asserted here
- * rather than left implicit because a green unit suite otherwise says nothing about wire validity:
- * an earlier revision of this branch emitted `thought: ""` on three paths and every test passed.
+ * The constraints below are transcribed from the **handoff artifact the server actually serves**,
+ * `octo-server/pkg/cardtmpl/ai_reasoning_process/handoff/ai.reasoning-process@0.3.0/contract/
+ * data.schema.json` (0.4.0 raises only `thought`, to 4001 — see octo-server#712). An earlier
+ * revision of this file cited a card-authoring repo instead and transcribed a superseded, unbounded
+ * contract, which is how it managed to assert that `statusGlyph` was the only capped field. Every
+ * string in the real contract is capped.
  *
- * Keep in sync when the server publishes a new template version. `thought.maxLength` is
- * deliberately *not* asserted: the published versions checked did not constrain it, and the server
- * is raising the bound — see THOUGHT_MAX in reasoning-process.ts for why the producer value is
- * nonetheless coupled to it.
+ * They are asserted here because a green unit suite otherwise says nothing about wire validity: an
+ * earlier revision of this branch emitted `thought: ""` on three paths and every test passed.
+ *
+ * WHAT THIS DOES NOT VALIDATE: the real schema also uses `allOf`, `if`/`then`, `oneOf`, `const`,
+ * `enum`, `additionalProperties` and a custom `x-octo-constraints` (`aggregateArrayLimits` /
+ * `maxTotalItems`). Only length and cardinality are checked here — that is where every violation
+ * found so far has been, but do not read a pass as full conformance. A vendored schema plus a real
+ * validator would be strictly better; it needs a new dependency, so it is out of scope here.
+ *
+ * Keep in sync when the server publishes a new template version.
  */
 const REQUIRED_TOP_LEVEL = [
   "reasoningId", "state", "title", "statusLabel", "statusTone",
@@ -34,16 +42,34 @@ function state(steps: CardProgressState["steps"], phase: CardProgressState["phas
 function expectContractValid(data: ReturnType<typeof buildReasoningProcessWireData>): void {
   expect(data).not.toBeNull();
   for (const key of REQUIRED_TOP_LEVEL) expect(data).toHaveProperty(key);
-  // phases: minItems 1
+  // 顶层字符串上限,取自同一份 handoff schema。
+  const runes = (v: string): number => [...v].length;
+  expect(runes(data!.reasoningId)).toBeLessThanOrEqual(512);
+  expect(runes(data!.title)).toBeLessThanOrEqual(64);
+  expect(runes(data!.statusLabel)).toBeLessThanOrEqual(32);
+  expect(runes(data!.timerText)).toBeLessThanOrEqual(128);
+  expect(runes(data!.collapsedSummary)).toBeLessThanOrEqual(160);
+  if (data!.progressText !== undefined) expect(runes(data!.progressText)).toBeLessThanOrEqual(160);
+  if (data!.errorTitle !== undefined) expect(runes(data!.errorTitle)).toBeLessThanOrEqual(64);
+  if (data!.errorMessage !== undefined) expect(runes(data!.errorMessage)).toBeLessThanOrEqual(121);
+  // phases: minItems 1, maxItems 6
   expect(data!.phases.length).toBeGreaterThanOrEqual(1);
+  expect(data!.phases.length).toBeLessThanOrEqual(6);
   for (const phase of data!.phases) {
     // phase required: [thought, actions]; thought minLength 1
     expect(typeof phase.thought).toBe("string");
-    expect(phase.thought.length).toBeGreaterThanOrEqual(1);
+    expect([...phase.thought].length).toBeGreaterThanOrEqual(1);
+    expect([...phase.thought].length).toBeLessThanOrEqual(281);
     expect(Array.isArray(phase.actions)).toBe(true);
+    expect(phase.actions.length).toBeGreaterThanOrEqual(1);
+    expect(phase.actions.length).toBeLessThanOrEqual(12);
     for (const action of phase.actions) {
       expect(action.tool.length).toBeGreaterThanOrEqual(1);
-      // statusGlyph is the one field the schema caps: maxLength 2.
+      expect([...action.tool].length).toBeLessThanOrEqual(81);
+      expect([...action.detail].length).toBeGreaterThanOrEqual(1);
+      expect([...action.detail].length).toBeLessThanOrEqual(192);
+      // statusGlyph: maxLength 2 (every string in the contract is capped; these are the ones this
+      // producer emits).
       expect(action.statusGlyph.length).toBeGreaterThanOrEqual(1);
       expect(action.statusGlyph.length).toBeLessThanOrEqual(2);
     }
