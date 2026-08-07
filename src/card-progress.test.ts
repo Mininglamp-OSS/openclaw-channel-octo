@@ -199,7 +199,7 @@ describe("server-driven Registry reasoning progress", () => {
       .toHaveProperty("template_ref.version", "0.3.0");
   });
 
-  it("keeps Registry send and edit payloads within the advertised UTF-8 byte limit", async () => {
+  it("keeps the actual Registry send and edit envelopes within the advertised UTF-8 byte limit", async () => {
     const maxPayloadBytes = 16_384;
     const wire = mockFetch({
       profile: profile({
@@ -234,13 +234,15 @@ describe("server-driven Registry reasoning progress", () => {
 
     const edit = wire.calls.find((call) => call.url.includes("/message/edit"))?.body;
     expect(edit).toBeDefined();
-    const editedPayload = {
-      type: 17,
-      template_ref: edit!.template_ref,
-      state: edit!.state,
-      data: edit!.data,
-    };
-    expect(new TextEncoder().encode(JSON.stringify(editedPayload)).byteLength)
+    const {
+      message_id: _messageId,
+      channel_id: _channelId,
+      channel_type: _channelType,
+      ...editedEnvelope
+    } = edit!;
+    expect(editedEnvelope).toHaveProperty("card_seq");
+    expect(editedEnvelope).toHaveProperty("transient", true);
+    expect(new TextEncoder().encode(JSON.stringify(editedEnvelope)).byteLength)
       .toBeLessThanOrEqual(maxPayloadBytes);
   });
 
