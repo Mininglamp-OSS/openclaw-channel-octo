@@ -129,6 +129,12 @@ function budgetPhaseThoughts(
 }
 
 const TEMPLATE_PAYLOAD_MAX_FALLBACK = 16_384;
+/**
+ * send 的 type-17 payload 与 edit 的扁平 envelope 不同:edit 还带 card_seq/transient。
+ * 预留固定余量后,安全性不再依赖服务端究竟把哪一层算进 max_payload_bytes,也给未来新增的
+ * 小型 envelope 字段留出空间。
+ */
+const TEMPLATE_PAYLOAD_ENVELOPE_RESERVE = 128;
 
 export interface ReasoningTemplatePayloadLimits {
   templateRef: CardTemplateRef;
@@ -157,7 +163,8 @@ function budgetTemplatePayload(
   const maxPayloadBytes = typeof advertised === "number" && Number.isFinite(advertised) && advertised > 0
     ? Math.floor(advertised)
     : TEMPLATE_PAYLOAD_MAX_FALLBACK;
-  if (templatePayloadBytes(data, limits.templateRef) <= maxPayloadBytes) return data;
+  const dataBudgetBytes = Math.max(0, maxPayloadBytes - TEMPLATE_PAYLOAD_ENVELOPE_RESERVE);
+  if (templatePayloadBytes(data, limits.templateRef) <= dataBudgetBytes) return data;
 
   const out: ReasoningProcessData = {
     ...data,
@@ -166,7 +173,7 @@ function budgetTemplatePayload(
   for (const phase of out.phases) {
     const original = [...phase.thought];
     phase.thought = NO_THOUGHT_WIRE_LABEL;
-    if (templatePayloadBytes(out, limits.templateRef) > maxPayloadBytes) continue;
+    if (templatePayloadBytes(out, limits.templateRef) > dataBudgetBytes) continue;
 
     // 当前 phase 已经足以把 payload 压进预算;二分找还能保留的最大前缀。
     let low = 1;
@@ -175,7 +182,7 @@ function budgetTemplatePayload(
     while (low <= high) {
       const keep = Math.floor((low + high) / 2);
       phase.thought = original.slice(0, keep).join("") + "…";
-      if (templatePayloadBytes(out, limits.templateRef) <= maxPayloadBytes) {
+      if (templatePayloadBytes(out, limits.templateRef) <= dataBudgetBytes) {
         best = keep;
         low = keep + 1;
       } else {
@@ -189,7 +196,7 @@ function budgetTemplatePayload(
   }
 
   // 连每个 phase 的契约最小占位都装不下时,宁可不发,也不要用确定性 400 让 session 永久 skip。
-  return templatePayloadBytes(out, limits.templateRef) <= maxPayloadBytes ? out : null;
+  return templatePayloadBytes(out, limits.templateRef) <= dataBudgetBytes ? out : null;
 }
 
 /**
