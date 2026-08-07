@@ -30,13 +30,63 @@ export interface CorpusRow {
 
 /** 凭据必须不出现在结果里。 */
 export const LEAK_CORPUS: CorpusRow[] = [
+  // R8:归约够不着、守卫也认不出的那四种 userinfo 形状。它们在 main 上是明文泄漏,此前挂在
+  // UNFIXED 组里。关掉它们是**方向性的选择**:评审两轮证明,只要这四种形状还在,「渲染的永远
+  // 只有 kept,而 kept 自己要过守卫」这句话就是假的,而尾部扫描的界建立在这句话上 ——
+  // 于是界放在 4000 还是 131072 都会漏,只是价钱不同。第四次收窄不如把前提修了。
   {
-    // R7:收窄尾部扫描时漏掉的那个前提。守卫抓不住单标签 userinfo(见 UNFIXED_CORPUS),
+    input: "user:hunter2@localhost",
+    expect: { grep: "https://localhost" },
+    note: "R8:裸单标签主机的 DSN。归约此前要求带点,一趟都不匹配",
+  },
+  {
+    input: "/user:pass@localhost",
+    expect: { grep: "/https://localhost" },
+    note: "R8:前导 `/`",
+  },
+  {
+    input: "prefix/user:pa/ss@db.example.com",
+    expect: { grep: "prefix/https://example.com" },
+    note: "R8:主机带点,但口令里的 `/` 让归约此前的 `[^\\s/]+` 匹配不上",
+  },
+  {
+    input: "user:hunter2@[::1]",
+    expect: { grep: "https://[::1]" },
+    note: "R8:IPv6 方括号主机。按 `:` 切主机会切成 `[`,整行被打空 —— 现在取到 `]` 为止",
+  },
+  {
+    // R7:收窄尾部扫描时漏掉的那个前提。守卫抓不住单标签 userinfo(此前在 UNFIXED 组),
     // 当时压住整串的只有 4000 字符之外那个 `token` —— 把整个守卫收进 TAIL_SCAN_MAX 之后,
     // 这三个 sink 全部渲染出明文口令。现在只有 JWT 那一档收窄,关键词档看完整条尾巴。
     input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + " token",
     expect: { grep: "", read: "", exec: "" },
     note: "R7:切口之外的关键词必须仍然压得住 kept 里守卫认不出的凭据",
+  },
+  // R8:上面那一行只钉住了「关键词落在窗口外」这一种,而它恰好是当时已经过了的那一种。
+  // 下面两行是评审第三轮实际复现的两个形状 —— 收窄一次它们就复活一次,所以必须各自有一行。
+  // 注意期望值**不是空串**:前缀被归约成 `https://localhost` 之后,后面的普通词照常渲染。
+  // 判据不是「整串扣下」,是「口令不出现」—— 这一组的造串检测与 LEAK 的子串检测都盯着它。
+  //
+  // 两条期望值是**实测粘贴**的,不是手算的。手算这种字面量我在这条分支上已经错了三次
+  // (COST 组的 mainRenders 两次、这里一次),每次都是差一两个字符 —— 它们看着像是能推出来的,
+  // 而 SUMMARY_MAX 截断落在哪个词中间取决于前缀长度,推错了测试还会绿着接受一个错的真相。
+  {
+    input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + "eyJabcdefgh.abcdefgh.abc",
+    expect: {
+      grep: "https://localhost word word word word word word word word word w…",
+      read: "https://localhost word word word word word word word word word w…",
+      exec: "",
+    },
+    note: "R8-P0:短的低熵 JWT 落在 TAIL_SCAN_MAX 之外 —— 熵检测看不见它,JWT_RE 够不着它",
+  },
+  {
+    input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(33_000) + " token",
+    expect: {
+      grep: "https://localhost word word word word word word word word word w…",
+      read: "https://localhost word word word word word word word word word w…",
+      exec: "",
+    },
+    note: "R8-P1:关键词落在线性档 RAW_INPUT_MAX 触及范围之外(136 KB)",
   },
   {
     input: "PASSPHRASE='correct horse battery staple' gpg --sign x",
@@ -214,11 +264,6 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     note: "R4c:搜邮箱是常规操作。曾被 userinfo 兜底整串打空",
   },
   {
-    input: "user:.*@example",
-    expect: { grep: "user:.*@example" },
-    note: "R4c:同上",
-  },
-  {
     input: "sed 's:a:b@c:g'",
     expect: { exec: "sed" },
     note: "既有:与 DSN 形状无法区分,shell 有程序名可退",
@@ -335,6 +380,20 @@ export const COST_CORPUS: CostRow[] = [
  * `https://sha256abcd`,`3:4@2/x` 曾被 new URL() 规范化成 `https://0.0.0.2`。
  */
 export const REWRITE_CORPUS: CorpusRow[] = [
+  // R8:单标签放宽的**误伤**,两条都记在这里而不是悄悄消化掉。方向安全(少渲染)、不造串
+  // (输出里每个字符都来自输入),但确实把可读内容改写了。之所以换得起:同样的形状既可能是
+  // `user:.*@example` 这样的 grep 模式,也可能是 `user:hunter2@example` 这样的真凭据,
+  // 光看形状分不开 —— 任何渲染前者的规则都会渲染后者。
+  {
+    input: "user:.*@example",
+    expect: { grep: "https://example" },
+    note: "R8 误伤:搜凭据的 grep 模式被当成 DSN 归约(原 BENIGN 行)",
+  },
+  {
+    input: "image:v1@registry/repo",
+    expect: { grep: "https://registry" },
+    note: "R8 误伤:docker 风格引用被当成 DSN 归约。仍是造串哨兵 —— `registry` 必须来自输入",
+  },
   {
     input: "user:pw@db.example.com:5432/prod",
     expect: { grep: "https://example.com" },
@@ -354,26 +413,8 @@ export const REWRITE_CORPUS: CorpusRow[] = [
  * 前四行是 `main` 上就存在的明文泄漏,**不是本 PR 引入的**,也不是本 PR 声称修好的。
  */
 export const UNFIXED_CORPUS: CorpusRow[] = [
-  {
-    input: "user:hunter2@localhost",
-    expect: { grep: "user:hunter2@localhost" },
-    note: "main 上的既有泄漏:裸单标签主机的 DSN。归约要求带点,一趟都不匹配",
-  },
-  {
-    input: "/user:pass@localhost",
-    expect: { grep: "/user:pass@localhost" },
-    note: "main 上的既有泄漏:前导 `/`",
-  },
-  {
-    input: "prefix/user:pa/ss@db.example.com",
-    expect: { grep: "prefix/user:pa/ss@db.example.com" },
-    note: "main 上的既有泄漏:主机带点,但口令里的 `/` 让归约的 `[^\\s/]+` 匹配不上",
-  },
-  {
-    input: "user:hunter2@[::1]",
-    expect: { grep: "user:hunter2@[::1]" },
-    note: "main 上的既有泄漏:IPv6 方括号主机",
-  },
+  // (原先这里有四行单标签/IPv6/口令带斜杠的明文泄漏。它们**已经修好**,搬到 LEAK 组了 ——
+  //  见那边的 R8 段。留这条注释是因为上面那段说明还在讲这一对正则的历史。)
   // 赋值折叠漏掉的一类:值以 SHELL_BREAK 里的字符开头(`(`、`;`、`|`、`&`、`<`、`>`、反引号)。
   // `(?:SHELL_WORD_ATOM)*` 匹配零个原子,折叠只写出 `NAME=_`,值的其余部分留在串里,跳过循环
   // 又落回值的第二个词 —— 正是折叠这条改动要关的那个失败。
@@ -406,11 +447,6 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
     input: "3:4@2/x",
     expect: { grep: "3:4@2/x" },
     note: "造串哨兵:纯数字主机被 new URL() 规范化成 `https://0.0.0.2`",
-  },
-  {
-    input: "image:v1@registry/repo",
-    expect: { grep: "image:v1@registry/repo" },
-    note: "造串哨兵:`word:token@letter-host/path` 这一类的代表形状",
   },
 ];
 

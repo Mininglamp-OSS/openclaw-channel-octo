@@ -1078,16 +1078,26 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
   });
 
   it("尾部扫描窗口的末端也只能落在空白上", () => {
-    // 裸 slice 会把跨过窗口边界的 token 切成碎片,正则匹配不上,等于没扫:AKIA 起点落在 7986 时
-    // 窗口只盖住 20 个字符里的 14 个,而 `/AKIA[0-9A-Z]{12,}/` 要 16 个 —— 于是漏过去。
-    const head = "psql db-admin:Tr0ub4dor3@localhost";
-    const build = (at: number) => {
-      const s = head + " " + "x".repeat(4000 - head.length - 1);   // kept 正好 4000
-      return s + " " + "y".repeat(at - s.length - 1) + " AKIAIOSFODNN7EXAMPLE";
-    };
-    for (const at of [7982, 7986, 7991]) {
-      expect(boundedForReduction(build(at)), `AKIA 落在 ${at} 时被切碎、漏过了守卫`).toBeNull();
-    }
+    // 裸 slice 会把跨过窗口边界的 token 切成碎片,正则匹配不上,等于没扫。
+    //
+    // **用的必须是有界档认得、线性档认不得的 token。** 上一版这条用 AKIA,而守卫按代价拆开
+    // 之后 AKIA 归线性档、线性档看完整条尾巴 —— 于是无论窗口末端怎么算,三条断言都绿,
+    // 有界档在这个输入上**根本没被调用**。把窗口换成裸 slice 也照样全绿:这条测试当时已经
+    // 失去了被测对象,和本文件里那条卡片级计时测试当初的失效方式一模一样。
+    //
+    // 短的低熵 JWT 正好满足:`hasGenericSecretShape` 要 32+ 混合串,它只有 24 个字符,
+    // 线性档抓不到;`JWT_RE` 抓得到,而那一条是唯一收进窗口的。
+    const jwt = "eyJabcdefgh.abcdefgh.abc";
+    const head = "word ".repeat(800).trim();            // 3999,切口落在它后面那个空格上
+    // JWT 起点落在尾巴的 3985–4000 之间时,裸切只盖住它的一部分而延长窗口盖得全 —— 实测
+    // 这一段的每个位置,两种实现都判得不一样。取中间那个。
+    const s = `${head} ${"p".repeat(3990)}${jwt} tail`;
+    expect(boundedForReduction(s), "跨窗口边界的 JWT 被切碎、漏过了守卫").toBeNull();
+    // 对照:同一个 JWT 挪到窗口之外,按设计就该够不着(这是 TAIL_SCAN_MAX 唯一还管着的事)。
+    // 填充**必须带空白** —— 第一版写的是连续的 `p`,于是整条尾巴是一个无空白长 token,
+    // tailScanWindow 直接 fail closed 返回 null,对照组是"因为无空白被扣下"而不是
+    // "因为够不着 JWT",看着通过其实什么也没对照到。
+    expect(boundedForReduction(`${head} ${"p ".repeat(4000)}${jwt} tail`)).not.toBeNull();
   });
 });
 
