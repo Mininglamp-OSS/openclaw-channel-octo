@@ -31,3 +31,21 @@ Do not manage server limits yourself: author complete high-level blocks and let 
 ## Finish the turn
 
 After a card tool returns, emit a short text reply stating what was sent, the result, or the next step. Never end the turn on the tool call. If the tool is absent, disabled, degraded, or fails, continue with a useful plain-text alternative.
+
+## When a card tool says it is disabled
+
+Card availability is a **server-side, per-Bot policy**. It is not an OpenClaw config setting, and there is nothing to switch on locally. The Bot card profile carries one flag per surface:
+
+| flag | governs |
+|---|---|
+| `display_enabled` | `octo_send_display_card` |
+| `interaction_enabled` | `octo_send_card` and its callback polling |
+| `reasoning_enabled` | the automatic reasoning progress card |
+| `card_enabled` | the master switch above all three |
+
+So when a tool reports `disabled by the server Bot policy`, say that the flag has to be turned on **for that Bot on the server** (Bot admin console or Bot management API) and answer in plain text meanwhile.
+
+**Do not send the operator hunting through `channels.octo.*`.** The local `cardDisplay`, `cardInteraction`, `cardProgress`, and `reasoningCardTemplateMode` keys are deprecated and ignored at runtime — they were the switches before the server took over, so a plausible-looking answer pointing at them is wrong now. Do not invent a field name either: every account-level option in this plugin happens to be shaped `channels.octo.accounts.<id>.<field>`, which makes a guess like `allowCards` easy to produce and impossible for the operator to find.
+
+A policy change is not picked up instantly: the profile is cached briefly per Bot, so a flag flipped on the server takes effect on a later turn rather than the current one.
+
