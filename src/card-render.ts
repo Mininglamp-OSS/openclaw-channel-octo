@@ -799,6 +799,24 @@ export function reduceUrlsInText(
   // 里都只挡住那一个调用方。`isSensitiveHere` 是调用方下游那道守卫,界用它检查自己丢掉了什么。
   const s = boundedForReduction(input, isSensitiveHere);
   if (s === null) return "";
+  // 超限 userinfo 必须在**归约之前**查。口令含 `/` 时,归约会在口令中间找到一个重启点
+  // (`…/x:b@host`),把原来那个真正超限的 `@` 吃掉;等归约跑完,post-reduction 的
+  // hasOverlongUserinfo 已经看不到那个 `@` 了(评审第八轮 P1-b)。在原串上查一次,与 main 一致
+  // (main 同样整行扣下),而且方向只会更严。
+  if (hasOverlongUserinfo(s)) return "";
+  // 归约会**删掉**它匹配的 span。如果那个 span 里有一个正压着整行的关键词/前缀,而这一行在
+  // main 上本来是靠它整行扣下的,删掉之后剩下的部分(可能含口令的另一份副本)就渲染出来了 ——
+  // 评审第八轮的 P1-a:`credential:tok@vault retry with tok`,main 扣下,本分支渲染
+  // `https://vault retry with tok`。**只发生在 main 没归约、而本分支新归约的那些 host 形状上**
+  // (main 的 pass 3 只认带点 host);带点的 main 也归约,两边一致,不在此列。
+  // 判据就用「main 当初据以扣下的那个信号」= 关键词 + 明确前缀 + 超限 userinfo(非 generic 档,
+  // 不含高熵 —— 高熵那份在被删的 span 里、删掉即消失,不会在别处留副本,不需要它)。命中即
+  // 让整条归约结果落空,与 main 同样整行扣下。
+  let poisoned = false;
+  const poisonIfNewShapeCarriesSignal = (m: string, host: string): void => {
+    const mainWouldReduce = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(host);
+    if (!mainWouldReduce && hasLinearSecretShape(m, false)) poisoned = true;
+  };
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。
   let out = s.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, (m) => originDomain(m) ?? "");
@@ -836,6 +854,7 @@ export function reduceUrlsInText(
     // **比对的是 `host`,不是整段 `m`。** `m` 含 userinfo,也就是口令 —— 拿归约结果去它里面找,
     // 口令里塞一份小写主机名就能满足检查:`a:akiaiosfodnn7example@AKIAIOSFODNN7EXAMPLE` 会渲染出
     // `https://akiaiosfodnn7example`,第 2 类那条小写化泄漏原样复活。必须只在 `host` 上比。
+    poisonIfNewShapeCarriesSignal(m, host);
     if (reduced === null) return "";
     return host.includes(reduced.slice("https://".length)) ? reduced : "";
   });
@@ -843,7 +862,8 @@ export function reduceUrlsInText(
   out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => (
     prefix + (originDomain(`https://${hostAndPath}`) ?? "")
   ));
-  return out;
+  // 新归约的 host 形状里带着 main 据以整行扣下的关键词/前缀 → 与 main 一样整行扣下。
+  return poisoned ? "" : out;
 }
 
 /** url 策略:取 url 参数并降级为注册域。 */

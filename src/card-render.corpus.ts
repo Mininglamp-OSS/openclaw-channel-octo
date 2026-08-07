@@ -253,6 +253,26 @@ export const LEAK_CORPUS: CorpusRow[] = [
     expect: { grep: "", read: "" },
     note: "R10:口令供给主机名绕过逐字比对。比 host 而非整段 m 才挡得住",
   },
+  // R12(评审第八轮 P1-a):归约**删掉**它匹配的 span,而那个 span 里可能正有一个把整行压住的
+  // 关键词。删掉之后剩下的部分(含口令的另一份副本)就渲染出来 —— main 靠 `credential` 整行扣下,
+  // 本分支归约掉单标签 DSN、关键词随之消失,`retry with tok9Fk2Lp` 里的口令副本泄漏。
+  // 只发生在 main 没归约、本分支新归约的 host 形状上;判据是 main 据以扣下的那个信号(关键词/
+  // 前缀/超限 userinfo),命中即整行扣下,与 main 一致。见 reduceUrlsInText 的 poisoned 分支。
+  {
+    input: "credential:tok9Fk2Lp@vault retry with tok9Fk2Lp",
+    expect: { grep: "", read: "", exec: "" },
+    note: "R12-P1a:关键词在被删的 userinfo span 里,口令副本在句子别处。main 整行扣下",
+  },
+  {
+    input: "auth failed for user:secret@redis, fallback key Ab3xY9zQ1wKp",
+    expect: { grep: "", read: "" },
+    note: "R12-P1a:同一成因,`secret` 作触发词,回退键在句尾",
+  },
+  {
+    input: "alice:hunter2" + "h".repeat(250) + "/x:b@localhost",
+    expect: { grep: "", read: "" },
+    note: "R12-P1b:超 256 口令含 `/`,归约重启点吃掉 `@`,hasOverlongUserinfo 看不到 —— 归约前 span 里有超限 userinfo,poisoned 整行扣下",
+  },
   // R11:评审第六轮的两个 P0/P1 —— 都是「为性能加的界静默削弱了脱敏」,而不是老问题重演。
   {
     // 口令超过 SCHEMELESS_USERINFO_RE 的 256 上限:整条正则匹配不上、DSN 原样流过归约。
