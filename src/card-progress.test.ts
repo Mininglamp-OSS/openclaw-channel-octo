@@ -52,6 +52,7 @@ function profile(opts: {
   reasoningEnabled?: boolean;
   configuredVersion?: string | null;
   catalogVersions?: string[];
+  maxPayloadBytes?: number;
 } = {}): Record<string, unknown> {
   const reasoningEnabled = opts.reasoningEnabled ?? true;
   const configuredVersion = opts.configuredVersion === undefined ? "0.3.0" : opts.configuredVersion;
@@ -72,6 +73,9 @@ function profile(opts: {
       wire: "template-ref/v1",
       templates: (opts.catalogVersions ?? ["0.3.0"]).map(template),
     },
+    ...(opts.maxPayloadBytes === undefined ? {} : {
+      limits: { max_payload_bytes: opts.maxPayloadBytes },
+    }),
   };
 }
 
@@ -193,6 +197,51 @@ describe("server-driven Registry reasoning progress", () => {
 
     expect(wire.calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload)
       .toHaveProperty("template_ref.version", "0.3.0");
+  });
+
+  it("keeps Registry send and edit payloads within the advertised UTF-8 byte limit", async () => {
+    const maxPayloadBytes = 16_384;
+    const wire = mockFetch({
+      profile: profile({
+        configuredVersion: "0.4.0",
+        catalogVersions: ["0.4.0"],
+        maxPayloadBytes,
+      }),
+    });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "payload-limit";
+    const hookContext = { sessionKey, runId: "run-1" };
+    setCardContext(sessionKey, context({ reasoningVisibility: "on" }));
+    handlers.before_agent_run?.({}, hookContext);
+
+    for (let index = 0; index < 6; index++) {
+      handlers.model_call_started?.({ callId: `model-${index}` }, hookContext);
+      recordCardReasoning(sessionKey, "界".repeat(4_000), { snapshot: true });
+      handlers.before_tool_call?.({ toolName: "read", toolCallId: `tool-${index}` }, hookContext);
+    }
+    await vi.advanceTimersByTimeAsync(900);
+
+    const sent = wire.calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload;
+    expect(sent).toBeDefined();
+    expect(new TextEncoder().encode(JSON.stringify(sent)).byteLength)
+      .toBeLessThanOrEqual(maxPayloadBytes);
+
+    handlers.model_call_started?.({ callId: "model-edit" }, hookContext);
+    recordCardReasoning(sessionKey, "界".repeat(4_000), { snapshot: true });
+    handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-edit" }, hookContext);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const edit = wire.calls.find((call) => call.url.includes("/message/edit"))?.body;
+    expect(edit).toBeDefined();
+    const editedPayload = {
+      type: 17,
+      template_ref: edit!.template_ref,
+      state: edit!.state,
+      data: edit!.data,
+    };
+    expect(new TextEncoder().encode(JSON.stringify(editedPayload)).byteLength)
+      .toBeLessThanOrEqual(maxPayloadBytes);
   });
 
   it("does not send when reasoning is disabled", async () => {

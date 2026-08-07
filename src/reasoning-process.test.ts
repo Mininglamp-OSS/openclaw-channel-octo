@@ -699,8 +699,11 @@ describe("internal-context marker cannot be split apart", () => {
  * 没有卡片。
  */
 describe("wire data budgets total thought across phases", () => {
-  const manyPhases = (perPhase: number, count: number): CardProgressState => {
-    const unit = "I need to check the runtime before answering. ";
+  const manyPhases = (
+    perPhase: number,
+    count: number,
+    unit = "I need to check the runtime before answering. ",
+  ): CardProgressState => {
     const thought = unit.repeat(Math.ceil(perPhase / unit.length)).slice(0, perPhase);
     const steps: CardProgressState["steps"] = [];
     for (let index = 0; index < count; index++) {
@@ -730,5 +733,27 @@ describe("wire data budgets total thought across phases", () => {
   it("leaves a single phase alone when it fits", () => {
     const data = buildReasoningProcessWireData(manyPhases(500, 1), "0.4.0");
     expect([...data!.phases[0]!.thought].length).toBe(500);
+  });
+
+  it("fits the actual template payload into the advertised UTF-8 byte limit", () => {
+    const templateRef = { id: "ai.reasoning-process", version: "0.4.0" };
+    const maxPayloadBytes = 16_384;
+    const data = buildReasoningProcessWireData(
+      manyPhases(3_500, 6, "界"),
+      templateRef.version,
+      { templateRef, maxPayloadBytes },
+    );
+
+    expect(data).not.toBeNull();
+    const payload = {
+      type: 17,
+      template_ref: templateRef,
+      state: data!.state,
+      data,
+    };
+    expect(new TextEncoder().encode(JSON.stringify(payload)).byteLength)
+      .toBeLessThanOrEqual(maxPayloadBytes);
+    expect([...data!.phases.at(-1)!.thought].length)
+      .toBeGreaterThan([...data!.phases[0]!.thought].length);
   });
 });
