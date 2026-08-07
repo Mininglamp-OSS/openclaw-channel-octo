@@ -11,8 +11,11 @@ vi.mock("./accounts.js", () => ({
 
 vi.mock("./api-fetch.js", () => ({
   sendCardMessage: vi.fn(),
-  getCardProfile: vi.fn(),
   generateClientMsgNo: vi.fn(),
+}));
+vi.mock("./card-profile-cache.js", () => ({
+  getBotCardProfile: vi.fn(),
+  peekBotCardProfile: vi.fn(),
 }));
 
 import { createDisplayCardTool } from "./card-display-tool.js";
@@ -20,7 +23,8 @@ import {
   listOctoAccountIds,
   resolveOctoAccount,
 } from "./accounts.js";
-import { sendCardMessage, getCardProfile } from "./api-fetch.js";
+import { sendCardMessage } from "./api-fetch.js";
+import { getBotCardProfile, peekBotCardProfile } from "./card-profile-cache.js";
 import { generateClientMsgNo } from "./api-fetch.js";
 import { cardMaxDepth, cardPayloadBytes, countCardNodes } from "./card-limits.js";
 
@@ -50,12 +54,20 @@ function setupOk(): void {
       heartbeatIntervalMs: 30000,
     },
   } as never);
-  vi.mocked(getCardProfile).mockResolvedValue({
+  vi.mocked(peekBotCardProfile).mockReturnValue(undefined);
+  vi.mocked(getBotCardProfile).mockResolvedValue({
     available: true,
     enabled: true,
     profiles: ["octo/v1"],
     card_version: "1.5",
     elements: ["TextBlock", "RichTextBlock", "Container", "FactSet"],
+    config: {
+      card_enabled: true,
+      display_enabled: true,
+      interaction_enabled: true,
+      reasoning_enabled: false,
+      reasoning_template_ref: null,
+    },
   } as never);
   vi.mocked(sendCardMessage).mockResolvedValue({ message_id: "m1" } as never);
 }
@@ -101,7 +113,7 @@ describe("createDisplayCardTool 骨架", () => {
     } as DisplayToolParams)).toEqual([]);
   });
 
-  it("已知当前账号 cardDisplay:false 时 discovery 不注册工具", () => {
+  it("本地 cardDisplay:false 已弃用，discovery 不再读取它", () => {
     vi.mocked(resolveOctoAccount).mockReturnValue({
       accountId: "default",
       enabled: true,
@@ -120,10 +132,10 @@ describe("createDisplayCardTool 骨架", () => {
       agentAccountId: "default",
       deliveryContext: CURRENT_DELIVERY,
       messageChannel: "octo",
-    } as DisplayToolParams)).toEqual([]);
+    } as DisplayToolParams)).toHaveLength(1);
   });
 
-  it("无当前账号上下文但只有一个配置账号时也按 cardDisplay:false 隐藏工具", () => {
+  it("无当前账号上下文时也不读取本地 cardDisplay:false", () => {
     vi.mocked(resolveOctoAccount).mockReturnValue({
       accountId: "only-account",
       enabled: true,
@@ -138,10 +150,10 @@ describe("createDisplayCardTool 骨架", () => {
     } as never);
     vi.mocked(listOctoAccountIds).mockReturnValue(["only-account"]);
 
-    expect(createDisplayCardTool({ cfg: mockCfg } as DisplayToolParams)).toEqual([]);
+    expect(createDisplayCardTool({ cfg: mockCfg } as DisplayToolParams)).toHaveLength(1);
   });
 
-  it("多账号且 discovery 无法确定当前账号时,全部 cardDisplay:false 则隐藏工具", () => {
+  it("多账号 discovery 不再聚合本地 cardDisplay 值", () => {
     vi.mocked(listOctoAccountIds).mockReturnValue(["account-a", "account-b"]);
     vi.mocked(resolveOctoAccount).mockImplementation(({ accountId }: { accountId?: string }) => ({
       accountId: accountId ?? "default",
@@ -156,7 +168,7 @@ describe("createDisplayCardTool 骨架", () => {
       },
     }) as never);
 
-    expect(createDisplayCardTool({ cfg: mockCfg } as DisplayToolParams)).toEqual([]);
+    expect(createDisplayCardTool({ cfg: mockCfg } as DisplayToolParams)).toHaveLength(1);
   });
 
   it("多账号且 discovery 无法确定当前账号时,任一账号允许展示卡则保留工具", () => {
@@ -175,6 +187,41 @@ describe("createDisplayCardTool 骨架", () => {
     }) as never);
 
     expect(createDisplayCardTool({ cfg: mockCfg } as DisplayToolParams)).toHaveLength(1);
+  });
+
+  it("cached display_enabled 只隐藏匹配 Bot 的展示卡工具", () => {
+    vi.mocked(listOctoAccountIds).mockReturnValue(["account-a", "account-b"]);
+    vi.mocked(resolveOctoAccount).mockImplementation(({ accountId }: { accountId?: string }) => ({
+      accountId: accountId ?? "account-a",
+      enabled: true,
+      configured: true,
+      config: {
+        botToken: `tok-${accountId}`,
+        apiUrl: "https://api.test",
+        pollIntervalMs: 2000,
+        heartbeatIntervalMs: 30000,
+      },
+    }) as never);
+    vi.mocked(peekBotCardProfile).mockImplementation(({ botToken }) => ({
+      available: true,
+      enabled: true,
+      config: {
+        card_enabled: true,
+        display_enabled: botToken !== "tok-account-a",
+        interaction_enabled: true,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
+    }));
+
+    expect(createDisplayCardTool({
+      cfg: mockCfg,
+      deliveryContext: { ...CURRENT_DELIVERY, accountId: "account-a" },
+    } as DisplayToolParams)).toEqual([]);
+    expect(createDisplayCardTool({
+      cfg: mockCfg,
+      deliveryContext: { ...CURRENT_DELIVERY, accountId: "account-b" },
+    } as DisplayToolParams)).toHaveLength(1);
   });
 
   it("tool 元数据:name=octo_send_display_card,description 涵盖『展示型』『不回流』", () => {
@@ -251,7 +298,7 @@ describe("execute:发展示卡", () => {
     expect(res.content[0].text).toContain("m1"); // 返回 message_id
   });
 
-  it("execute 再检查热更新后的 cardDisplay:false,不探测 manifest 也不发送", async () => {
+  it("execute 忽略本地 cardDisplay:false，仍以服务端配置为准", async () => {
     const tool = getTool();
     vi.mocked(resolveOctoAccount).mockReturnValue({
       accountId: "default",
@@ -265,14 +312,36 @@ describe("execute:发展示卡", () => {
         cardDisplay: false,
       },
     } as never);
-    vi.mocked(getCardProfile).mockClear();
-
     const res = await tool.execute("display-disabled-after-discovery", {
+      blocks: [{ type: "text", text: "server policy allows this" }],
+    });
+
+    expect(res.details).toMatchObject({ message_id: "m1" });
+    expect(getBotCardProfile).toHaveBeenCalledTimes(1);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("服务端 display_enabled=false 时拒绝发送展示卡", async () => {
+    vi.mocked(getBotCardProfile).mockResolvedValue({
+      available: true,
+      enabled: true,
+      profiles: ["octo/v1"],
+      card_version: "1.5",
+      elements: ["TextBlock"],
+      config: {
+        card_enabled: true,
+        display_enabled: false,
+        interaction_enabled: true,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
+    } as never);
+
+    const res = await getTool().execute("server-display-disabled", {
       blocks: [{ type: "text", text: "must use plain text" }],
     });
 
     expect(res.content[0].text).toMatch(/disabled|plain text/i);
-    expect(getCardProfile).not.toHaveBeenCalled();
     expect(sendCardMessage).not.toHaveBeenCalled();
   });
 
@@ -315,7 +384,7 @@ describe("execute:发展示卡", () => {
   });
 
   it("gate available:false + env 未开 → 拒绝(agent 由错误退回文本)", async () => {
-    vi.mocked(getCardProfile).mockResolvedValue({ available: false, enabled: false } as never);
+    vi.mocked(getBotCardProfile).mockResolvedValue({ available: false, enabled: false } as never);
     delete process.env.OCTO_CARD_MESSAGE_ENABLED;
     const t = getTool();
     const res = await t.execute("c3", { channelId: "group:g1", title: "T", blocks: [{ type: "text", text: "a" }] });
@@ -323,22 +392,32 @@ describe("execute:发展示卡", () => {
     expect(res.content[0].text.toLowerCase()).toMatch(/error|not (available|enabled)|unavailable/);
   });
 
-  it("gate available:false + 显式 env opt-in → 按 legacy baseline 发送", async () => {
-    vi.mocked(getCardProfile).mockResolvedValue({ available: false, enabled: false } as never);
+  it("gate available:false 即使有旧 env opt-in 也 fail closed", async () => {
+    vi.mocked(getBotCardProfile).mockResolvedValue({ available: false, enabled: false } as never);
     process.env.OCTO_CARD_MESSAGE_ENABLED = "1";
     try {
       const res = await getTool().execute("legacy-opt-in", {
         blocks: [{ type: "text", text: "legacy deployment" }],
       });
-      expect(sendCardMessage).toHaveBeenCalledTimes(1);
-      expect(res.content[0].text).toContain("sent display card");
+      expect(sendCardMessage).not.toHaveBeenCalled();
+      expect(res.content[0].text).toMatch(/disabled|policy/i);
     } finally {
       delete process.env.OCTO_CARD_MESSAGE_ENABLED;
     }
   });
 
   it("gate enabled:false → 拒绝", async () => {
-    vi.mocked(getCardProfile).mockResolvedValue({ available: true, enabled: false } as never);
+    vi.mocked(getBotCardProfile).mockResolvedValue({
+      available: true,
+      enabled: false,
+      config: {
+        card_enabled: false,
+        display_enabled: false,
+        interaction_enabled: false,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
+    } as never);
     const t = getTool();
     const res = await t.execute("c4", { channelId: "group:g1", title: "T", blocks: [{ type: "text", text: "a" }] });
     expect(sendCardMessage).not.toHaveBeenCalled();
@@ -346,11 +425,18 @@ describe("execute:发展示卡", () => {
   });
 
   it("profile 不含 octo/v1 → 拒绝(避免 400)", async () => {
-    vi.mocked(getCardProfile).mockResolvedValue({
+    vi.mocked(getBotCardProfile).mockResolvedValue({
       available: true,
       enabled: true,
       profiles: ["octo/v2"],
       card_version: "1.5",
+      config: {
+        card_enabled: true,
+        display_enabled: true,
+        interaction_enabled: true,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
     } as never);
     const t = getTool();
     const res = await t.execute("c5", { channelId: "group:g1", title: "T", blocks: [{ type: "text", text: "a" }] });
@@ -359,11 +445,18 @@ describe("execute:发展示卡", () => {
   });
 
   it("card_version 不兼容 → fail closed", async () => {
-    vi.mocked(getCardProfile).mockResolvedValue({
+    vi.mocked(getBotCardProfile).mockResolvedValue({
       available: true,
       enabled: true,
       profiles: ["octo/v1"],
       card_version: "1.4",
+      config: {
+        card_enabled: true,
+        display_enabled: true,
+        interaction_enabled: true,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
     } as never);
     const res = await getTool().execute("bad-version", {
       blocks: [{ type: "text", text: "must not send" }],
@@ -437,7 +530,7 @@ describe("execute:发展示卡", () => {
   });
 
   it("profile probe 与 send 的非 Error 异常都转成稳定工具错误", async () => {
-    vi.mocked(getCardProfile).mockRejectedValue("profile unavailable");
+    vi.mocked(getBotCardProfile).mockRejectedValue("profile unavailable");
     const probe = await getTool().execute("probe-failure", { blocks: [{ type: "text", text: "x" }] });
     expect(probe.content[0].text).toContain("profile unavailable");
 
@@ -448,12 +541,19 @@ describe("execute:发展示卡", () => {
   });
 
   it("能力协商生效:advertise 不含 FactSet → 卡里 FactSet 被降级(不 400,不拒绝)", async () => {
-    vi.mocked(getCardProfile).mockResolvedValue({
+    vi.mocked(getBotCardProfile).mockResolvedValue({
       available: true,
       enabled: true,
       profiles: ["octo/v1"],
       card_version: "1.5",
       elements: ["TextBlock"], // 无 FactSet
+      config: {
+        card_enabled: true,
+        display_enabled: true,
+        interaction_enabled: true,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
     } as never);
     const t = getTool();
     await t.execute("c6", { channelId: "group:g1", blocks: [
@@ -468,12 +568,19 @@ describe("execute:发展示卡", () => {
   });
 
   it("manifest 明确 elements=[] → 无安全 fallback,拒绝发送", async () => {
-    vi.mocked(getCardProfile).mockResolvedValue({
+    vi.mocked(getBotCardProfile).mockResolvedValue({
       available: true,
       enabled: true,
       profiles: ["octo/v1"],
       card_version: "1.5",
       elements: [],
+      config: {
+        card_enabled: true,
+        display_enabled: true,
+        interaction_enabled: true,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
     } as never);
     const res = await getTool().execute("empty-elements", {
       blocks: [{ type: "text", text: "cannot render" }],
@@ -483,13 +590,20 @@ describe("execute:发展示卡", () => {
   });
 
   it("manifest hard limits 贯穿到最终 sendCardMessage 信封", async () => {
-    vi.mocked(getCardProfile).mockResolvedValue({
+    vi.mocked(getBotCardProfile).mockResolvedValue({
       available: true,
       enabled: true,
       profiles: ["octo/v1"],
       card_version: "1.5",
       elements: ["TextBlock", "RichTextBlock", "Container", "Table"],
       limits: { max_nodes: 8, max_depth: 3, max_payload_bytes: 420 },
+      config: {
+        card_enabled: true,
+        display_enabled: true,
+        interaction_enabled: true,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
     } as never);
     await getTool().execute("limited", {
       blocks: [{

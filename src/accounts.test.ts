@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { resolveOctoAccount } from "./accounts.js";
 
-describe("resolveOctoAccount reasoning card template mode", () => {
-  it("uses the account override before the channel default", () => {
+describe("resolveOctoAccount server-owned card policy", () => {
+  it("ignores legacy local card policy fields", () => {
     const cfg = {
       channels: {
         octo: {
@@ -16,9 +16,9 @@ describe("resolveOctoAccount reasoning card template mode", () => {
       },
     };
 
-    expect(resolveOctoAccount({ cfg: cfg as never, accountId: "a1" }).config.reasoningCardTemplateMode)
-      .toBe("experimental");
-    expect(resolveOctoAccount({ cfg: cfg as never, accountId: "a2" }).config.reasoningCardTemplateMode)
-      .toBe("shadow");
+    expect(resolveOctoAccount({ cfg: cfg as never, accountId: "a1" }).config)
+      .not.toHaveProperty("reasoningCardTemplateMode");
+    expect(resolveOctoAccount({ cfg: cfg as never, accountId: "a2" }).config)
+      .not.toHaveProperty("reasoningCardTemplateMode");
   });
 });

@@ -24,7 +24,8 @@ import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry
 import { listOctoAccountIds, resolveOctoAccount } from "./accounts.js";
 import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
-import { sendCardMessage, getCardProfile, generateClientMsgNo, type CardProfileManifest } from "./api-fetch.js";
+import { sendCardMessage, generateClientMsgNo, type CardProfileManifest } from "./api-fetch.js";
+import { getBotCardProfile, peekBotCardProfile } from "./card-profile-cache.js";
 import { buildDisplayCard, validateDisplayBlocks } from "./card-blocks.js";
 import { deriveCardCaps } from "./card-caps.js";
 import { isSensitive, reduceUrlsInText } from "./card-render.js";
@@ -32,6 +33,7 @@ import { resolveOutboundOctoTarget } from "./actions.js";
 import type { CardCaps } from "./card-render.js";
 import { ChannelType, CARD_PROFILE, CARD_VERSION } from "./types.js";
 import { CHANNEL_ID, DISPLAY_CARD_TOOL_NAME } from "./constants.js";
+import { requestCardEventPolling } from "./events-poll.js";
 
 /** 展示卡发送超时(postJson 无默认超时,防挂起的 POST 拖死 tool 调用)。 */
 const SEND_TIMEOUT_MS = 15_000;
@@ -82,6 +84,7 @@ function manifestForDebug(m: CardProfileManifest): Record<string, unknown> {
     elements: m.elements,
     actions: m.actions,
     limits: m.limits,
+    config: m.config,
   };
 }
 
@@ -99,17 +102,13 @@ async function recordDisplayCardRequest(entry: Record<string, unknown>): Promise
 }
 
 /**
- * gate 校验:manifest 明确 disabled / profile 不含 octo/v1 / card_version 不匹配 → 拒绝。
- * `available:false`(端点未部署)时回退 env `OCTO_CARD_MESSAGE_ENABLED === "1"` —— 与 hook
- * 进度卡的 gate 语义对齐,单一权威。
+ * gate 校验：服务端 Bot 策略未明确允许 / profile 不含 octo/v1 / card_version 不匹配
+ * 均拒绝；不读取本地配置兜底。
  */
 function gateReason(m: CardProfileManifest): string | null {
-  if (!m.available) {
-    return process.env.OCTO_CARD_MESSAGE_ENABLED === "1"
-      ? null
-      : "card manifest endpoint not available and OCTO_CARD_MESSAGE_ENABLED is not set";
+  if (!m.available || m.config?.display_enabled !== true) {
+    return "display cards are disabled by the server Bot policy";
   }
-  if (!m.enabled) return "card sending is disabled on this deployment (manifest.enabled=false)";
   if (Array.isArray(m.profiles) && m.profiles.length > 0 && !m.profiles.includes(CARD_PROFILE)) {
     return `profile ${CARD_PROFILE} not advertised by server (got: ${m.profiles.join(",")})`;
   }
@@ -153,18 +152,23 @@ export function createDisplayCardTool(params: Params): Array<{
       .map((id) => resolveOctoAccount({ cfg, accountId: id }))
       .filter((acct) => acct.enabled && acct.configured && !!acct.config.botToken);
     if (configuredAccounts.length === 0) return [];
-    // Best-effort discovery filtering: when the runtime identifies the current
-    // account, do not offer a tool that account explicitly disabled. Execution
-    // checks again because config may hot-reload after tool discovery. When a
-    // multi-account discovery has no current account, hide only if every usable
-    // account disables the tool; a mixed set must keep it available.
+    // Discovery is synchronous. Hide only on a cached authoritative server decision; an unknown
+    // profile stays visible so execute can perform the authoritative async read.
     const discoveryAccountId = deliveryContext?.accountId
       ?? agentAccountId
       ?? (ids.length === 1 ? ids[0] : undefined);
     if (discoveryAccountId) {
       const discoveryAccount = resolveOctoAccount({ cfg, accountId: discoveryAccountId });
-      if (discoveryAccount.config.cardDisplay === false) return [];
-    } else if (configuredAccounts.every((account) => account.config.cardDisplay === false)) {
+      if (discoveryAccount.config.botToken &&
+          peekBotCardProfile({
+            apiUrl: discoveryAccount.config.apiUrl,
+            botToken: discoveryAccount.config.botToken,
+          })?.config?.display_enabled === false) return [];
+    } else if (configuredAccounts.every((account) =>
+      !!account.config.botToken && peekBotCardProfile({
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken,
+      })?.config?.display_enabled === false)) {
       return [];
     }
   } catch {
@@ -265,9 +269,6 @@ export function createDisplayCardTool(params: Params): Array<{
         if (!acct.enabled || !acct.configured || !acct.config.botToken) {
           return err("Octo account is not fully configured");
         }
-        if (acct.config.cardDisplay === false) {
-          return err("display cards are disabled for this Octo account. Send your reply as a plain text message instead.");
-        }
         const apiUrl = acct.config.apiUrl;
         const botToken = acct.config.botToken;
         if (!apiUrl) return err("apiUrl not configured");
@@ -275,7 +276,8 @@ export function createDisplayCardTool(params: Params): Array<{
         // D12 能力探测(gate + caps)。
         let manifest: CardProfileManifest;
         try {
-          manifest = await getCardProfile({ apiUrl, botToken });
+          requestCardEventPolling(acct.accountId);
+          manifest = await getBotCardProfile({ apiUrl, botToken });
         } catch (e) {
           return err(`card profile probe failed: ${e instanceof Error ? e.message : String(e)}`);
         }

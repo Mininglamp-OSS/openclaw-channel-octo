@@ -86,9 +86,29 @@ function installFetchStub(opts: { failPlainSend?: boolean } = {}) {
     if (url.includes("/card/profile")) {
       return json({
         enabled: true,
-        profiles: ["octo/v1"],
+        profiles: ["octo/v1", "octo/v2"],
         card_version: "1.5",
         elements: ["TextBlock", "RichTextBlock", "Container", "ColumnSet"],
+        config: {
+          card_enabled: true,
+          display_enabled: true,
+          interaction_enabled: true,
+          reasoning_enabled: true,
+          reasoning_template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+        },
+        templating: {
+          supported: true,
+          wire: "template-ref/v1",
+          templates: [{
+            id: "ai.reasoning-process",
+            version: "0.3.0",
+            views: [
+              { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
+              { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+            ],
+          }],
+        },
       });
     }
     if (url.includes("/members")) {
@@ -204,13 +224,12 @@ describe("inbound progress-card failure precedence", () => {
     // …so the card must not claim success on the strength of the tool delivery.
     const terminal = edits.at(-1);
     expect(terminal).toBeTruthy();
-    const card = JSON.parse(terminal!.content_edit as string).card as {
-      body: Array<Record<string, unknown>>;
-    };
-    const header = String((card.body[0] as { text?: string }).text
-      ?? JSON.stringify(card.body[0]));
-    expect(header).toContain("Interrupted");
-    expect(header).not.toContain("Done");
+    expect(terminal).toMatchObject({
+      template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+      state: "error",
+      data: { state: "error" },
+    });
+    expect(terminal).not.toHaveProperty("content_edit");
   });
   it("keeps the card in the error state when the buffered final send failed silently", async () => {
     const { edits, texts } = installFetchStub({ failPlainSend: true });
@@ -232,12 +251,11 @@ describe("inbound progress-card failure precedence", () => {
     expect(texts).toHaveLength(0);
     const terminal = edits.at(-1);
     expect(terminal).toBeTruthy();
-    const card = JSON.parse(terminal!.content_edit as string).card as {
-      body: Array<Record<string, unknown>>;
-    };
-    const header = String((card.body[0] as { text?: string }).text
-      ?? JSON.stringify(card.body[0]));
-    expect(header).toContain("Interrupted");
-    expect(header).not.toContain("Done");
+    expect(terminal).toMatchObject({
+      template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+      state: "error",
+      data: { state: "error" },
+    });
+    expect(terminal).not.toHaveProperty("content_edit");
   });
 });

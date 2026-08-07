@@ -64,7 +64,7 @@ Bot accounts are stored in `~/.openclaw/openclaw.json` under `channels.octo.acco
 
 Configuration fields per account:
 
-`cardProgress`, `reasoningCardTemplateMode`, `cardDisplay`, and `cardInteraction` may also be set directly under `channels.octo` as defaults for every account. An explicit per-account value overrides the corresponding top-level value.
+Card policy is configured per Bot on the Octo server, not in `openclaw.json`. The plugin reads the effective `card_enabled`, `display_enabled`, `interaction_enabled`, `reasoning_enabled`, and `reasoning_template_ref` values from `GET /v1/bot/card/profile`. Legacy local fields (`cardProgress`, `reasoningCardTemplateMode`, `cardDisplay`, and `cardInteraction`) are ignored.
 
 - `botToken` (required): Bot token. Either a User Bot token from BotFather (`bf_` prefix, full group + thread access) or an App Bot token from the Octo admin console (`app_` prefix, direct-message only — server-enforced).
 - `apiUrl` (required): Octo server REST API base URL (e.g. `https://your-server/api`). The default `http://localhost:8090/api` only works for a local Octo dev server with the standard `/api` mount.
@@ -73,32 +73,10 @@ Configuration fields per account:
 - `requireMention` (optional): Only respond when @mentioned in groups
 - `pollIntervalMs` (optional): Short-poll interval for `card_action` callbacks after this account sends an interactive card (default `2000`, minimum `500`).
 - `eventWaitSeconds` (optional): Seconds to let the server hold an empty `/v1/bot/events` queue open, so a card action reaches the bot as soon as it is clicked instead of on the next poll tick (default `0` = plain short polling at `pollIntervalMs`; a non-zero value is clamped to 5–30 — below 5 a hold issues more requests than the short polling it replaces, and 30 matches the server's own clamp). Requires a server that supports the long poll; older servers answer immediately and the poller falls back to `pollIntervalMs` pacing, so setting it is safe but gives no benefit. Lower it if a reverse proxy in front of the server has an idle timeout below ~40s, since the client request timeout is derived as `eventWaitSeconds + 10s`.
-- `cardProgress` (optional): Set `false` to force-disable automatic progress cards for this account. Omitted or `true` follows the server card capability gate.
-- `reasoningCardTemplateMode` (optional): Registry migration mode for automatic reasoning cards. `experimental` (default) sends Model A when the server advertises exactly one compatible `ai.reasoning-process` template and uses that manifest version unchanged, without a local version allowlist. Compatibility includes exactly one copy of every required view/state, rejects unknown Submit actions, and accepts either no controls or the deployed view-scoped controls (`reasoning_stop` on active, `reasoning_retry` on error, none on result). Zero or multiple compatible entries fall back to Model B because catalog order is not a preference signal. `off` keeps local Model B rendering; `shadow` validates Registry discovery but still sends Model B. This does not affect `octo_send_display_card` or `octo_send_card`. Separately, when OpenClaw reasoning visibility is enabled (`on` or `stream`), sanitized and length-bounded reasoning text is included in progress cards and is visible to channel members. Note that this changes the local Model B card too: whenever Model B is the one rendering — `off`, `shadow`, or `experimental` with no single compatible template — a turn that actually captured reasoning text uses the reasoning layout instead of the plain progress card.
-
-  Four `experimental` behaviours are deliberate and worth knowing before you enable it. Template compatibility alone selects Model A, independent of reasoning visibility: a turn that never exposed any reasoning still renders the `ai.reasoning-process` card, with real tool rows under a generic placeholder thought line instead of captured reasoning text (local Model B rendering keeps its plain progress card in that case). Model A never synthesizes tool actions it did not observe, so a reasoning phase that has not yet run a tool is omitted from the frame — its thought text appears once that phase calls one, where Model B shows the phase immediately with a synthetic `think` row; a turn's last reasoning phase usually calls no tool before the model answers, so that closing segment usually never reaches the Model A card at all. Neither mode sends a progress card for a turn that calls no tools at all. Run control (stop/regenerate) is not a card action: the deployed template is expected to render no such controls, and this plugin only ACKs view-scoped `reasoning_stop` / `reasoning_retry` as a defensive no-op for cards already sitting in channels and for catalogs that still advertise them, so those buttons do not perform run control. Finally, if the initial Model A send receives a deterministic template-frame rejection and the advertised Model B profile is compatible, the plugin retries that first frame exactly once as Model B; an existing Model A message never switches wire modes.
-- `cardDisplay` (optional): Set `false` to hide and reject the `octo_send_display_card` tool for this account. Omitted or `true` follows the server card capability gate.
-- `cardInteraction` (optional): Set `false` to hide `octo_send_card` and prevent new interactive-card callback polling for this account. Omitted or `true` follows the server `octo/v2` capability gate.
 - `historyLimit` (optional): Group chat history message limit (default: 20)
 - `dispatchTimeoutMs` (optional): Per-inbound dispatch timeout in milliseconds — an infrastructure backstop that releases the per-group message queue if an upstream dispatch hangs. When unset, it is derived from OpenClaw's `agents.defaults.timeoutSeconds` (600 if unset) as `timeoutSeconds * 1000 + 60000`, so it always fires *after* the agent-run timeout: the agent terminates gracefully first, and this timeout only catches genuinely hung dispatches. Set explicitly only if you need to decouple it from the agent timeout.
 
-For example, to suppress intermediate progress frames while keeping final display cards available:
-
-```json
-{
-  "channels": {
-    "octo": {
-      "accounts": {
-        "my_bot": {
-          "cardProgress": false,
-          "cardDisplay": true,
-          "cardInteraction": true
-        }
-      }
-    }
-  }
-}
-```
+Automatic reasoning progress uses only the exact Registry template ref selected by the server and advertised in the same profile response. If reasoning is disabled, the ref is missing/incompatible, or the profile cannot be read, no progress card is sent; the plugin never falls back to the old locally rendered Model B. Profile results are cached privately per Bot and invalidated immediately by the server's `bot_setting_updated` event.
 
 ## Agent tools
 

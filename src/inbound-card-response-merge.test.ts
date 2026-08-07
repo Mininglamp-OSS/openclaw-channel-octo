@@ -77,10 +77,30 @@ function installFetchStub() {
     if (url.includes("/card/profile")) {
       return json({
         enabled: true,
-        profiles: ["octo/v1"],
+        profiles: ["octo/v1", "octo/v2"],
         card_version: "1.5",
         elements: ["TextBlock", "RichTextBlock", "Container", "ColumnSet", "ActionSet"],
         actions: ["Action.ToggleVisibility"],
+        config: {
+          card_enabled: true,
+          display_enabled: true,
+          interaction_enabled: true,
+          reasoning_enabled: true,
+          reasoning_template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+        },
+        templating: {
+          supported: true,
+          wire: "template-ref/v1",
+          templates: [{
+            id: "ai.reasoning-process",
+            version: "0.3.0",
+            views: [
+              { name: "active", states: ["reasoning", "answering"], wire_profile: "octo/v2", submit_actions: ["reasoning_stop"] },
+              { name: "error", states: ["error"], wire_profile: "octo/v2", submit_actions: ["reasoning_retry"] },
+              { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
+            ],
+          }],
+        },
       });
     }
     if (url.includes("/members")) {
@@ -218,7 +238,7 @@ describe("inbound final response progress-card merge", () => {
     else process.env.OCTO_CARD_MERGE_FINAL = originalMergeFlag;
   });
 
-  it("edits the visible progress card with the final text instead of sending a second text message", async () => {
+  it("keeps the Registry progress card separate and sends the final answer on the text path", async () => {
     const { sends, edits } = installFetchStub();
     const hooks = collectCardHooks();
     const finalText = "结论\n\n渠道 B 的下降主要来自权益认知不足。";
@@ -228,12 +248,16 @@ describe("inbound final response progress-card merge", () => {
     const cardSends = sends.filter((body) => (body.payload as { type?: number } | undefined)?.type === 17);
     const textSends = sends.filter((body) => (body.payload as { type?: number } | undefined)?.type === 1);
     expect(cardSends).toHaveLength(1);
-    expect(textSends).toHaveLength(0);
+    expect(textSends).toHaveLength(1);
+    expect((textSends[0].payload as { content?: string }).content).toContain("渠道 B 的下降主要来自权益认知不足");
     expect(edits).toHaveLength(1);
     expect(edits[0].message_id).toBe("progress-message");
-    const contentEdit = JSON.parse(edits[0].content_edit as string);
-    expect(contentEdit.transient).toBeUndefined();
-    expect(JSON.stringify(contentEdit.card)).toContain("渠道 B 的下降主要来自权益认知不足");
+    expect(edits[0]).toMatchObject({
+      template_ref: { id: "ai.reasoning-process", version: "0.3.0" },
+      state: "completed",
+      card_seq: 1,
+    });
+    expect(edits[0]).not.toHaveProperty("content_edit");
   });
 
   it("captures reasoning snapshots in the progress card without sending a reasoning text message", async () => {
@@ -249,10 +273,11 @@ describe("inbound final response progress-card merge", () => {
     const cardSends = sends.filter((body) => (body.payload as { type?: number } | undefined)?.type === 17);
     const textSends = sends.filter((body) => (body.payload as { type?: number } | undefined)?.type === 1);
     expect(cardSends).toHaveLength(1);
-    expect(textSends).toHaveLength(0);
-    const card = (cardSends[0]?.payload as { card: Record<string, unknown> }).card;
-    expect(JSON.stringify(card)).toContain("先核对渠道数据，再给出结论。");
-    expect(JSON.stringify(card)).toContain("read");
+    expect(textSends).toHaveLength(1);
+    const payload = cardSends[0]?.payload;
+    expect(JSON.stringify(payload)).toContain("先核对渠道数据，再给出结论。");
+    expect(JSON.stringify(payload)).toContain("read");
+    expect(payload).not.toHaveProperty("card");
   });
 
   it.each(["stream", "dispatcher"] as const)(
@@ -274,7 +299,7 @@ describe("inbound final response progress-card merge", () => {
       expect(JSON.stringify(cardSend?.payload)).not.toContain("MUST STAY HIDDEN");
       const textSends = sends.filter((body) =>
         (body.payload as { type?: number } | undefined)?.type === 1);
-      expect(textSends).toHaveLength(0);
+      expect(textSends).toHaveLength(1);
     },
   );
 

@@ -1,7 +1,8 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { listOctoAccountIds, resolveOctoAccount } from "./accounts.js";
-import { getCardProfile, sendCardMessage, sendMessage, type CardProfileManifest } from "./api-fetch.js";
+import { sendCardMessage, sendMessage, type CardProfileManifest } from "./api-fetch.js";
+import { getBotCardProfile, peekBotCardProfile } from "./card-profile-cache.js";
 import {
   buildInteractiveCard,
   type CardButtonSpec,
@@ -15,6 +16,7 @@ import { INTERACTIVE_CARD_TOOL_NAME, CHANNEL_ID } from "./constants.js";
 import { resolveOutboundOctoTarget } from "./actions.js";
 import { CARD_INTERACTIVE_PROFILE, CARD_VERSION, type ChannelType } from "./types.js";
 import type { CardCaps } from "./card-render.js";
+import { requestCardEventPolling } from "./events-poll.js";
 
 const SEND_TIMEOUT_MS = 15_000;
 
@@ -114,8 +116,9 @@ function normalizeBlocks(value: unknown): InteractiveCardBlockSpec[] | undefined
 }
 
 function interactiveGateReason(manifest: CardProfileManifest): string | null {
-  if (!manifest.available) return "interactive card manifest is unavailable";
-  if (!manifest.enabled) return "card sending is disabled by the server";
+  if (!manifest.available || manifest.config?.interaction_enabled !== true) {
+    return "interactive cards are disabled by the server Bot policy";
+  }
   if (!manifest.profiles?.includes(CARD_INTERACTIVE_PROFILE)) return "octo/v2 is not advertised";
   if (manifest.card_version !== CARD_VERSION) return `card_version ${manifest.card_version ?? "missing"} is unsupported`;
   return null;
@@ -146,8 +149,16 @@ export function createInteractiveCardTool(params: Params): any[] {
       ?? agentAccountId
       ?? (ids.length === 1 ? ids[0] : undefined);
     if (discoveryAccountId) {
-      if (resolveOctoAccount({ cfg, accountId: discoveryAccountId }).config.cardInteraction === false) return [];
-    } else if (configured.every((account) => account.config.cardInteraction === false)) {
+      const account = resolveOctoAccount({ cfg, accountId: discoveryAccountId });
+      if (account.config.botToken && peekBotCardProfile({
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken,
+      })?.config?.interaction_enabled === false) return [];
+    } else if (configured.every((account) =>
+      !!account.config.botToken && peekBotCardProfile({
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken,
+      })?.config?.interaction_enabled === false)) {
       return [];
     }
   } catch {
@@ -257,10 +268,6 @@ export function createInteractiveCardTool(params: Params): any[] {
       if (!account.enabled || !account.configured || !account.config.botToken) {
         return error("Octo account is not fully configured");
       }
-      if (account.config.cardInteraction === false) {
-        return error("interactive cards are disabled for this account; use plain text");
-      }
-
       const target = resolveOutboundOctoTarget(deliveryContext.to, deliveryContext.threadId);
       const spec: InteractiveCardSpec = {
         title: typeof args.title === "string" ? args.title : "",
@@ -276,10 +283,14 @@ export function createInteractiveCardTool(params: Params): any[] {
       let negotiatedCaps: CardCaps | undefined;
       let unsupportedReason = "card profile probe failed";
       try {
-        manifest = await getCardProfile({
+        requestCardEventPolling(account.accountId);
+        manifest = await getBotCardProfile({
           apiUrl: account.config.apiUrl,
           botToken: account.config.botToken,
         });
+        if (!manifest.available || manifest.config?.interaction_enabled !== true) {
+          return error("interactive cards are disabled by the server Bot policy; use plain text");
+        }
         unsupportedReason = interactiveGateReason(manifest) ?? "";
       } catch (probeError) {
         unsupportedReason = `card profile probe failed: ${probeError instanceof Error ? probeError.message : String(probeError)}`;

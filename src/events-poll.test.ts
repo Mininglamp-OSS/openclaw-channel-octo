@@ -10,6 +10,11 @@ import {
   type EventCursorStore,
 } from "./events-poll.js";
 import type { CardAction } from "./card-action.js";
+import {
+  _resetBotCardProfileCacheForTests,
+  getBotCardProfile,
+  peekBotCardProfile,
+} from "./card-profile-cache.js";
 
 const actionEvent = (eventId: number) => ({
   event_id: eventId,
@@ -37,8 +42,12 @@ function memoryCursor(initial = 0): EventCursorStore & { saved: number[] } {
 }
 
 describe("event poller", () => {
-  beforeEach(() => vi.useFakeTimers());
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetBotCardProfileCacheForTests();
+  });
   afterEach(() => {
+    _resetBotCardProfileCacheForTests();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -125,6 +134,54 @@ describe("event poller", () => {
 
     expect(onCardAction).not.toHaveBeenCalled();
     expect(cursor.saved).toEqual([31]);
+    poller.stop();
+  });
+
+  it("bot_setting_updated 只清理当前 Bot 的 profile cache，并正常推进 cursor", async () => {
+    const profile = (displayEnabled: boolean) => ({
+      enabled: true,
+      profiles: ["octo/v1"],
+      card_version: "1.5",
+      config: {
+        card_enabled: true,
+        display_enabled: displayEnabled,
+        interaction_enabled: true,
+        reasoning_enabled: false,
+        reasoning_template_ref: null,
+      },
+    });
+    global.fetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      const token = String((init?.headers as Record<string, string> | undefined)?.Authorization ?? "");
+      return Response.json(profile(token.includes("bot-b")));
+    }) as typeof fetch;
+    const botA = { apiUrl: "https://api.test", botToken: "bot-a" };
+    const botB = { apiUrl: "https://api.test", botToken: "bot-b" };
+    await getBotCardProfile(botA);
+    await getBotCardProfile(botB);
+
+    global.fetch = vi.fn().mockResolvedValue(Response.json({
+      results: [{
+        event_id: 32,
+        event_type: "bot_setting_updated",
+        event_data: { scope: "bot_setting" },
+      }],
+    })) as typeof fetch;
+    const cursor = memoryCursor(31);
+    const onCardAction = vi.fn();
+    const poller = startEventPoller({
+      ...botA,
+      intervalMs: 1000,
+      cursorStore: cursor,
+      onCardAction,
+    });
+
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(peekBotCardProfile(botA)).toBeUndefined();
+    expect(peekBotCardProfile(botB)?.config?.display_enabled).toBe(true);
+    expect(onCardAction).not.toHaveBeenCalled();
+    expect(cursor.saved).toEqual([32]);
     poller.stop();
   });
 
@@ -290,6 +347,20 @@ describe("event poller", () => {
     setCardEventPollStarter("BOT-A", undefined);
     requestCardEventPolling("bot-a");
     expect(starter).toHaveBeenCalledOnce();
+  });
+
+  it("channel 与 agent runtime 的独立模块实例共享懒启动器", async () => {
+    vi.resetModules();
+    const channelRuntime = await import("./events-poll.js");
+    const starter = vi.fn();
+    channelRuntime.setCardEventPollStarter("Cross-Loader-Bot", starter);
+
+    vi.resetModules();
+    const agentRuntime = await import("./events-poll.js");
+    agentRuntime.requestCardEventPolling("cross-loader-bot");
+
+    expect(starter).toHaveBeenCalledOnce();
+    agentRuntime.setCardEventPollStarter("cross-loader-bot", undefined);
   });
 });
 

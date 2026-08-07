@@ -34,36 +34,17 @@ describe("openclaw.plugin.json channelConfigs", () => {
     );
   });
 
-  it.each(["cardProgress", "cardDisplay", "cardInteraction"])(
-    "%s description matches at top-level and per-account",
-    (key) => {
-      const manifestProps = manifest.channelConfigs.octo.schema.properties;
-      const manifestAccountProps = manifestProps.accounts.additionalProperties.properties;
-      const tsProps = OctoConfigJsonSchema.schema.properties as Record<string, any>;
-      const tsAccountProps = (tsProps.accounts as any).additionalProperties.properties;
-      const description = tsProps[key]?.description as string | undefined;
-
-      expect(description).toBeDefined();
-      expect(manifestProps[key]?.description).toBe(description);
-      expect(tsAccountProps[key]?.description).toBe(description);
-      expect(manifestAccountProps[key]?.description).toBe(description);
-      expect(description).toMatch(/omitted|true/i);
-      expect(description).toMatch(/false/i);
-      expect(description).toMatch(/server/i);
-    },
-  );
-
-  it("reasoningCardTemplateMode is synced at top-level and per-account", () => {
+  it("does not advertise the deprecated local card policy fields", () => {
     const manifestProps = manifest.channelConfigs.octo.schema.properties;
     const manifestAccountProps = manifestProps.accounts.additionalProperties.properties;
     const tsProps = OctoConfigJsonSchema.schema.properties as Record<string, any>;
     const tsAccountProps = (tsProps.accounts as any).additionalProperties.properties;
-
-    expect(tsProps.reasoningCardTemplateMode.enum).toEqual(["off", "shadow", "experimental"]);
-    expect(tsProps.reasoningCardTemplateMode.default).toBe("experimental");
-    expect(tsAccountProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
-    expect(manifestProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
-    expect(manifestAccountProps.reasoningCardTemplateMode).toEqual(tsProps.reasoningCardTemplateMode);
+    for (const key of ["cardProgress", "reasoningCardTemplateMode", "cardDisplay", "cardInteraction"]) {
+      expect(tsProps[key]).toBeUndefined();
+      expect(tsAccountProps[key]).toBeUndefined();
+      expect(manifestProps[key]).toBeUndefined();
+      expect(manifestAccountProps[key]).toBeUndefined();
+    }
   });
 
   // Description drift guard: secretsFileRoot carries operator-facing semantics

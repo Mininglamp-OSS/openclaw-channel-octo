@@ -2682,12 +2682,11 @@ export async function handleInboundMessage(params: {
   // 波 B:登记进度卡发送上下文(hook 侧懒发/更新时用)。route.sessionKey 桥接
   // dispatch↔hook(H1 实证一致)。OBO(persona-clone)场景由 setCardContext 内部标记跳过。
   setCardContext(route.sessionKey, {
+    accountId: account.accountId,
     apiUrl,
     botToken,
     channelId: replyChannelId,
     channelType: replyChannelType,
-    cardProgress: account.config.cardProgress,
-    reasoningCardTemplateMode: account.config.reasoningCardTemplateMode,
     reasoningVisibility,
     ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
   });
