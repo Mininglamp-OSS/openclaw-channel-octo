@@ -406,7 +406,13 @@ describe("reasoning detail sanitization", () => {
     expect(sanitizeReasoningThought(
       "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>> private completion event",
     )).toBe("Reasoning hidden — matched a redaction rule");
-    expect(sanitizeReasoningThought("x".repeat(600)).length).toBeLessThanOrEqual(281);
+    // A real chain of thought routinely runs past the old 280-char cap and used to be cut
+    // mid-sentence, losing the part that says what the model was about to do next. 600 chars now
+    // survive intact; the cap is still hard, so 2000 is truncated with an ellipsis.
+    expect(sanitizeReasoningThought("x".repeat(600))).toBe("x".repeat(600));
+    const long = sanitizeReasoningThought("x".repeat(2000));
+    expect(long.length).toBeLessThanOrEqual(1201);
+    expect(long.endsWith("…")).toBe(true);
   });
 
   /**

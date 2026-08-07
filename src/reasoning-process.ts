@@ -76,7 +76,18 @@ const NO_SUMMARY_THOUGHT = "Reasoned without a visible summary";
  * operator where to look, so it must stay distinguishable from NO_SUMMARY_THOUGHT.
  */
 const REDACTED_THOUGHT = "Reasoning hidden — matched a redaction rule";
-const THOUGHT_MAX = 280;
+/**
+ * Per-phase cap on rendered reasoning text. 280 (a tweet) cut real thinking mid-sentence: Anthropic
+ * returns a raw chain of thought rather than a summary, so a single phase routinely runs past it and
+ * the reader lost the part that says what the model was about to do.
+ *
+ * 1200 is still a hard cap, not "unbounded". The budget that matters is per *card*: at
+ * MAX_RENDERED_PHASES phases that is ~7.2K chars of thought, an order of magnitude under the
+ * server's advertised max_payload_bytes, but cardFitsLimits drops trailing blocks when a card does
+ * not fit — so an unbounded thought would crowd out the tool rows below it. Capture is separately
+ * bounded by MAX_REASONING_CAPTURE (4000) in card-progress.ts, which this stays below.
+ */
+const THOUGHT_MAX = 1200;
 const TOOL_NAME_MAX = 80;
 const MAX_RENDERED_PHASES = 6;
 const MAX_RENDERED_ACTIONS = 12;
