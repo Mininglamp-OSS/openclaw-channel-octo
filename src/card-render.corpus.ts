@@ -331,6 +331,14 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     expect: { read: "word ".repeat(12) + "word…" },
     note: "R6:尾部 git SHA 的普通长文本。main 的 read 渲染它、grep 扣下它 —— main 自己就按策略分岔,所以界不能有一个写死的判定",
   },
+  // R11:无空白的长 minified JSON,里面有个邮箱。hasOverlongUserinfo 若只看「有冒号、有 @、
+  // 中间超 256」,这一整块会被打空(评审第七轮 P2)—— JSON 的 `":"` 冒号前面是 `"` 不是用户名
+  // 字符,不该算 userinfo 分隔符。要求冒号紧挨用户名字符之后,这条恢复渲染。
+  {
+    input: '{"detail":"' + "z".repeat(300) + '","owner":"ops@example.com"}',
+    expect: { grep: '{"detail":"' + "z".repeat(53) + "…", read: '{"detail":"' + "z".repeat(53) + "…" },
+    note: "R11:minified JSON 不是 DSN。冒号前是 `\"` 不是用户名字符,不触发超限 userinfo 扣留",
+  },
 ];
 
 /**

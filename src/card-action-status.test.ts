@@ -121,6 +121,28 @@ describe("renderCardActionStatus", () => {
     expect(texts).not.toContain("[admin](");
   });
 
+  it("显示名里归约漏掉的凭据退回 [redacted],不明文渲染", () => {
+    // neutralizeEcho 是全树唯一「归约即脱敏、后面没有守卫」的 sink。归约本身漏掉的凭据形状
+    // (口令超 256 上限整条不匹配 —— 评审第七轮 P1)此前原样进群卡片。补守卫后退回占位符。
+    const pw = "correcthorsebatterystaple".repeat(11).slice(0, 275);
+    const rendered = renderCardActionStatus({
+      card: {
+        type: "AdaptiveCard",
+        version: "1.5",
+        body: [{ type: "TextBlock", text: "选择方案" }],
+        actions: [{ type: "Action.Submit", id: "s", title: "确认" }],
+      },
+      plain: "选择方案",
+      inputs: {},
+      operator: `alice:${pw}@db.example.com`,
+      actionLabel: "确认",
+      status: "completed",
+    } as never);
+    const texts = collectText(rendered.card).join("\n") + "\n" + rendered.plain;
+    expect(texts, "275 字符口令明文进了群卡片").not.toContain(pw);
+    expect(texts).toContain("[redacted]");
+  });
+
   it("普通提交值与显示名不被加转义(无回归)", () => {
     const rendered = renderCardActionStatus({
       card: {

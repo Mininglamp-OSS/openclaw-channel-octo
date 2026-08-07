@@ -169,10 +169,23 @@ same string to a matcher — so this reduces or deletes `word:x@y` broadly in or
 tool output, not only the two rows first recorded: npm/maven coordinates
 (`pkg:1.2.3@latest`), timestamps (`10:30@venue`), even `sed` scripts. A mixed-case
 host is **deleted** rather than reduced (`time 12:00@GMT` → `time `), because the
-verbatim check fails on it. All safe-direction (renders less, never fabricates), but
-it changes how legible cards are, and that breadth is a product call — the corpus
-pins the exact current behaviour of every shape so whatever revisits it cannot
-change anything else silently.
+verbatim check fails on it.
+
+**This reaches non-ASCII text, which for a CJK-first product is the larger cost.**
+The host class is `\p{L}\p{N}` (Unicode letters/digits) plus `.` and `-`, so an
+IDN host (`user:pw@例子.测试`) reaches the verbatim check and is deleted — but so is
+the host-shaped run in a `word:x@host` false positive written in Chinese, where the
+"host" runs until the next CJK punctuation or space. `报警 level:warn@数据库连接池耗尽。建议扩容。`
+renders as `报警 。建议扩容。` — the clause `数据库连接池耗尽` between `@` and the first
+`。` is gone. It is bounded to that run (the class deliberately excludes CJK
+punctuation and the whitespace-like code points, so it no longer swallows the whole
+sentence as an earlier all-non-ASCII class did), and it never fabricates, but a
+clause disappearing with no marker is a real legibility cost in the product's
+primary language. All of this is safe-direction (renders less), and the breadth is a
+product call — the corpus (`REWRITE_CORPUS` for the CJK sentence, `BENIGN_CORPUS`
+for a minified-JSON token that must *not* be blanked) pins the exact current
+behaviour of every shape so whatever revisits it cannot change anything else
+silently.
 
 ### The reduction step bounds its own input
 
@@ -310,9 +323,23 @@ either: a long alphabetic passphrase is neither long-hex nor digit+letter mixed,
 guard caught it "at that length"; measurement disproved that (it rendered the
 plaintext password, exact threshold 257, on every sink including `trusted: true`
 progress cards where the entropy tiers do not run at all). A dedicated linear check —
-`hasOverlongUserinfo`, a whitespace-token scan for a `:` … `@` with an over-256
-middle — now fires as a guard hit whenever the cap is exceeded, so the over-cap case
-withholds instead of falling open.
+`hasOverlongUserinfo`, a whitespace-token scan for a `:` immediately after a
+username-class character, before an `@`, with an over-256 middle — now fires as a
+guard hit whenever the cap is exceeded, so the over-cap case withholds instead of
+falling open. (The "immediately after a username-class character" part matters: an
+earlier version fired on any `:`…`@`…256 token and blanked minified JSON that
+happened to contain an address; the check now aligns with what the reduction regex
+actually matches, and a `BENIGN_CORPUS` row pins that JSON still renders.)
+
+**This is a guard-based fix, so it protects only sinks that call `isSensitive`.**
+One sink does not: `neutralizeEcho` in `card-action-status.ts` treats
+`reduceUrlsInText` *as* the redaction, with nothing behind it — and it is the
+lowest-trust sink in the tree (group-member-set display names and submitted form
+values). Left as-is, the over-cap case still fell open there. It now runs the same
+`isSensitive` gate the other reduce-only callers already do
+(`card-display-tool.ts`, `reasoning-process.ts`), returning `[redacted]` when the
+reduced value is still sensitive. That is the one sink where the guard living
+inside `isSensitive` had to be wired in explicitly rather than inherited.
 
 The false positives that come with the relaxation are broader than a couple of rows
 and are recorded in `REWRITE_CORPUS` rather than absorbed silently — `word:x@y` is

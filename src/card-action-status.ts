@@ -1,4 +1,4 @@
-import { reduceUrlsInText } from "./card-render.js";
+import { reduceUrlsInText, isSensitive } from "./card-render.js";
 
 export type CardActionStatus = "processing" | "completed" | "error";
 
@@ -12,9 +12,18 @@ export type CardActionStatus = "processing" | "completed" | "error";
  * `reduceUrlsInText`), then backslash-escape the inline markdown control chars (CommonMark) so
  * no link / code / emphasis span can form. Authored strings (input labels, resolved choice
  * titles, the action label) are already sanitized at authoring time and are not routed here.
+ *
+ * **归约之后还要过一遍 `isSensitive`,和其它 sink 一样**(见 card-display-tool 的
+ * `redactDebugValue`、reasoning-process 的思考清洗)。这条路是全树唯一「归约即脱敏、后面没有
+ * 守卫」的 sink —— 于是任何**归约本身漏掉**的凭据(口令超 256 上限整条不匹配、非 ASCII 用户名
+ * 逃过匹配)会原样渲染。评审第七轮的 P1:275 字符口令的 DSN 作显示名时明文进群卡片。
+ * 补上守卫后,归约没盖住的那些形状退回 `[redacted]`,而不是明文。归约命中即敏感的输入
+ * (`reduceUrlsInText` 已把它变成安全的注册域)照常显示,不受影响。
  */
 function neutralizeEcho(value: string): string {
-  return reduceUrlsInText(value).replace(/[\\`*_~\[\]<]/g, "\\$&");
+  const reduced = reduceUrlsInText(value);
+  if (isSensitive(reduced, true)) return "[redacted]";
+  return reduced.replace(/[\\`*_~\[\]<]/g, "\\$&");
 }
 
 interface StatusParams {

@@ -232,18 +232,28 @@ function hasLinearSecretShape(s: string, generic: boolean): boolean {
  * 不归约 = 明文渲染(评审第六轮的 P0,阈值精确在 257,无长度前提,五个群可见 sink 全中,
  * 且 path/shell 的 generic=false 连高熵兜底都不跑)。补一道 fail-closed:超限即敏感。
  *
- * **线性实现,不用正则。** 按空白分词,每个 token 里若有 `:` 在先、`@` 在后,且中间那段
- * (口令)超过 256,即命中。indexOf/lastIndexOf 都是线性;冒号密集 / `@` 密集的对抗串上
- * 实测 ~1.85 ms/MB,而且这里的输入已经被界收进 4000/64 KiB,不会更大。
+ * **线性实现,不用正则。** 按空白分词,找一个「前面紧挨用户名字符的冒号」在先、`@` 在后,
+ * 且中间那段(口令)超过 256 的 token,即命中。indexOf/lastIndexOf 都是线性。
  * 放在 generic 判定**之前**,所以 path/shell 也走它 —— 那正是漏得最狠的那条路。
+ *
+ * **分隔冒号必须紧挨用户名字符**(`[A-Za-z0-9._%+-]`),这是为了对齐 SCHEMELESS_USERINFO_RE
+ * 只匹配 `[A-Za-z0-9._%+-]+:` 开头这一点 —— 否则一段无空白的 minified JSON
+ * (`{"level":"error","detail":"<300 z>","owner":"ops@example.com"}`)里,第一个冒号前面是
+ * `"`,却因为「有冒号、有 @、中间超 256」被整块打空(评审第七轮 P2)。要求冒号前是用户名字符,
+ * JSON 那些 `":"` 全部被跳过,而 `alice:<300>@host` 照样命中。
  */
 const OVERLONG_USERINFO_MAX = 256;
+const USERINFO_NAME_CHAR = /[A-Za-z0-9._%+-]/;
 function hasOverlongUserinfo(s: string): boolean {
   for (const tok of s.split(/\s+/)) {
-    const colon = tok.indexOf(":");
-    if (colon < 0) continue;
     const at = tok.lastIndexOf("@");
-    if (at <= colon + 1) continue;             // 需要 `:` 在 `@` 之前,且中间非空
+    if (at < 2) continue;                        // `x:@` 起码要 3 个字符
+    // 找 userinfo 分隔冒号:前一个字符是用户名字符的那个 `:`(与归约正则的 `[…]+:` 对齐)。
+    let colon = -1;
+    for (let c = tok.indexOf(":"); c >= 0 && c < at; c = tok.indexOf(":", c + 1)) {
+      if (c > 0 && USERINFO_NAME_CHAR.test(tok[c - 1]!)) { colon = c; break; }
+    }
+    if (colon < 0) continue;
     if (at - colon - 1 > OVERLONG_USERINFO_MAX) return true;
   }
   return false;
@@ -537,7 +547,7 @@ const PROTOCOL_RELATIVE_RE =
  * `LEAK_CORPUS` 里 3995 字符口令那两行正是这一类,它们靠守卫扣下,不靠归约。
  */
 const SCHEMELESS_USERINFO_RE =
-  /\b[A-Za-z0-9._%+-]+:[^\s]{1,256}@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|[A-Za-z0-9.\u002d\u0080-\uffff]+)(?::\d+)?(?:\/[^\s]*)?(?![A-Za-z0-9-])(?!:\d)/g;
+  /\b[A-Za-z0-9._%+-]+:[^\s]{1,256}@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|[.\u002d\p{L}\p{N}]+)(?::\d+)?(?:\/[^\s]*)?(?![A-Za-z0-9-])(?!:\d)/gu;
 
 /** 任意无 scheme 的 `host.tld/path`:path 常承载 webhook token、签名或对象凭据。 */
 const SCHEMELESS_HOST_PATH_RE =
