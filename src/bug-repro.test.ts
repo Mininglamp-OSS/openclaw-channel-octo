@@ -190,52 +190,13 @@ describe("Bug A fix: Exponential backoff grows correctly", () => {
 });
 
 
-describe("Bug B fix: Kicked during cooldown still reconnects", () => {
-  it("channel.ts onError handler reconnects even when cooldown is active", () => {
-    /**
-     * With the fix, the else branch in channel.ts onError reconnects the
-     * bot with current credentials when cooldown is active, instead of
-     * doing nothing and letting the bot die permanently.
-     */
-    let lastTokenRefreshAt = 0;
-    const TOKEN_REFRESH_COOLDOWN_MS = 60_000;
-    let isRefreshingToken = false;
-    let stopped = false;
-    let tokenRefreshCount = 0;
-    let reconnectCount = 0;
-
-    // Simulate the FIXED onError handler from channel.ts
-    function onError(err: Error) {
-      const cooldownElapsed = Date.now() - lastTokenRefreshAt > TOKEN_REFRESH_COOLDOWN_MS;
-      if (cooldownElapsed && !isRefreshingToken && !stopped &&
-          (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
-        isRefreshingToken = true;
-        lastTokenRefreshAt = Date.now();
-        tokenRefreshCount++;
-        // Would do: socket.disconnect() + socket.updateCredentials() + socket.connect()
-        reconnectCount++;
-        isRefreshingToken = false;
-      } else if (!isRefreshingToken && !stopped &&
-          (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
-        // FIX: Cooldown active — skip token refresh but still reconnect
-        // Would do: socket.disconnect() + socket.connect()
-        reconnectCount++;
-      }
-    }
-
-    // First kick — cooldown not active yet, full refresh happens
-    onError(new Error("Kicked by server"));
-    expect(tokenRefreshCount).toBe(1);
-    expect(reconnectCount).toBe(1);
-
-    // Second kick — within 60s cooldown
-    onError(new Error("Kicked by server"));
-
-    // FIX VERIFIED: reconnect still happens (via else branch), just no token refresh
-    expect(tokenRefreshCount).toBe(1); // no new refresh (cooldown active)
-    expect(reconnectCount).toBe(2);    // reconnect DID happen!
-  });
-
+// The onError branch selection that used to be simulated here with local variables is gone:
+// it reset its refresh flag synchronously, so no amount of exercising it could have caught the
+// real implementation leaving that flag stuck on. That behaviour is now covered against real
+// code in reconnect-coordination.test.ts.
+//
+// The case below is a different thing and stays: it drives a real WKSocket.
+describe("Kicked bots can be revived", () => {
   it("socket reconnects after channel.ts calls disconnect+connect on kick", () => {
     /**
      * When CONNACK returns kicked (reasonCode=0), needReconnect is set to false
@@ -276,7 +237,7 @@ describe("Bug B fix: Kicked during cooldown still reconnects", () => {
     ws1.emit("close");
     expect(setTimeoutCalls.length).toBe(0);
 
-    // FIX: channel.ts calls disconnect + connect → bot reconnects
+    // channel.ts calls disconnect + connect → bot reconnects
     socket.disconnect();
     socket.connect();
 

@@ -22,6 +22,7 @@ import {
   type CardProfileManifest,
   type CardTemplateRef,
 } from "./api-fetch.js";
+import { OctoApiError } from "./api-error.js";
 import {
   _resetBotCardProfileCacheForTests,
   getBotCardProfile,
@@ -94,6 +95,8 @@ interface CardEntry {
   templateEditPromise?: Promise<boolean>;
   /** paused 卡的有界回收定时器。 */
   pausedExpiryTimer?: ReturnType<typeof setTimeout>;
+  /** 限流冷却期结束后把最新一帧发出去的一次性唤醒定时器;见 armCooldownWake。 */
+  cooldownTimer?: ReturnType<typeof setTimeout>;
   /** replacement/clear 时主动取消 profile/send/edit,缩小 stale side-effect 窗口。 */
   flushAbort?: AbortController;
   /** Server-selected ref, pinned for every frame of a Registry-authored message. */
@@ -117,6 +120,13 @@ interface CardEntry {
 type CardProgressSharedState = {
   cards: Map<string, CardEntry>;
   pausedCards: Map<string, CardEntry>;
+  /**
+   * 每个后端最早可以再发进度帧的时刻,按 apiUrl 归集。
+   *
+   * 按 URL 而不是按卡:服务端的桶是按来源 IP 的,同一后端下所有 session、所有 bot 撞的是
+   * 同一个桶,分别计时只会让每个 session 各自去把同一个限制重新踩一遍。
+   */
+  rateLimitedUntil: Map<string, number>;
 };
 
 /**
@@ -129,10 +139,15 @@ const CARD_PROGRESS_STATE_KEY = Symbol.for("openclaw.octo.card-progress-state.v1
 function getCardProgressSharedState(): CardProgressSharedState {
   const root = process as unknown as Record<PropertyKey, unknown>;
   const existing = root[CARD_PROGRESS_STATE_KEY] as CardProgressSharedState | undefined;
-  if (existing) return existing;
+  if (existing) {
+    // 惰性补齐:同一进程内两个实例跑的是同一份构建,但 key 复用而结构演进时缺字段会直接崩。
+    existing.rateLimitedUntil ??= new Map();
+    return existing;
+  }
   const created: CardProgressSharedState = {
     cards: new Map(),
     pausedCards: new Map(),
+    rateLimitedUntil: new Map(),
   };
   root[CARD_PROGRESS_STATE_KEY] = created;
   return created;
@@ -196,6 +211,7 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
     clearTimeout(existing.flushTimer);
     existing.flushTimer = undefined;
   }
+  if (existing) clearCooldownTimer(existing);
   existing?.flushAbort?.abort(new Error("card entry replaced"));
   if (collision) {
     if (existing) existing.skip = true;
@@ -257,6 +273,11 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
     if (signal?.aborted) throw signal.reason;
     return !!reasoningTemplateForProfile(m);
   } catch (err: unknown) {
+    // 探测自己被限流时,把窗口记下来 —— 否则后续每个工具事件都会再探一次,而这条路径打的
+    // 正是刚刚拒绝我们的那个桶。
+    if (err instanceof OctoApiError && err.isRateLimited) {
+      noteRateLimited(ctx.apiUrl, err.retryAfterMs);
+    }
     // 瞬时失败(5xx/网络抖动)不缓存、不 skip —— 否则一次抖动会让该 apiUrl(缓存)或
     // 该 session(skip)的卡片进度永久关闭。返回 null,下次 flush(仍在 !messageId 期间)重探。
     warn(`card gate probe failed (not caching): ${err instanceof Error ? err.message : String(err)}`);
@@ -297,6 +318,81 @@ function resolveEntryDeliveryMode(entry: CardEntry): void {
   entry.skip = true;
 }
 
+const rateLimitedUntil = sharedState.rateLimitedUntil;
+
+/** 与 postJson 拼 URL 时同款去尾斜杠,否则同一后端会落进两个桶、冷却门形同虚设。 */
+function cooldownKey(apiUrl: string): string {
+  return apiUrl.replace(/\/+$/, "");
+}
+
+/**
+ * 冷却门自己的上限。
+ *
+ * 解析层刻意保留服务端原值(缩短等待就是提前重试),但这里是唯一的消费方,而且影响面是
+ * 「该后端下整个进程所有 session 的进度帧」。一个 `Retry-After: 86400`(或代理乱填)会让卡片
+ * 静默停摆一整天,代价远大于偶尔早回去一次 —— 进度帧本来就是可丢弃的。
+ */
+const MAX_CARD_COOLDOWN_MS = 5 * 60 * 1000;
+
+function noteRateLimited(apiUrl: string, retryAfterMs: number): void {
+  if (retryAfterMs > MAX_CARD_COOLDOWN_MS) {
+    warn(
+      `server asked progress frames to wait ${retryAfterMs}ms; capping the card cooldown at ` +
+        `${MAX_CARD_COOLDOWN_MS}ms`,
+    );
+  }
+  const capped = Math.min(retryAfterMs, MAX_CARD_COOLDOWN_MS);
+  const key = cooldownKey(apiUrl);
+  // 单调:并发的另一个 429 若带更短的 retry_after,直接覆盖会把已有冷却**缩短** ——
+  // 那等于提前回去撞,正是这次要消掉的行为。
+  rateLimitedUntil.set(key, Math.max(rateLimitedUntil.get(key) ?? 0, Date.now() + capped));
+}
+
+function cooldownRemainingMs(apiUrl: string): number {
+  return Math.max(0, (rateLimitedUntil.get(cooldownKey(apiUrl)) ?? 0) - Date.now());
+}
+
+/**
+ * 取消冷却唤醒。
+ *
+ * stale guard 已经能阻止陈旧 entry 产生网络副作用,但一个 30s 的 Retry-After 会让被替换掉的
+ * entry 及其闭包多活 30 秒。凡是 entry 走到终点或被顶掉的路径都要调这个。
+ */
+function clearCooldownTimer(entry: CardEntry): void {
+  if (entry.cooldownTimer) {
+    clearTimeout(entry.cooldownTimer);
+    entry.cooldownTimer = undefined;
+  }
+}
+
+/**
+ * 排一次(且仅一次)冷却结束后的唤醒。
+ *
+ * 冷却期内直接 return 会让这一帧只能等下一个事件才可能发出;而靠 800ms 去抖反复进来,
+ * 又会在整个窗口里空转。所以留一个精确到到期时刻的定时器,并且回调必须:
+ * 先清自己的句柄、校验 entry 仍有效、重读可能已被延长的 deadline。
+ */
+function armCooldownWake(sessionKey: string, entry: CardEntry, delayMs: number): void {
+  if (entry.cooldownTimer) return; // 已排过;重排会让唤醒次数翻倍
+  // 窗口按 apiUrl 共享但唤醒按 entry,所以同后端的多个 session 会在同一刻醒来 —— 正好把一批
+  // 请求同时怼给刚刚才恢复的桶。错峰几百毫秒把这一下摊开。
+  const staggered = delayMs + Math.floor(Math.random() * 500);
+  entry.cooldownTimer = setTimeout(() => {
+    entry.cooldownTimer = undefined;
+    // entry 可能在等待期间被替换。Map 对象身份是本文件既有的 generation fence,
+    // stale entry 绝不能继续产生网络副作用。
+    if (!isCurrentEntry(sessionKey, entry)) return;
+    const remaining = cooldownRemainingMs(entry.ctx.apiUrl);
+    if (remaining > 0) {
+      // 窗口在本定时器排好之后被后续 429 延长了。此刻醒来就发等于提前回去撞,
+      // 所以只把自己重排到新的截止时刻。
+      armCooldownWake(sessionKey, entry, remaining);
+      return;
+    }
+    if (entry.dirty) void flush(sessionKey);
+  }, staggered);
+}
+
 function scheduleFlush(sessionKey: string, entry: CardEntry): void {
   entry.dirty = true;
   if (entry.flushTimer) return;
@@ -332,7 +428,9 @@ function isRetryableRegistryEditError(error: unknown): boolean {
   if (transportStatus === undefined && /^octo: /.test(message)) return false;
   const semanticStatus = semanticHttpStatusFromApiError(error);
   const errorCode = errorCodeFromApiError(error);
-  return transportStatus === undefined || transportStatus === 429 || transportStatus >= 500 ||
+  // 429 归 postJson 那一处退避管,而进度帧对它整体弃权:在这里按 100/250ms 重试是无视
+  // 服务端给的等待时间空转,叠上 postJson 的重试后单帧最坏九次请求。限流由冷却门处理。
+  return transportStatus === undefined || transportStatus >= 500 ||
     (semanticStatus !== undefined && semanticStatus >= 500) || errorCode === "err.shared.internal";
 }
 
@@ -392,6 +490,7 @@ async function editEntryProgress(params: {
       // Reserve inside the single Registry queue: reservation order now equals request order, so
       // a later CAS value cannot commit before an earlier one and make it stale on arrival.
       const cardSeq = entry.nextCardSeq++;
+      const isTransientFrame = !!params.transient && !TERMINAL_TEMPLATE_STATES.has(data.state);
       await editTemplateCardWithRetry({
         apiUrl: entry.ctx.apiUrl,
         botToken: entry.ctx.botToken,
@@ -405,9 +504,10 @@ async function editEntryProgress(params: {
         // 调用方意图 **与** 非终态双重约束。只看 state 会把 markCardPaused 的持久 paused 帧
         // (contractState 映射成 reasoning,却可能挂上 PAUSED_CARD_TTL_MS=1h)误标 transient;
         // 只看调用方意图又会漏掉从 debounce flush 路径(恒 transient:true)到达的 stopped 终态。
-        ...(params.transient && !TERMINAL_TEMPLATE_STATES.has(data.state)
-          ? { transient: true }
-          : {}),
+        ...(isTransientFrame ? { transient: true } : {}),
+        // 同一个判定管弃权:可丢弃的帧不在 flush 里睡等退避(会占住 inFlight 拖住后面的帧,
+        // 限流交给冷却门),而终态帧必须落地,所以保留默认退避 —— 哪怕它是从 debounce 路径来的。
+        ...(isTransientFrame ? { retryOn429: false } : {}),
         signal: params.signal,
       });
       return true;
@@ -448,6 +548,16 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
   try {
     // 首帧前做一次 D12 gate。明确禁用 → 永久跳过本 session;瞬时失败 → 本轮不发,
     // 下次 flush(下个工具事件触发)重探,避免一次抖动永久关闭本 session。
+    // 冷却门必须在能力探测之前:profile GET 打的是同一个 per-IP 桶,冷却期内每个工具事件都
+    // 探一次等于继续敲服务端刚点名要我们停下的那扇门。另一个 bot/session 已经学到的窗口也
+    // 应该立刻生效,而不是等这次 GET 打完才算。
+    const cooldownBeforeProbe = cooldownRemainingMs(entry.ctx.apiUrl);
+    if (cooldownBeforeProbe > 0) {
+      entry.dirty = true; // 唤醒定时器会带着最新状态回来
+      armCooldownWake(sessionKey, entry, cooldownBeforeProbe);
+      return;
+    }
+
     if (!entry.messageId) {
       const gate = await gateEnabled(entry.ctx, signal);
       // gate await 期间 entry 可能已被同 sessionKey 的下一 run 或跨身份上下文替换。
@@ -455,15 +565,46 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
       if (!isCurrentEntry(sessionKey, entry)) return;
       if (gate === false) {
         entry.skip = true;
+        // 这条 session 永久不再发帧了,留着冷却唤醒只会白白持有 entry 到窗口到期。
+        clearCooldownTimer(entry);
         return;
       }
       if (gate === null) {
-        // 瞬时探测失败:清 dirty 且不自动重排,避免端点故障期每 ~800ms 一次探测风暴。
-        // 累积的 steps 仍在 entry 上,下个工具事件会重新 scheduleFlush 并重探。
-        entry.dirty = false;
+        // 探测失败的原因之一就是这次 GET 自己撞了 429,而它刚把窗口记下来。这两种失败要区
+        // 别对待:
+        //
+        // 窗口开着 —— 保持 dirty 并排唤醒。唤醒本身就是节奏控制(到期一次,不是每 800ms
+        // 一次),而清掉 dirty 会让唤醒回调的 `if (entry.dirty)` 空转,那一帧就只能等下一个
+        // 事件 —— 没有下一个事件就永远发不出去。
+        //
+        // 窗口没开(端点 5xx / 网络抖动)—— 清 dirty 且不自排,否则端点故障期每 ~800ms 探
+        // 一次。累积的 steps 仍在 entry 上,下个工具事件会重新 scheduleFlush 并重探。
+        const cooldownAfterProbe = cooldownRemainingMs(entry.ctx.apiUrl);
+        if (cooldownAfterProbe > 0) {
+          entry.dirty = true;
+          armCooldownWake(sessionKey, entry, cooldownAfterProbe);
+        } else {
+          entry.dirty = false;
+        }
         return;
       }
       resolveEntryDeliveryMode(entry);
+    }
+
+    // resolveEntryDeliveryMode 在拿不到模板时会把本 session 永久标 skip;给一个已经放弃的
+    // entry 排一个最长五分钟的唤醒纯属白持有它和它的闭包(回调有 isCurrentEntry 兜底,不会
+    // 产生错误副作用,但和 gate 的两个 return 都清了定时器相比这里漏了就不对称)。
+    if (entry.skip || !isCurrentEntry(sessionKey, entry)) {
+      clearCooldownTimer(entry);
+      return;
+    }
+
+    // 进度帧可以丢,但在服务端刚点名的窗口里反复撞不行。留住最新状态,等窗口结束再发。
+    const cooldown = cooldownRemainingMs(entry.ctx.apiUrl);
+    if (cooldown > 0) {
+      entry.dirty = true; // 唤醒定时器会把最新状态发出去
+      armCooldownWake(sessionKey, entry, cooldown);
+      return;
     }
 
     entry.dirty = false;
@@ -484,6 +625,11 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         templateRef: entry.templateRef,
         state: data.state,
         data,
+        // The placeholder frame is part of the debounced flush path, so it opts out of the
+        // shared 429 backoff for the same reason the transient edits do: a sleep here holds
+        // entry.inFlight and stalls every frame queued behind it. Rate limiting for progress
+        // frames is handled by the cooldown gate instead.
+        retryOn429: false,
         signal,
       });
       entry.messageId = res?.message_id;
@@ -515,11 +661,26 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         errorCodeFromApiError(err) !== "err.shared.internal") {
       entry.skip = true;
     }
+    if (err instanceof OctoApiError && err.isRateLimited) {
+      noteRateLimited(entry.ctx.apiUrl, err.retryAfterMs);
+      // 重新标脏并排唤醒,让这一帧被**暂缓**而不是丢掉:dirty 在发送前已被清,否则真正撞上
+      // 限流的这一帧会成为唯一没人重试的一帧,卡片停在旧状态直到下一个事件恰好到来。
+      // 暂缓让规则统一 —— 被限流的帧总会在窗口结束时带着最新状态发出。
+      if (isCurrentEntry(sessionKey, entry)) {
+        entry.dirty = true;
+        armCooldownWake(sessionKey, entry, cooldownRemainingMs(entry.ctx.apiUrl));
+      }
+    }
   } finally {
     if (entry.flushAbort === abort) entry.flushAbort = undefined;
     entry.inFlight = false;
     // 期间有新帧 → 再刷。entry 已被 finalize/clear 删除时不再重排,避免悬挂定时器。
-    if (entry.dirty && !entry.skip && cards.get(sessionKey) === entry) scheduleFlush(sessionKey, entry);
+    // 冷却期内不排 debounce:唤醒定时器已负责窗口结束后的那一次发送,再排一个 800ms 的
+    // 只会在整个窗口里反复进来又被挡回。
+    if (entry.dirty && !entry.skip && cards.get(sessionKey) === entry &&
+        cooldownRemainingMs(entry.ctx.apiUrl) === 0) {
+      scheduleFlush(sessionKey, entry);
+    }
   }
 }
 
@@ -533,6 +694,7 @@ function isTrackedEntry(sessionKey: string, entry: CardEntry): boolean {
 }
 
 function releasePausedCard(sessionKey: string, entry: CardEntry, reason: string): void {
+  clearCooldownTimer(entry);
   if (entry.pausedExpiryTimer) {
     clearTimeout(entry.pausedExpiryTimer);
     entry.pausedExpiryTimer = undefined;
@@ -591,6 +753,7 @@ async function editTrackedCardState(
       clearTimeout(entry.flushTimer);
       entry.flushTimer = undefined;
     }
+    clearCooldownTimer(entry);
     if (!isTrackedEntry(sessionKey, entry) || !entry.messageId) return;
 
     const now = Date.now();
@@ -756,6 +919,7 @@ export async function finalizeCard(
     try { await entry.flushPromise; } catch { /* flush 内部已告警 */ }
   }
   if (entry.flushTimer) clearTimeout(entry.flushTimer);
+  clearCooldownTimer(entry);
   // P1-g:若仍有 running thinking(agent 收尾时最后一次 model_call 之后未再调工具),
   // 用当前时间把它标 done + 算 duration —— 终态帧不留 ⏳。
   endRunningThinking(entry, Date.now());
@@ -838,6 +1002,7 @@ export async function finalizeCardWithResponse(
     clearTimeout(entry.flushTimer);
     entry.flushTimer = undefined;
   }
+  clearCooldownTimer(entry);
   endRunningThinking(entry, Date.now());
   if (entry.skip || !entry.messageId || cards.get(sessionKey) !== entry) return false;
   // Registry-authored messages can only be updated with template_ref + state + data.
@@ -853,6 +1018,7 @@ export function clearCard(sessionKey: string): void {
   for (const tracked of new Set([entry, paused].filter((item): item is CardEntry => !!item))) {
     if (tracked.flushTimer) clearTimeout(tracked.flushTimer);
     if (tracked.pausedExpiryTimer) clearTimeout(tracked.pausedExpiryTimer);
+    clearCooldownTimer(tracked);
     tracked.flushAbort?.abort(new Error("card entry cleared"));
     tracked.stateEditAbort?.abort(new Error("card entry cleared"));
     tracked.skip = true;
@@ -866,6 +1032,7 @@ export function _resetCardProgressForTests(): void {
   for (const e of new Set([...cards.values(), ...pausedCards.values()])) {
     if (e.flushTimer) clearTimeout(e.flushTimer);
     if (e.pausedExpiryTimer) clearTimeout(e.pausedExpiryTimer);
+    clearCooldownTimer(e);
     e.flushAbort?.abort(new Error("card progress reset"));
     e.stateEditAbort?.abort(new Error("card progress reset"));
     e.skip = true;
@@ -873,6 +1040,8 @@ export function _resetCardProgressForTests(): void {
   cards.clear();
   pausedCards.clear();
   _resetBotCardProfileCacheForTests();
+  // 否则一个测试撞出的冷却窗口会静默让后面的测试全都不发帧。
+  rateLimitedUntil.clear();
 }
 
 /**

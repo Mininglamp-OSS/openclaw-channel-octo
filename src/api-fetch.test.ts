@@ -2343,3 +2343,399 @@ describe("getCardProfile server-driven config", () => {
       .rejects.toThrow(/card\/profile failed \(500\)/);
   });
 });
+
+describe("postJson 429 backoff", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    global.fetch = originalFetch;
+  });
+
+  const rateLimited = (retryAfter: string | null = "1") => ({
+    ok: false,
+    status: 429,
+    statusText: "too many",
+    headers: {
+      get: (name: string) => (name.toLowerCase() === "retry-after" ? retryAfter : null),
+    },
+    text: async () => "rate limited",
+  });
+
+  const ok = (body = "{}") => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    text: async () => body,
+  });
+
+  it("retries after the server's wait and returns the retry's result", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(rateLimited())
+      .mockResolvedValueOnce(ok('{"a":1}'));
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+
+    const promise = postJson("https://x.test", "bf", "/v1/bot/sendMessage", {});
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(await promise).toEqual({ a: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws a structured error once the retries are spent", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+    const { OctoApiError } = await import("./api-error.js");
+
+    const promise = postJson("https://x.test", "bf", "/p", {});
+    const assertion = expect(promise).rejects.toBeInstanceOf(OctoApiError);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await assertion;
+    // Three attempts total: the original plus MAX_429_RETRIES.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry a non-429", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: "boom",
+      headers: { get: () => null },
+      text: async () => "boom",
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+
+    await expect(postJson("https://x.test", "bf", "/p", {})).rejects.toMatchObject({ status: 500 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry when the caller opts out", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+
+    await expect(
+      postJson("https://x.test", "bf", "/p", {}, undefined, { retryOn429: false }),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Retry-After is the earliest acceptable retry time, so jitter may only add. Pinned
+  // rather than sampled: the lower bound is the whole point of the property.
+  it("never waits less than the server asked", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0); // the lowest jitter multiplier
+    const fetchMock = vi.fn().mockResolvedValueOnce(rateLimited("2")).mockResolvedValueOnce(ok());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+
+    const promise = postJson("https://x.test", "bf", "/p", {});
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // still waiting one ms short of the ask
+    await vi.advanceTimersByTimeAsync(1);
+    await promise;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("adds at most a quarter on top of the server's wait", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.999999);
+    const fetchMock = vi.fn().mockResolvedValueOnce(rateLimited("2")).mockResolvedValueOnce(ok());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+
+    const promise = postJson("https://x.test", "bf", "/p", {});
+    await vi.advanceTimersByTimeAsync(2_500);
+    await promise;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives up instead of shortening a wait beyond the cap", async () => {
+    const { MAX_RETRY_AFTER_MS, postJson } = await import("./api-fetch.js");
+    const tooLong = String(MAX_RETRY_AFTER_MS / 1000 + 5);
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited(tooLong));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(postJson("https://x.test", "bf", "/p", {})).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops once the cumulative backoff budget is spent", async () => {
+    const { MAX_429_BACKOFF_WAIT_MS, MAX_RETRY_AFTER_MS, postJson } = await import(
+      "./api-fetch.js"
+    );
+    // Two waits at the cap exceed the budget, so the second retry is never armed.
+    expect(MAX_RETRY_AFTER_MS * 2).toBeGreaterThan(MAX_429_BACKOFF_WAIT_MS);
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited(String(MAX_RETRY_AFTER_MS / 1000)));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const promise = postJson("https://x.test", "bf", "/p", {});
+    const assertion = expect(promise).rejects.toMatchObject({ status: 429 });
+    await vi.advanceTimersByTimeAsync(MAX_429_BACKOFF_WAIT_MS + 1_000);
+    await assertion;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts mid-backoff and keeps the rate limit as the cause", async () => {
+    global.fetch = vi.fn().mockResolvedValue(rateLimited("5")) as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+    const controller = new AbortController();
+
+    const promise = postJson("https://x.test", "bf", "/p", {}, controller.signal);
+    const assertion = expect(promise).rejects.toMatchObject({
+      cause: expect.objectContaining({ status: 429 }),
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    controller.abort(new Error("caller gone"));
+    await assertion;
+  });
+
+  it("does not fetch at all when the signal is already aborted", async () => {
+    const fetchMock = vi.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+
+    await expect(
+      postJson("https://x.test", "bf", "/p", {}, AbortSignal.abort()),
+    ).rejects.toBeDefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("applies a default deadline when the caller passes no signal", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    global.fetch = vi.fn().mockResolvedValue(ok()) as unknown as typeof fetch;
+    const { DEFAULT_POST_TIMEOUT_MS, postJson } = await import("./api-fetch.js");
+
+    await postJson("https://x.test", "bf", "/p", {});
+    expect(timeoutSpy).toHaveBeenCalledWith(DEFAULT_POST_TIMEOUT_MS);
+  });
+
+  // A long poll deliberately asks for a deadline well past the default, so the caller's own
+  // deadline has to survive — the 30s default must not be layered on top of it and cut a
+  // legitimate 40s hold short.
+  it("does not impose the default deadline on a caller that brought its own", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    global.fetch = vi.fn().mockResolvedValue(ok()) as unknown as typeof fetch;
+    const { DEFAULT_POST_TIMEOUT_MS, postJson } = await import("./api-fetch.js");
+
+    await postJson("https://x.test", "bf", "/p", {}, AbortSignal.timeout(40_000));
+    const defaults = timeoutSpy.mock.calls.filter(([ms]) => ms === DEFAULT_POST_TIMEOUT_MS);
+    expect(defaults).toHaveLength(0);
+  });
+
+  it("keeps a caller signal live well past the default deadline", async () => {
+    const callerSignal = AbortSignal.timeout(40_000);
+    let seen: AbortSignal | undefined;
+    global.fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      seen = init.signal as AbortSignal;
+      return ok();
+    }) as unknown as typeof fetch;
+    const { DEFAULT_POST_TIMEOUT_MS, postJson } = await import("./api-fetch.js");
+
+    await postJson("https://x.test", "bf", "/p", {}, callerSignal);
+    await vi.advanceTimersByTimeAsync(DEFAULT_POST_TIMEOUT_MS + 5_000);
+    expect(seen?.aborted).toBe(false); // still alive at 35s, as a 40s hold requires
+  });
+
+  // The caller's signal wins for anything under the ceiling — the events long poll asks for
+  // 40s on purpose — but a signal with no deadline of its own must not make the request
+  // unbounded, which is the class of hang this module exists to remove.
+  it("caps even a caller-supplied signal at the hard ceiling", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    global.fetch = vi.fn().mockResolvedValue(ok()) as unknown as typeof fetch;
+    const { POST_HARD_CEILING_MS, postJson } = await import("./api-fetch.js");
+    const bareController = new AbortController();
+
+    await postJson("https://x.test", "bf", "/p", {}, bareController.signal);
+    expect(timeoutSpy).toHaveBeenCalledWith(POST_HARD_CEILING_MS);
+  });
+
+  it("leaves room for a 40s long-poll hold under the ceiling", async () => {
+    const { POST_HARD_CEILING_MS } = await import("./api-fetch.js");
+    // 30s hold + margin must fit, or the ceiling would abort a legitimate hold.
+    expect(POST_HARD_CEILING_MS).toBeGreaterThan(40_000);
+  });
+
+  it("rebuilds the default deadline for every attempt", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    const fetchMock = vi.fn().mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(ok());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { DEFAULT_POST_TIMEOUT_MS, postJson } = await import("./api-fetch.js");
+
+    const promise = postJson("https://x.test", "bf", "/p", {});
+    await vi.advanceTimersByTimeAsync(2_000);
+    await promise;
+    // One per attempt: a deadline built once outside the loop would leave the retry
+    // running on a budget the first attempt had already spent.
+    const deadlineCalls = timeoutSpy.mock.calls.filter(([ms]) => ms === DEFAULT_POST_TIMEOUT_MS);
+    expect(deadlineCalls).toHaveLength(2);
+  });
+
+  it("tolerates a rate-limit response without headers", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 429,
+      statusText: "too many",
+      text: async () => "rate limited",
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { postJson } = await import("./api-fetch.js");
+
+    const promise = postJson("https://x.test", "bf", "/p", {}, undefined, { retryOn429: false });
+    await expect(promise).rejects.toMatchObject({ status: 429, retryAfterMs: 1_000 });
+  });
+});
+
+describe("callers that opt out of the shared 429 backoff", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    global.fetch = originalFetch;
+  });
+
+  const rateLimited = () => ({
+    ok: false,
+    status: 429,
+    statusText: "too many",
+    headers: {
+      get: (name: string) => (name.toLowerCase() === "retry-after" ? "1" : null),
+    },
+    text: async () => "rate limited",
+  });
+
+  // Each of these has a cadence of its own — a periodic beat, a discardable hint, or a
+  // sequential loop that paces itself — so a sleep hidden inside the call is wrong even
+  // though the backoff itself is correct.
+  it("sendHeartbeat issues exactly one request on 429", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { sendHeartbeat } = await import("./api-fetch.js");
+
+    await expect(
+      sendHeartbeat({ apiUrl: "https://x.test", botToken: "bf" }),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("sendTyping issues exactly one request on 429", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { sendTyping } = await import("./api-fetch.js");
+
+    await expect(
+      sendTyping({
+        apiUrl: "https://x.test",
+        botToken: "bf",
+        channelId: "g",
+        channelType: ChannelType.Group,
+      }),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("sendReadReceipt issues exactly one request on 429", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { sendReadReceipt } = await import("./api-fetch.js");
+
+    await expect(
+      sendReadReceipt({
+        apiUrl: "https://x.test",
+        botToken: "bf",
+        channelId: "g",
+        channelType: ChannelType.Group,
+        messageIds: ["1"],
+      }),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetchBotEvents issues exactly one request on 429", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { fetchBotEvents } = await import("./api-fetch.js");
+
+    await expect(
+      fetchBotEvents({ apiUrl: "https://x.test", botToken: "bf", sinceEventId: 0 }),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("ackBotEvent issues exactly one request on 429", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { ackBotEvent } = await import("./api-fetch.js");
+
+    await expect(
+      ackBotEvent({ apiUrl: "https://x.test", botToken: "bf", eventId: 1 }),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // The card wrappers take the flag from their caller: a transient progress frame opts
+  // out, while a finalize frame keeps the backoff because that state has to land.
+  it.each([
+    ["sendCardMessage", "sendCardMessage"],
+    ["sendTemplateCardMessage", "sendTemplateCardMessage"],
+  ])("%s honours retryOn429: false", async (_name, fnName) => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mod = (await import("./api-fetch.js")) as unknown as Record<
+      string,
+      (params: Record<string, unknown>) => Promise<unknown>
+    >;
+
+    await expect(
+      mod[fnName]!({
+        apiUrl: "https://x.test",
+        botToken: "bf",
+        channelId: "g",
+        channelType: ChannelType.Group,
+        card: { type: "card" },
+        templateRef: { id: "t", version: "1" },
+        state: "reasoning",
+        data: { state: "reasoning" },
+        retryOn429: false,
+      }),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["editCardMessage", "editCardMessage"],
+    ["editTemplateCardMessage", "editTemplateCardMessage"],
+  ])("%s honours retryOn429: false", async (_name, fnName) => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimited());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mod = (await import("./api-fetch.js")) as unknown as Record<
+      string,
+      (params: Record<string, unknown>) => Promise<unknown>
+    >;
+
+    await expect(
+      mod[fnName]!({
+        apiUrl: "https://x.test",
+        botToken: "bf",
+        channelId: "g",
+        channelType: ChannelType.Group,
+        messageId: "m1",
+        card: { type: "card" },
+        templateRef: { id: "t", version: "1" },
+        state: "reasoning",
+        data: { state: "reasoning" },
+        cardSeq: 1,
+        retryOn429: false,
+      }),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

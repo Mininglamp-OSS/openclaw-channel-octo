@@ -5,6 +5,14 @@ import type {
 } from "openclaw/plugin-sdk";
 import type { ChannelOutboundContext } from "openclaw/plugin-sdk/channel-contract";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
+import { createHeartbeatLoop } from "./heartbeat.js";
+import { createConnectionWatchdog } from "./connection-watchdog.js";
+import {
+  buildWatchdogPredicate,
+  createDeferredReconnect,
+  createReconnectSequencer,
+  createSingleFlightFlag,
+} from "./reconnect-coordination.js";
 import { OctoConfigJsonSchema, type OctoConfig } from "./config-schema.js";
 import { CHANNEL_ID, MAX_UPLOAD_SIZE, stripAllChannelPrefixes, getChannelConfig } from "./constants.js";
 import { streamToFileWithCap } from "./stream-helpers.js";
@@ -1402,36 +1410,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 2. Resolve WebSocket URL
       const wsUrl = account.config.wsUrl || credentials.ws_url;
 
-      // 3. Start heartbeat timer
-      let heartbeatTimer: NodeJS.Timeout | null = null;
+      // 3. Account-scoped liveness and reconnect coordination.
+      //
+      // The heartbeat is wired further down, once `socket` exists for it to consult. It is
+      // no longer started or stopped by connection events: it used to be restartable only
+      // from onConnected, so a reconnect that never completed left the beat stopped for
+      // good, and its failures used to tear down the socket even though a REST beat says
+      // nothing about whether the socket is healthy.
       let stopped = false;
-
-      const startHeartbeat = () => {
-        if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-        heartbeatTimer = setInterval(() => {
-          if (stopped) return;
-          sendHeartbeat({
-            apiUrl: account.config.apiUrl,
-            botToken: account.config.botToken!,
-          }).then(() => {
-            consecutiveHeartbeatFailures = 0; // Reset on success
-          }).catch(async (err) => {
-            consecutiveHeartbeatFailures++;
-            log?.error?.(`octo: [${account.accountId}] heartbeat failed (${consecutiveHeartbeatFailures}/${MAX_HEARTBEAT_FAILURES}): ${String(err)}`);
-            if (consecutiveHeartbeatFailures >= MAX_HEARTBEAT_FAILURES && !stopped) {
-              log?.warn?.(`octo: [${account.accountId}] too many heartbeat failures, triggering reconnect...`);
-              consecutiveHeartbeatFailures = 0;
-              if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-              const backoffMs = 3000 + Math.floor(Math.random() * 2000);
-              await new Promise(r => setTimeout(r, backoffMs));
-              if (stopped) return;
-              await socket.disconnectAndWait();
-              socket.stopReconnectTimer();
-              socket.connect();
-            }
-          });
-        }, account.config.heartbeatIntervalMs);
-      };
 
       // 4. Group history map — persists across auto-restarts (module-level)
       const groupHistories = getOrCreateHistoryMap(account.accountId);
@@ -1458,14 +1444,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 5. Token refresh state — time-based cooldown to prevent refresh storms
       let lastTokenRefreshAt = 0;
       const TOKEN_REFRESH_COOLDOWN_MS = 60_000; // 60 seconds
-      let isRefreshingToken = false; // Guard against concurrent refreshes (#43)
+      // Guard against concurrent refreshes (#43). A unit rather than a bare boolean because
+      // the lowering has to survive the inner call declining to run — see
+      // createSingleFlightFlag.
+      const refreshGuard = createSingleFlightFlag();
 
-      // 5b. Cooldown reconnect timer — deduplicate to prevent self-kick storms (#139)
-      let cooldownReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-      // 5c. Heartbeat failure tracking — reconnect after consecutive failures (#42)
-      let consecutiveHeartbeatFailures = 0;
-      const MAX_HEARTBEAT_FAILURES = 3;
+      // 5c. Serialises the reconnect sequences so the watchdog can tell that one is already
+      // running — including during the awaits, when nothing else shows it.
+      const reconnectSequencer = createReconnectSequencer({ log });
 
       const dispatchInboundMessage = (
         msg: BotMessage,
@@ -1612,13 +1598,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         onConnected: () => {
           log?.info?.(`octo: [${account.accountId}] WebSocket connected to ${wsUrl}`);
           statusSink({ lastError: null });
-          consecutiveHeartbeatFailures = 0;
-          startHeartbeat();
         },
 
         onDisconnected: () => {
           log?.warn?.(`octo: [${account.accountId}] WebSocket disconnected, will reconnect...`);
-          if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
           statusSink({ lastError: "disconnected" });
         },
 
@@ -1628,63 +1611,114 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
 
           // If kicked or connect failed, try refreshing the IM token with a cooldown
           // to prevent refresh storms (e.g. 9000+ refreshes across 11 bots).
-          // Use isRefreshingToken to prevent concurrent refresh attempts (#43)
+          // refreshGuard prevents concurrent refresh attempts (#43)
           const cooldownElapsed = Date.now() - lastTokenRefreshAt > TOKEN_REFRESH_COOLDOWN_MS;
-          if (cooldownElapsed && !isRefreshingToken && !stopped &&
+          if (cooldownElapsed && !refreshGuard.isRaised() && !stopped &&
               (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
-            isRefreshingToken = true;
             lastTokenRefreshAt = Date.now();
-            log?.warn?.(`octo: [${account.accountId}] connection rejected — refreshing IM token...`);
-            try {
-              await socket.disconnectAndWait();
-              const fresh = await registerBot({
-                apiUrl: account.config.apiUrl,
-                botToken: account.config.botToken!,
-                forceRefresh: true,
-                agentPlatform: "OpenClaw",
-                agentVersion: getAgentVersion(),
-                pluginVersion: PLUGIN_VERSION,
+            await refreshGuard.run(async () => {
+              log?.warn?.(`octo: [${account.accountId}] connection rejected — refreshing IM token...`);
+              await reconnectSequencer.run("token-refresh", async () => {
+                try {
+                  await socket.disconnectAndWait();
+                  if (stopped) return; // the account can stop during any of these awaits
+                  const fresh = await registerBot({
+                    apiUrl: account.config.apiUrl,
+                    botToken: account.config.botToken!,
+                    forceRefresh: true,
+                    agentPlatform: "OpenClaw",
+                    agentVersion: getAgentVersion(),
+                    pluginVersion: PLUGIN_VERSION,
+                  });
+                  if (stopped) return;
+                  credentials = fresh;
+                  log?.info?.(`octo: [${account.accountId}] got fresh IM token, reconnecting WS...`);
+                  socket.updateCredentials(fresh.robot_id, fresh.im_token);
+                  // Stagger reconnect to avoid thundering herd when multiple bots
+                  // refresh tokens simultaneously after server-wide token expiry
+                  const staggerMs = Math.floor(Math.random() * 5000);
+                  log?.info?.(`octo: [${account.accountId}] staggering reconnect by ${staggerMs}ms`);
+                  await new Promise(r => setTimeout(r, staggerMs));
+                  if (stopped) return; // account was stopped during stagger delay
+                  socket.stopReconnectTimer();
+                  socket.connect();
+                } catch (refreshErr) {
+                  log?.error?.(`octo: [${account.accountId}] token refresh failed: ${String(refreshErr)}`);
+                  // Returning here used to end the story: needReconnect was already false and
+                  // disconnectAndWait had cleared the socket's own timer, so nothing was left
+                  // to try again and the account stayed dark until someone restarted the
+                  // process. Under a rate-limit storm /v1/bot/register is exactly as likely to
+                  // fail as the call that got us here, so this path is not hypothetical.
+                  deferredReconnect.schedule("post-register-retry");
+                }
               });
-              credentials = fresh;
-              log?.info?.(`octo: [${account.accountId}] got fresh IM token, reconnecting WS...`);
-              socket.updateCredentials(fresh.robot_id, fresh.im_token);
-              // Stagger reconnect to avoid thundering herd when multiple bots
-              // refresh tokens simultaneously after server-wide token expiry
-              const staggerMs = Math.floor(Math.random() * 5000);
-              log?.info?.(`octo: [${account.accountId}] staggering reconnect by ${staggerMs}ms`);
-              await new Promise(r => setTimeout(r, staggerMs));
-              if (stopped) return; // account was stopped during stagger delay
-              socket.connect();
-            } catch (refreshErr) {
-              log?.error?.(`octo: [${account.accountId}] token refresh failed: ${String(refreshErr)}`);
-              // Keep cooldown active even on failure to prevent rapid retry hammering
-            } finally {
-              isRefreshingToken = false;
-            }
-          } else if (!isRefreshingToken && !stopped &&
+            });
+          } else if (!refreshGuard.isRaised() && !stopped &&
               (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
             // Cooldown active — skip token refresh but still reconnect with current credentials.
-            // Deduplicate: clear any pending cooldown reconnect timer to prevent self-kick storms
-            // where multiple setTimeout callbacks fire simultaneously, each calling connect(),
-            // causing the same bot to have multiple WS connections that kick each other (#139).
-            if (cooldownReconnectTimer) {
-              clearTimeout(cooldownReconnectTimer);
-            }
             log?.warn?.(`octo: [${account.accountId}] cooldown active, scheduling reconnect with current credentials...`);
-            const backoffMs = 5000 + Math.floor(Math.random() * 5000);
-            cooldownReconnectTimer = setTimeout(async () => {
-              cooldownReconnectTimer = null;
-              if (!stopped) {
-                await socket.disconnectAndWait();
-                socket.stopReconnectTimer();
-                socket.connect();
-              }
-            }, backoffMs);
+            deferredReconnect.schedule("cooldown");
           }
         },
       });
 
+      // Must stay above socket.connect(): the onError closure defined earlier captures this
+      // binding, and connect() is what can trigger onError. Moving the start-up sequence
+      // (connect / heartbeat.start / watchdog.start) above this const turns that capture into
+      // a temporal-dead-zone throw, and the else-branch call site is not inside a try.
+      const deferredReconnect = createDeferredReconnect({
+        isStopped: () => stopped,
+        sequencer: reconnectSequencer,
+        run: async () => {
+          // The wait is 5-10s, which is long enough for the connection to have come back on
+          // its own. Tearing down a socket that is already carrying traffic is the very
+          // thing this change set out to stop doing.
+          if (socket.isConnected()) return;
+          await socket.disconnectAndWait();
+          if (stopped) return; // the account can stop while the teardown above runs
+          socket.stopReconnectTimer();
+          socket.connect();
+        },
+      });
+
+      const heartbeat = createHeartbeatLoop({
+        intervalMs: account.config.heartbeatIntervalMs,
+        accountId: account.accountId,
+        send: (signal) =>
+          sendHeartbeat({
+            apiUrl: account.config.apiUrl,
+            botToken: account.config.botToken!,
+            signal,
+          }),
+        // The post-CONNACK predicate, not the readyState one: a beat sent while the socket
+        // is merely OPEN would claim a liveness the connection cannot yet deliver.
+        isConnected: () => socket.isConnected(),
+        log,
+      });
+
+      const watchdog = createConnectionWatchdog({
+        accountId: account.accountId,
+        log,
+        shouldReconnect: buildWatchdogPredicate({
+          isStopped: () => stopped,
+          isReconnectInFlight: () => reconnectSequencer.isInFlight(),
+          isConnectingOrConnected: () => socket.isConnectingOrConnected(),
+          hasPendingReconnect: () => socket.hasPendingReconnect(),
+          isRefreshingToken: () => refreshGuard.isRaised(),
+          hasDeferredReconnect: () => deferredReconnect.isPending(),
+        }),
+        reconnect: () =>
+          reconnectSequencer.run("watchdog", async () => {
+            await socket.disconnectAndWait();
+            if (stopped) return;
+            socket.stopReconnectTimer();
+            socket.connect();
+          }),
+      });
+
       socket.connect();
+      heartbeat.start();
+      watchdog.start();
 
       // Keep Promise pending until stopped — gateway treats resolve as "account stopped"
       return new Promise((resolve) => {
@@ -1694,8 +1728,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           socket.disconnect();
           cardEventPoller?.stop();
           setCardEventPollStarter(account.accountId, undefined);
-          if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-          if (cooldownReconnectTimer) { clearTimeout(cooldownReconnectTimer); cooldownReconnectTimer = null; }
+          heartbeat.stop();
+          watchdog.stop();
+          deferredReconnect.cancel();
           stopPersonaPromptCache(account.accountId);
           ctx.setStatus({
             accountId: account.accountId,

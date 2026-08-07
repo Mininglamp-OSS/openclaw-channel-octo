@@ -4,6 +4,7 @@
  */
 
 import { ChannelType, MessageType, CARD_INTERACTIVE_PROFILE, CARD_PROFILE, CARD_VERSION, type CardProfile, type MentionEntity, type RichTextBlock, type SendMessageResult, type TargetCandidate } from "./types.js";
+import { OctoApiError } from "./api-error.js";
 import path from "path";
 import { open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -101,9 +102,64 @@ export const API_FETCH_STATUS_RE = /failed \((\d{3})\)/;
  *   as a generic failure.
  */
 export function httpStatusFromApiFetchError(err: unknown): number | undefined {
+  // OctoApiError carries the status as a field. The regex stays for the errors this
+  // module throws without building one, and for anything constructed before it existed.
+  if (err instanceof OctoApiError) return err.status;
   const message = err instanceof Error ? err.message : String(err);
   const match = message.match(API_FETCH_STATUS_RE);
   return match ? Number(match[1]) : undefined;
+}
+
+/** At most three attempts per call: the original plus two retries. */
+export const MAX_429_RETRIES = 2;
+/**
+ * A wait longer than this is not worth holding the call for. Used only to decide whether
+ * to retry — never to shorten the server's requested wait, because a shortened wait means
+ * going back before the server said we could.
+ */
+export const MAX_RETRY_AFTER_MS = 10_000;
+/** Cumulative backoff sleep budget for one call. Not an end-to-end deadline. */
+export const MAX_429_BACKOFF_WAIT_MS = 15_000;
+/**
+ * Deadline applied to a POST when the caller expresses none of its own.
+ *
+ * `fetch` has no default timeout, so without this a hung connection blocks its caller
+ * indefinitely. Callers that pass a signal keep full control: the events long poll asks
+ * for far more than this on purpose, and intersecting the two would abort a legitimate
+ * hold and discard the batch the server was about to return.
+ */
+export const DEFAULT_POST_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
+/**
+ * Absolute ceiling on one POST attempt, applied even when the caller supplied its own signal.
+ *
+ * The caller's signal is honoured as-is for anything under this, because it knows what this
+ * particular request needs — the events long poll deliberately asks for up to 40s and cutting
+ * it short would abort a legitimate hold. But a signal that carries no deadline at all would
+ * otherwise make the request unbounded, which is the class of hang this module is trying to
+ * remove; nothing here has any business running for a full minute.
+ */
+export const POST_HARD_CEILING_MS = 60_000;
+
+/** Sleep that rejects as soon as the caller's signal aborts, preserving `cause`. */
+function backoffSleep(ms: number, signal: AbortSignal | undefined, cause: unknown): Promise<void> {
+  const aborted = (): Error =>
+    new Error("aborted while backing off from a rate limit", { cause });
+  // Checked before arming anything: an abort that landed between the response returning
+  // and this call would otherwise be missed entirely and we would serve the full wait.
+  if (signal?.aborted) return Promise.reject(aborted());
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      // Surface the rate limiting as the cause; without it the failure site shows only a
+      // generic abort and the 429 diagnosis is lost.
+      reject(aborted());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export async function postJson<T>(
@@ -112,29 +168,67 @@ export async function postJson<T>(
   path: string,
   payload: Record<string, unknown>,
   signal?: AbortSignal,
+  opts?: { retryOn429?: boolean },
 ): Promise<T | undefined> {
   const url = `${apiUrl.replace(/\/+$/, "")}${path}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      ...DEFAULT_HEADERS,
-      Authorization: `Bearer ${botToken}`,
-    },
-    body: JSON.stringify(payload),
-    signal,
-  });
+  const retryOn429 = opts?.retryOn429 ?? true;
+  let waited = 0;
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Octo API ${path} failed (${response.status}): ${text || response.statusText}`);
-  }
+  for (let attempt = 0; ; attempt++) {
+    if (signal?.aborted) throw signal.reason;
 
-  const text = await response.text();
-  if (!text) return undefined;
-  try {
-    return parseOctoJson<T>(text);
-  } catch {
-    throw new Error(`Octo API ${path} returned invalid JSON: ${text.slice(0, 200)}`);
+    // Rebuilt per attempt: a deadline created once outside the loop is shared across
+    // attempts, so a retry could start on a budget the first attempt already spent.
+    const fetchSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(POST_HARD_CEILING_MS)])
+      : AbortSignal.timeout(DEFAULT_POST_TIMEOUT_MS);
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        ...DEFAULT_HEADERS,
+        Authorization: `Bearer ${botToken}`,
+      },
+      body: JSON.stringify(payload),
+      signal: fetchSignal,
+    });
+
+    if (response.ok) {
+      const text = await response.text();
+      if (!text) return undefined;
+      try {
+        return parseOctoJson<T>(text);
+      } catch {
+        throw new Error(`Octo API ${path} returned invalid JSON: ${text.slice(0, 200)}`);
+      }
+    }
+
+    const body = await response.text().catch(() => "");
+    const err = OctoApiError.from(response, path, body);
+
+    if (!err.isRateLimited) throw err;
+
+    // Logged on every rate limit, including the one we give up on: the scope and the
+    // remaining count are the only way to tell which bucket ran dry and whose traffic
+    // filled it, and they are discarded once this error leaves here.
+    console.warn(
+      `octo: rate limited on ${path} (scope=${err.rateLimitScope ?? "?"} ` +
+        `remaining=${err.rateLimitRemaining ?? "?"} retry_after=${err.retryAfterMs}ms) ` +
+        `attempt=${attempt + 1}/${retryOn429 ? MAX_429_RETRIES + 1 : 1}`,
+    );
+
+    if (!retryOn429 || attempt >= MAX_429_RETRIES) throw err;
+    // A wait this long is the server telling us to go away, not to try again shortly.
+    // Clamping it down instead would just return before it was ready for us.
+    if (err.retryAfterMs > MAX_RETRY_AFTER_MS) throw err;
+
+    // Jitter only ever adds. Retry-After is the earliest acceptable retry time, so a
+    // downward jitter would put us back on the server before it allowed it.
+    const delay = Math.round(err.retryAfterMs * (1 + Math.random() * 0.25));
+    if (waited + delay > MAX_429_BACKOFF_WAIT_MS) throw err;
+
+    await backoffSleep(delay, signal, err);
+    waited += delay;
   }
 }
 
@@ -464,6 +558,14 @@ export async function sendCardMessage(params: {
   onBehalfOf?: string;
   clientMsgNo?: string;
   signal?: AbortSignal;
+  /**
+   * Forwarded to postJson. A transient progress frame passes false: it is discardable, and
+   * holding the flush while we back off would block the frames behind it. Every current
+   * caller of this particular wrapper wants the default — their cards are user-visible and
+   * have to land — so the parameter reads as unused here; it is the uniform contract across
+   * the four card senders, not dead weight.
+   */
+  retryOn429?: boolean;
 }): Promise<SendMessageResult | undefined> {
   if (!params.channelId || !params.channelId.trim()) {
     throw new Error("octo: channelId is required to send a message");
@@ -497,7 +599,7 @@ export async function sendCardMessage(params: {
     payload,
     client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
     ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
-  }, params.signal);
+  }, params.signal, { retryOn429: params.retryOn429 ?? true });
 }
 
 export interface CardTemplateRef {
@@ -583,6 +685,12 @@ export async function sendTemplateCardMessage(params: {
   data: object;
   clientMsgNo?: string;
   signal?: AbortSignal;
+  /**
+   * Forwarded to postJson. A transient progress frame passes false: it is discardable,
+   * and holding the flush while we back off would block the frames behind it. A finalize
+   * frame leaves it unset, because that state has to land.
+   */
+  retryOn429?: boolean;
 }): Promise<SendMessageResult | undefined> {
   if (!params.channelId.trim()) {
     throw new Error("octo: channelId is required to send a message");
@@ -598,7 +706,7 @@ export async function sendTemplateCardMessage(params: {
       data: params.data,
     },
     client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
-  }, params.signal);
+  }, params.signal, { retryOn429: params.retryOn429 ?? true });
 }
 
 /**
@@ -630,6 +738,14 @@ export async function editCardMessage(params: {
   transient?: boolean;
   onBehalfOf?: string;
   signal?: AbortSignal;
+  /**
+   * Forwarded to postJson. A transient progress frame passes false: it is discardable, and
+   * holding the flush while we back off would block the frames behind it. Every current
+   * caller of this particular wrapper wants the default — their cards are user-visible and
+   * have to land — so the parameter reads as unused here; it is the uniform contract across
+   * the four card senders, not dead weight.
+   */
+  retryOn429?: boolean;
 }): Promise<void> {
   if (!params.messageId) {
     throw new Error("octo: messageId is required to edit a card");
@@ -662,7 +778,7 @@ export async function editCardMessage(params: {
     channel_type: params.channelType,
     content_edit: JSON.stringify(envelope),
     ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
-  }, params.signal);
+  }, params.signal, { retryOn429: params.retryOn429 ?? true });
 }
 
 /** Replace one Registry-authored card frame; raw content_edit is intentionally unavailable. */
@@ -678,6 +794,12 @@ export async function editTemplateCardMessage(params: {
   cardSeq: number;
   transient?: boolean;
   signal?: AbortSignal;
+  /**
+   * Forwarded to postJson. A transient progress frame passes false: it is discardable,
+   * and holding the flush while we back off would block the frames behind it. A finalize
+   * frame leaves it unset, because that state has to land.
+   */
+  retryOn429?: boolean;
 }): Promise<void> {
   if (!params.messageId) throw new Error("octo: messageId is required to edit a card");
   if (!params.channelId.trim()) throw new Error("octo: channelId is required to edit a card");
@@ -694,7 +816,7 @@ export async function editTemplateCardMessage(params: {
     data: params.data,
     card_seq: params.cardSeq,
     ...(params.transient ? { transient: true } : {}),
-  }, params.signal);
+  }, params.signal, { retryOn429: params.retryOn429 ?? true });
 }
 
 /**
@@ -832,7 +954,11 @@ export async function getCardProfile(params: {
   if (resp.status === 404) return { available: false, enabled: false };
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    throw new Error(`Bot API GET /v1/bot/card/profile failed (${resp.status}): ${text || resp.statusText}`);
+    // Structured, so a caller can tell a rate limit from any other failure and honour the
+    // wait the server asked for. This is the one hot path that does not go through postJson,
+    // and flattening a 429 into a generic Error here threw away the Retry-After that the
+    // progress-card cooldown needs.
+    throw OctoApiError.from(resp, "GET /v1/bot/card/profile", text);
   }
   // 端点已部署（available:true）；manifest 内容异常时保守视作 enabled:false。
   const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
@@ -889,6 +1015,11 @@ export async function fetchBotEvents(params: {
       ...(waitSeconds > 0 ? { wait: waitSeconds } : {}),
     },
     params.signal ?? AbortSignal.timeout(eventsPollTimeoutMs(waitSeconds)),
+    // The poll loop paces itself from the outcome of each request, with an exponential
+    // backoff on errors. It also infers "did the server hold?" from the time elapsed
+    // around this call, and a sleep inside it would inflate that measurement: a fast
+    // empty return after a backoff reads as an honoured hold and re-polls immediately.
+    { retryOn429: false },
   );
   return Array.isArray(response?.results) ? response.results : [];
 }
@@ -906,6 +1037,11 @@ export async function ackBotEvent(params: {
     `/v1/bot/events/${params.eventId}/ack`,
     {},
     params.signal ?? AbortSignal.timeout(EVENTS_POLL_TIMEOUT_MS),
+    // An ack runs inside the poll loop's sequential drain and its failure is only
+    // logged — it never becomes a poll outcome, so nothing downstream would pace a
+    // retry. Sleeping here would just stall the events queued behind this one, and the
+    // cursor is persisted before the ack, so a lost ack costs at most one redelivery.
+    { retryOn429: false },
   );
 }
 
@@ -921,7 +1057,9 @@ export async function sendTyping(params: {
     channel_id: params.channelId,
     channel_type: params.channelType,
     ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
-  }, params.signal);
+    // A discardable hint, re-sent every few seconds while the model works. Retrying it
+    // only adds pressure to a bucket that is already empty.
+  }, params.signal, { retryOn429: false });
 }
 
 export async function sendReadReceipt(params: {
@@ -936,7 +1074,8 @@ export async function sendReadReceipt(params: {
     channel_id: params.channelId,
     channel_type: params.channelType,
     ...(params.messageIds && params.messageIds.length > 0 ? { message_ids: params.messageIds } : {}),
-  }, params.signal);
+    // Same reasoning as typing: nothing downstream depends on this landing.
+  }, params.signal, { retryOn429: false });
 }
 
 export async function sendHeartbeat(params: {
@@ -944,7 +1083,12 @@ export async function sendHeartbeat(params: {
   botToken: string;
   signal?: AbortSignal;
 }): Promise<void> {
-  await postJson(params.apiUrl, params.botToken, "/v1/bot/heartbeat", {}, params.signal);
+  await postJson(params.apiUrl, params.botToken, "/v1/bot/heartbeat", {}, params.signal, {
+    // A missed beat costs nothing: the next one is one interval away, and no server-side
+    // reader consumes the heartbeat key. Sleeping inside the call would only add pressure
+    // to a bucket that is already empty, and would hold the beat's single-flight slot.
+    retryOn429: false,
+  });
 }
 
 
