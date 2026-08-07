@@ -30,6 +30,11 @@ const REAL_HEADERS = {
   "content-type": "application/json; charset=utf-8",
 };
 
+/** 1s Retry-After times the 1.25 jitter ceiling. */
+const JITTER_CEILING_MS = 1_250;
+/** Timer scheduling and a real socket round trip are not free; this is not extra jitter budget. */
+const SCHEDULING_SLACK_MS = 250;
+
 let limitedResponses = 0;
 let succeedAfter = Number.POSITIVE_INFINITY;
 const attemptAt = [];
@@ -93,7 +98,10 @@ const checks = [
   ["reads the server's 1s wait off the real headers", err?.retryAfterMs === 1000],
   [`makes exactly ${MAX_429_RETRIES + 1} attempts`, gaps1.length === MAX_429_RETRIES],
   ["never retries earlier than the server asked", gaps1.every((g) => g >= 1000)],
-  ["never waits more than the jitter allows", gaps1.every((g) => g <= 1250 + 250)],
+  [
+    `never waits more than jitter allows (<= ${JITTER_CEILING_MS}ms + ${SCHEDULING_SLACK_MS}ms slack)`,
+    gaps1.every((g) => g <= JITTER_CEILING_MS + SCHEDULING_SLACK_MS),
+  ],
   ["a retry that succeeds returns the retry's body", ok !== undefined],
   ["the successful run waited too", gaps2.every((g) => g >= 1000)],
   ["an opted-out caller sends exactly once", attemptAt.length === 1],

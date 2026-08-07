@@ -5,7 +5,20 @@
 import { OctoApiError } from "../dist/src/api-error.js";
 
 const url = process.argv[2] ?? "http://127.0.0.1:8090/v1/users/me";
+
+// The entire point of this script is to empty a rate-limit bucket, so pointing it at a shared
+// or production host is a load test nobody asked for. One pasted command is all it would take.
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const { hostname } = new URL(url);
+if (!LOOPBACK.has(hostname) && process.env.OCTO_VERIFY_ALLOW_REMOTE !== "1") {
+  console.error(
+    `refusing to flood ${hostname}: this script drains a rate-limit bucket on purpose.\n` +
+      `Point it at a local server, or set OCTO_VERIFY_ALLOW_REMOTE=1 if you own the target.`,
+  );
+  process.exit(2);
+}
 const CONCURRENCY = 400;
+const PER_REQUEST_TIMEOUT_MS = 5_000;
 const ROUNDS = 30;
 
 let firstLimited = null;
@@ -14,7 +27,7 @@ let sent = 0;
 
 async function one() {
   try {
-    const resp = await fetch(url, { method: "GET" });
+    const resp = await fetch(url, { method: "GET", signal: AbortSignal.timeout(PER_REQUEST_TIMEOUT_MS) });
     sent++;
     codes.set(resp.status, (codes.get(resp.status) ?? 0) + 1);
     if (resp.status === 429 && !firstLimited) {

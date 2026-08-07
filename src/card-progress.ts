@@ -485,6 +485,7 @@ async function editEntryProgress(params: {
       // Reserve inside the single Registry queue: reservation order now equals request order, so
       // a later CAS value cannot commit before an earlier one and make it stale on arrival.
       const cardSeq = entry.nextCardSeq++;
+      const isTransientFrame = !!params.transient && !TERMINAL_TEMPLATE_STATES.has(data.state);
       await editTemplateCardWithRetry({
         apiUrl: entry.ctx.apiUrl,
         botToken: entry.ctx.botToken,
@@ -498,13 +499,10 @@ async function editEntryProgress(params: {
         // 调用方意图 **与** 非终态双重约束。只看 state 会把 markCardPaused 的持久 paused 帧
         // (contractState 映射成 reasoning,却可能挂上 PAUSED_CARD_TTL_MS=1h)误标 transient;
         // 只看调用方意图又会漏掉从 debounce flush 路径(恒 transient:true)到达的 stopped 终态。
-        ...(params.transient && !TERMINAL_TEMPLATE_STATES.has(data.state)
-          ? { transient: true }
-          : {}),
-        // A transient frame opts out of the shared 429 backoff. It is discardable, and
-        // sleeping inside the call would hold entry.inFlight for the whole wait, blocking
-        // the frames behind it. Rate limiting is handled by the cooldown gate instead.
-        ...(params.transient ? { retryOn429: false } : {}),
+        ...(isTransientFrame ? { transient: true } : {}),
+        // 同一个判定管弃权:可丢弃的帧不在 flush 里睡等退避(会占住 inFlight 拖住后面的帧,
+        // 限流交给冷却门),而终态帧必须落地,所以保留默认退避 —— 哪怕它是从 debounce 路径来的。
+        ...(isTransientFrame ? { retryOn429: false } : {}),
         signal: params.signal,
       });
       return true;
@@ -565,6 +563,14 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         return;
       }
       resolveEntryDeliveryMode(entry);
+    }
+
+    // resolveEntryDeliveryMode 在拿不到模板时会把本 session 永久标 skip;给一个已经放弃的
+    // entry 排一个最长五分钟的唤醒纯属白持有它和它的闭包(回调有 isCurrentEntry 兜底,不会
+    // 产生错误副作用,但和 gate 的两个 return 都清了定时器相比这里漏了就不对称)。
+    if (entry.skip || !isCurrentEntry(sessionKey, entry)) {
+      clearCooldownTimer(entry);
+      return;
     }
 
     // 进度帧可以丢,但在服务端刚点名的窗口里反复撞不行。留住最新状态,等窗口结束再发。

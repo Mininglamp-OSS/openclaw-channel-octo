@@ -185,7 +185,7 @@ describe("connection build-up deadline", () => {
     expect(ws.closed).toBe(false);
   });
 
-  // The branch N2 fixed. A CONNACK reporting a failed connect used to leave the socket OPEN
+  // A CONNACK reporting a failed connect used to leave the socket OPEN
   // and non-null, so readyState claimed somebody was still connecting and the supervisor
   // stayed out of the way forever.
   it("closes and drops the socket when CONNACK reports a failed connect", async () => {

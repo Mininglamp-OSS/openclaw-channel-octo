@@ -146,7 +146,7 @@ loop:
 
 **这不是我们在"非目标"里否掉的自限流。** 自限流是插件**猜**服务端还剩多少额度；冷却门只是**遵守服务端明确告知的最早重试时间**，输入完全来自响应本身。
 
-**丢帧后的行为要如实描述（不要过度承诺）：** 429 不会置 `entry.skip`（`:644` 的 fail-closed 条件显式排除了 429），所以不会永久禁用；但 `:652` 的重排条件是 `entry.dirty`，而 `dirty` 只由**新事件**置真 —— 若在途期间没有新事件，这一帧就是被丢掉，等下一个事件重新渲染，**不会自动重试**。这是刻意接受的策略，不是漏洞。
+**被限流的帧是暂缓，不是丢弃。** 429 不会置 `entry.skip`（fail-closed 条件显式排除了 429），所以不会永久禁用本 session。但 `dirty` 在发送前已被清，若不额外处理，真正撞上限流的这一帧会成为唯一没人重试的一帧 —— 卡片停在旧状态，直到下一个事件恰好到来。所以 429 的 catch 里重新置 `dirty` 并排唤醒，规则统一：**被限流的帧总会在窗口结束时带着最新状态发出**，即使之后再没有任何新事件。
 
 ### 4. `src/heartbeat.ts`（新文件）—— 心跳与 WS 解耦
 
@@ -295,7 +295,7 @@ WS 断开（任何原因）
 - 退避中 `signal` abort → 立刻抛，且 `cause` 是原 `OctoApiError`
 - 进入时 signal 已 aborted → 不发请求
 - **调用方未传 signal 时，fetch 仍带 `DEFAULT_TIMEOUT_MS` 的内部 deadline**（挂住的 fetch 会被中断）
-- **调用方传了 signal 时，只用调用方的，不与内部 deadline 求交集** —— 用 `fetchBotEvents` 的 long-poll 场景锁死：`waitSeconds = 30` 时 40s 的超时不得被砍到 30s
+- **调用方传了 signal 时，不叠默认 30s deadline** —— 用 `fetchBotEvents` 的 long-poll 场景锁死：`waitSeconds = 30` 时 40s 的超时不得被砍到 30s；但仍与 `POST_HARD_CEILING_MS`（60s）求交，锁死"裸 controller signal 也不会无界"这条不变量
 - **deadline 每次尝试重建**：第 1 次尝试耗掉大部分 deadline 后，第 2 次尝试仍有完整预算
 - 响应对象缺 `headers` 时不抛 `TypeError`，退回默认 `retryAfterMs`
 
@@ -333,8 +333,8 @@ WS 断开（任何原因）
 - ⚠️ **`:879-918` 与 `:2659-2681` 会真的挂**：两处 mock 的失败响应都是 `{ok:false, status, …}` 形状、**没有 `headers`**；postJson 读 `Retry-After` 会 `TypeError`。两件事都要做：`OctoApiError.from()` 容错读头（见 §2），以及给这些 mock 补 `headers`。
 - ⚠️ `:879-918` 的 `it.each([429, 503])` 断言 `/sendMessage` 恰好 2 次 —— 429 与 503 的路径在本设计下已分岔（429 不重试且受冷却门约束、503 仍按原策略重试），必须按新语义拆开重写，不能沿用同一个 each。
 - 新增：transient 帧遇 429 → 只发一次、`entry.skip` 保持 false
-- 新增：429 后**没有新事件** → 该帧被丢弃、不自动重试（如实锁住 §3 的策略）
-- 新增：429 后**有新事件** → 下一帧正常渲染发送（这也是 `:879-918` / `:2659-2681` 原有的契约）
+- 新增：429 后**没有新事件** → 窗口到期时仍把那一帧发出去（锁住 §3 的"暂缓不丢弃"）
+- 新增：429 后**有新事件** → 窗口内一律不发，到期只发最新一帧（中间帧被合并）
 - 新增：**冷却门** —— 429 之后在 `rateLimitedUntil` 窗口内持续产生新事件，期间**不再发出任何 transient edit**；窗口到期后只发**最新一帧**（中间帧被合并掉）
 - 新增：**冷却门按 `apiUrl` 共享** —— 同 `apiUrl` 的另一个 session 在窗口内同样被拦；`https://x.test` 与 `https://x.test/` 落进同一个桶
 - 新增：**单调更新** —— 窗口内又来一个 `retry_after` 更小的 429，已有到期时间**不被缩短**
@@ -368,7 +368,7 @@ WS 断开（任何原因）
 - `postJson` 新增第 6 个可选参数。已核实全部 13 个调用点（`api-fetch.ts:163,308,378,460,548,616,645,779,799,816,831,843,871`）均只传 5 个位置参数，测试文件无直接调用 —— 加第 6 个可选参数不冲突。
 - `OctoApiError.message` 保持既有格式，`httpStatusFromApiFetchError` 双路径兼容（见 §1）。
 - **行为变化 1**：`postJson` 从"调用方不传 signal 就无超时"变成"总有 `DEFAULT_TIMEOUT_MS` 内部 deadline"。这是修 bug，但确实是行为变化 —— 极慢的合法请求会被 30s 截断。
-- **行为变化 2**：card-progress 的 429 不再本地重试、transient 帧也不退避，改为丢帧 + 等下一事件。`channels status` 也看不到心跳故障（见 §4 的代价说明）。
+- **行为变化 2**：card-progress 的 429 不再本地重试、transient 帧也不在 flush 里退避，改为按 `apiUrl` 记冷却窗口、窗口内暂缓、到期发最新一帧（上限 5 分钟）。`channels status` 也看不到心跳故障（见 §4 的代价说明）。
 - **行为变化 3**：心跳失败不再触发重连。这条契约在 `reconnect-fixes.test.ts:383-432` 有明文测试，需一并改写。
 
 ## 开放问题（需 caster 拍板）

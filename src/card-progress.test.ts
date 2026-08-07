@@ -660,6 +660,58 @@ describe("progress frames under rate limiting", () => {
     expect(wire.frameCount()).toBe(framesBefore);
   });
 
+  // Contract: a terminal frame has to land. If the cooldown gate ever grew to cover the
+  // terminal edit, a rate-limited card would freeze on "working" forever — and nothing else
+  // in the suite would go red.
+  it("lets a finalize frame through inside the window", async () => {
+    const wire = rateLimitedWire({ retryAfterSeconds: 30, limitFrom: 1 });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("cool-6", context({ apiUrl: "https://cool6.test" }));
+
+    await triggerFirstFrame(handlers, "cool-6");
+    await toolEvent(handlers, "cool-6", "t2"); // 429 opens a 30s window
+    const during = wire.frameCount();
+
+    await finalizeCard("cool-6");
+    expect(wire.frameCount()).toBeGreaterThan(during);
+  });
+
+  // Contract 6 (the deadline only ever moves later) has no honest test at this level, and
+  // saying so is more useful than a test that passes for the wrong reason.
+  //
+  // A shorter wait can only shorten an open window if two flushes both clear the gate before
+  // either records its 429. Trying to arrange that showed the gate is tighter than assumed:
+  // the second flush is already blocked by the first one's window, so only one 429 ever
+  // lands. Faking the race would mean reaching into module state that is deliberately
+  // private. The Math.max in noteRateLimited stays as defence against a future caller that
+  // does record concurrently — reviewed by reading, not by test.
+
+  // Contract: 429 is transient. The fail-closed branch that disables a session on a
+  // deterministic 4xx carves it out, so frames resume once the window closes.
+  it("keeps the card enabled — a 429 is not a permanent rejection", async () => {
+    const wire = rateLimitedWire({ retryAfterSeconds: 2, limitFrom: 1 });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("cool-7", context({ apiUrl: "https://cool7.test" }));
+
+    await triggerFirstFrame(handlers, "cool-7");
+    await toolEvent(handlers, "cool-7", "t2"); // 429
+    const during = wire.frameCount();
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    await toolEvent(handlers, "cool-7", "t3");
+    // A 4xx that meant "stop" would have skipped the session for good.
+    expect(wire.frameCount()).toBeGreaterThan(during);
+  });
+
+  // The two production call sites pass retryOn429: false, but a frame-count assertion here
+  // cannot see it: postJson's retries happen inside the flush, and under a clock that is not
+  // being advanced the extra attempts never fire, so the count is identical either way.
+  // Mutating the opt-out away leaves this whole block green — which is why the property is
+  // pinned where it is observable instead: api-fetch.test.ts asserts one request per
+  // rate-limited call for each of the four card wrappers.
+
   // The stale guard already blocks a replaced entry from sending, so a send-count assertion
   // cannot tell "timer cancelled" from "timer fired and was turned away". The leak itself is
   // what needs asserting.
