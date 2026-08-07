@@ -271,3 +271,38 @@ describe("buildInteractiveCard", () => {
     }, { ...caps, maxInputsBytes: 1 })).toEqual(expect.objectContaining({ error: "input definitions exceed max_inputs_bytes" }));
   });
 });
+
+describe("标题失败时的原因", () => {
+  const button = { id: "b", label: "ok", value: "v" };
+  // 归约跑在 cleanText 自己的 max 截断**之前**,所以一个超长且不含空白的标题会被界整段拒掉。
+  // 之前一律报「含敏感信息」,把作者指向了错误的方向 —— 真实原因是长度。
+  it("超长无空白 → 说长度,不说敏感", () => {
+    const r = buildInteractiveCard({ title: "T".repeat(4100), buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("too long to sanitize");
+    expect("error" in r && r.error).not.toContain("sensitive");
+  });
+  it("真敏感 → 说敏感", () => {
+    const r = buildInteractiveCard({ title: "my password is hunter2", buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("must not contain sensitive data");
+  });
+  it("空 → 说必填", () => {
+    const r = buildInteractiveCard({ title: "   ", buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("is required");
+  });
+  // 归约返回空还有第三个原因,而上面三条一条都盖不到它 —— 反向验证时把长度判据改成恒真,
+  // 这一组全绿,说明「短标题被告知超过 4000 字符」这个缺陷当时没有任何断言看得见。
+  it("短的不可解析 URL → 说 URL,不说长度", () => {
+    const r = buildInteractiveCard({ title: "http://[", buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("could not be parsed");
+    expect("error" in r && r.error, "5 个字符的标题被告知超过 4000 字符")
+      .not.toContain("too long");
+  });
+  // 超长、有空白、但切口之后那段敏感 —— 界拒的理由是内容不是长度,报错也要这么说。
+  it("超长但敏感尾巴 → 说敏感,不说长度", () => {
+    const title = `deploy notes ${"word ".repeat(900)} AKIAIOSFODNN7EXAMPLE`;
+    expect(title.length).toBeGreaterThan(4000);
+    const r = buildInteractiveCard({ title, buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("must not contain sensitive data");
+    expect("error" in r && r.error).not.toContain("too long");
+  });
+});

@@ -8,6 +8,8 @@ import {
   summarizeToolParams,
   sanitizeErrorText,
   reduceUrlsInText,
+  collapseForReduction,
+  boundedForReduction,
   fmtDuration,
   stepLine,
   cardSupports,
@@ -968,5 +970,95 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     expect(cardSupports({ inputs: new Set(["Input.Text"]) }, "Input.Number")).toBe(false);
     expect(cardSupports({ actions: new Set(["Action.ToggleVisibility"]) }, "Action.ToggleVisibility")).toBe(true);
     expect(cardSupports({ actions: new Set(["Action.Submit"]) }, "Action.ToggleVisibility")).toBe(false);
+  });
+});
+
+describe("归约管线的输入有界(每一处都自己有界,不靠调用方)", () => {
+  // 界丢掉的那一段要过一遍守卫,但**喂给守卫的量本身必须有界** —— 守卫里的正则不保证线性
+  // (JWT 那条在无点长串上是二次的:单块 120 KB 实测 5548 ms)。这里断言的是那条规则的
+  // **可观察形式**,不是耗时:切口之后 TAIL_SCAN_MAX 以内的凭据仍然让整串扣下,以外的不再。
+  it("尾部扫描到 TAIL_SCAN_MAX 为止", () => {
+    const kept = "word ".repeat(800).trim();          // 3999 字符,切口落在这里
+    const near = `${kept} ${"pad ".repeat(200)}AKIAIOSFODNN7EXAMPLE`;   // 密钥在尾巴第 ~800 位
+    const far  = `${kept} ${"pad ".repeat(1200)}AKIAIOSFODNN7EXAMPLE`;  // 密钥在尾巴第 ~4800 位
+    expect(reduceUrlsInText(near), "扫描窗口内的凭据应让整串扣下").toBe("");
+    expect(reduceUrlsInText(far), "扫描窗口外的凭据不再连累前面那段").toBe(kept);
+    // 但被放弃的只是"因为远处有东西连近处也不显示";远处那段本来就渲染不出来。
+    expect(reduceUrlsInText(far)).not.toContain("AKIA");
+  });
+
+  it("折叠空白之前先把原串收进 RAW_INPUT_MAX", () => {
+    // 折叠跑在界**之前**,所以界救不了它 —— 实测 32–92 ms/MB。
+    const head = "word ".repeat(20_000);                  // 100 KB,已超 64 KiB
+    // 64 KiB 之后的**普通**内容不参与输出。注意这一条只说"不参与输出",不说"中性" ——
+    // 见下一条:它参与判定。
+    expect(collapseForReduction(head + "TAILMARKER"))
+      .toBe(collapseForReduction(head));
+    // 上限之内的内容一字不差。
+    expect(collapseForReduction("a  b\n\nc")).toBe("a b c");
+    expect(collapseForReduction("x".repeat(1000))).toBe("x".repeat(1000));
+  });
+
+  it("折叠丢掉的那一段也要过谓词 —— 否则截断自己变成泄漏路径", () => {
+    // 上一版这里断言的是「尾巴被丢掉」,而那**正是缺陷本身**:它把一个 fail-open 的行为
+    // 写成了期望值。boundedForReduction 会检查自己丢掉的那一段,collapseForReduction 当时
+    // 只镜像了切口规则、没镜像这道守卫 —— 又一次「第二处该照着第一处写,却没有」。
+    //
+    // 压住整串的关键词落在 64 KiB 之外:折叠比 ~12,所以折叠后它离渲染出来的内容并不远,
+    // 「远处的东西不再压住近处」那条豁免在这里不成立。
+    const leaky = `user:hunter2@localhost ${("x" + " ".repeat(23)).repeat(3000)} y token`;
+    expect(leaky.length).toBeGreaterThan(64 * 1024);
+    expect(collapseForReduction(leaky), "被丢掉的 token 关键词没有参与判定").toBe("");
+    expect(sanitizeErrorText(leaky)).toBe("");
+    // 同样的串,尾巴不敏感时照常渲染 —— 这道守卫不是"超过 64 KiB 一律打空"。
+    const benign = `user hunter2 localhost ${("x" + " ".repeat(23)).repeat(3000)} y done`;
+    expect(collapseForReduction(benign)).not.toBe("");
+  });
+
+  it("exec 的程序名扫描自己有界,而且界的代价说得出口", () => {
+    // summarizeShell 跑在归约那道界**之上**,所以 REDUCE_INPUT_MAX 管不到它:4 MB 的 command
+    // 实测 201 ms,只为读出一个词。它现在自己先切一刀。
+    //
+    // 这一刀**有可观察的代价**,不是纯优化 —— 所以断言它,而不是只测耗时(耗时断言在 4 MB
+    // 这个量级上要么慢得不能进套件,要么松得抓不到东西)。程序名落在切口之后就读不到了:
+    const many = "A=1 ".repeat(1200) + "docker";      // 4806 字符,程序名在 4800 之后
+    expect(many.length).toBeGreaterThan(4000);
+    expect(summarizeToolParams("exec", { command: many }), "切口之后的程序名不该被读出来").toBe("");
+    // 切口之内一切如常 —— 这道界不是"超长就打空"。
+    const few = "A=1 ".repeat(100) + "docker";
+    expect(summarizeToolParams("exec", { command: few })).toBe("docker");
+    // 4000 字符以上的单 token 不可能是程序名,切不出空白就整条返回空。
+    expect(summarizeToolParams("exec", { command: "x".repeat(5000) })).toBe("");
+  });
+
+  it("尾部扫描窗口的末端也只能落在空白上", () => {
+    // 裸 slice 会把跨过窗口边界的 token 切成碎片,正则匹配不上,等于没扫:AKIA 起点落在 7986 时
+    // 窗口只盖住 20 个字符里的 14 个,而 `/AKIA[0-9A-Z]{12,}/` 要 16 个 —— 于是漏过去。
+    const head = "psql db-admin:Tr0ub4dor3@localhost";
+    const build = (at: number) => {
+      const s = head + " " + "x".repeat(4000 - head.length - 1);   // kept 正好 4000
+      return s + " " + "y".repeat(at - s.length - 1) + " AKIAIOSFODNN7EXAMPLE";
+    };
+    for (const at of [7982, 7986, 7991]) {
+      expect(boundedForReduction(build(at)), `AKIA 落在 ${at} 时被切碎、漏过了守卫`).toBeNull();
+    }
+  });
+});
+
+describe("process 工具的摘要", () => {
+  // 它此前映射到 `"shell"`,而 shell 策略读的是 `command`/`cmd` —— `process` 根本没有这两个
+  // 字段(参数是 `action` + `sessionId` 等),于是这个工具的摘要**恒为空串**。
+  it("渲染白名单内的动作名", () => {
+    expect(summarizeToolParams("process", { action: "kill", sessionId: "s1" })).toBe("kill");
+    expect(summarizeToolParams("process", { action: "list" })).toBe("list");
+    expect(summarizeToolParams("process", { action: "send-keys", keys: ["a"] })).toBe("send-keys");
+  });
+
+  it("认不出的动作退回空串,而不是原样渲染", () => {
+    // 上游 schema 把 action 声明成 Type.String,枚举只写在 description 里、并不强制,而
+    // openclaw 的依赖是范围不是 pin。所以失败模式选在"少显示一个词"这一侧。
+    expect(summarizeToolParams("process", { action: "rm -rf /" })).toBe("");
+    expect(summarizeToolParams("process", { action: "未来新增的动作" })).toBe("");
+    expect(summarizeToolParams("process", {})).toBe("");
   });
 });

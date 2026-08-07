@@ -13,7 +13,7 @@
  * 纯函数、无副作用、无 I/O —— hook 进度卡与 agent 展示卡工具共享这一层。
  */
 
-import { cardSupports, isSensitive, reduceUrlsInText, REDUCE_INPUT_MAX, type CardCaps } from "./card-render.js";
+import { cardSupports, collapseForReduction, isSensitive, reduceUrlsInText, REDUCE_INPUT_MAX, type CardCaps } from "./card-render.js";
 import { cardFitsLimits } from "./card-limits.js";
 import { CARD_VERSION } from "./types.js";
 
@@ -98,10 +98,30 @@ export interface BuildDisplayCardOptions {
    * 调用方覆盖它,避免同一张卡里中英混排。
    */
   dropMarker?: DropMarker;
+  /** 归约预算耗尽时的提示;与 dropMarker 同理,英文化的调用方覆盖它。 */
+  budgetMarker?: BudgetMarker;
 }
 
 /** dropped → 卡面文案 + plain 兜底文案(plain 略去括号里的原因,与正文行宽对齐)。 */
 export type DropMarker = (dropped: number) => { text: string; plain: string };
+
+/**
+ * 归约预算耗尽时的提示。与 `dropMarker` 同理 —— 整卡已英文化的调用方要能覆盖它,否则同一张卡
+ * 里中英混排。它**不带数量**:预算是在 sanitize 里逐段扣的,一个嵌套块可能只掉了其中一段,
+ * 编一个"少了 N 块"出来是错的。
+ */
+export type BudgetMarker = () => { text: string; plain: string };
+
+const DEFAULT_BUDGET_MARKER: BudgetMarker = () => ({
+  text: "… 部分内容超出本卡片的脱敏预算,未渲染",
+  plain: "… 部分内容未渲染",
+});
+
+/** 英文卡面用的预算提示(进度卡)。 */
+export const EN_BUDGET_MARKER: BudgetMarker = () => ({
+  text: "… some content exceeded this card's sanitization budget and was not rendered",
+  plain: "… some content not rendered",
+});
 
 const DEFAULT_DROP_MARKER: DropMarker = (dropped) => ({
   text: `… 省略 ${dropped} 项(超出服务端限制)`,
@@ -121,6 +141,22 @@ export interface BuildDisplayCardResult {
 
 // ── 文本清洗(与 card-render 的参数摘要/错误脱敏同套)────────
 /**
+ * 一张卡片能送进归约管线的字符总量。
+ *
+ * `REDUCE_INPUT_MAX` 管**单次调用**、`RAW_INPUT_MAX` 管**单次折叠**、`MAX_TOTAL_BLOCKS` 管
+ * **块数量** —— 没有一个管一张卡片的累计代价,而这条管线在同步路径上、无 try/catch,累计代价
+ * 就是事件循环停摆的时长。实测 200 块(`MAX_TOTAL_BLOCKS` 自己允许的额度)、每块 4000 字符:
+ *
+ *     普通英文散文   200 块    47 ms
+ *     冒号密集      200 块  1084 ms      ← 同样 800 KB,形状差 23 倍
+ *
+ * 所以按**字符**计,不按块计。计的是 `min(折叠后长度, REDUCE_INPUT_MAX)` —— 超出上限的部分
+ * 由界自己截掉、由 RAW_INPUT_MAX 挡住,不该按原长收费,否则一个超长块会独吞预算,而它今天
+ * 是能正常渲染的。
+ */
+const REDUCE_BUDGET_PER_CARD = 120_000;
+
+/**
  * 群卡片全员可见 → 与 summarizeToolParams/sanitizeErrorText 同套:
  *   1. 折叠空白;
  *   2. 内嵌 URL 降级为 `scheme://注册域`(丢子域/path/query/userinfo,杀 webhook/预签名/隧道
@@ -133,9 +169,30 @@ export interface BuildDisplayCardResult {
  *     git SHA / docker digest / 缓存哈希等正常内容二次误删(见 renderProgressCard 的 trusted)。
  * 返回 null 表示"敏感,不该展示";空串同 null(text-only block 无内容也不渲染)。
  */
-function sanitize(text: string, generic = true): string | null {
-  let s = text.replace(/\s+/g, " ").trim();
+function sanitize(text: string, ctx: RenderCtx): string | null {
+  const generic = ctx.generic;
+  // 预算耗尽之后一个字都不要再折叠。计费跑在折叠**之后**(要按管线真正处理的量计,见下面),
+  // 于是耗尽之后每个块仍要付一次最多 64 KiB 的折叠:实测 200 个 120 KB 块里有 170 个是白付的,
+  // 元素数从第 30 块起就钉死在 31,耗时却还在线性往上走(54 → 265 ms)。
+  if (ctx.reduce.exhausted) return null;
+  const sensitiveHere = (t: string) => isSensitive(t, generic);
+  // **谓词从第一步就要带上。** 折叠自己在 RAW_INPUT_MAX 处截断,被截掉的那一段要过同一道守卫 ——
+  // 上一版这里是不带谓词的 `collapseForReduction(text)`,于是 64 KiB 之外那个压住凭据的关键词
+  // 被无声丢掉,`user:hunter2@localhost …… token` 在 main 上渲染 `""`,在这里渲染出口令。
+  //
+  // 说清楚哪一半是有观测的:红的是**尾部扫描存在**(上面那条断言),不是**传的是调用方那个谓词**。
+  // 后者今天没有可观测差异,而且是可证的:缺省谓词取 `isSensitive(_, true)`,它是本模块所有
+  // 谓词里最严的一档(generic=true 在 false 之上多加长 hex/高熵;错误文本那道还多一条构建哈希
+  // 豁免)。所以漏传只会**多藏**,不会漏。传它是为了让两步不可能分岔 —— 哪天某个调用方的谓词
+  // 变得比缺省宽,这里就不必再想起来改。反向验证时它是绿的,如实记在这里,不假装它被覆盖了。
+  let s = collapseForReduction(text, sensitiveHere);
   if (!s) return null;
+  const cost = Math.min(s.length, REDUCE_INPUT_MAX);
+  if (cost > ctx.reduce.left) {
+    ctx.reduce.exhausted = true;
+    return null;
+  }
+  ctx.reduce.left -= cost;
   // 这个 sink **没有渲染上限** —— 与摘要(64)、错误(120)、debug 串(512)不同,一段长文本
   // 会整段渲染,所以界在这里的影响是直接可见的。曾经这里另有一道「截断前先在未截断原串上跑
   // isSensitive」的预检,用来挡住横跨切口被切成两半、守卫认不出的密钥。
@@ -149,8 +206,7 @@ function sanitize(text: string, generic = true): string | null {
   //     "https://hooks.slack.com/services/T../B../XXXX " + "word "×900
   //
   // 这种空白充裕、归约后完全安全的内容被整块丢掉(main 渲染 4517 字符)。
-  const sensitiveHere = (t: string) => isSensitive(t, generic);
-  s = reduceUrlsInText(s, sensitiveHere).replace(/\s+/g, " ").trim();
+  s = collapseForReduction(reduceUrlsInText(s, sensitiveHere), sensitiveHere);
   if (!s) return null;
   if (sensitiveHere(s)) return null;
   return s;
@@ -238,6 +294,8 @@ interface RenderCtx {
   uid: { n: number };
   /** 传给 sanitize 的 generic 档位:false=可信(进度卡),true=不可信(agent 展示卡,默认最严)。 */
   generic: boolean;
+  /** 本张卡片剩余的归约预算(字符)。见 REDUCE_BUDGET_PER_CARD。 */
+  reduce: { left: number; exhausted: boolean };
 }
 
 function nextId(ctx: RenderCtx, prefix: string): string {
@@ -263,19 +321,19 @@ function openUrlAction(title: string, url: string): Record<string, unknown> {
 }
 
 function renderHeading(text: string, size: "medium" | "large" | undefined, ctx: RenderCtx): Rendered {
-  const clean = sanitize(text, ctx.generic);
+  const clean = sanitize(text, ctx);
   if (!clean) return EMPTY;
   return { elements: [textBlock(clean, { bold: true, size })], plainLines: [clean] };
 }
 
 function renderText(text: string, ctx: RenderCtx): Rendered {
-  const clean = sanitize(text, ctx.generic);
+  const clean = sanitize(text, ctx);
   if (!clean) return EMPTY;
   return { elements: [textBlock(clean)], plainLines: [clean] };
 }
 
 function sanitizeUrlForAction(url: string, ctx: RenderCtx): string | null {
-  const clean = sanitize(url, ctx.generic);
+  const clean = sanitize(url, ctx);
   if (!clean) return null;
   try {
     const u = new URL(clean);
@@ -286,7 +344,7 @@ function sanitizeUrlForAction(url: string, ctx: RenderCtx): string | null {
 }
 
 function renderLink(text: string, url: string, ctx: RenderCtx): Rendered {
-  const cleanText = sanitize(text, ctx.generic);
+  const cleanText = sanitize(text, ctx);
   const cleanUrl = sanitizeUrlForAction(url, ctx);
   if (!cleanText || !cleanUrl) return EMPTY;
   if (cardSupports(ctx.caps, "ActionSet") && cardSupports(ctx.caps, "Action.OpenUrl")) {
@@ -312,15 +370,32 @@ function renderLink(text: string, url: string, ctx: RenderCtx): Rendered {
 function renderRich(segments: RichSegment[], ctx: RenderCtx): Rendered {
   const joined = segments.map((s) => s.text).join("");
   // clean 走完整 sanitize:对**整段 joined** 做 URL 降级(能抓到跨 segment 拆开的 URL)+ secret 检查。
-  const clean = sanitize(joined, ctx.generic);
+  const clean = sanitize(joined, ctx);
   if (!clean) return EMPTY;
   // 关键(F1 修复):仅当 joined 里**没有任何可降级 URL** 时,才保留逐段 TextRun 的富样式 ——
   // 否则某个 segment(或跨段拆开)的 URL 会以原文进 TextRun,而 plain 已降级 → card ⊋ plain 泄露。
   // 含 URL 时降级为单个 TextBlock(用已降级的 clean),card 与 plain 一致、绝不多出密钥。
-  // 这里**不传谓词**,因为传了也没用:`reduceUrlsInText(joined, P) === joined` 的结果与 P 无关。
-  // joined ≤ 4000 时界原样返回,与 P 无关;> 4000 时界要么返回 ""、要么返回一个 ≤4000 的前缀,
-  // 两者都不可能等于 joined。曾经这里传了一个谓词并配了段注释说"两次调用的界必须一致",那个
-  // 约束根本约束不到任何东西 —— 留着只会让下一个读者以为它在起作用。
+  // **判据必须建立在「即将写出去的字节就是被清洗过的那些字节」之上。**
+  //
+  // 下面这个 RichTextBlock 分支写出的是**每段的原文** `s.text`,不是 `clean`。所以判据一旦
+  // 建立在 `joined` 的任何一个**有损视图**上,超出那个视图的原文就会绕过清洗直接进卡片。
+  // 曾经为了省掉一趟管线,这里写成 `clean === collapseForReduction(joined)` —— 两边都出自
+  // 被 RAW_INPUT_MAX 截断过的视图,于是 64 KiB 之后的段原样渲染:
+  //
+  //     segments: [{ text: "Deployment summary\n" + " "×65536 },
+  //                { text: "AWS key AKIAIOSFODNN7EXAMPLE for the runner" }]
+  //       main   整块不渲染      那一版   TextRun 里带着 AKIA…
+  //
+  // 触发条件不是"必须是空白块":前 64 KiB 的折叠比超过约 20 就够了,一张 80 列对齐、单元格
+  // 大多为空的报表就是这个比例。
+  //
+  // 所以判据回到与原文直接比。代价是 rich 块要多跑一趟管线,省它省出一个泄漏,不可以。
+  //
+  // **但要说准这笔代价谁在兜。** 上一版写的是"被界和每卡片预算兜着" —— 界是真的(这一趟同样
+  // 走 boundedForReduction,单次有上限),**预算不是**:预算在 sanitize 里只扣一次,而 rich
+  // 这条路跑两趟。实测同样计费下 200 块冒号密集 text 517 ms / rich 1011 ms,1.96×。
+  // 也就是说 rich 块占满的卡片,实际天花板是 README 里那个数字的两倍。这是已知的、可接受的
+  // (两倍于 0.9 秒仍远好于 main 的 5.4 秒),但它得写下来,而不是被一句"预算兜着"盖过去。
   const noReducibleUrl = reduceUrlsInText(joined) === joined;
   if (noReducibleUrl && cardSupports(ctx.caps, "RichTextBlock")) {
     return {
@@ -437,8 +512,8 @@ function renderFacts(items: Fact[], ctx: RenderCtx): Rendered {
   // 每条键值独立过 sanitize:label 或 value 命中 secret → 该条隐藏,不影响其它条(细粒度)。
   const cleaned: Array<{ label: string; value: string }> = [];
   for (const f of items) {
-    const label = sanitize(f.label, ctx.generic);
-    const value = sanitize(f.value, ctx.generic);
+    const label = sanitize(f.label, ctx);
+    const value = sanitize(f.value, ctx);
     if (!label || !value) continue;
     cleaned.push({ label, value });
   }
@@ -523,18 +598,34 @@ function renderCollapsibleWithSummary(
   blocks: DisplayBlock[],
   ctx: RenderCtx,
 ): Rendered {
-  const rawSummary = summarySegments ? summarySegments.map((s) => s.text).join("") : summary;
-  const cleanSummary = sanitize(rawSummary, ctx.generic);
-  if (!cleanSummary) return EMPTY;
-  const rawExpandLabel = expandLabel ?? (actionLabel && actionLabel !== cleanSummary ? actionLabel : "展开");
-  const cleanExpandLabel = sanitize(rawExpandLabel, ctx.generic) ?? "展开";
-  const cleanCollapseLabel = sanitize(collapseLabel ?? "收起", ctx.generic) ?? "收起";
+  // summarySegments 在下面交给 renderRich,由它自己 sanitize —— 这里再 sanitize 一遍会把同一段
+  // 文本对预算收两次费(实测:20 个 collapsible 各带 3996 字符摘要与正文时,内容元素从 30 掉到
+  // 20)。只有走 textBlock 那条分支时才需要在这里清洗。
+  // 先算摘要再算正文。反过来的话,正文把预算花掉、摘要随后失败,这里 return EMPTY —— 正文扣掉
+  // 的每一个字符都白扣了,后面的块还因此少了额度。
+  //
+  // summarySegments 由 renderRich 自己 sanitize;这里不再另外清洗一遍 `summary`,那会把同一段
+  // 文本对预算收两次费(实测 12 个 collapsible 各带 3995 字符摘要与正文时,元素从 24 掉到 21)。
+  const summaryRendered = summarySegments
+    ? renderRich(summarySegments, ctx)
+    : (() => {
+        const clean = sanitize(summary, ctx);
+        return clean
+          ? { elements: [textBlock(clean, { bold: true })], plainLines: [clean] }
+          : EMPTY;
+      })();
+  const summaryElements = summaryRendered.elements;
+  if (summaryElements.length === 0) return EMPTY;
+  // **plain 用 renderRich 自己产出的行。** 第一版把 cleanSummary 置空之后,plain 仍然拼的是
+  // `[cleanSummary, ...]`,于是折叠态那一行标签在 plain 里变成空行 —— 而 plain 是每张卡都要
+  // 附带的兜底正文,摘要正是它最不能丢的一行。当时的测试只数元素个数,一路绿着。
+  const summaryPlain = summaryRendered.plainLines;
+  const dedupeAgainst = summarySegments ? summarySegments.map((seg) => seg.text).join("") : summary;
+  const rawExpandLabel = expandLabel ?? (actionLabel && actionLabel !== dedupeAgainst ? actionLabel : "展开");
+  const cleanExpandLabel = sanitize(rawExpandLabel, ctx) ?? "展开";
+  const cleanCollapseLabel = sanitize(collapseLabel ?? "收起", ctx) ?? "收起";
   const inner = renderBlocks(blocks, ctx);
   if (inner.elements.length === 0) return EMPTY;
-  const summaryElements = summarySegments
-    ? renderRich(summarySegments, ctx).elements
-    : [textBlock(cleanSummary, { bold: true })];
-  if (summaryElements.length === 0) return EMPTY;
 
   const canToggle =
     cardSupports(ctx.caps, "Container") &&
@@ -605,14 +696,14 @@ function renderCollapsibleWithSummary(
         },
       ],
       // plain 全展开,与折叠视觉无关。服务端 Finalize 会权威重算 plain。
-      plainLines: [cleanSummary, ...inner.plainLines],
+      plainLines: [...summaryPlain, ...inner.plainLines],
     };
   }
 
   // 降级:summary 当 heading + inner 全部展开在下方(零回归展开态)。
   return {
     elements: [...summaryElements, ...inner.elements],
-    plainLines: [cleanSummary, ...inner.plainLines],
+    plainLines: [...summaryPlain, ...inner.plainLines],
   };
 }
 
@@ -643,15 +734,28 @@ function renderCopy(label: string | undefined, text: string, ctx: RenderCtx): Re
   // TextBlock,告诉它"未渲染复制按钮"是句没有指涉的话。下面那条字节判定按同一条规则摆:它只约束
   // 复制按钮,所以整个判定都在回退之后。上一版把这条放在回退之前,违反了本文件自己写下、也自己
   // 断言过的那条不变量 —— 而断言之所以是绿的,是因为它那个用例走的是字节路径,压根没碰到这里。
+  // **判原始长度,不判折叠后长度。** 上一版改成了 `collapseForReduction(text).length`,理由是
+  // 「全是空白的 4001 字符折叠后什么都不剩,却拿到一句『内容超过 4000 字符』」。那个理由是真的,
+  // 但改法错得离谱,而且是两头都错:
+  //
+  //   - **它自己违反了上面那条不变量。** 折叠在 RAW_INPUT_MAX 处会截断,于是 70 KB 的输入折出
+  //     ≤4000 字符、闸门放行,复制按钮拿到一段**残值而且没有任何提示** —— 正是上面写着
+  //     「给残值比给提示糟得多」要挡的东西。
+  //   - **代价从 O(1) 变成每块一次 64 KiB 正则扫描。** 200 个 123 KB 的 copy 块实测
+  //     0.40 ms → 269 ms(输出字节完全相同),而且 renderCopy 在 sanitize **之前**返回,
+  //     这笔钱 REDUCE_BUDGET_PER_CARD 一分也没收到。
+  //
+  // 折叠只会让串变短,所以原长 ≤4000 必定折叠后也 ≤4000:这道闸门宁可多拒,不可能漏。
+  // 那句提示语的准确性不值得用一条泄漏路径和 670× 的代价去换。
   if (text.length > REDUCE_INPUT_MAX) {
     const msg = canCopy
       ? `复制内容超过 ${REDUCE_INPUT_MAX} 字符，无法安全脱敏，未渲染复制按钮`
       : `内容超过 ${REDUCE_INPUT_MAX} 字符，无法安全脱敏，未渲染`;
     return { elements: [textBlock(msg)], plainLines: [msg] };
   }
-  const cleanText = sanitize(text, ctx.generic);
+  const cleanText = sanitize(text, ctx);
   if (!cleanText) return EMPTY;
-  const cleanLabel = sanitize(label ?? COPY_LABEL_DEFAULT, ctx.generic) ?? COPY_LABEL_DEFAULT;
+  const cleanLabel = sanitize(label ?? COPY_LABEL_DEFAULT, ctx) ?? COPY_LABEL_DEFAULT;
   if (!canCopy) {
     return {
       elements: [textBlock(cleanText)],
@@ -735,18 +839,21 @@ function renderBlocks(blocks: DisplayBlock[], ctx: RenderCtx): Rendered {
  * plain = 纯文本兜底(与布局无关,服务端 Finalize 会权威重算)。
  */
 export function buildDisplayCard(opts: BuildDisplayCardOptions): BuildDisplayCardResult {
-  const { title, blocks, caps, trusted, dropMarker = DEFAULT_DROP_MARKER } = opts;
+  const { title, blocks, caps, trusted, dropMarker = DEFAULT_DROP_MARKER, budgetMarker = DEFAULT_BUDGET_MARKER } = opts;
   // Every currently supported block either is TextBlock or degrades through TextBlock.
   // An explicitly advertised capability set without TextBlock has no safe output shape.
   if (caps?.elements !== undefined && !cardSupports(caps, "TextBlock")) {
     return { card: adaptiveCard([]), plain: "" };
   }
-  const ctx: RenderCtx = { caps, uid: { n: 0 }, generic: !trusted };
+  const ctx: RenderCtx = {
+    caps, uid: { n: 0 }, generic: !trusted,
+    reduce: { left: REDUCE_BUDGET_PER_CARD, exhausted: false },
+  };
   const groups: Rendered[] = [];
   let cleanTitle = "";
 
   if (title) {
-    cleanTitle = sanitize(title, ctx.generic) ?? "";
+    cleanTitle = sanitize(title, ctx) ?? "";
     if (cleanTitle) {
       groups.push({ elements: [textBlock(cleanTitle, { bold: true })], plainLines: [cleanTitle] });
     }
@@ -765,6 +872,11 @@ export function buildDisplayCard(opts: BuildDisplayCardOptions): BuildDisplayCar
     firstRendered.plainLines.shift();
   }
   groups.push(...renderedGroups.filter((group) => group.elements.length > 0 || group.plainLines.length > 0));
+  // 预算用尽时说一句,而不是让内容静默消失。
+  if (ctx.reduce.exhausted && cardSupports(caps, "TextBlock")) {
+    const { text, plain } = budgetMarker();
+    groups.push({ elements: [textBlock(text)], plainLines: [plain] });
+  }
   const { body, plainLines } = fitRenderedGroups(groups, caps, dropMarker);
   const card = adaptiveCard(body);
   return { card, plain: plainLines.join("\n") };

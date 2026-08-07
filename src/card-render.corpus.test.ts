@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { summarizeToolParams, reduceUrlsInText, sanitizeErrorText } from "./card-render.js";
-import { REDUCE_INPUT_MAX, boundedForReduction } from "./card-render.js";
+import { REDUCE_INPUT_MAX, SUMMARY_MAX, boundedForReduction } from "./card-render.js";
 import { LEAK_CORPUS, BENIGN_CORPUS, COST_CORPUS, REWRITE_CORPUS, UNFIXED_CORPUS, PERF_CORPUS, type CorpusRow } from "./card-render.corpus.js";
 
 const PARAM: Record<string, (s: string) => Record<string, unknown>> = {
@@ -58,6 +58,12 @@ describe("摘要管线形状语料", () => {
       const at = JSON.stringify(row.input.slice(0, 40));
       expect(row.mainRenders, `${at} 的 mainRenders 为空 —— main 上也不渲染,这一行记录不到差异`)
         .not.toBe("");
+      // 长度必须是这条策略发得出来的。`mainRenders` 是手写的实测值,而这一组的判据全靠它 ——
+      // 上一版有一行写着 70 个字符,那是 grep 策略**不可能**产出的长度(SUMMARY_MAX + 省略号
+      // 封顶 65),而当时的断言只查非空,看不见。漂移就这么搬进了被指定为真相的那个字段。
+      expect(row.mainRenders.length,
+        `${at} 的 mainRenders 有 ${row.mainRenders.length} 字符,而 grep 策略最多发出 ${SUMMARY_MAX + 1}`)
+        .toBeLessThanOrEqual(SUMMARY_MAX + 1);
       // 期望值必须全空:有一项非空就说明这不是"刻意打空",放错组了。
       for (const [tool, want] of Object.entries(row.expect)) {
         expect(want, `${at} 的 ${tool} 期望值非空,它不属于 COST 组`).toBe("");

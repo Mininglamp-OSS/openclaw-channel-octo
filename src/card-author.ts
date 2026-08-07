@@ -1,5 +1,5 @@
 import { cardFitsLimits } from "./card-limits.js";
-import { cardSupports, isSensitive, reduceUrlsInText, type CardCaps } from "./card-render.js";
+import { boundedForReduction, cardSupports, cutOnWhitespace, isSensitive, reduceUrlsInText, REDUCE_INPUT_MAX, type CardCaps } from "./card-render.js";
 import { CARD_INTERACTIVE_PROFILE } from "./types.js";
 
 export interface CardButtonSpec {
@@ -76,11 +76,39 @@ function failure(error: string): BuildFailure {
   return { ok: false, error };
 }
 
-function cleanText(value: unknown, max: number): string | null {
-  if (typeof value !== "string") return null;
+/**
+ * 清洗一段作者提供的文本。返回 null 表示不可用;`reason` 说明**为什么**不可用 ——
+ * 归约在自己的 `max` 截断之前跑,所以一个超长且不含空白的标题会被界整段拒掉,而调用方原本
+ * 一律报「含敏感信息」,把作者指向了错误的方向。
+ */
+function cleanTextWithReason(value: unknown, max: number): { text: string } | { reason: string } {
+  if (typeof value !== "string") return { reason: "must be a string" };
   const reduced = reduceUrlsInText(value).trim();
-  if (!reduced || isSensitive(reduced, true)) return null;
-  return reduced.length > max ? `${reduced.slice(0, max)}…` : reduced;
+  if (!reduced) {
+    if (!value.trim()) return { reason: "is required" };
+    // **归约返回空有三个原因,不能用一句话全包。** 上一版把「不是空白」一律报成长度问题,于是
+    // 5 个字符的 `a://:` 被告知「over 4000 characters」—— 上一个版本报错报反了方向,这一版
+    // 换了个方向报反,同样把作者指向查不到东西的地方。三个原因逐个问**规则本人**,不重写判据:
+    if (value.length > REDUCE_INPUT_MAX) {
+      // 1. 超长且前 4000 字符里切不出空白 —— 界整段拒掉,确实是长度问题。
+      if (cutOnWhitespace(value, REDUCE_INPUT_MAX) === null) {
+        return {
+          reason: `is too long to sanitize (over ${REDUCE_INPUT_MAX} characters with no whitespace to break on)`,
+        };
+      }
+      // 2. 切得出空白,但切口之后那一段敏感 —— 这是内容问题,不是长度问题。
+      if (boundedForReduction(value) === null) return { reason: "must not contain sensitive data" };
+    }
+    // 3. 界放行,归约仍然清空 —— 第 1 趟里 `new URL()` 解析失败,整段被抹掉。
+    return { reason: "contains a URL that could not be parsed" };
+  }
+  if (isSensitive(reduced, true)) return { reason: "must not contain sensitive data" };
+  return { text: reduced.length > max ? `${reduced.slice(0, max)}…` : reduced };
+}
+
+function cleanText(value: unknown, max: number): string | null {
+  const r = cleanTextWithReason(value, max);
+  return "text" in r ? r.text : null;
 }
 
 function sanitizeData(value: unknown, key = "", depth = 0): unknown {
@@ -106,8 +134,9 @@ export function buildInteractiveCard(
   spec: InteractiveCardSpec,
   caps?: CardCaps,
 ): BuiltInteractiveCard | BuildFailure {
-  const title = cleanText(spec.title, MAX_TITLE);
-  if (!title) return failure("title is required and must not contain sensitive data");
+  const titleResult = cleanTextWithReason(spec.title, MAX_TITLE);
+  if (!("text" in titleResult)) return failure(`title ${titleResult.reason}`);
+  const title = titleResult.text;
   if (caps && !cardSupports(caps, "TextBlock")) return failure("TextBlock is not supported");
   if (caps && !cardSupports(caps, "Action.Submit")) return failure("Action.Submit is not supported");
 

@@ -8,7 +8,7 @@
  * 视觉属性仅用端到端验证过的(weight/spacing/size/wrap),不用未验证的 color 以规避白名单。
  */
 import { CARD_VERSION } from "./types.js";
-import { buildDisplayCard, EN_DROP_MARKER, type DisplayBlock, type RichSegment } from "./card-blocks.js";
+import { buildDisplayCard, EN_BUDGET_MARKER, EN_DROP_MARKER, type DisplayBlock, type RichSegment } from "./card-blocks.js";
 import { cardFitsLimits, type CardLimits } from "./card-limits.js";
 
 /**
@@ -111,7 +111,7 @@ export function resolveToolMeta(tool: string): { icon: string; label: string } {
   return { icon: TOOL_ICONS[tool] ?? "🔧", label: tool };
 }
 
-const SUMMARY_MAX = 64;
+export const SUMMARY_MAX = 64;
 /**
  * `reduceUrlsInText` 的输入长度上限。
  *
@@ -221,10 +221,33 @@ function registrableDomain(host: string): string {
  * 工具 → 摘要提取策略(allowlist)。未列出的工具(含 MCP、未知工具)一律**不显示摘要**,
  * 杜绝把任意参数直渲到群卡片的泄露面。
  */
-type SummaryStrategy = "path" | "shell" | "url" | "query";
+type SummaryStrategy = "path" | "shell" | "url" | "query" | "enum";
+
+/**
+ * `process` 工具的动作白名单。
+ *
+ * 它此前映射到 `"shell"`,而 shell 策略读的是 `command`/`cmd` —— `process` 根本没有这两个字段
+ * (它的参数是 `action` + `sessionId` 等),于是这个工具的摘要**恒为空串**。实测
+ * `{action:"kill",sessionId:"x"}` → `""`。
+ *
+ * 取值抄自 vendored 的 `openclaw/dist/bash-tools.schemas-*.js`,而那里 `action` 声明的是
+ * `Type.String`,枚举只写在 description 里、**并不被 schema 强制**。所以这里按白名单渲染:
+ * 认得的动作原样显示,认不出的返回空串(退回只显示工具名)。上游新增动作时的失败模式是
+ * **少显示一个词**,不是渲染出未知内容 —— 这是刻意选的那一侧,`openclaw` 的依赖声明是
+ * `^2026.6.9` 这样的范围,不是 pin。
+ */
+const PROCESS_ACTIONS = new Set([
+  "list", "poll", "log", "write", "send-keys", "submit", "paste", "kill", "clear", "remove",
+]);
+
+/** enum 策略:只渲染白名单内的动作名。 */
+function summarizeEnum(p: Record<string, unknown>, allowed: ReadonlySet<string>): string {
+  const raw = firstString(p, ["action"]).trim();
+  return allowed.has(raw) ? raw : "";
+}
 const SUMMARY_STRATEGY: Record<string, SummaryStrategy> = {
   read: "path", write: "path", edit: "path", apply_patch: "path", ls: "path", find: "path", glob: "path",
-  exec: "shell", bash: "shell", shell: "shell", process: "shell",
+  exec: "shell", bash: "shell", shell: "shell", process: "enum",
   fetch: "url",
   web_search: "query", search: "query", grep: "query",
 };
@@ -297,6 +320,9 @@ const PROGRAM_TOKEN_RE = /^[A-Za-z0-9_./@:+-]+$/;
  * 用下标而不是正则,还顺带解决了代价:`[^@]*:[^@]*@` 在「冒号密集、没有 `@`」的 token 上是
  * 二次的,而 summarizeShell 跑在**归约那道界之上**,`REDUCE_INPUT_MAX` 管不到它 ——
  * `":"×131072` 实测 19 077 ms(main 4.3 ms)。indexOf/lastIndexOf 是线性的。
+ *
+ * (summarizeShell 现在自己设了界,那条超长 token 走不到这里;但线性的实现仍然是对的 ——
+ * 界是第二道防线,不该让这个函数的正确性依赖调用方喂了多少。)
  */
 const TOKEN_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 function isDsnShapedToken(t: string): boolean {
@@ -346,7 +372,13 @@ function foldAssignmentValues(cmd: string): string {
  * 含引号/空格/等号等异常字符的 token 一律判为可疑值片段 → 不展示。
  */
 function summarizeShell(p: Record<string, unknown>): string {
-  const cmd = firstString(p, ["command", "cmd"]).trim();
+  // **自己设界。** 这一步跑在归约那道界**之上**(见 summarizeToolParams:先取程序名,再折叠归约),
+  // 所以 REDUCE_INPUT_MAX 管不到它,而下面的 foldAssignmentValues + split 都按整串长度走:
+  // 4 MB 的 command 实测 91 ms。程序名必定在头一段里,后面再长也影响不到结果。
+  // 切口走 cutOnWhitespace —— 盲切会把程序名切成半截(`docker` → `doc`)渲染出去;
+  // 窗口内没有空白说明这是一个 4000 字符以上的单 token,不可能是程序名,返回空。
+  const bounded = cutOnWhitespace(firstString(p, ["command", "cmd"]), REDUCE_INPUT_MAX);
+  const cmd = (bounded ?? "").trim();
   if (!cmd) return "";
   // 先折叠赋值,再按空白取程序名。直接空白分词会把带引号的多词值切碎,跳过首个片段后落在值的
   // **第二个**词上,而那个词往往不含异常字符、能通过 PROGRAM_TOKEN_RE:
@@ -405,6 +437,104 @@ export type SensitivePredicate = (s: string) => boolean;
 
 /** 缺省谓词取最严的一档:不知道调用方是谁时,宁可过度隐藏。 */
 const DEFAULT_SENSITIVE: SensitivePredicate = (s) => isSensitive(s, true);
+
+/**
+ * 界丢掉的那一段,最多喂给谓词多少字符。见 boundedForReduction 里那段说明 ——
+ * 谓词里的正则不保证线性,所以喂进去的量必须自己有界。
+ */
+const TAIL_SCAN_MAX = REDUCE_INPUT_MAX;
+
+/**
+ * **按长度截断的唯一实现。** 切口只能落在空白上:归约靠锚点定位,盲切会把锚点切掉,于是本该
+ * 被剥掉的凭据原样留下;窗口里没有空白就返回 null,由调用方 fail closed。
+ *
+ * 这个函数存在的理由不是复用,是**消灭第二份**。这条分支上反复出现的缺陷是同一类 ——
+ * 「第二处该镜像第一处的规则,没镜像上」:兜底正则的字符类与归约的分岔、DSN token 取第一个
+ * `@` 而第 3 趟取最后一个、`collapseForReduction` 写成裸 slice。每次都是把规则**又写了一遍**
+ * 而不是**用同一份**。三个截断点(64 KiB 折叠、4000 归约界、shell 程序名)现在共用这一份。
+ */
+export function cutOnWhitespace(s: string, max: number): string | null {
+  if (s.length <= max) return s;
+  // +1:空白正好落在下标 max 时也要找得到,否则那一位被当成"窗口内无空白"。
+  const cut = s.slice(0, max + 1);
+  const lastSpace = cut.search(/\s\S*$/);
+  return lastSpace < 0 ? null : cut.slice(0, lastSpace);
+}
+
+/**
+ * 取 `s` 从 `from` 起、约 `max` 个字符喂给敏感判定。**窗口末端也只能落在空白上。**
+ *
+ * 上一版这里是裸 `slice`,于是跨过窗口边界的 token 被切成碎片、正则匹配不上,等于没扫:
+ * `AKIAIOSFODNN7EXAMPLE` 起点落在 7986 时窗口只盖住 20 个字符里的 14 个,而
+ * `/AKIA[0-9A-Z]{12,}/` 要 16 个 —— 于是 base 掩掉的输入在这里照渲。
+ *
+ * 方向必须是**往前延**,不是往回缩:缩到上一个空白会把那个 token 整个排除在窗口外,漏得更多。
+ * 延长再多给 `max` 个字符;还找不到空白就说明尾巴是一整块无空白 token —— 返回 null,fail closed。
+ */
+function tailScanWindow(s: string, from: number, max: number): string | null {
+  if (from >= s.length) return "";
+  const end = from + max;
+  if (end >= s.length) return s.slice(from);
+  const ws = s.slice(end, end + max).search(/\s/);
+  if (ws >= 0) return s.slice(from, end + ws);
+  // 延长窗口里没有空白,但它已经吃到串尾 —— 那个 token 到此为止,整段收进来就是完整的,
+  // 长度仍然有界(≤2×max)。第一版这里直接 fail closed,把「尾巴只比窗口多 1 个字符」也判成
+  // 超长 token,`"x X=" + "'a"×1999` 这类本该跑完管线的输入被整块拒掉。
+  return end + max >= s.length ? s.slice(from) : null;
+}
+
+/**
+ * 归约之前那一步空白折叠的输入上限。
+ *
+ * `REDUCE_INPUT_MAX` 管的是管线,但把文本送进管线之前先要对**原串**折叠空白,而那一步没有
+ * 任何上限。实测(4 MB,同一台机器,形状不同差三倍):
+ *
+ *     普通散文  62 ms/MB    制表对齐  78    单空格密集  92    多空格密集  32
+ *
+ * 界救不了它,因为它跑在界之前 —— `sanitizeErrorText` 吃 4 MB 要 493 ms,而 200 个 1 MB 的
+ * 块要 6673 ms。
+ *
+ * 取 64 KiB。**它不是"对输出中性"的** —— 上一版这么写,而且据此把切口写成了裸 slice,结果
+ * 在折叠比高的输入上把归约的锚点切掉、渲染出完整口令。真实的性质弱一些,但足够:
+ *
+ *   - 切口**只落在空白上**(`cutOnWhitespace`),所以不会把 token 切开、不会切掉锚点;
+ *   - 被丢掉的那一段**要过一遍调用方的谓词**(见下面的实现)。这一条是推送前的对抗评审补上的:
+ *     上一版只镜像了 `boundedForReduction` 的切口规则,没镜像它的尾部守卫,于是
+ *
+ *         `user:hunter2@localhost ` + ("x" + " "×23)×3000 + ` y token`
+ *
+ *     里那个把整串压住的 `token` 落在 64 KiB 之外被切掉,base 渲染 `""`,而这里渲染出
+ *     `user:hunter2@localhost` —— 一个**为了性能加的截断,自己变成了泄漏路径**。
+ *   - 折叠比高时(大量连续空白、对齐排版),64 KiB 原文可能只折出几千字符,此时后面的内容
+ *     **会**被丢掉。方向是安全的(少渲染),但它是一处真实的可用性代价,不是"不改变输出"。
+ */
+export const RAW_INPUT_MAX = 64 * 1024;
+
+/**
+ * 折叠空白,并且**先把原串收进上限**。
+ *
+ * 三个把未截断文本送进管线的 sink 走它:`sanitize`(展示卡)、`sanitizeErrorText`、
+ * `summarizeToolParams`。`reasoning-process` 与 `card-display-tool` 仍各自写着
+ * `replace(/\s+/g, " ")`,但它们的输入在上游已有上限(思考文本 4000、debug 串 512),
+ * 或者折叠跑在归约**之后**、面对的已是 ≤4000 的串 —— 逐个查过,不是遗漏。
+ */
+export function collapseForReduction(
+  text: string,
+  isSensitiveHere: SensitivePredicate = DEFAULT_SENSITIVE,
+): string {
+  const kept = cutOnWhitespace(text, RAW_INPUT_MAX);
+  if (kept === null) return "";
+  const collapsed = kept.replace(/\s+/g, " ").trim();
+  if (kept.length === text.length) return collapsed;
+  // 丢掉的那一段也要过谓词 —— 与 boundedForReduction 同一条规则。**尾巴是原文,先折叠再看**:
+  // 折叠比高时(这个上限存在的理由就是它)4000 个原始字符可能全是空白,直接喂进去什么也扫不到。
+  // 两道窗口都走 tailScanWindow,所以两个末端都落在空白上,喂给谓词的量仍然有界(≤8000)。
+  const rawTail = tailScanWindow(text, kept.length, RAW_INPUT_MAX);
+  if (rawTail === null) return "";
+  const tail = tailScanWindow(rawTail.replace(/\s+/g, " ").trim(), 0, TAIL_SCAN_MAX);
+  if (tail === null) return "";
+  return tail && isSensitiveHere(tail) ? "" : collapsed;
+}
 
 /**
  * 超长输入的截断:**切口只能落在空白上**,切不到就整串不渲染。
@@ -469,17 +599,36 @@ const DEFAULT_SENSITIVE: SensitivePredicate = (s) => isSensitive(s, true);
  *       尾巴先定界再归约        isSensitive=false  ← 漏掉
  *
  * 用可用性换泄漏是这条管线不做的交易,所以守卫维持查原文。代价钉在 COST_CORPUS。
+ *
+ * **但扫多长是有界的(TAIL_SCAN_MAX)。** 上一版把整条尾巴喂给谓词,而谓词里的 JWT 正则
+ * `eyJ…{8,}\.…` 在**没有点的长串**上是二次的:`eyJ` 每出现一次都是一个起点,每个起点都要
+ * 贪心扫到串尾再逐字符回退找 `.`。于是这道守卫自己成了它要防的那种停顿 ——
+ * 单个 block 实测,计费只收 4000 却:
+ *
+ *      15 KB     90 ms
+ *      30 KB    354 ms
+ *      60 KB   1404 ms
+ *     120 KB   5710 ms      ← 干净的 4× 每翻倍
+ *
+ * 修法不是去改那条正则(这条分支已经证明追着正则改会一直有下一个),而是**限定喂给它的量**:
+ * 与界本身同一个数,4000 字符。
+ *
+ * 这条规则要能说出口:**切口之后 4000 字符以外的凭据,不再导致前面那段安全内容被一起扣下。**
+ * 它不会让凭据被渲染出来 —— 渲染的永远只有 kept,而 kept 自己要过下游那道守卫。被放弃的只是
+ * 「因为远处有东西,所以连近处也不显示」这一层 fail-closed。
  */
 export function boundedForReduction(
   s: string,
   isSensitiveHere: SensitivePredicate = DEFAULT_SENSITIVE,
 ): string | null {
-  if (s.length <= REDUCE_INPUT_MAX) return s;
-  const cut = s.slice(0, REDUCE_INPUT_MAX + 1);
-  const lastSpace = cut.search(/\s\S*$/);
-  if (lastSpace < 0) return null;
-  const kept = cut.slice(0, lastSpace);
-  return isSensitiveHere(s.slice(kept.length)) ? null : kept;
+  const kept = cutOnWhitespace(s, REDUCE_INPUT_MAX);
+  if (kept === null) return null;
+  if (kept.length === s.length) return kept;
+  // 窗口末端也只能落在空白上 —— 见 tailScanWindow:裸 slice 会把跨界的 token 切碎,
+  // 正则匹配不上,等于没扫。
+  const tail = tailScanWindow(s, kept.length, TAIL_SCAN_MAX);
+  if (tail === null) return null;
+  return isSensitiveHere(tail) ? null : kept;
 }
 
 /**
@@ -551,6 +700,7 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
     case "shell": v = summarizeShell(p); break;
     case "url": v = summarizeUrl(p); break;
     case "query": v = firstString(p, ["query", "pattern"]); break;
+    case "enum": v = summarizeEnum(p, PROCESS_ACTIONS); break;
   }
   if (!v) return "";
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
@@ -561,8 +711,12 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
   // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
   // 输入上限住在 reduceUrlsInText 内部,这里不再重复设界(见 REDUCE_INPUT_MAX)。**同一个谓词
   // 传进去**,界丢掉的那一段就用下面这道守卫检查,两者不可能再分岔。
-  const s = reduceUrlsInText(v.replace(/\s+/g, " ").trim(), sensitiveHere)
-    .replace(/\s+/g, " ").trim();
+  // **两趟折叠都要带上谓词** —— 折叠自己会在 RAW_INPUT_MAX 处截断,被截掉的那一段要过同一道
+  // 守卫,否则「压住凭据的那个关键词」被丢掉,fail-closed 的输入就变成看起来干净的输入。
+  const s = collapseForReduction(
+    reduceUrlsInText(collapseForReduction(v, sensitiveHere), sensitiveHere),
+    sensitiveHere,
+  );
   if (!s || sensitiveHere(s)) return "";
   return s.length > SUMMARY_MAX ? s.slice(0, SUMMARY_MAX) + "…" : s;
 }
@@ -601,10 +755,10 @@ const ERROR_MAX = 120;
  */
 export function sanitizeErrorText(err?: string): string {
   if (!err) return "";
-  let s = err.replace(/\s+/g, " ").trim();
+  // 传自己的守卫:界和折叠丢掉的那一段都用**同一个**判定检查(错误文本这道多一条构建哈希豁免)。
+  let s = collapseForReduction(err, isSensitiveErrorText);
   if (!s) return "";
-  // 传自己的守卫:界丢掉的那一段用**同一个**判定检查(错误文本这道多一条构建哈希豁免)。
-  s = reduceUrlsInText(s, isSensitiveErrorText).replace(/\s+/g, " ").trim(); // URL 降级可能留下空隙
+  s = collapseForReduction(reduceUrlsInText(s, isSensitiveErrorText), isSensitiveErrorText); // URL 降级可能留下空隙
   if (!s || isSensitiveErrorText(s)) return "";
   return s.length > ERROR_MAX ? s.slice(0, ERROR_MAX) + "…" : s;
 }
@@ -1066,6 +1220,7 @@ export function renderProgressCard(
       caps: flatCaps,
       trusted: true,
       dropMarker: EN_DROP_MARKER,
+      budgetMarker: EN_BUDGET_MARKER,
     });
     return { card: flat.card, plain: flat.plain || PROGRESS_CARD_PLACEHOLDER };
   };
@@ -1081,7 +1236,7 @@ export function renderProgressCard(
   // trusted:进度卡的每行文案已在上游逐 sink 脱敏(summarizeToolParams/sanitizeErrorText/safeLabel:
   // URL 已降级、path/shell 按 generic=false 保留 git SHA/digest)。buildDisplayCard 默认 generic=true
   // 会二次套用长 hex/高熵检测,误删含哈希的正常行、甚至把错误终态帧整卡清空 —— 故此路径关掉严格 generic。
-  const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true, dropMarker: EN_DROP_MARKER });
+  const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true, dropMarker: EN_DROP_MARKER, budgetMarker: EN_BUDGET_MARKER });
   const headerItems = progressHeaderItems(state, header, state.steps, total, canRichText);
   const canToggle = supportsTerminalCollapse(caps);
   const isTerminal = state.phase === "done" || state.phase === "stopped" || state.phase === "error" || state.phase === "expired";

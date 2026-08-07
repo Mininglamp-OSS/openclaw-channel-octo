@@ -304,7 +304,7 @@ export const COST_CORPUS: CostRow[] = [
     input: "connection refused after 3 retries " + "word ".repeat(900)
       + "see https://docs.example.com/troubleshooting/connection-refused-timeouts",
     expect: { grep: "" },
-    mainRenders: "connection refused after 3 retries " + "word ".repeat(6) + "word…",
+    mainRenders: "connection refused after 3 retries word word word word word word…",
     note: "R6-审:长错误文本 + 尾部文档链接。**只在 generic 那一侧被打空** —— read(generic=false)不套用高熵检测,两边都渲染,故不列。sanitizeErrorText 也走高熵那一路:main 121 字符,这里空",
   },
   {
@@ -498,6 +498,24 @@ export const PERF_CORPUS: PerfRow[] = [
     input: "x http://" + "a".repeat(3980),
     reachesPasses: true,
     note: "R1:走第 1 趟 scheme 正则,与上面几行代价完全不同",
+  },
+  // 这两行钉住本 PR 的两个上限。加它们是因为对抗评审点出:**修复本身一行都没被钉住** ——
+  // 整组里没有任何一行「超过 64 KiB 且含空白」,于是 collapseForReduction 的切口路径零覆盖;
+  // 尾部扫描那个二次方也没有一行会在 main 上超时。修复不被自己的语料覆盖,下一次改动就没有红。
+  {
+    label: "超过 64 KiB 且含空白 —— 折叠切口路径",
+    input: "word ".repeat(20_000),
+    reachesPasses: true,
+    note: "R8:唯一一行会真的走到 collapseForReduction 的空白切口(其余超长行全无空白,长度判定处就短路了)",
+  },
+  {
+    label: "空白 + 64 KiB 无点 base64",
+    input: "x " + "eyJ".repeat(21_845),
+    // main 上没有这道守卫,它**跑完了**整条管线,实测 426 ms —— 超过本组 300 ms 的预算。
+    // 现在切口之后是一整块 65 KB 无空白 token,tailScanWindow fail closed,守卫处就拒了。
+    // 标注是 false 正说明修复生效:这一行钉的是"这个形状不再贵",不是"这几趟有界"。
+    reachesPasses: false,
+    note: "R8:尾部扫描的二次方形状 —— main 426 ms,本分支在守卫处短路,3 ms",
   },
   // 赋值折叠的对抗形状。它此前一行都没有 —— ASSIGNMENT_VALUE_RE / SHELL_WORD_ATOM 是本 PR 新加的
   // 正则,而 `SHELL_WORD_ATOM` 是 `(?:A|B|C|D|E)*` 这种嵌套重复,正是灾难性回溯的经典形状。
