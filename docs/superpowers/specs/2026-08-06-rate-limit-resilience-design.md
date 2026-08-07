@@ -125,6 +125,12 @@ loop:
 
 **冷却门（必须有，否则只消掉了叠乘、没消掉反复撞）。** 光让 transient 帧不重试是不够的：只要事件持续到来，`dirty` 就持续为真，flush 会每约 800ms（`FLUSH_DEBOUNCE_MS`）发一个新 edit —— 正好在服务端刚给出的 `Retry-After` 窗口里反复撞 429。
 
+**冷却门必须在能力探测之前。** `runFlush` 会先调 `gateEnabled()` 拿 `/v1/bot/card/profile`，而这个 GET 打的是**同一个 per-IP 桶**，且是唯一不经 `postJson` 的热路径。冷却期内每个工具事件都探一次，等于继续敲服务端刚点名要我们停下的那扇门；另一个 bot/session 已经学到的窗口也应该立刻生效，而不是等这次 GET 打完才算。
+
+配套两件事：`getCardProfile` 的非 2xx 要抛 `OctoApiError` 而不是压成普通 `Error`（否则 `Retry-After` 在这条路径上被丢掉），并且探测自己撞 429 时要把窗口记下来。
+
+**探测失败要区分两种原因。** `gate === null` 的旧行为是清 `dirty` 且不自排（防端点故障期每 800ms 探一次）。但如果失败原因就是这次 GET 撞了 429，它刚把窗口记下来 —— 此时**保持 `dirty` 并排唤醒**：唤醒本身就是节奏控制（到期一次，不是 800ms 一次），而清掉 `dirty` 会让唤醒回调的 `if (entry.dirty)` 空转，那一帧就只能等下一个事件，没有下一个事件就永远发不出去。窗口没开时（5xx / 网络抖动）仍按旧行为清 `dirty`。
+
 做法：进程内维护 `rateLimitedUntil: Map<normalizedApiUrl, number>`。transient flush 前先看这张表，未到期就**跳过本次发送但保留 `dirty`**，到期后只发最新一帧（天然合并了中间帧）。收到 429 时按 `OctoApiError.retryAfterMs` 写入到期时间。**finalize / 终态帧绕过此门** —— 终态必须落地。
 
 三条实现细则，缺一个就会出问题：

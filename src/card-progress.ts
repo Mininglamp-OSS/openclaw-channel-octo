@@ -273,6 +273,11 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
     if (signal?.aborted) throw signal.reason;
     return !!reasoningTemplateForProfile(m);
   } catch (err: unknown) {
+    // 探测自己被限流时,把窗口记下来 —— 否则后续每个工具事件都会再探一次,而这条路径打的
+    // 正是刚刚拒绝我们的那个桶。
+    if (err instanceof OctoApiError && err.isRateLimited) {
+      noteRateLimited(ctx.apiUrl, err.retryAfterMs);
+    }
     // 瞬时失败(5xx/网络抖动)不缓存、不 skip —— 否则一次抖动会让该 apiUrl(缓存)或
     // 该 session(skip)的卡片进度永久关闭。返回 null,下次 flush(仍在 !messageId 期间)重探。
     warn(`card gate probe failed (not caching): ${err instanceof Error ? err.message : String(err)}`);
@@ -543,6 +548,16 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
   try {
     // 首帧前做一次 D12 gate。明确禁用 → 永久跳过本 session;瞬时失败 → 本轮不发,
     // 下次 flush(下个工具事件触发)重探,避免一次抖动永久关闭本 session。
+    // 冷却门必须在能力探测之前:profile GET 打的是同一个 per-IP 桶,冷却期内每个工具事件都
+    // 探一次等于继续敲服务端刚点名要我们停下的那扇门。另一个 bot/session 已经学到的窗口也
+    // 应该立刻生效,而不是等这次 GET 打完才算。
+    const cooldownBeforeProbe = cooldownRemainingMs(entry.ctx.apiUrl);
+    if (cooldownBeforeProbe > 0) {
+      entry.dirty = true; // 唤醒定时器会带着最新状态回来
+      armCooldownWake(sessionKey, entry, cooldownBeforeProbe);
+      return;
+    }
+
     if (!entry.messageId) {
       const gate = await gateEnabled(entry.ctx, signal);
       // gate await 期间 entry 可能已被同 sessionKey 的下一 run 或跨身份上下文替换。
@@ -555,11 +570,22 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         return;
       }
       if (gate === null) {
-        // 瞬时探测失败:清 dirty 且不自动重排,避免端点故障期每 ~800ms 一次探测风暴。
-        // 累积的 steps 仍在 entry 上,下个工具事件会重新 scheduleFlush 并重探。
-        entry.dirty = false;
-        // 同理:本轮不发且不自排,唤醒定时器醒来也只会撞上同一个 gate。
-        clearCooldownTimer(entry);
+        // 探测失败的原因之一就是这次 GET 自己撞了 429,而它刚把窗口记下来。这两种失败要区
+        // 别对待:
+        //
+        // 窗口开着 —— 保持 dirty 并排唤醒。唤醒本身就是节奏控制(到期一次,不是每 800ms
+        // 一次),而清掉 dirty 会让唤醒回调的 `if (entry.dirty)` 空转,那一帧就只能等下一个
+        // 事件 —— 没有下一个事件就永远发不出去。
+        //
+        // 窗口没开(端点 5xx / 网络抖动)—— 清 dirty 且不自排,否则端点故障期每 ~800ms 探
+        // 一次。累积的 steps 仍在 entry 上,下个工具事件会重新 scheduleFlush 并重探。
+        const cooldownAfterProbe = cooldownRemainingMs(entry.ctx.apiUrl);
+        if (cooldownAfterProbe > 0) {
+          entry.dirty = true;
+          armCooldownWake(sessionKey, entry, cooldownAfterProbe);
+        } else {
+          entry.dirty = false;
+        }
         return;
       }
       resolveEntryDeliveryMode(entry);

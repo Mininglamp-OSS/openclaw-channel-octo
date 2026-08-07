@@ -954,7 +954,11 @@ export async function getCardProfile(params: {
   if (resp.status === 404) return { available: false, enabled: false };
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    throw new Error(`Bot API GET /v1/bot/card/profile failed (${resp.status}): ${text || resp.statusText}`);
+    // Structured, so a caller can tell a rate limit from any other failure and honour the
+    // wait the server asked for. This is the one hot path that does not go through postJson,
+    // and flattening a 429 into a generic Error here threw away the Retry-After that the
+    // progress-card cooldown needs.
+    throw OctoApiError.from(resp, "GET /v1/bot/card/profile", text);
   }
   // 端点已部署（available:true）；manifest 内容异常时保守视作 enabled:false。
   const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;

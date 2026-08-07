@@ -660,6 +660,100 @@ describe("progress frames under rate limiting", () => {
     expect(wire.frameCount()).toBe(framesBefore);
   });
 
+  // The capability probe is the one hot path that does not go through postJson, and it hits
+  // the same per-IP bucket. Probing inside an open window is the exact behaviour this change
+  // set exists to remove.
+  it("records the window when the capability probe itself is rate limited", async () => {
+    const calls: string[] = [];
+    let probes = 0;
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      calls.push(u);
+      if (u.includes("/card/profile")) {
+        probes++;
+        return new Response(
+          JSON.stringify({ error: { code: "err.shared.rate.limited", details: { retry_after: 30 } } }),
+          {
+            status: 429,
+            statusText: "Too Many Requests",
+            headers: { "Retry-After": "30", "X-RateLimit-Scope": "ip", "X-RateLimit-Remaining": "0" },
+          },
+        );
+      }
+      return new Response(JSON.stringify({ message_id: "card-1" }), { status: 200 });
+    }) as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("probe-1", context({ apiUrl: "https://probe1.test" }));
+
+    await triggerFirstFrame(handlers, "probe-1"); // cold cache: probe → 429
+    expect(probes).toBe(1);
+
+    // Every later event used to probe again, hammering the bucket that just refused us.
+    await toolEvent(handlers, "probe-1", "t2");
+    await toolEvent(handlers, "probe-1", "t3");
+    expect(probes).toBe(1);
+  });
+
+  // A window learned by one bot has to apply to the next one immediately, not only after its
+  // own probe has already gone out.
+  it("keeps a second session from probing inside a window the first one learned", async () => {
+    const calls: string[] = [];
+    let probes = 0;
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      calls.push(u);
+      if (u.includes("/card/profile")) {
+        probes++;
+        return new Response(
+          JSON.stringify({ error: { code: "err.shared.rate.limited", details: { retry_after: 30 } } }),
+          { status: 429, statusText: "Too Many Requests", headers: { "Retry-After": "30" } },
+        );
+      }
+      return new Response(JSON.stringify({ message_id: "card-1" }), { status: 200 });
+    }) as typeof fetch;
+    const handlers = makeApi();
+
+    setCardContext("probe-2a", context({ apiUrl: "https://probe2.test" }));
+    await triggerFirstFrame(handlers, "probe-2a", "run-a"); // records the window
+    expect(probes).toBe(1);
+
+    // Same backend, different session: the window is shared, so no second probe.
+    setCardContext("probe-2b", context({ apiUrl: "https://probe2.test", channelId: "group-2" }));
+    await triggerFirstFrame(handlers, "probe-2b", "run-b");
+    expect(probes).toBe(1);
+  });
+
+  // The probe failure path must not cancel a wake-up the probe's own 429 just armed —
+  // otherwise the held frame waits for an event that may never come.
+  it("still delivers the held frame after a rate-limited probe, with no further events", async () => {
+    let probes = 0;
+    let sends = 0;
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/card/profile")) {
+        probes++;
+        if (probes === 1) {
+          return new Response(
+            JSON.stringify({ error: { code: "err.shared.rate.limited", details: { retry_after: 2 } } }),
+            { status: 429, statusText: "Too Many Requests", headers: { "Retry-After": "2" } },
+          );
+        }
+        return Response.json(profile());
+      }
+      sends++;
+      return new Response(JSON.stringify({ message_id: "card-1" }), { status: 200 });
+    }) as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("probe-3", context({ apiUrl: "https://probe3.test" }));
+
+    await triggerFirstFrame(handlers, "probe-3"); // probe → 429, window + wake-up
+    expect(sends).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(3_000); // window closes; nothing else happens
+    expect(probes).toBe(2); // re-probed once the window was over
+    expect(sends).toBe(1); // and the held frame went out
+  });
+
   // Contract: a terminal frame has to land. If the cooldown gate ever grew to cover the
   // terminal edit, a rate-limited card would freeze on "working" forever — and nothing else
   // in the suite would go red.
