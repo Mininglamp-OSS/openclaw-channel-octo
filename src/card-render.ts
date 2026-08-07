@@ -220,7 +220,33 @@ export function isSensitive(s: string, generic: boolean): boolean {
 function hasLinearSecretShape(s: string, generic: boolean): boolean {
   if (SECRET_RE.test(s)) return true;
   if (SECRET_PREFIX_RES.some((re) => re.test(s))) return true;
+  if (hasOverlongUserinfo(s)) return true;
   return generic && hasGenericSecretShape(s);
+}
+
+/**
+ * 一个 `user:pass@host` 里的 userinfo 段超过 SCHEMELESS_USERINFO_RE 的口令上限(256)时,
+ * 那条正则整条匹配不上、DSN 原样流过归约 —— 而**这里必须把它当命中扣下,不能让它漏过去**。
+ *
+ * 上限本身是对的(它是 `a:b/c/…` 那条二次方的唯一解),问题是超限的失败方向:上一版超限 =
+ * 不归约 = 明文渲染(评审第六轮的 P0,阈值精确在 257,无长度前提,五个群可见 sink 全中,
+ * 且 path/shell 的 generic=false 连高熵兜底都不跑)。补一道 fail-closed:超限即敏感。
+ *
+ * **线性实现,不用正则。** 按空白分词,每个 token 里若有 `:` 在先、`@` 在后,且中间那段
+ * (口令)超过 256,即命中。indexOf/lastIndexOf 都是线性;冒号密集 / `@` 密集的对抗串上
+ * 实测 ~1.85 ms/MB,而且这里的输入已经被界收进 4000/64 KiB,不会更大。
+ * 放在 generic 判定**之前**,所以 path/shell 也走它 —— 那正是漏得最狠的那条路。
+ */
+const OVERLONG_USERINFO_MAX = 256;
+function hasOverlongUserinfo(s: string): boolean {
+  for (const tok of s.split(/\s+/)) {
+    const colon = tok.indexOf(":");
+    if (colon < 0) continue;
+    const at = tok.lastIndexOf("@");
+    if (at <= colon + 1) continue;             // 需要 `:` 在 `@` 之前,且中间非空
+    if (at - colon - 1 > OVERLONG_USERINFO_MAX) return true;
+  }
+  return false;
 }
 
 /** 必须设界的那一档。目前只有 JWT 一条(见 JWT_RE 上面那段)。 */
@@ -511,7 +537,7 @@ const PROTOCOL_RELATIVE_RE =
  * `LEAK_CORPUS` 里 3995 字符口令那两行正是这一类,它们靠守卫扣下,不靠归约。
  */
 const SCHEMELESS_USERINFO_RE =
-  /\b[A-Za-z0-9._%+-]+:[^\s]{1,256}@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*)(?::\d+)?(?:\/[^\s]*)?(?![A-Za-z0-9-])(?!:\d)/g;
+  /\b[A-Za-z0-9._%+-]+:[^\s]{1,256}@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|[A-Za-z0-9.\u002d\u0080-\uffff]+)(?::\d+)?(?:\/[^\s]*)?(?![A-Za-z0-9-])(?!:\d)/g;
 
 /** 任意无 scheme 的 `host.tld/path`:path 常承载 webhook token、签名或对象凭据。 */
 const SCHEMELESS_HOST_PATH_RE =

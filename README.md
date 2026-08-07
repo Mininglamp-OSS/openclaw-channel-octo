@@ -271,12 +271,23 @@ shape reproduced it at 136 KB once the linear tier's own cap was passed. **Any
 reach limit leaks while the premise is false** — the limit only sets the price.
 Three narrowings, three reproductions.
 
-So the premise is now closed instead. The reduction pass handles the four shapes
-that were in `UNFIXED_CORPUS` — single-label hosts, a leading `/`, a `/` inside the
-password, and bracketed IPv6 — so `user:hunter2@localhost` reduces to
-`https://localhost` and the password never reaches the output. The clause *"only
-the kept prefix renders, and it faces a guard that can vet it"* is true for the
-first time, and a reach bound rests on something real.
+So the reduction pass was widened instead. It handles the four shapes that were in
+`UNFIXED_CORPUS` — single-label hosts, a leading `/`, a `/` inside the password, and
+bracketed IPv6 — so `user:hunter2@localhost` reduces to `https://localhost` and the
+password never reaches the output; and after review it was widened again to reach
+all-numeric hosts (`user:pw@1`) and non-ASCII/IDN hosts, which the verbatim-host
+check then *deletes* (their normalised form is not in the input), and to withhold —
+rather than pass through — a DSN whose password exceeds the 256-character cap.
+
+**The honest statement is narrower than "the premise now holds".** What holds is
+that every schemeless `user:pass@host` shape *the reduction matches* either reduces
+to its host or is withheld — it never renders the password. What is not claimed is
+that the match covers every conceivable shape: a username with characters outside
+`[A-Za-z0-9._%+-]` (e.g. a non-ASCII username) still escapes the pass, and for such
+a residue the tail-scan reach bound below is still a fail-open cost, not a
+trade-off. That residual is a known-open item, recorded rather than asserted away —
+this is the fifth time a "the premise is now closed" claim has been made on this
+branch, and each previous one was disproved by a shape nobody had enumerated.
 
 Relaxing that pass is where this branch has historically broken things. How the
 failure modes are closed — by the verbatim-host check, not by the shape of the
@@ -292,8 +303,16 @@ The password segment is capped at 256 characters, which is a cost bound rather t
 a semantic one: allowing `/` inside it turned `a:b/c/a:b/c/…` with no `@` into a
 quadratic scan (5.0 / 74.9 / 1 245.8 ms at 4 K / 16 K / 64 K, against a flat 0.1 ms
 before), because every start position scanned to the end of the token. Capped, it
-is 1.3 / 4.7 / 17.5 ms. A DSN whose password exceeds 256 characters is not reduced;
-at that length it is a high-entropy run and the guard is what catches it.
+is 1.3 / 4.7 / 17.5 ms. A DSN whose password exceeds 256 characters does not match
+the reduction regex, so it is **not** reduced — and the guard does not catch it
+either: a long alphabetic passphrase is neither long-hex nor digit+letter mixed, so
+`isSensitive` returns false for both strategy tiers. An earlier revision claimed the
+guard caught it "at that length"; measurement disproved that (it rendered the
+plaintext password, exact threshold 257, on every sink including `trusted: true`
+progress cards where the entropy tiers do not run at all). A dedicated linear check —
+`hasOverlongUserinfo`, a whitespace-token scan for a `:` … `@` with an over-256
+middle — now fires as a guard hit whenever the cap is exceeded, so the over-cap case
+withholds instead of falling open.
 
 The false positives that come with the relaxation are broader than a couple of rows
 and are recorded in `REWRITE_CORPUS` rather than absorbed silently — `word:x@y` is

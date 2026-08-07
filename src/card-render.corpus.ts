@@ -253,6 +253,27 @@ export const LEAK_CORPUS: CorpusRow[] = [
     expect: { grep: "", read: "" },
     note: "R10:口令供给主机名绕过逐字比对。比 host 而非整段 m 才挡得住",
   },
+  // R11:评审第六轮的两个 P0/P1 —— 都是「为性能加的界静默削弱了脱敏」,而不是老问题重演。
+  {
+    // 口令超过 SCHEMELESS_USERINFO_RE 的 256 上限:整条正则匹配不上、DSN 原样流过归约。
+    // 上一版这里 fail-open,明文口令在五个群可见 sink 全渲染出来(阈值精确在 257,无长度前提)。
+    // hasOverlongUserinfo 补的那道 fail-closed 把它扣下。守卫**抓不住**这个纯字母口令
+    // (isSensitive 两档都 false),所以不能靠守卫,必须靠这道超限检测。
+    input: "connect failed for alice:" + "correcthorsebatterystaple".repeat(11).slice(0, 275) + "@db.example.com after 3 retries",
+    expect: { grep: "", read: "" },
+    note: "R11-P0:口令 275 字符 > 256。上一版 fail-open 渲染明文;现在超限即敏感,扣下",
+  },
+  {
+    // 纯数字单标签主机,守卫看不见(不含关键词/前缀/高熵),归约此前也够不着(要求含字母)。
+    // 去掉字母要求后它走到逐字比对:`new URL("https://1")` 规范成 `0.0.0.1`,不在输入里 → 删除。
+    // 这一条钉住「前提」对这类形状也成立 —— 不然 collapseForReduction 的 128 KiB 触及上限
+    // 又会变成泄漏(远处关键词够不着、而近处的 `@1` DSN 守卫认不出)。
+    input: "alice:hunter2@1 " + "x ".repeat(80_000) + " token",
+    // `@1` 前缀被删,剩下的 `x x x…` 是无害填充,截到 SUMMARY_MAX 加省略号。判据是**口令不出现**
+    // (本组的子串断言盯着 `hunter2`);等值这一栏只是把「删掉凭据后剩什么」如实记下。
+    expect: { grep: "x ".repeat(32) + "…", read: "x ".repeat(32) + "…" },
+    note: "R11-P1:纯数字单标签 + 128 KiB 外的关键词。去掉字母要求让它走到逐字比对被删",
+  },
 ];
 
 /** 普通内容不该被误伤成空白。 */
@@ -469,8 +490,8 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
   },
   {
     input: "3:4@2/x",
-    expect: { grep: "3:4@2/x" },
-    note: "造串哨兵:纯数字主机被 new URL() 规范化成 `https://0.0.0.2`",
+    expect: { grep: "" },
+    note: "R11 造串哨兵:纯数字主机 `2` 曾被 new URL() 规范成 `https://0.0.0.2`。去掉「单标签必须含字母」后它走到逐字比对 —— `0.0.0.2` 不在输入里 → 删除(比渲染原文更安全:不造串也不泄漏)",
   },
   {
     input: "a:b@1.2.3",
