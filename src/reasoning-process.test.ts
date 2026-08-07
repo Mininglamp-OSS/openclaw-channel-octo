@@ -410,8 +410,9 @@ describe("reasoning detail sanitization", () => {
     // mid-sentence, losing the part that says what the model was about to do next. 600 chars now
     // survive intact; the cap is still hard, so 2000 is truncated with an ellipsis.
     expect(sanitizeReasoningThought("x".repeat(600))).toBe("x".repeat(600));
+    // 精确钉住:`<= 1201` 对 [600,1200] 区间内任何上限都成立,起不到锚定作用。
     const long = sanitizeReasoningThought("x".repeat(2000));
-    expect(long.length).toBeLessThanOrEqual(1201);
+    expect(long.length).toBe(1201);
     expect(long.endsWith("…")).toBe(true);
   });
 
@@ -419,6 +420,23 @@ describe("reasoning detail sanitization", () => {
    * The four outcomes used to collapse into one string. "Redacted" is the only one that tells an
    * operator where to look, so it must never be confusable with "the model produced nothing".
    */
+  /**
+   * recordCardReasoning 在非 snapshot 时拼接(`previous + text`),一个 __thinking__ 步骤可能
+   * 收到两次 model call 的文本。全等匹配一旦被拼接破坏,占位句会被判成 `text`,把宿主的英文
+   * 诊断句原样渲染到群卡上 —— brief 明确列为非目标的结果。
+   */
+  it("holds the no-summary classification under concatenation", () => {
+    const placeholder = "Native reasoning was produced; no summary text was returned.";
+    expect(resolveReasoningThought(placeholder).kind).toBe("no-summary");
+    // 只有占位句(前后带空白)仍是 no-summary。
+    expect(resolveReasoningThought(`  ${placeholder}  `).kind).toBe("no-summary");
+    // 占位句被剥掉后还有真实文本 → 展示真实文本,且绝不渲染宿主诊断句。
+    const mixed = resolveReasoningThought(`${placeholder} Checking the reducer.`);
+    expect(mixed.kind).toBe("text");
+    expect(mixed.text).toBe("Checking the reducer.");
+    expect(mixed.text).not.toContain("Native reasoning was produced");
+  });
+
   it("classifies the four thought outcomes distinguishably", () => {
     expect(resolveReasoningThought("Checking the reducer.")).toEqual({
       kind: "text",

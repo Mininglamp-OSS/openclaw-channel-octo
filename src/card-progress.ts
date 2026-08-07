@@ -30,6 +30,7 @@ import {
 } from "./card-profile-cache.js";
 import { summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState } from "./card-render.js";
 import {
+  HOST_NO_SUMMARY_PLACEHOLDER,
   buildReasoningProcessId,
   buildReasoningProcessWireData,
   selectReasoningProcessTemplate,
@@ -275,7 +276,7 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
     // 成因必须在这里报:调用方拿到 false 就 `entry.skip = true` 并 return,永远走不到
     // resolveEntryDeliveryMode —— 那边的同款日志只是 profile 在 gate 与 resolve 之间被
     // 失效时的兜底。不报的话,「卡片没了」在运维手上没有任何线索。
-    if (!outcome.ref) logReasoningTemplateSkip(outcome.reason);
+    if (!outcome.ref) logReasoningTemplateSkip(ctx, outcome.reason);
     return !!outcome.ref;
   } catch (err: unknown) {
     // 探测自己被限流时,把窗口记下来 —— 否则后续每个工具事件都会再探一次,而这条路径打的
@@ -306,23 +307,48 @@ type ReasoningTemplateSkipReason =
    * 服务端说开着,但 templating/ref 与本消费者的契约不匹配。这是**契约不一致**,不是正常状态:
    * selectReasoningProcessTemplate 把十余种不兼容原因收敛成一个 null,所以只能报到这一层。
    */
-  | "template-incompatible";
+  | "template-incompatible"
+  /**
+   * `available: true` 却没有 `config`。这是**契约不一致**(config 在类型上可选,但一个可用的
+   * 端点应当给出),不是「配置如此」—— 混进 reasoning-disabled 会又造出一个静默消失的场景。
+   */
+  | "config-missing";
+
+/** 契约不一致的成因走 warn(该被看见);其余是正常配置状态,走 dbg 不刷日志。 */
+const CONTRACT_MISMATCH_REASONS = new Set<ReasoningTemplateSkipReason>([
+  "template-incompatible",
+  "config-missing",
+]);
 
 /**
- * 「卡片为什么没有」的唯一线索。`template-incompatible` 用 warn:服务端说推理卡开着,我们却
- * 用不了它广告的模板 —— 契约不一致,该被看见。其余是正常配置状态,走 dbg 不刷日志。
+ * 已 warn 过的 (bot, 成因) 组合。profile 按 bot 缓存,但日志不缓存 —— 一个持续广告不兼容模板
+ * 的服务端会在**每个产卡的 turn**上 warn 一次、无限重复。按 bot+成因去重,现象仍会被看见一次,
+ * 之后不刷屏。dbg 那条不去重:它默认关,开着就是为了看每一轮。
  */
-function logReasoningTemplateSkip(reason: ReasoningTemplateSkipReason): void {
+const warnedTemplateSkips = new Set<string>();
+
+/** 「卡片为什么没有」的唯一线索。 */
+function logReasoningTemplateSkip(ctx: CardContext, reason: ReasoningTemplateSkipReason): void {
   const message = `no reasoning template; progress card skipped (${reason})`;
-  if (reason === "template-incompatible") warn(message);
-  else dbg(message);
+  if (!CONTRACT_MISMATCH_REASONS.has(reason)) {
+    dbg(message);
+    return;
+  }
+  const key = JSON.stringify([ctx.apiUrl, ctx.botToken, reason]);
+  if (warnedTemplateSkips.has(key)) {
+    dbg(`${message}; already warned`);
+    return;
+  }
+  warnedTemplateSkips.add(key);
+  warn(message);
 }
 
 function reasoningTemplateForProfile(
   manifest: CardProfileManifest,
 ): { ref: CardTemplateRef } | { ref: null; reason: ReasoningTemplateSkipReason } {
   if (!manifest.available) return { ref: null, reason: "endpoint-unavailable" };
-  if (manifest.config?.reasoning_enabled !== true) return { ref: null, reason: "reasoning-disabled" };
+  if (!manifest.config) return { ref: null, reason: "config-missing" };
+  if (manifest.config.reasoning_enabled !== true) return { ref: null, reason: "reasoning-disabled" };
   const ref = selectReasoningProcessTemplate(
     manifest.templating,
     manifest.config.reasoning_template_ref,
@@ -355,7 +381,7 @@ function resolveEntryDeliveryMode(entry: CardEntry): void {
     return;
   }
   // gate 已经报过成因了;这里只在 profile 于 gate 与 resolve 之间被失效时兜底。
-  logReasoningTemplateSkip(outcome.reason);
+  logReasoningTemplateSkip(entry.ctx, outcome.reason);
   entry.skip = true;
 }
 
@@ -1070,6 +1096,8 @@ export function clearCard(sessionKey: string): void {
 
 /** 测试辅助:清空全部状态。 */
 export function _resetCardProgressForTests(): void {
+  // 去重集合是模块级的,不清会跨测试泄漏(第二个用例拿不到本该出现的 warn)。
+  warnedTemplateSkips.clear();
   for (const e of new Set([...cards.values(), ...pausedCards.values()])) {
     if (e.flushTimer) clearTimeout(e.flushTimer);
     if (e.pausedExpiryTimer) clearTimeout(e.pausedExpiryTimer);
@@ -1385,10 +1413,20 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     }
     const message = asRecord(root?.lastAssistant);
     if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+    // 签名有、文本空的 thinking block 也要计入,否则这条车道会把「推理了但拿不到内容」退化成
+    // 「压根没推理」—— 四态区分在只经由本车道可见的 provider 上就白做了。宿主在别处会为这种
+    // block 合成一句英文占位,这里用同一个常量对齐,让下游 resolveReasoningThought 归类为
+    // no-summary。
     const thought = message.content
       .map((part) => asRecord(part))
-      .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
-      .map((part) => part!.thinking as string)
+      .filter((part) => part?.type === "thinking")
+      .map((part) => {
+        const text = typeof part!.thinking === "string" ? part!.thinking : "";
+        if (text.trim()) return text;
+        const signature = part!.thinkingSignature;
+        return typeof signature === "string" && signature.trim() ? HOST_NO_SUMMARY_PLACEHOLDER : "";
+      })
+      .filter(Boolean)
       .join("\n")
       .trim();
     if (thought) recordCardReasoning(sk!, thought, { snapshot: true });

@@ -240,6 +240,34 @@ describe("server-driven Registry reasoning progress", () => {
     expect(warned).toContain("template-incompatible");
   });
 
+  it("warns when an available profile carries no config at all", async () => {
+    // config 在类型上可选。`available: true` 却没有 config 是契约不一致,不是「配置如此」——
+    // 混进 reasoning-disabled 会又造出一个静默消失的场景。
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { config: _dropped, ...withoutConfig } = profile() as Record<string, unknown>;
+    const wire = mockFetch({ profile: withoutConfig });
+    global.fetch = wire.fetch as typeof fetch;
+    setCardContext("no-config", context({ botToken: "bot-no-config" }));
+    await triggerFirstFrame(makeApi(), "no-config");
+
+    expect(wire.calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+    expect(warnSpy.mock.calls.flat().join("\n")).toContain("config-missing");
+  });
+
+  it("warns once per bot for a persistent template mismatch, not once per turn", async () => {
+    // profile 按 bot 缓存,日志不缓存的话,持续广告不兼容模板的服务端会在每个产卡 turn 上 warn。
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wire = mockFetch({ profile: profile({ configuredVersion: "9.9.9" }) });
+    global.fetch = wire.fetch as typeof fetch;
+    for (const key of ["dup-1", "dup-2", "dup-3"]) {
+      setCardContext(key, context({ botToken: "bot-dup" }));
+      await triggerFirstFrame(makeApi(), key);
+    }
+    const hits = warnSpy.mock.calls.flat().filter((line) =>
+      String(line).includes("template-incompatible")).length;
+    expect(hits).toBe(1);
+  });
+
   it.each([
     profile({ configuredVersion: null }),
     profile({ configuredVersion: "9.9.9" }),

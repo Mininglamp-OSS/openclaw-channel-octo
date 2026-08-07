@@ -44,7 +44,12 @@ return "";                                                          // 无 think
 
 - **不**放宽 `sanitizeReasoningThought` 的脱敏强度。群卡对全员可见,守卫命中即隐藏这条底线不动。
 - **不**渲染宿主的诊断散文。用户面文案由本仓掌握。
-- **不**改 `MAX_REASONING_CAPTURE` / `THOUGHT_MAX` 等既有上限。
+- **不**改 `MAX_REASONING_CAPTURE`。
+- `THOUGHT_MAX` **原列为非目标,后改为 280 → 1200**:实测线上卡片被截在正好 280 字符、句子中断,
+  而 Anthropic 返回原始思维链而非摘要,单个 phase 超过 280 是常态而非例外。这条非目标作废,
+  但**受一个硬约束**:该值不得超过所选 template 版本对 `phases[].thought` 的上限 —— 超了是
+  确定性 400,而 4xx 会置 `entry.skip`,整个 session 从此没有卡片(#204 之后无本地回落可兜)。
+  服务端将放开该上限并下发 0.4.0;在此之前的窗口期,超长思考仍可能触发上述失败。
 
 ## 设计
 

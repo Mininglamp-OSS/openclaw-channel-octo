@@ -61,7 +61,7 @@ export interface ReasoningProcessData {
  * red. Re-check this string when upgrading OpenClaw. The durable fix belongs upstream: a structured
  * flag on the event rather than a sentence.
  */
-const HOST_NO_SUMMARY_PLACEHOLDER = "Native reasoning was produced; no summary text was returned.";
+export const HOST_NO_SUMMARY_PLACEHOLDER = "Native reasoning was produced; no summary text was returned.";
 
 /**
  * The model demonstrably reasoned but returned no readable text. Reached via the host placeholder
@@ -81,11 +81,18 @@ const REDACTED_THOUGHT = "Reasoning hidden — matched a redaction rule";
  * returns a raw chain of thought rather than a summary, so a single phase routinely runs past it and
  * the reader lost the part that says what the model was about to do.
  *
- * 1200 is still a hard cap, not "unbounded". The budget that matters is per *card*: at
- * MAX_RENDERED_PHASES phases that is ~7.2K chars of thought, an order of magnitude under the
- * server's advertised max_payload_bytes, but cardFitsLimits drops trailing blocks when a card does
- * not fit — so an unbounded thought would crowd out the tool rows below it. Capture is separately
- * bounded by MAX_REASONING_CAPTURE (4000) in card-progress.ts, which this stays below.
+ * 1200 is still a hard cap, not "unbounded", and capture is separately bounded by
+ * MAX_REASONING_CAPTURE (4000) in card-progress.ts, which this stays below.
+ *
+ * The bound that actually governs this value is the **server template's** `phases[].thought`
+ * constraint, validated on every send: a value over it is a deterministic 400, and a 4xx sets
+ * `entry.skip` — the card disappears for the rest of the session rather than degrading. There is no
+ * local fallback left to absorb that (renderReasoningProcessCard has no production caller after
+ * #204). So this constant may only exceed a published version's cap once the server raises it.
+ *
+ * Do not justify a value here by `cardFitsLimits`: it is a pure predicate, and on a miss
+ * renderReasoningProcessCard discards the whole reasoning layout rather than trimming trailing
+ * blocks — and that path is dead code anyway.
  */
 const THOUGHT_MAX = 1200;
 const TOOL_NAME_MAX = 80;
@@ -251,8 +258,14 @@ export function resolveReasoningThought(text: string | undefined): ReasoningThou
     .trim();
   // Whitespace-only input carries no reasoning; it is not something we withheld.
   if (!normalized) return { kind: "none", text: "" };
-  if (normalized === HOST_NO_SUMMARY_PLACEHOLDER) {
-    return { kind: "no-summary", text: NO_SUMMARY_THOUGHT };
+  // 包含式而非全等:recordCardReasoning 在非 snapshot 时会拼接(`previous + text`),而一个
+  // `__thinking__` 步骤可能收到两次 model call 的文本(有些 host 从不投递 model_call_ended)。
+  // 一旦占位句和别的文本相邻,全等就失效,值会被判成 `text`,把宿主的诊断句原样渲染到群卡上 ——
+  // 正是 brief 列为非目标的那个结果。剥掉占位句后若还有真实文本,那才是要展示的内容。
+  if (normalized.includes(HOST_NO_SUMMARY_PLACEHOLDER)) {
+    const rest = normalized.split(HOST_NO_SUMMARY_PLACEHOLDER).join(" ").replace(/\s+/g, " ").trim();
+    if (!rest) return { kind: "no-summary", text: NO_SUMMARY_THOUGHT };
+    normalized = rest;
   }
   if (normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
       normalized.includes("<<<END_OPENCLAW_INTERNAL_CONTEXT>>>")) {
@@ -467,10 +480,23 @@ function trimForRender(data: ReasoningProcessData): ReasoningProcessData {
   return { ...data, phases: visible.reverse() };
 }
 
+/**
+ * 「不渲染思考行」这件事在**数据契约里表达不出来**:template 的 `phases[].thought` 是
+ * `required` 且 `minLength: 1`,空串会让服务端校验失败返回 400,而 4xx 会让 runFlush 置
+ * `entry.skip = true` —— 整个 session 从此没有卡片。#204 之后模板路径是唯一出口,
+ * renderReasoningProcessCard 已无生产调用方,所以契约违规不是降级渲染,而是功能整体消失。
+ *
+ * 因此 wire 侧对「没有可说的推理」用一句**简短的非空标签**,而不是空串。本地渲染器可以省掉
+ * 整行(那是更好的呈现),但那个自由度只属于本地渲染。
+ */
+const NO_THOUGHT_WIRE_LABEL = "—";
+
 /** Build bounded Registry data without inventing synthetic tool actions for empty model calls. */
 export function buildReasoningProcessWireData(state: CardProgressState): ReasoningProcessData | null {
   const phases = phasesFromSteps(state.steps, { synthesizeEmptyActions: false })
-    .filter((phase) => phase.actions.length > 0);
+    .filter((phase) => phase.actions.length > 0)
+    // 空 thought 违反契约的 minLength:1 —— 见 NO_THOUGHT_WIRE_LABEL。
+    .map((phase) => (phase.thought ? phase : { ...phase, thought: NO_THOUGHT_WIRE_LABEL }));
   if (phases.length === 0) return null;
   return trimForRender(buildReasoningProcessDataWithPhases(state, phases));
 }
