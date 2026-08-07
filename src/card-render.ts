@@ -485,20 +485,23 @@ const PROTOCOL_RELATIVE_RE =
  * 放在哪里都是泄漏而不是取舍,因为无论界在 4000 还是 131072,总有一个更远的位置。
  * 收窄了三次都没关掉,第四次该改的是前提。
  *
- * 放宽会踩两个坑,四轮评审里各踩过一次,所以这里两条都钉住:
+ * 放宽会踩两个坑 —— 造串,和小写化泄漏。**它们由下面 pass 3 里那条「归约出的主机必须逐字
+ * 出现在 host 里」的检查一并关掉,不在这条正则上解决。** 那才是承重的机制,说明写在检查那里。
  *
- *   1. **切在词中间会造串。** `nginx:1.21@sha256:1234abcd` 曾被匹配到 `…@sha256:1234`,
- *      剩下的 `abcd` 拼回替换结果,造出输入里不存在的 `https://sha256abcd`。
- *      末尾的 `(?![A-Za-z0-9:-])` 要求匹配停在 token 边界上,这一类由构造消失。
- *      (不能把 `.` 放进去 —— `连接 user:pw@localhost.` 的句号会让整条匹配不上。)
- *   2. **纯数字单标签会被 `new URL()` 规范化。** `3:4@2/x` 里 `new URL("https://2")` 把主机
- *      规范成 `0.0.0.2`,同样是输入里没有的串,而且**语料的造串检测抓不住它** ——
- *      `0.0.0.2` 里没有 4 个字符以上的字母数字段。所以单标签分支要求至少含一个字母;
- *      带点主机(含 IPv4)走前一个分支,不受影响。
+ * 这条正则里唯一为「坑」而写的是末尾的 `(?![A-Za-z0-9-])(?!:\d)`:要求匹配停在 token 边界上,
+ * 且冒号后不是数字。它挡的是 `nginx:1.21@sha256:1234` 被切在词中间(sha256 的冒号接的是数字),
+ * 而放行 `user:pw@localhost: refused`(冒号接的不是数字)—— 后者是 DSN 在错误串里最常见的写法。
+ * **早先这里写的是 `(?![A-Za-z0-9:-])`,把冒号一律排除,于是那个最常见的形状整条匹配不上、
+ * 口令原样渲染;评审第四轮点出。** `(?!:\d)` 才是那条规则的准确表述。
+ *
+ * 造串曾经试过用「单标签必须含字母 / 带点分支不受影响」来挡 —— **那个说法是错的,评审证伪:**
+ * 前瞻会让带点分支回退成纯数字主机,`new URL()` 照样把它规范成输入里没有的地址。所以不靠
+ * 分支形状,靠逐字比对(见 pass 3)。
  *
  * 代价是几种误伤,方向安全(少渲染)、不造串,记在 REWRITE 组里:`at 10:30@venue` →
- * `at https://venue`,`com.foo:bar:1.0@jar` → `https://jar`。凭据泄漏在群可见 sink 上,
- * 这笔换得起。
+ * `at https://venue`,`com.foo:bar:1.0@jar` → `https://jar`。误伤面比两行宽 ——
+ * `word:number@word` 与 `word:word@word` 在工具输出里都常见,详见 README。凭据泄漏在群可见
+ * sink 上,这笔换得起。
  *
  * **口令段有长度上限 256,那是为了不引入一条新的二次方。** 旧版口令写作 `[^\s/]+`,`/` 把
  * 长串切成短段;放开 `/` 之后,`a:b/c/a:b/c/…` 这种无 `@` 的长 token 上,每个起点都要扫到
@@ -793,8 +796,12 @@ export function reduceUrlsInText(
     //
     // 代价:主机大小写混写的 DSN(`user:pw@DB.Example.COM`)不再归约,整段被丢弃而不是
     // 渲染成注册域。方向安全(少渲染),而且这种写法在 DSN 里罕见。
+    //
+    // **比对的是 `host`,不是整段 `m`。** `m` 含 userinfo,也就是口令 —— 拿归约结果去它里面找,
+    // 口令里塞一份小写主机名就能满足检查:`a:akiaiosfodnn7example@AKIAIOSFODNN7EXAMPLE` 会渲染出
+    // `https://akiaiosfodnn7example`,第 2 类那条小写化泄漏原样复活。必须只在 `host` 上比。
     if (reduced === null) return "";
-    return m.includes(reduced.slice("https://".length)) ? reduced : "";
+    return host.includes(reduced.slice("https://".length)) ? reduced : "";
   });
   // 4. 任意无 scheme 的 `host.tld/path`:保留注册域,统一抹掉可能承载凭据的 path。
   out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => (

@@ -132,19 +132,47 @@ to paste a secret in plaintext. Whether to adjust the configuration is up to you
 7. Sends display and submit-interactive cards with negotiated fallback
 8. Polls durable `card_action` events only after an interactive card is sent
 
-### A scheme-less `user:pass@host` is only reduced when the host carries a dot
+### A scheme-less `user:pass@host` is reduced even when the host has no dot
 
-`postgres://user:pw@host/db` and `user:pw@db.example.com` lose their userinfo, but
-a single-label host (`user:pw@localhost`), an IPv6 literal (`user:pw@[::1]`), a
-password containing `/` (`user:pa/ss@db.example.com`) and a leading slash
-(`/user:pass@localhost`) all render in full.
+`postgres://user:pw@host/db`, `user:pw@db.example.com`, a single-label host
+(`user:pw@localhost`), an IPv6 literal (`user:pw@[::1]`), a password containing `/`
+(`user:pa/ss@db.example.com`) and a leading slash (`/user:pass@localhost`) all lose
+their userinfo. The last four were open gaps on `main`; they are what made the
+tail-scan bound unsafe (the "premise" section below), so closing them is part of
+this change, not deferred.
 
-These are pre-existing gaps and closing them is its own change. The shape is
-genuinely ambiguous — `sed 's:a:b@c:g'` and `user:pw@localhost` are the same
-string to a matcher — so in review both widening the reduction and adding a
-withhold-everything backstop each traded one defect for a worse one. Their exact
-current behaviour is pinned in `src/card-render.corpus.ts` so that whatever
-closes them cannot silently change anything else.
+**The mechanism that makes widening the reduction safe is a single check, not the
+shape of the regex.** After pass 3 picks a host and `originDomain` reduces it, the
+substitution is refused unless the reduced host appears **verbatim in the host
+segment** (`host.includes(...)`, not the whole match). That one check closes both
+ways widening had gone wrong across review rounds:
+
+- **`new URL()` fabricates.** It normalises `1.2.3` → `1.2.0.3`, `1.0.0` →
+  `1.0.0.0`, `0x7f.1` → `127.0.0.1` — addresses absent from the input. An earlier
+  attempt tried to exclude these by requiring a letter in single-label hosts, on the
+  theory that dotted hosts and IPv4 "take a different branch"; review disproved it —
+  the token-boundary lookahead backtracks the dotted branch to a shorter all-numeric
+  host, so that branch reaches `new URL()` too. The verbatim check needs no such
+  case analysis: a normalised host is not a substring of the input, so it is dropped.
+- **`new URL()` lowercases the host** (WHATWG), and `AKIA…`/`AIza…` are
+  case-sensitive detectors, so `a:b@AKIAIOSFODNN7EXAMPLE` had been reducing to
+  `https://akiaiosfodnn7example` — past a guard that could no longer see it. The
+  verbatim check is case-sensitive, so the lowercased host fails it. It compares
+  against the **host segment only**: comparing against the whole match let a
+  lowercase copy of the host planted in the *password*
+  (`a:akiaiosfodnn7example@AKIAIOSFODNN7EXAMPLE`) satisfy the check and reopen the
+  leak. Both are pinned in `LEAK_CORPUS`, and that group's substring assertion is
+  case-insensitive so a lowercased secret cannot slip it.
+
+The shape is genuinely ambiguous — `sed 's:a:b@c:g'` and `user:pw@localhost` are the
+same string to a matcher — so this reduces or deletes `word:x@y` broadly in ordinary
+tool output, not only the two rows first recorded: npm/maven coordinates
+(`pkg:1.2.3@latest`), timestamps (`10:30@venue`), even `sed` scripts. A mixed-case
+host is **deleted** rather than reduced (`time 12:00@GMT` → `time `), because the
+verbatim check fails on it. All safe-direction (renders less, never fabricates), but
+it changes how legible cards are, and that breadth is a product call — the corpus
+pins the exact current behaviour of every shape so whatever revisits it cannot
+change anything else silently.
 
 ### The reduction step bounds its own input
 
@@ -250,18 +278,15 @@ password, and bracketed IPv6 — so `user:hunter2@localhost` reduces to
 the kept prefix renders, and it faces a guard that can vet it"* is true for the
 first time, and a reach bound rests on something real.
 
-Relaxing that pass is where this branch has historically broken things, so both
-known failure modes are pinned by sentinels that stay in the corpus:
-
-- **Cutting mid-token fabricates.** `nginx:1.21@sha256:1234abcd` once matched
-  through `…@sha256:1234`, and the unmatched `abcd` was concatenated onto the
-  replacement to produce `https://sha256abcd`, a string not in the input. The match
-  must now end on a token boundary.
-- **All-numeric single labels get normalised.** `new URL("https://2")` rewrites the
-  host to `0.0.0.2` — also absent from the input, and invisible to the corpus's
-  fabrication check, which looks for alphanumeric runs of 4+ and finds none in
-  `0.0.0.2`. Single-label hosts must contain a letter; dotted hosts and IPv4 take a
-  different branch.
+Relaxing that pass is where this branch has historically broken things. How the
+failure modes are closed — by the verbatim-host check, not by the shape of the
+regex — is described under "[A scheme-less `user:pass@host`](#a-scheme-less-userpasshost-is-reduced-even-when-the-host-has-no-dot)"
+above, together with the two attempts that traded one defect for another (a
+mid-token cut that fabricated `https://sha256abcd`, and a "single-label must contain
+a letter" rule that review disproved because the dotted branch backtracks into
+`new URL()` too). The sentinels for both — `nginx:1.21@sha256:1234abcd`, `3:4@2/x`,
+`a:b@1.2.3`, `scope:name@1.0.0`, `a:b@0x7f.1`, and the two `AKIA` case-folding rows —
+stay in the corpus.
 
 The password segment is capped at 256 characters, which is a cost bound rather than
 a semantic one: allowing `/` inside it turned `a:b/c/a:b/c/…` with no `@` into a
@@ -270,12 +295,12 @@ before), because every start position scanned to the end of the token. Capped, i
 is 1.3 / 4.7 / 17.5 ms. A DSN whose password exceeds 256 characters is not reduced;
 at that length it is a high-entropy run and the guard is what catches it.
 
-Two false positives come with the relaxation, recorded in `REWRITE_CORPUS` rather
-than absorbed silently: `at 10:30@venue` renders as `at https://venue`, and
-`com.foo:bar:1.0@jar` as `https://jar`. Neither fabricates — every character comes
-from the input — and both render less, not more. They are unavoidable in kind:
-`user:.*@example` (a grep pattern) and `user:hunter2@example` (a credential) are the
-same shape, and any rule that renders the first renders the second.
+The false positives that come with the relaxation are broader than a couple of rows
+and are recorded in `REWRITE_CORPUS` rather than absorbed silently — `word:x@y` is
+rewritten or deleted across ordinary tool output (npm/maven coordinates, timestamps,
+`sed` scripts). They never fabricate and always render less, and they are unavoidable
+in kind: `user:.*@example` (a grep pattern) and `user:hunter2@example` (a credential)
+are the same shape, and any rule that renders the first renders the second.
 
 Measurement says the narrowing was never needed in that form. Timed per detector
 on 64 KB of the adversarial shape:

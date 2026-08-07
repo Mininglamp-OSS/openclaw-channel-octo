@@ -237,6 +237,22 @@ export const LEAK_CORPUS: CorpusRow[] = [
     expect: { fetch: "https://host.com" },
     note: "既有:带 scheme 的 DSN 由第 1 趟 new URL() 剥掉 userinfo 与 query",
   },
+  // R9/R10:归约把主机小写化(WHATWG),而 AKIA/AIza 探测器大小写敏感 —— 归约会把唯一压着这个
+  // 凭据的信号自己毁掉。逐字比对**只比 host、不比整段**,大小写不同即不匹配,这条路断掉。
+  // 放在 LEAK(不是 UNFIXED)是因为它是凭据泄漏哨兵:除了逐行等值,本组的大小写不敏感子串
+  // 断言也盯着它 —— 上一版只有等值这一道,而子串那道又是大小写敏感的,小写输出照样过。
+  {
+    input: "a:b@AKIAIOSFODNN7EXAMPLE",
+    expect: { grep: "", read: "" },
+    note: "R9:new URL() 小写化主机,AKIA 探测器大小写敏感。逐字比对时不匹配,不发",
+  },
+  {
+    // 口令里塞一份小写主机名。逐字比对若比整段 `m`(含 userinfo),口令这份副本就满足它,
+    // 上一行那条泄漏原样复活 —— 上一版正是这么漏的,而当时套件分辨不出。必须只比 `host`。
+    input: "a:akiaiosfodnn7example@AKIAIOSFODNN7EXAMPLE",
+    expect: { grep: "", read: "" },
+    note: "R10:口令供给主机名绕过逐字比对。比 host 而非整段 m 才挡得住",
+  },
 ];
 
 /** 普通内容不该被误伤成空白。 */
@@ -470,11 +486,6 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
     input: "a:b@0x7f.1",
     expect: { grep: "" },
     note: "R9 造串哨兵:十六进制被 new URL() 展开成 `127.0.0.1`",
-  },
-  {
-    input: "a:b@AKIAIOSFODNN7EXAMPLE",
-    expect: { grep: "", read: "" },
-    note: "R9:new URL() 把主机小写化,而 AKIA/AIza 探测器大小写敏感 —— 归约把唯一压着它的信号毁掉。逐字比对时大小写不同即不匹配,这条路断掉",
   },
 ];
 

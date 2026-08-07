@@ -31,14 +31,17 @@ describe("摘要管线形状语料", () => {
     assertRows(LEAK_CORPUS);
     // 除了逐行等值,再断言一次「口令子串不出现」—— 等值断言只能守住已知的输出形态,
     // 这一条守住的是「无论输出变成什么,那几个串都不许在里面」。
+    // **大小写不敏感比对。** new URL() 会把主机小写(WHATWG),泄漏出来的是 `akiaiosfodnn7example`,
+    // 而这里若按大小写敏感查 `AKIA`,小写输出照样过 —— 那正是上一版没被套件抓到的原因。
     const SECRETS = ["horse", "hunter2", "s3cr3tvalue", "abcdEFGH1234", "sk-secret",
                      "AKIA", "hhhhhhhh", "abcdefghij"];
     for (const row of LEAK_CORPUS) {
       for (const [tool] of Object.entries(row.expect)) {
-        const got = run(row, tool);
+        const got = run(row, tool).toLowerCase();
         for (const secret of SECRETS) {
-          if (!row.input.includes(secret)) continue;
-          expect(got, `${tool} ${JSON.stringify(row.input)} 渲染出了 ${secret}`).not.toContain(secret);
+          const needle = secret.toLowerCase();
+          if (!row.input.toLowerCase().includes(needle)) continue;
+          expect(got, `${tool} ${JSON.stringify(row.input)} 渲染出了 ${secret}`).not.toContain(needle);
         }
       }
     }
