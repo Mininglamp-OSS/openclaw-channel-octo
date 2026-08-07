@@ -476,13 +476,39 @@ const PROTOCOL_RELATIVE_RE =
  * 无 scheme 的 userinfo DSN(`user:pass@host[:port][/path]`):userinfo 即明文口令。
  * 密码可含 `@`,按最后一个 `@` 分隔主机。
  *
- * **只覆盖带点主机。** 单标签主机(`localhost`、compose 服务名)与配套的 fail-closed 兜底
- * 曾经在这条分支上,四轮评审里两次把缺陷改成了更糟的缺陷 —— 放宽归约会把
- * `nginx:1.21@sha256:…` 改写成输入里不存在的 `https://sha256abcd`,收紧兜底又会让一个尾随
- * 逗号或引号整条绕过它。那一对已经摘出去单独评审(见 PR 说明),这里保持 main 的形状不变。
+ * **单标签主机、IPv6、口令带 `/` 都覆盖。** 这四种形状此前挂在 `UNFIXED_CORPUS` 上 ——
+ * 归约够不着,守卫也认不出,于是 `user:hunter2@localhost` 原样渲染进群卡片。
+ *
+ * 关掉它们不是为了补一个洞,是为了让**一句话成立**:这条管线一直声称「渲染的永远只有 kept,
+ * 而 kept 自己要过守卫」。只要单标签 userinfo 还在 UNFIXED 里,这句话就是假的 —— kept 可以
+ * 装着明文口令大摇大摆走过守卫。评审两轮指出:前提是假的,那么「尾部扫描能伸多远」这个界
+ * 放在哪里都是泄漏而不是取舍,因为无论界在 4000 还是 131072,总有一个更远的位置。
+ * 收窄了三次都没关掉,第四次该改的是前提。
+ *
+ * 放宽会踩两个坑,四轮评审里各踩过一次,所以这里两条都钉住:
+ *
+ *   1. **切在词中间会造串。** `nginx:1.21@sha256:1234abcd` 曾被匹配到 `…@sha256:1234`,
+ *      剩下的 `abcd` 拼回替换结果,造出输入里不存在的 `https://sha256abcd`。
+ *      末尾的 `(?![A-Za-z0-9:-])` 要求匹配停在 token 边界上,这一类由构造消失。
+ *      (不能把 `.` 放进去 —— `连接 user:pw@localhost.` 的句号会让整条匹配不上。)
+ *   2. **纯数字单标签会被 `new URL()` 规范化。** `3:4@2/x` 里 `new URL("https://2")` 把主机
+ *      规范成 `0.0.0.2`,同样是输入里没有的串,而且**语料的造串检测抓不住它** ——
+ *      `0.0.0.2` 里没有 4 个字符以上的字母数字段。所以单标签分支要求至少含一个字母;
+ *      带点主机(含 IPv4)走前一个分支,不受影响。
+ *
+ * 代价是几种误伤,方向安全(少渲染)、不造串,记在 REWRITE 组里:`at 10:30@venue` →
+ * `at https://venue`,`com.foo:bar:1.0@jar` → `https://jar`。凭据泄漏在群可见 sink 上,
+ * 这笔换得起。
+ *
+ * **口令段有长度上限 256,那是为了不引入一条新的二次方。** 旧版口令写作 `[^\s/]+`,`/` 把
+ * 长串切成短段;放开 `/` 之后,`a:b/c/a:b/c/…` 这种无 `@` 的长 token 上,每个起点都要扫到
+ * token 末尾再回退 —— 实测 4000/16000/64000 字符是 5.0/74.9/1245.8 ms,干净的二次方,
+ * 而旧版是平的 0.1 ms。加上限之后 1.3/4.7/17.5 ms,回到线性。
+ * 代价:口令超过 256 字符的 DSN 不再被归约。那个长度本身已经是高熵串,交给守卫 ——
+ * `LEAK_CORPUS` 里 3995 字符口令那两行正是这一类,它们靠守卫扣下,不靠归约。
  */
 const SCHEMELESS_USERINFO_RE =
-  /\b[A-Za-z0-9._%+-]+:[^\s/]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:\/[^\s]*)?/g;
+  /\b[A-Za-z0-9._%+-]+:[^\s]{1,256}@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*)(?::\d+)?(?:\/[^\s]*)?(?![A-Za-z0-9-])(?!:\d)/g;
 
 /** 任意无 scheme 的 `host.tld/path`:path 常承载 webhook token、签名或对象凭据。 */
 const SCHEMELESS_HOST_PATH_RE =
@@ -744,8 +770,31 @@ export function reduceUrlsInText(
   });
   // 3. 无 scheme 的 userinfo DSN(`user:pass@host…`):只留注册域,丢 userinfo/path。
   out = out.replace(SCHEMELESS_USERINFO_RE, (m) => {
-    const host = m.slice(m.lastIndexOf("@") + 1).split(/[/:]/)[0];
-    return originDomain(`https://${host}`) ?? "";
+    const afterAt = m.slice(m.lastIndexOf("@") + 1);
+    // IPv6 主机整段带方括号,而按 `:` 切会把 `[::1]` 切成 `[` —— `new URL("https://[")` 抛错,
+    // 整条落到 `?? ""`,于是一条 IPv6 DSN 把整行打空。方向安全,但没必要:方括号里的部分
+    // 本来就是完整主机,直接取到 `]` 为止。
+    const host = afterAt.startsWith("[")
+      ? afterAt.slice(0, afterAt.indexOf("]") + 1)
+      : afterAt.split(/[/:]/)[0];
+    const reduced = originDomain(`https://${host}`);
+    // **归约出的主机必须逐字出现在被替换的那一段里,否则什么都不发。**
+    //
+    // 这一条同时关掉两类缺陷,而且是按构造关掉,不是逐个枚举:
+    //
+    //   1. `new URL()` 的规范化会造串。`a:b@1.2.3` → `1.2.0.3`、`scope:name@1.0.0` →
+    //      `1.0.0.0`、`a:b@0x7f.1` → `127.0.0.1` —— 都是输入里没有的地址。此前只给**无点**
+    //      分支加了「必须含字母」,而带点分支是同一个 new URL() 的第二条路,漏在那里;
+    //      而语料的造串检测按「4 个以上字母数字连排」找,`1.0.0.0` 拆开全是单字符,看不见。
+    //   2. `new URL()` 会把主机**小写**(WHATWG)。而 `AKIA…`/`AIza…` 两条探测器是大小写敏感的,
+    //      于是 `a:b@AKIAIOSFODNN7EXAMPLE` 归约成 `https://akiaiosfodnn7example`,守卫再看
+    //      就认不出了 —— 归约把唯一压着它的信号自己毁掉。逐字比对时大小写不同即不匹配,
+    //      这条路直接断掉。
+    //
+    // 代价:主机大小写混写的 DSN(`user:pw@DB.Example.COM`)不再归约,整段被丢弃而不是
+    // 渲染成注册域。方向安全(少渲染),而且这种写法在 DSN 里罕见。
+    if (reduced === null) return "";
+    return m.includes(reduced.slice("https://".length)) ? reduced : "";
   });
   // 4. 任意无 scheme 的 `host.tld/path`:保留注册域,统一抹掉可能承载凭据的 path。
   out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => (

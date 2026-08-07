@@ -83,12 +83,22 @@ describe("摘要管线形状语料", () => {
     // 造串检测:去掉归约自己加的 `https://` 前缀后,输出的每个字母数字段都必须在输入里出现过。
     // `nginx:1.21@sha256:1234abcd` → `https://sha256abcd` 这类失败就是被这一条抓住的:
     // `sha256abcd` 是端口在词中间截断后、把没匹配上的尾巴拼上去造出来的,输入里没有。
-    for (const row of [...REWRITE_CORPUS, ...BENIGN_CORPUS, ...COST_CORPUS, ...UNFIXED_CORPUS]) {
+    // **LEAK 也要进这条检查。** 它此前不在这个列表里,而上一轮恰好把四行搬进 LEAK ——
+    // 搬进去的同一次改动让它们有能力造串,于是它们正好离开了唯一能抓住造串的检测。
+    for (const row of [...REWRITE_CORPUS, ...BENIGN_CORPUS, ...COST_CORPUS, ...UNFIXED_CORPUS, ...LEAK_CORPUS]) {
       for (const [tool] of Object.entries(row.expect)) {
         const got = run(row, tool).replace(/https?:\/\//g, "");
         for (const seg of got.match(/[A-Za-z0-9]{4,}/g) ?? []) {
           expect(row.input, `${tool} ${JSON.stringify(row.input)} 的输出里出现了输入中没有的串 ${seg}`)
             .toContain(seg);
+        }
+        // **「4 个以上字母数字连排」这条规则看不见点分地址。** `1.0.0.0` / `1.2.0.3` 拆开
+        // 全是单字符,循环体一次都不执行,行照样绿 —— 而这正是 `new URL()` 规范化造出来的
+        // 那一类串。所以再加一条:归约发出的每个 `scheme://主机` 里的主机,必须逐字出现在输入里。
+        for (const host of run(row, tool).match(/https?:\/\/([^\s,)\]]+)/g) ?? []) {
+          const bare = host.replace(/^https?:\/\//, "").replace(/[:/].*$/, "");
+          expect(row.input, `${tool} ${JSON.stringify(row.input)} 归约出的主机 ${bare} 不在输入里`)
+            .toContain(bare);
         }
       }
     }
