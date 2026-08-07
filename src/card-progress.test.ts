@@ -268,6 +268,29 @@ describe("server-driven Registry reasoning progress", () => {
     expect(hits).toBe(1);
   });
 
+  it("warns again after the dedup window, so a recurrence is not silent", async () => {
+    // 「warn 过一次就永远不再说」意味着修好之后再次损坏时是静默的 —— 而这条信号的全部意义
+    // 就是「卡片为什么没有」的唯一线索。
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const hits = (): number => warnSpy.mock.calls.flat()
+      .filter((line) => String(line).includes("template-incompatible")).length;
+    const wire = mockFetch({ profile: profile({ configuredVersion: "9.9.9" }) });
+    global.fetch = wire.fetch as typeof fetch;
+
+    setCardContext("ttl-1", context({ botToken: "bot-ttl" }));
+    await triggerFirstFrame(makeApi(), "ttl-1");
+    expect(hits()).toBe(1);
+
+    setCardContext("ttl-2", context({ botToken: "bot-ttl" }));
+    await triggerFirstFrame(makeApi(), "ttl-2");
+    expect(hits()).toBe(1); // 窗口内不重复
+
+    await vi.advanceTimersByTimeAsync(61_000);
+    setCardContext("ttl-3", context({ botToken: "bot-ttl" }));
+    await triggerFirstFrame(makeApi(), "ttl-3");
+    expect(hits()).toBe(2); // 窗口过后再次可见
+  });
+
   it.each([
     profile({ configuredVersion: null }),
     profile({ configuredVersion: "9.9.9" }),

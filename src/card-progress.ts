@@ -276,7 +276,7 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
     // 成因必须在这里报:调用方拿到 false 就 `entry.skip = true` 并 return,永远走不到
     // resolveEntryDeliveryMode —— 那边的同款日志只是 profile 在 gate 与 resolve 之间被
     // 失效时的兜底。不报的话,「卡片没了」在运维手上没有任何线索。
-    if (!outcome.ref) logReasoningTemplateSkip(ctx, outcome.reason);
+    if (!outcome.ref) logReasoningTemplateSkip(ctx, outcome.reason, m.config?.reasoning_template_ref);
     return !!outcome.ref;
   } catch (err: unknown) {
     // 探测自己被限流时,把窗口记下来 —— 否则后续每个工具事件都会再探一次,而这条路径打的
@@ -321,25 +321,43 @@ const CONTRACT_MISMATCH_REASONS = new Set<ReasoningTemplateSkipReason>([
 ]);
 
 /**
- * 已 warn 过的 (bot, 成因) 组合。profile 按 bot 缓存,但日志不缓存 —— 一个持续广告不兼容模板
- * 的服务端会在**每个产卡的 turn**上 warn 一次、无限重复。按 bot+成因去重,现象仍会被看见一次,
- * 之后不刷屏。dbg 那条不去重:它默认关,开着就是为了看每一轮。
+ * 已 warn 过的 (bot, 成因, 模板 ref) 组合 → 该条目的过期时刻。
+ *
+ * 三件事共同决定了这个形状:
+ *  - **要去重**:profile 按 bot 缓存,日志不缓存的话,持续广告不兼容模板的服务端会在每个产卡的
+ *    turn 上 warn 一次、无限重复。
+ *  - **要过期**:「warn 过一次就永远不再说」意味着修好之后再次损坏时是静默的 —— 而这条信号的
+ *    全部意义就是「卡片为什么没有」的唯一线索,恢复后再复发反而无声是错的默认。
+ *  - **key 要带模板 ref**:只带成因的话,服务端从坏模板 A 修好、之后换成另一个坏模板 B,会被
+ *    旧条目压住而无声。
  */
-const warnedTemplateSkips = new Set<string>();
+const warnedTemplateSkips = new Map<string, number>();
+const TEMPLATE_SKIP_WARN_TTL_MS = 60_000;
 
 /** 「卡片为什么没有」的唯一线索。 */
-function logReasoningTemplateSkip(ctx: CardContext, reason: ReasoningTemplateSkipReason): void {
-  const message = `no reasoning template; progress card skipped (${reason})`;
+function logReasoningTemplateSkip(
+  ctx: CardContext,
+  reason: ReasoningTemplateSkipReason,
+  offendingRef?: CardTemplateRef | null,
+): void {
+  const refLabel = offendingRef ? `${offendingRef.id}@${offendingRef.version}` : "-";
+  const message = `no reasoning template; progress card skipped (${reason}; ref=${refLabel})`;
   if (!CONTRACT_MISMATCH_REASONS.has(reason)) {
     dbg(message);
     return;
   }
-  const key = JSON.stringify([ctx.apiUrl, ctx.botToken, reason]);
-  if (warnedTemplateSkips.has(key)) {
+  const key = JSON.stringify([ctx.apiUrl, ctx.botToken, reason, refLabel]);
+  const now = Date.now();
+  const expiresAt = warnedTemplateSkips.get(key);
+  if (expiresAt !== undefined && expiresAt > now) {
     dbg(`${message}; already warned`);
     return;
   }
-  warnedTemplateSkips.add(key);
+  // 顺手清掉过期项,避免这张表随部署见过的凭据无界增长。
+  for (const [existing, deadline] of warnedTemplateSkips) {
+    if (deadline <= now) warnedTemplateSkips.delete(existing);
+  }
+  warnedTemplateSkips.set(key, now + TEMPLATE_SKIP_WARN_TTL_MS);
   warn(message);
 }
 
@@ -381,7 +399,7 @@ function resolveEntryDeliveryMode(entry: CardEntry): void {
     return;
   }
   // gate 已经报过成因了;这里只在 profile 于 gate 与 resolve 之间被失效时兜底。
-  logReasoningTemplateSkip(entry.ctx, outcome.reason);
+  logReasoningTemplateSkip(entry.ctx, outcome.reason, profile?.config?.reasoning_template_ref);
   entry.skip = true;
 }
 

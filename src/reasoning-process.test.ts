@@ -663,3 +663,72 @@ describe("wire data clamps to the selected template version", () => {
     expect(/[\uD800-\uDFFF]/.test(thought.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, ""))).toBe(false);
   });
 });
+
+/**
+ * 宿主内部上下文标记的绕过形态。评审在 merge-base c81df55 上复现了 C/D/E 三种泄漏 —— 这一类
+ * 不是本 PR 引入的,但在这里一并收掉:标记散开时固定子串匹配不上,而标记后面的内容会原样进
+ * 群可见卡片。
+ */
+describe("internal-context marker cannot be split apart", () => {
+  // payload 必须是**无关键词**的普通散文:带 credential/token 之类的词会触发 isSensitive,
+  // 测试就会因为脱敏而通过、而不是因为标记检查 —— 那是假阳性。
+  const payload = "the meeting notes are in the shared folder upstairs";
+  const P = "Native reasoning was produced; no summary text was returned.";
+
+  it.each([
+    ["完整标记", "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>> " + payload],
+    ["占位句在标记之前", P + " <<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>> " + payload],
+    ["占位句插入标记内部", "<<<BEGIN_OPENCLAW_INTERNAL_" + P + "CONTEXT>>> " + payload],
+    ["占位句插入两处", "<<<BEGIN_OPENCLAW_" + P + "INTERNAL_" + P + "CONTEXT>>> " + payload],
+    ["下划线被替换", "<<<BEGIN_OPENCLAW_INTERNAL~CONTEXT>>> " + payload],
+    ["END 变体", "<<<END_OPENCLAW_INTERNAL~CONTEXT>>> " + payload],
+    // 只有容忍式填充能挡的形态:分隔符从下划线换成空格,窄正则要求 BEGIN_OPENCLAW_INTERNAL
+    // 逐字相连,一个都抓不到。
+    ["分隔符换成空格", "<<< BEGIN OPENCLAW INTERNAL CONTEXT >>> " + payload],
+    ["分隔符换成连字符", "<<<BEGIN-OPENCLAW-INTERNAL-CONTEXT>>> " + payload],
+  ])("blocks %s", (_label, input) => {
+    const result = resolveReasoningThought(input);
+    expect(result.kind).toBe("redacted");
+    expect(result.text).not.toContain("meeting notes");
+  });
+});
+
+/**
+ * 逐字段 clamp 挡不住总量:6 个 phase 各自用满 0.4.0 的 4001 就是 ~24K runes(CJK 约 72 KB),
+ * 而模板发送路径没有 cardFitsLimits 那样的体积兜底,越界即 400 → entry.skip → 整个 session
+ * 没有卡片。
+ */
+describe("wire data budgets total thought across phases", () => {
+  const manyPhases = (perPhase: number, count: number): CardProgressState => {
+    const unit = "I need to check the runtime before answering. ";
+    const thought = unit.repeat(Math.ceil(perPhase / unit.length)).slice(0, perPhase);
+    const steps: CardProgressState["steps"] = [];
+    for (let index = 0; index < count; index++) {
+      steps.push({ tool: "__thinking__", status: "done", modelCallId: "c" + index, thought });
+      steps.push({ tool: "exec", status: "done", toolCallId: "t" + index, summary: "npm", resultSummary: "exit 0" });
+    }
+    return { reasoningId: "r", phase: "tool", elapsedMs: 5_000, steps };
+  };
+  const totalRunes = (data: ReturnType<typeof buildReasoningProcessWireData>): number =>
+    data!.phases.reduce((sum, phase) => sum + [...phase.thought].length, 0);
+
+  it("keeps six maxed-out phases inside a total budget on 0.4.0", () => {
+    const data = buildReasoningProcessWireData(manyPhases(3_500, 6), "0.4.0");
+    expect(data!.phases.length).toBeGreaterThan(1);
+    expect(totalRunes(data)).toBeLessThanOrEqual(6_000);
+  });
+
+  it("spends the budget on the newest phases, shrinking the oldest first", () => {
+    const data = buildReasoningProcessWireData(manyPhases(3_500, 6), "0.4.0");
+    const lengths = data!.phases.map((phase) => [...phase.thought].length);
+    // 最后一个 phase 是当前正在发生的,必须比第一个留得多。
+    expect(lengths.at(-1)!).toBeGreaterThan(lengths[0]!);
+    // 每个 phase 仍满足契约的 minLength: 1。
+    expect(lengths.every((n) => n >= 1)).toBe(true);
+  });
+
+  it("leaves a single phase alone when it fits", () => {
+    const data = buildReasoningProcessWireData(manyPhases(500, 1), "0.4.0");
+    expect([...data!.phases[0]!.thought].length).toBe(500);
+  });
+});

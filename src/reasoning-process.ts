@@ -76,12 +76,65 @@ const NO_SUMMARY_THOUGHT = "Reasoned without a visible summary";
  * operator where to look, so it must stay distinguishable from NO_SUMMARY_THOUGHT.
  */
 const REDACTED_THOUGHT = "Reasoning hidden — matched a redaction rule";
+
+/**
+ * 宿主内部上下文标记,容忍式匹配。固定子串挡不住把下划线换成别的字符(`INTERNAL~CONTEXT`)或
+ * 在中间插入内容的变体 —— 这里只要求出现 `<<<`、BEGIN/END、OPENCLAW、INTERNAL 这几个片段,
+ * 中间允许任意非字母数字的填充。宁可过度隐藏。
+ */
+const INTERNAL_CONTEXT_MARKER_RE =
+  /<<<[^A-Za-z0-9]*(?:BEGIN|END)[^A-Za-z0-9]*OPENCLAW[^A-Za-z0-9]*INTERNAL/i;
+/**
+ * 一张卡上所有 phase 的 thought 加起来的上限(runes)。
+ *
+ * 逐字段 clamp 挡不住总量:trimForRender 允许 MAX_RENDERED_PHASES 个 phase,每个都有自己的
+ * thought 预算(各由独立的 __thinking__ 步骤 + MAX_REASONING_CAPTURE 供给),所以 0.4.0 上
+ * 最坏是 6 × 4001 ≈ 24K runes —— ASCII 约 24 KB、CJK 约 72 KB。
+ *
+ * 而模板发送路径**没有任何体积兜底**:本仓其他卡片生产者(card-blocks / card-author /
+ * card-render)发送前都过 cardFitsLimits(它校验 maxPayloadBytes),而 sendTemplateCardMessage
+ * 只调 validateTemplateFrame —— 只查形状,不查大小。仓库 fixture 里出现过 max_payload_bytes
+ * 为 16384 的部署,24 KB 就已经越界。越界的代价不是内容变短,而是 400 → entry.skip → 整个
+ * session 没有卡片。
+ *
+ * 6000 runes ≈ 18 KB CJK,留足余量;单 phase 仍可用满其版本上限,只有多个长 phase 同时出现时
+ * 才开始裁剪。裁剪方向与 trimForRender 一致:**留最近的**,旧 phase 的思考先让位。
+ */
+const PHASES_THOUGHT_TOTAL_MAX = 6_000;
+
+/**
+ * 按总量裁剪 thought,从**最旧**的 phase 开始收缩。不删 phase(那会丢掉工具行 —— 读者没有
+ * 别处可查),只把它的思考文本压短;压到 NO_THOUGHT_WIRE_LABEL 为止,因为契约要求 minLength 1。
+ */
+function budgetPhaseThoughts(
+  phases: ReasoningProcessPhase[],
+  total = PHASES_THOUGHT_TOTAL_MAX,
+): ReasoningProcessPhase[] {
+  const cost = (text: string): number => [...text].length;
+  let used = phases.reduce((sum, phase) => sum + cost(phase.thought), 0);
+  if (used <= total) return phases;
+  const out = phases.map((phase) => ({ ...phase }));
+  // 最旧的先收缩,最新的 phase 最后才被动到。
+  for (let index = 0; index < out.length && used > total; index++) {
+    const phase = out[index]!;
+    const before = cost(phase.thought);
+    // clampRunes 会追加一个 "…",产出是 keep + 1 —— 预算里要为它留位,否则每裁一个 phase
+    // 就超 1 个 rune。
+    const keep = before - (used - total) - 1;
+    phase.thought = keep > 0 ? clampRunes(phase.thought, keep) : NO_THOUGHT_WIRE_LABEL;
+    used -= before - cost(phase.thought);
+  }
+  return out;
+}
+
 /**
  * 其余字段的契约上限(0.2.0 起至 0.4.0 一致,0.4.0 只放开了 thought)。同样取自 handoff 产物。
  * 留一个字符给截断用的 "…"。
  */
 const TIMER_TEXT_MAX = 128 - 1;
 const ACTION_DETAIL_MAX = 192 - 1;
+const ERROR_MESSAGE_MAX = 121 - 1;
+const REASONING_ID_CONTRACT_MAX = 512;
 
 /**
  * 按**码点**截断。契约的 maxLength 按 rune 计,而 JS slice 按 UTF-16 码元切 —— 后者会把代理对
@@ -296,13 +349,19 @@ export function resolveReasoningThought(text: string | undefined): ReasoningThou
     .trim();
   // Whitespace-only input carries no reasoning; it is not something we withheld.
   if (!normalized) return { kind: "none", text: "" };
-  // 内部上下文标记必须在**剥离占位句之前**检查:剥离会把拼接进标记内部的占位句去掉、
-  // 让标记重新拼合不上,从而绕过这道检查(实测 `<<<BEGIN_OPENCLAW_INTERNAL_` + 占位句 +
-  // `CONTEXT>>> …` 会被判成 text 并原样渲染)。可达性窄(需要模型输出被这样构造),但改的成本为零。
-  if (normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
-      normalized.includes("<<<END_OPENCLAW_INTERNAL_CONTEXT>>>") ||
-      normalized.includes("<<<BEGIN_OPENCLAW_INTERNAL_") ||
-      normalized.includes("_CONTEXT>>>")) {
+  // 内部上下文标记:宿主用它包裹运行时生成的私有上下文,一旦渲染就是把内部信息发到群里。
+  //
+  // 三件事共同决定了这里的写法:
+  //  1. **必须在剥离占位句之前查一次** —— 剥离会把拼进标记内部的占位句去掉,让标记散开、
+  //     固定子串匹配不上(评审实测的 C 形态)。
+  //  2. **剥离之后要再查一次** —— 占位句可以插在两处,一次剥离后标记仍是断的,但第二次
+  //     检查能看到拼合后的结果(D 形态)。
+  //  3. **容忍式正则而非固定子串** —— `INTERNAL~CONTEXT` 这类把下划线换成别的字符的变体,
+  //     固定子串一个都抓不到(E/F 形态)。
+  //
+  // 这一类整体在 merge-base 上就存在(评审在 c81df55 上复现了 C/D/E),这里是收窄而非引入。
+  // 可达性窄(需要模型输出被这样构造,即 prompt injection),但改的成本为零。
+  if (INTERNAL_CONTEXT_MARKER_RE.test(normalized)) {
     return { kind: "redacted", text: REDACTED_THOUGHT };
   }
   // 包含式而非全等:recordCardReasoning 在非 snapshot 时会拼接(`previous + text`),而一个
@@ -312,6 +371,10 @@ export function resolveReasoningThought(text: string | undefined): ReasoningThou
   if (normalized.includes(HOST_NO_SUMMARY_PLACEHOLDER)) {
     const rest = normalized.split(HOST_NO_SUMMARY_PLACEHOLDER).join(" ").replace(/\s+/g, " ").trim();
     if (!rest) return { kind: "no-summary", text: NO_SUMMARY_THOUGHT };
+    // 剥离可能让原本散开的标记拼合上 —— 再查一次。
+    if (INTERNAL_CONTEXT_MARKER_RE.test(rest)) {
+      return { kind: "redacted", text: REDACTED_THOUGHT };
+    }
     normalized = rest;
   }
   normalized = reduceUrlsInText(normalized).replace(/\s+/g, " ").trim();
@@ -556,8 +619,17 @@ export function buildReasoningProcessWireData(
     }));
   if (phases.length === 0) return null;
   const data = trimForRender(buildReasoningProcessDataWithPhases(state, phases));
+  // 逐字段 clamp 之后再收一次总量 —— trimForRender 决定了留几个 phase,总量只能在它之后算。
+  data.phases = budgetPhaseThoughts(data.phases);
   // timerText 在失败轮次上会带上清洗后的错误详情,实测 error 135 / expired 138 runes,超过契约 128。
-  return { ...data, timerText: clampRunes(data.timerText, TIMER_TEXT_MAX) };
+  return {
+    ...data,
+    timerText: clampRunes(data.timerText, TIMER_TEXT_MAX),
+    // 这两个此前靠「另一个模块的常量刚好等于契约上限」成立,零余量:改动 ERROR_MAX 或
+    // REASONING_ID_MAX_LENGTH 就会让错误态卡片 400 并消失。在这里 clamp,不再依赖那个巧合。
+    ...(data.errorMessage === undefined ? {} : { errorMessage: clampRunes(data.errorMessage, ERROR_MESSAGE_MAX) }),
+    reasoningId: clampRunes(data.reasoningId, REASONING_ID_CONTRACT_MAX),
+  };
 }
 
 function textBlock(text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
