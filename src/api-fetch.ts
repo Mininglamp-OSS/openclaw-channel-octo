@@ -559,9 +559,11 @@ export async function sendCardMessage(params: {
   clientMsgNo?: string;
   signal?: AbortSignal;
   /**
-   * Forwarded to postJson. A transient progress frame passes false: it is discardable,
-   * and holding the flush while we back off would block the frames behind it. A finalize
-   * frame leaves it unset, because that state has to land.
+   * Forwarded to postJson. A transient progress frame passes false: it is discardable, and
+   * holding the flush while we back off would block the frames behind it. Every current
+   * caller of this particular wrapper wants the default — their cards are user-visible and
+   * have to land — so the parameter reads as unused here; it is the uniform contract across
+   * the four card senders, not dead weight.
    */
   retryOn429?: boolean;
 }): Promise<SendMessageResult | undefined> {
@@ -737,9 +739,11 @@ export async function editCardMessage(params: {
   onBehalfOf?: string;
   signal?: AbortSignal;
   /**
-   * Forwarded to postJson. A transient progress frame passes false: it is discardable,
-   * and holding the flush while we back off would block the frames behind it. A finalize
-   * frame leaves it unset, because that state has to land.
+   * Forwarded to postJson. A transient progress frame passes false: it is discardable, and
+   * holding the flush while we back off would block the frames behind it. Every current
+   * caller of this particular wrapper wants the default — their cards are user-visible and
+   * have to land — so the parameter reads as unused here; it is the uniform contract across
+   * the four card senders, not dead weight.
    */
   retryOn429?: boolean;
 }): Promise<void> {
