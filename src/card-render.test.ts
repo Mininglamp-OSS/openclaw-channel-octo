@@ -7,6 +7,7 @@ import {
   resolveToolMeta,
   summarizeToolParams,
   sanitizeErrorText,
+  reduceUrlsInText,
   fmtDuration,
   stepLine,
   cardSupports,
@@ -133,9 +134,24 @@ describe("summarizeToolParams", () => {
     expect(summarizeToolParams("exec", { command: "SLACK_WEBHOOK=https://hooks.slack.com/services/T/B/X curl -X POST" })).toBe("curl");
     expect(summarizeToolParams("bash", { command: "MY_CREDS=abc123 DEPLOY_KEY=xyz ./deploy.sh" })).toBe("./deploy.sh");
   });
-  it("shell 带引号多词环境变量值 → 落在值片段则整体不展示(形状校验)", () => {
-    // 空白分词把 TOKEN="a b" 切成 TOKEN="a / b" —— 落在片段 b",含引号 → 不展示。
-    expect(summarizeToolParams("exec", { command: 'TOKEN="a b" node app.js' })).toBe("");
+  it("shell 带引号的多词赋值值先折叠,程序名不会落在值的中间那个词上", () => {
+    // 不折叠时空白分词会把值切碎,跳过首个片段后落在**第二个**词上 —— 而那个词往往不含异常
+    // 字符、能通过 PROGRAM_TOKEN_RE。加折叠前实测:
+    //   PASSPHRASE='correct horse battery staple' gpg --sign x  →  "horse"
+    //   MY_CREDS='alpha hunter2 charlie' ./go                   →  "hunter2"
+    //   DEPLOY_KEY="one s3cr3tvalue two" ./deploy.sh            →  "s3cr3tvalue"
+    // 这些变量名恰好是 SECRET_RE 没有的,关键词守卫救不回来。
+    expect(summarizeToolParams("exec", { command: "PASSPHRASE='correct horse battery staple' gpg --sign x" }))
+      .toBe("gpg");
+    expect(summarizeToolParams("bash", { command: "MY_CREDS='alpha hunter2 charlie' ./go" })).toBe("./go");
+    expect(summarizeToolParams("exec", { command: 'DEPLOY_KEY="one s3cr3tvalue two" ./deploy.sh' }))
+      .toBe("./deploy.sh");
+    // 两个词的值原本靠「片段带引号」侥幸挡住,折叠后走的是正路。
+    expect(summarizeToolParams("exec", { command: 'TOKEN="a b" node app.js' })).toBe("node");
+    // 值里带转义引号,不能在转义处提前收尾。
+    expect(summarizeToolParams("exec", { command: 'PASSPHRASE="alpha\\" hunter2 x" gpg' })).toBe("gpg");
+    // 拼接词:引号出现在值的中间偏移处也要覆盖(shell 里 `a"b"c` 是一个词)。
+    expect(summarizeToolParams("exec", { command: "MY_CREDS=$'alpha hunter2 x' ./go" })).toBe("./go");
     // 合法程序名/路径不受影响。
     expect(summarizeToolParams("exec", { command: "/usr/bin/python3 x.py" })).toBe("/usr/bin/python3");
   });
@@ -163,6 +179,8 @@ describe("summarizeToolParams", () => {
     // 不误伤 Windows 盘符路径(无 ://)。
     expect(summarizeToolParams("read", { path: "C:/Users/me/app.ts" })).toBe("…/me/app.ts");
   });
+  // 注:shell 策略在默认档只渲染程序名,所以只有 DSN **本身就是 argv[0]** 时才会经由 shell
+  // 泄漏;path/query 策略则原样返回整个值,是这一类的主要 sink。下面按各自的真实 sink 取样。
   it("url 类只保留 scheme://注册域,丢弃 path/query/userinfo 与所有子域", () => {
     expect(summarizeToolParams("fetch", { url: "https://u:p@host.com/a/b?token=sk-secret&x=1" })).toBe(
       "https://host.com",
@@ -193,6 +211,66 @@ describe("summarizeToolParams", () => {
     // 正常长英文 / 纯字母长串不误伤。
     expect(summarizeToolParams("web_search", { query: "how to configure oauth flow correctly" })).toBe("how to configure oauth flow correctly");
   });
+  // 这里原来有两条计时断言,已删除,由 card-render.corpus.test.ts 的 PERF 组接管。
+  //
+  // 删而不是修,是因为它们已经**在断言另一件事而不自知**。它们只用三个不含空白的形状
+  // (`"a"×100000+"?x"`、`"http://"+"a"×120000`、`"a:b@"+"a"×60000`),而空白边界截断落地后,
+  // 这三个都在长度判定处被拒,一趟正则都不跑 —— 十五个格子全部 0.005 ms。它们自己的注释写着
+  // 存在理由是「测调用方测不出上限放错了地方,测管线本身才行」,而那个性质已经不是它们测的了:
+  // 现在测的是「长度守卫存在」,测了两遍。预算还停在 2000 ms,R4a 那个三次方(4000 字符约
+  // 1.7 秒)会绿着通过。
+  //
+  // 留着两套计时断言,本身就是这条分支反复犯的那个错:**第二张表该跟着第一张改而没有跟**。
+  // PERF 组同时覆盖 reduceUrlsInText / sanitizeErrorText / summarizeToolParams 的三个策略
+  // (与删掉这两条的入口完全相同),含这三个形状,并且每行标注 reachesPasses、标注本身被断言。
+
+  // 切点搜索的边界形态。这几条此前一条都没有,而它们正是改动切法时最先坏掉的一批。
+  // 「空白正好在下标 4000」曾经是错的:搜索范围取 REDUCE_INPUT_MAX 而不是 +1,前 4000 字符
+  // 明明已经是一个完整的、token 边界对齐的前缀,却连同整串一起被拒。
+  it("空白边界截断:切点搜索的边界形态", () => {
+    // 填充字符全部用非十六进制的 `z`/`y`。用 `a`/`b` 会踩到 LONG_HEX_RE —— 被丢掉的那一段现在
+    // 要过一遍守卫,而 `"b"×100` 是一个 100 字符的十六进制串,于是测的就不是切点而是守卫了。
+    const CASES: Array<[string, string, number]> = [
+      ["空白正好在下标 4000", "z".repeat(4000) + " " + "y".repeat(100), 4000],
+      ["空白在下标 3999", "z".repeat(3999) + " " + "y".repeat(100), 3999],
+      ["长度正好 4000、无空白", "z".repeat(4000), 4000],
+      ["长度 4001、无空白", "z".repeat(4001), 0],
+      ["空白只在下标 0", " " + "z".repeat(4100), 0],
+      ["全是空白", " ".repeat(5000), 4000],
+    ];
+    for (const [label, input, wantLen] of CASES) {
+      expect(reduceUrlsInText(input).length, label).toBe(wantLen);
+    }
+    // 返回值长度恒 ≤ 上限 —— 多取的那一个字符只用于**发现**切点,不能进入结果。
+    for (const [, input] of CASES) expect(reduceUrlsInText(input).length).toBeLessThanOrEqual(4000);
+    // 代理对不会被从中间切开。切在空白上时这一条由构造成立,但它是切法改动时最容易回归的一项。
+    const LONE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    for (const input of [
+      "z".repeat(3998) + "\u{1F600}".repeat(60), // 切口落在代理对中间
+      "z".repeat(3990) + " " + "\u{1F600}".repeat(60), // 切口前有空白,emoji 整段落在保留段外
+    ]) {
+      expect(LONE.test(reduceUrlsInText(input)), `${JSON.stringify(input.slice(0, 12))}… 输出里出现孤立代理`).toBe(false);
+    }
+  });
+  // 界丢掉的那一段用**哪一个**谓词判定,是可观察的 —— 但上一版三处接线里有两处删掉之后
+  // 整个 1838 条的套件依然全绿(子代理评审跑变异发现的)。下面三条各钉一处接线。
+  it("界丢掉的那一段:三处谓词接线各自可观察", () => {
+    const PAD = "word ".repeat(900);
+    // 1) 缺省谓词必须是**最严**的一档:尾巴只有高熵、没有关键词也没有明确前缀。
+    //    写成 isSensitive(s, false) 时这一条会渲染出来。
+    expect(reduceUrlsInText(PAD + "aB3dE7gH1jK4mN8pQ2rS5tU9vW6xY0zA")).toBe("");
+    expect(reduceUrlsInText(PAD + "just more ordinary words here")).not.toBe("");
+    // 2) sanitizeErrorText 必须传自己那道(带构建哈希豁免的)判定。不传就退回缺省的最严档,
+    //    而缺省档不认 `commit:` 豁免 → 一条标注过的构建哈希把整条错误打空。
+    const withHash = PAD + "commit: 2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c";
+    expect(sanitizeErrorText(withHash), "错误文本没把自己的豁免传进界里").not.toBe("");
+    // 3) query/url 策略是 generic=true、path/shell 是 false —— 同一个尾部 git SHA,
+    //    grep 扣下、read 渲染。任一侧接错线,这里立刻分岔。
+    const withSha = PAD + "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c";
+    expect(summarizeToolParams("grep", { pattern: withSha })).toBe("");
+    expect(summarizeToolParams("read", { file_path: withSha })).not.toBe("");
+  });
+
   it("前缀式密钥被前置词字符粘连也隐藏(去词界锚点;两类 sink 都覆盖)", () => {
     // 回归 yujiawei P1:`\b` 词界锚点会被"前面粘一个词字符"绕过 → 明文密钥泄露。
     // query 策略(generic=true):

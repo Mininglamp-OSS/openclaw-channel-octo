@@ -74,6 +74,57 @@ describe("heading / text block", () => {
     expect(body({ card })[0]).toEqual({ type: "TextBlock", text: "正文", wrap: true });
   });
 
+  it("跨截断点的密钥不出现在渲染结果里", () => {
+    // 归约管线对超过 REDUCE_INPUT_MAX(4000 字符)的输入会截断,而 text block **没有渲染上限**
+    // —— 与摘要(64)、错误(120)、debug 串(512)不同,长文本会整段渲染。于是横跨截断点的密钥
+    // 被切成两半,isSensitive 认不出那个片段,整块照渲。修好之前实测:
+    //
+    //     "z"×3990 + " AKIAIOSFODNN7EXAMPLE"  →  渲染 4000 字符,尾部是 `AKIAIOSFO`
+    //
+    // 偏移量是可选的 —— padding 调一下,几乎整个 token 都能渲染出来。
+    //
+    // **断言的是「密钥不出现」,不是「整块不渲染」。** 这两者不是一回事:安全的截断前缀渲染出来
+    // 也满足不变式,而 `toHaveLength(0)` 会把「整块扣下」钉成唯一正确答案 —— 那比不变式严,
+    // 会把一处本可以放宽的实现选择锁死。这一组正是 LEAK 语料用非等值断言的同一个理由。
+    for (const [pad, secret] of [
+      [3990, "AKIAIOSFODNN7EXAMPLE"],
+      [3985, "AKIAIOSFODNN7EXAMPLE"],   // 偏移可选:切点后移,露出更多
+      [3990, "ghp_ABCDEFGHIJ1234567890XY"],
+      [3990, "sk-ABCDEFGHIJKLMNOP1234"],
+    ] as [number, string][]) {
+      const rendered = buildDisplayCard({ blocks: [{ type: "text", text: `${"z".repeat(pad)} ${secret}` }] });
+      const all = JSON.stringify(rendered.card) + rendered.plain;
+      // 整个密钥、以及它任何 ≥8 字符的前缀片段,都不许出现 —— 后者是"被切成两半"那一类。
+      for (let n = secret.length; n >= 8; n--) {
+        expect(all, `pad=${pad} ${secret} 的前 ${n} 字符出现在渲染结果里`).not.toContain(secret.slice(0, n));
+      }
+    }
+    // 反向:归约后本该安全的内容必须照常渲染 —— 下面这条归约后是 `https://slack.com`。
+    // 曾经这里有一道查**整串**的预检,它会把这类内容整块丢掉;界改成只查被丢掉的那一段之后,
+    // 长文本里带 webhook 的形状也能正常渲染(见 card-render.corpus.ts 的 COST 组)。
+    const ok = buildDisplayCard({
+      blocks: [{ type: "text", text: "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234" }],
+    });
+    expect((body(ok)[0] as { text: string }).text).toContain("https://slack.com");
+    const long = buildDisplayCard({
+      blocks: [{ type: "text", text: "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234 " + "word ".repeat(900) }],
+    });
+    expect((body(long)[0] as { text: string }).text, "空白充裕、归约后安全的长文本被整块丢掉")
+      .toContain("https://slack.com");
+  });
+
+  // 这一条钉住 sanitize 把自己的 generic 传进了界里。删掉那个实参、退回缺省的最严档时,
+  // 整个套件依然全绿(子代理评审跑变异发现的),而行为是可观察的:trusted 卡走 generic=false,
+  // 尾部的 git SHA 不该被当成密钥 —— 那正是 generic 这个开关存在的理由。
+  it("界丢掉的那一段按本卡的 generic 判定,而不是一律用最严的一档", () => {
+    const text = "word ".repeat(900) + "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c";
+    const trusted = buildDisplayCard({ trusted: true, blocks: [{ type: "text", text }] });
+    expect(body(trusted), "trusted 卡(generic=false)不该因为尾部 git SHA 被打空").toHaveLength(1);
+    // 反面:不可信卡是 generic=true,长 hex 归它管,整块扣下。
+    const untrusted = buildDisplayCard({ blocks: [{ type: "text", text }] });
+    expect(body(untrusted)).toHaveLength(0);
+  });
+
   it("text 内嵌 URL 降级到 scheme://注册域(webhook/隧道/预签名主机都吃)", () => {
     const { card } = buildDisplayCard({
       blocks: [{ type: "text", text: "回调 https://hooks.slack.com/services/T00/B00/xy → 500" }],
@@ -684,6 +735,46 @@ describe("copy block(Action.CopyToClipboard 本地动作)", () => {
     expect(el.type).toBe("TextBlock");
     expect(el.text).toContain("4KiB");
     expect(JSON.stringify(tooLong.card)).not.toContain("Action.CopyToClipboard");
+  });
+
+  it("超限判定跑在原始 text 上:绝不把截断过的残值塞进复制按钮", () => {
+    // 归约管线对超过 REDUCE_INPUT_MAX(4000 字符)的输入会截断 —— 那是它的性能界。若超限判定
+    // 跑在 sanitize 的**输出**上,ASCII 下 4000 字符恒 ≤ 4096 字节,4KiB 那条判定就永远不再
+    // 触发:20000 字符会安静地变成 4000 字符进复制按钮,而 4050 字符这种**合法在契约内**的
+    // 内容同样被截成 4000。两种情况用户粘出来都是残的,却没有任何提示。
+    //
+    // 复制按钮是读者会直接拿去用的 sink。要么给全文,要么给提示,不给残值。
+    // 两条上限的理由不同,提示语也必须不同:4050 个 ASCII 字符**就是 4050 字节**,合法地在
+    // 4KiB 契约内 —— 告诉读者"超过 4KiB"是假话,下一个人去查字节数会什么也查不到。
+    for (const [label, n, want] of [
+      ["超出字符上限", 4050, "字符"],
+      ["远超两条上限", 20_000, "字符"],
+    ] as [string, number, string][]) {
+      const r = buildDisplayCard({ caps: CAPS_WITH_COPY, blocks: [{ type: "copy", text: "x".repeat(n) }] });
+      const el = body(r)[0] as { type: string; text: string };
+      expect(el.type, label).toBe("TextBlock");
+      expect(el.text, label).toContain(want);
+      expect(JSON.stringify(r.card), label).not.toContain("Action.CopyToClipboard");
+    }
+    // 字节超限但字符数在界内(CJK)仍报 4KiB。
+    const cjk = buildDisplayCard({ caps: CAPS_WITH_COPY, blocks: [{ type: "copy", text: "中".repeat(1366) }] });
+    expect((body(cjk)[0] as { text: string }).text).toContain("4KiB");
+    // 不支持复制按钮的客户端走普通 TextBlock —— 那条路径没有复制按钮,不该收到"未渲染复制按钮"。
+    // **两条上限都要覆盖到**:上一版这里只测了 1366 个 CJK 字符,那走的是**字节**路径,于是新加的
+    // 字符判定放错了位置(在能力回退之前)也照样绿。断言与它要守的路径必须对得上。
+    for (const [label, text] of [
+      ["字节路径", "中".repeat(1366)],
+      ["字符路径", "y".repeat(4100)],
+    ] as [string, string][]) {
+      const noCopy = buildDisplayCard({ blocks: [{ type: "copy", text }] });
+      const el = body(noCopy)[0] as { type: string; text: string };
+      expect(el.type, label).toBe("TextBlock");
+      expect(el.text, label).not.toContain("未渲染复制按钮");
+    }
+    // 界内的照常给出完整内容,一个字符都不少。
+    const ok = buildDisplayCard({ caps: CAPS_WITH_COPY, blocks: [{ type: "copy", text: "x".repeat(3000) }] });
+    expect((body(ok)[0] as { type: string }).type).toBe("ActionSet");
+    expect(JSON.stringify(ok.card)).toContain("x".repeat(3000));
   });
 
   it("copy text / label 仍走脱敏;label 命中敏感时退回默认标题", () => {

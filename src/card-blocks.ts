@@ -13,7 +13,7 @@
  * 纯函数、无副作用、无 I/O —— hook 进度卡与 agent 展示卡工具共享这一层。
  */
 
-import { cardSupports, isSensitive, reduceUrlsInText, type CardCaps } from "./card-render.js";
+import { cardSupports, isSensitive, reduceUrlsInText, REDUCE_INPUT_MAX, type CardCaps } from "./card-render.js";
 import { cardFitsLimits } from "./card-limits.js";
 import { CARD_VERSION } from "./types.js";
 
@@ -136,9 +136,23 @@ export interface BuildDisplayCardResult {
 function sanitize(text: string, generic = true): string | null {
   let s = text.replace(/\s+/g, " ").trim();
   if (!s) return null;
-  s = reduceUrlsInText(s).replace(/\s+/g, " ").trim();
+  // 这个 sink **没有渲染上限** —— 与摘要(64)、错误(120)、debug 串(512)不同,一段长文本
+  // 会整段渲染,所以界在这里的影响是直接可见的。曾经这里另有一道「截断前先在未截断原串上跑
+  // isSensitive」的预检,用来挡住横跨切口被切成两半、守卫认不出的密钥。
+  //
+  // 那道预检**已经删掉**,因为界自己现在会用下面这同一个谓词检查它丢掉的那一段
+  // (见 boundedForReduction)。不是"覆盖面严格更大" —— 被丢掉的那一段是预检所查范围的
+  // **子集**,覆盖面是**挪了位置**:预检只装在这一个 sink 上,界覆盖全部十一个调用点。
+  // 只有预检看得见的那些形状,归约本来就会把它们中和掉,实测没有可观察的损失。
+  // 留着它还要付一笔与界无关的代价 —— 它查的是**整串**,于是
+  //
+  //     "https://hooks.slack.com/services/T../B../XXXX " + "word "×900
+  //
+  // 这种空白充裕、归约后完全安全的内容被整块丢掉(main 渲染 4517 字符)。
+  const sensitiveHere = (t: string) => isSensitive(t, generic);
+  s = reduceUrlsInText(s, sensitiveHere).replace(/\s+/g, " ").trim();
   if (!s) return null;
-  if (isSensitive(s, generic)) return null;
+  if (sensitiveHere(s)) return null;
   return s;
 }
 
@@ -303,6 +317,10 @@ function renderRich(segments: RichSegment[], ctx: RenderCtx): Rendered {
   // 关键(F1 修复):仅当 joined 里**没有任何可降级 URL** 时,才保留逐段 TextRun 的富样式 ——
   // 否则某个 segment(或跨段拆开)的 URL 会以原文进 TextRun,而 plain 已降级 → card ⊋ plain 泄露。
   // 含 URL 时降级为单个 TextBlock(用已降级的 clean),card 与 plain 一致、绝不多出密钥。
+  // 这里**不传谓词**,因为传了也没用:`reduceUrlsInText(joined, P) === joined` 的结果与 P 无关。
+  // joined ≤ 4000 时界原样返回,与 P 无关;> 4000 时界要么返回 ""、要么返回一个 ≤4000 的前缀,
+  // 两者都不可能等于 joined。曾经这里传了一个谓词并配了段注释说"两次调用的界必须一致",那个
+  // 约束根本约束不到任何东西 —— 留着只会让下一个读者以为它在起作用。
   const noReducibleUrl = reduceUrlsInText(joined) === joined;
   if (noReducibleUrl && cardSupports(ctx.caps, "RichTextBlock")) {
     return {
@@ -610,15 +628,39 @@ function utf8Bytes(s: string): number {
  * 所以与普通正文同样脱敏,并按服务端/客户端约定限制为 UTF-8 4KiB。
  */
 function renderCopy(label: string | undefined, text: string, ctx: RenderCtx): Rendered {
+  const canCopy = cardSupports(ctx.caps, "Action.CopyToClipboard") && cardSupports(ctx.caps, "ActionSet");
+  // 长度判定必须跑在**原始 text** 上,不能跑在 sanitize 的输出上 —— sanitize 里的
+  // reduceUrlsInText 会把超长输入截掉,而这里的契约是字节数。ASCII 下 4000 字符恒 ≤ 4096 字节,
+  // 所以下面那条 utf8Bytes 判定再也不会触发:20000 字符会安静地变成 4000 字符塞进复制按钮。
+  // 复制按钮是读者会直接粘出去用的 sink,给残值比给提示糟得多。
+  //
+  // 两条上限的**理由不同,所以提示语也不同**。上一版把两者合并成一句"超过 4KiB",而
+  // 4050 个 ASCII 字符就是 4050 字节 —— 合法地在契约内,却被告知超了字节限制,下一个人去查
+  // 字节数会什么也查不到。
+  //
+  // **判定的位置和措辞是两件事。** 字符判定必须留在 sanitize 之前(它挡的就是 sanitize 的截断),
+  // 但措辞取决于这条路径**有没有**复制按钮 —— 不支持 Action.CopyToClipboard 的客户端走的是普通
+  // TextBlock,告诉它"未渲染复制按钮"是句没有指涉的话。下面那条字节判定按同一条规则摆:它只约束
+  // 复制按钮,所以整个判定都在回退之后。上一版把这条放在回退之前,违反了本文件自己写下、也自己
+  // 断言过的那条不变量 —— 而断言之所以是绿的,是因为它那个用例走的是字节路径,压根没碰到这里。
+  if (text.length > REDUCE_INPUT_MAX) {
+    const msg = canCopy
+      ? `复制内容超过 ${REDUCE_INPUT_MAX} 字符，无法安全脱敏，未渲染复制按钮`
+      : `内容超过 ${REDUCE_INPUT_MAX} 字符，无法安全脱敏，未渲染`;
+    return { elements: [textBlock(msg)], plainLines: [msg] };
+  }
   const cleanText = sanitize(text, ctx.generic);
   if (!cleanText) return EMPTY;
   const cleanLabel = sanitize(label ?? COPY_LABEL_DEFAULT, ctx.generic) ?? COPY_LABEL_DEFAULT;
-  if (!cardSupports(ctx.caps, "Action.CopyToClipboard") || !cardSupports(ctx.caps, "ActionSet")) {
+  if (!canCopy) {
     return {
       elements: [textBlock(cleanText)],
       plainLines: [cleanText],
     };
   }
+  // 字节上限只约束**复制按钮**,所以判定留在 cardSupports 回退之后。放到回退之前会让不支持
+  // Action.CopyToClipboard 的客户端也收到"未渲染复制按钮" —— 那条路径走的是普通 TextBlock,
+  // 本来就没有复制按钮,也从来没有字节限制。
   if (utf8Bytes(cleanText) > COPY_TEXT_MAX_BYTES) {
     const msg = "复制内容超过 4KiB，未渲染复制按钮";
     return {
