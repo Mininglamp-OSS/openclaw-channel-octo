@@ -655,6 +655,14 @@ describe("wire data clamps to the selected template version", () => {
     expect(runes(data!.phases[0]!.actions[0]!.detail)).toBeLessThanOrEqual(192);
   });
 
+  it("counts the truncation marker inside the reasoningId contract bound", () => {
+    const data = buildReasoningProcessWireData({
+      ...withThought("核对输入。"),
+      reasoningId: "r".repeat(513),
+    }, "0.3.0");
+    expect(runes(data!.reasoningId)).toBeLessThanOrEqual(512);
+  });
+
   it("truncates by code point so a surrogate pair is never split", () => {
     const data = buildReasoningProcessWireData(withThought("🙂".repeat(1_000)), "0.3.0");
     const thought = data!.phases[0]!.thought;
