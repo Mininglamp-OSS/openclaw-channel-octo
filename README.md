@@ -244,6 +244,13 @@ instead of arguing that the prefix must already be safe.
 The reduction pass still recognizes common schemeless forms — single-label,
 IPv6, numeric and IDN hosts, leading `/`, and `/` inside passwords — and the
 verbatim-host check prevents `new URL()` normalization from fabricating output.
+Sensitivity evidence is saved before the protocol-relative pass can rewrite a
+candidate: after complete scheme URLs are consumed, a preflight uses the same
+scheme-less userinfo matcher and poison predicate as the final userinfo pass.
+That prevents a protocol-relative JWT prefix from disappearing and exposing a
+later copy of its password. The final pass still repeats the same check for
+shapes formed by earlier rewrites, and both scans stay inside the 4000-character
+reduction bound.
 After those passes, one default-deny choke point withholds any remaining
 scheme-less whitespace token whose first `:` precedes its last `@`. That closes
 non-ASCII and punctuation-terminated usernames, IPv6 zone IDs and empty hosts

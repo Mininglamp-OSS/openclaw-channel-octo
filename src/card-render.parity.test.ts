@@ -89,7 +89,7 @@ const OVER_HIDE: Array<{ id: string; note: string; when: (h: Hit) => boolean; co
     id: "刻意/pass 2 前保存敏感证据",
     note:
       "pass 2 会消费 protocol-relative JWT 主机的前半段,让后半段在 pass 3 形成新的 userinfo。" +
-      "preflight 在信号消失前与 pass 3 共用 matcher/helper 并整行扣下;这 30 组 base 只渲染了" +
+      "preflight 在信号消失前与 pass 3 共用 matcher/helper 并整行扣下;这 45 组 base 只渲染了" +
       "不含外部口令的截断前缀,因此属于修复换来的安全方向可读性代价。",
     when: ({ row }) => row.dims.signal === "jwtDestroyedByPass2",
     count: 45,
