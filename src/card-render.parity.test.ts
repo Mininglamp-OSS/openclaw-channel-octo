@@ -88,6 +88,14 @@ const OVER_HIDE: Array<{ id: string; note: string; when: (h: Hit) => boolean; co
   // 用户名又是 JWT 的行,该记在 finding 头上,而不是记成「我们本来就想藏」。
   // 第一版顺序反了,结果 Q2 那一格是 0,变成一条断言不到任何东西的豁免。
   {
+    id: "刻意/超长工具参数摘要",
+    note:
+      "参数摘要在 trim/path split/URL parse 之前按 RAW_INPUT_MAX fail closed。当前空间中只有两条" +
+      "超长 exec 命令因此少显示开头的程序名;输入本身超过 64 KiB,方向安全且不读取远端尾巴。",
+    when: ({ row, sink }) => sink === "exec" && row.input.length > head.RAW_INPUT_MAX,
+    count: 2,
+  },
+  {
     id: "刻意/pass 2 前保存敏感证据",
     note:
       "pass 2 会消费 protocol-relative JWT 主机的前半段,让后半段在 pass 3 形成新的 userinfo。" +

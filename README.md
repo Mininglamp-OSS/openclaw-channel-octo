@@ -199,7 +199,7 @@ with input.** Three limits sit around it:
 
 | limit | what it bounds | why the 4000-character bound misses it |
 |---|---|---|
-| `RAW_INPUT_MAX` (64 KiB) | pre-reduction whitespace collapse and any discarded-tail scan | both happen outside the reduction body |
+| `RAW_INPUT_MAX` (64 KiB) | raw tool-summary extraction, pre-reduction whitespace collapse, and any discarded-tail scan | trim/path split/URL parse and collapse all happen outside the reduction body |
 | `REDUCE_BUDGET_PER_CARD` (120 000) | one display card's metered sanitization across blocks | per-call and block-count limits say nothing about the sum |
 | the `exec` summary's own cut (4000) | picking a program name out of a command | it runs above the reduction pipeline |
 
@@ -211,6 +211,12 @@ cross the 7/8-character segment boundary, run-local start offsets and invalid
 separators. The test requires substantial positive and negative populations, so
 an implementation that always returns one side cannot pass. Adversarial tests
 also cover both dense starts and many short runs before a distant match.
+
+Tool summaries apply `RAW_INPUT_MAX` before choosing a non-empty parameter, so
+`trim()`, path `split()` and URL parsing never see an unbounded raw value. A tool
+argument above 64 KiB omits its summary instead of trying to recover a prefix;
+the tool name still renders. This is fail-closed and affects only legibility,
+not tool execution.
 
 **The per-card budget meters the reduction body and discarded-tail predicates,
 not every bounded step.** The reduction body charges up to 4000 units per block.
