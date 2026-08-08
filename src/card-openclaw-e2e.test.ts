@@ -430,3 +430,46 @@ suite("OpenClaw messaging-tool delivery E2E", () => {
     expect(card?.state).toBe("completed");
   }, 150_000);
 });
+
+suite("OpenClaw display-card delivery E2E", () => {
+  it("does not mark reasoning failed after the display card delivered the answer", async () => {
+    expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
+    const marker = randomUUID();
+    const sessionKey = `agent:main:octo-host-e2e:${marker}`;
+
+    await callBridge({ kind: "configure-reasoning", marker, targetUid, sessionKey });
+    const startedAtMs = Date.now();
+    const accepted = await callBridge({
+      kind: "display-card-delivery",
+      marker,
+      targetUid,
+      sessionKey,
+    });
+    expect(accepted.kind).toBe("display-card-delivery");
+
+    const completed = await waitForEvidence(
+      marker,
+      sessionKey,
+      startedAtMs,
+      (evidence) => evidence.toolCalls.some((call) => call.name === "octo_send_display_card") &&
+        evidence.cards.some((card) => card.templateRef?.id === "ai.reasoning-process" &&
+          (card.state === "completed" || card.state === "error")),
+      90_000,
+    );
+
+    expect(completed.toolCalls.map((call) => call.name)).toEqual([
+      "exec",
+      "octo_send_display_card",
+    ]);
+    const displayCard = completed.cards.find((card) =>
+      card.templateRef?.id !== "ai.reasoning-process" && cardText(card).includes(marker));
+    expect(displayCard, "the requested display card should be delivered").toBeDefined();
+
+    const reasoningCard = completed.cards.find((card) =>
+      card.templateRef?.id === "ai.reasoning-process");
+    const text = cardText(reasoningCard);
+    expect(text).not.toContain("Generation failed");
+    expect(text).not.toContain("Reasoning was interrupted");
+    expect(reasoningCard?.state).toBe("completed");
+  }, 150_000);
+});

@@ -10,7 +10,7 @@ import {
   registerCardProgress,
   setCardContext,
 } from "./card-progress.js";
-import { DISPLAY_CARD_TOOL_NAME } from "./constants.js";
+import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.js";
 
 type Hook = (event: Record<string, unknown>, ctx: { sessionKey: string; runId?: string }) => unknown;
 
@@ -601,6 +601,77 @@ describe("server-driven Registry reasoning progress", () => {
     await finalizeCard("display-only", { success: true });
 
     expect(wire.calls).toEqual([]);
+  });
+
+  it.each([
+    ["display", DISPLAY_CARD_TOOL_NAME],
+    ["interactive", INTERACTIVE_CARD_TOOL_NAME],
+  ])("treats a successful %s card tool as delivery for an existing reasoning card", async (_label, toolName) => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = `card-tool-delivery-${toolName}`;
+    const hookContext = { sessionKey, runId: "run-1" };
+    setCardContext(sessionKey, context());
+
+    await triggerFirstFrame(handlers, sessionKey);
+    handlers.after_tool_call?.({ toolName: "read", toolCallId: "tool-1", result: {} }, hookContext);
+    handlers.before_tool_call?.({ toolName, toolCallId: "card-tool-1" }, hookContext);
+    handlers.after_tool_call?.({ toolName, toolCallId: "card-tool-1", result: {} }, hookContext);
+    await finalizeCard(sessionKey, { success: false });
+
+    const terminalEdit = wire.calls.filter((call) => call.url.includes("/message/edit")).at(-1)?.body;
+    expect(terminalEdit).toMatchObject({ state: "completed" });
+  });
+
+  it("does not count a failed display-card tool as delivery", async () => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "failed-display-card-tool";
+    const hookContext = { sessionKey, runId: "run-1" };
+    setCardContext(sessionKey, context());
+
+    await triggerFirstFrame(handlers, sessionKey);
+    handlers.after_tool_call?.({ toolName: "read", toolCallId: "tool-1", result: {} }, hookContext);
+    handlers.before_tool_call?.({
+      toolName: DISPLAY_CARD_TOOL_NAME,
+      toolCallId: "display-1",
+    }, hookContext);
+    handlers.after_tool_call?.({
+      toolName: DISPLAY_CARD_TOOL_NAME,
+      toolCallId: "display-1",
+      error: "send rejected",
+    }, hookContext);
+    await finalizeCard(sessionKey, { success: false });
+
+    const terminalEdit = wire.calls.filter((call) => call.url.includes("/message/edit")).at(-1)?.body;
+    expect(terminalEdit).toMatchObject({ state: "error" });
+  });
+
+  it("keeps a real dispatch failure ahead of successful card-tool delivery evidence", async () => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "display-card-dispatch-failed";
+    const hookContext = { sessionKey, runId: "run-1" };
+    setCardContext(sessionKey, context());
+
+    await triggerFirstFrame(handlers, sessionKey);
+    handlers.after_tool_call?.({ toolName: "read", toolCallId: "tool-1", result: {} }, hookContext);
+    handlers.before_tool_call?.({
+      toolName: DISPLAY_CARD_TOOL_NAME,
+      toolCallId: "display-1",
+    }, hookContext);
+    handlers.after_tool_call?.({
+      toolName: DISPLAY_CARD_TOOL_NAME,
+      toolCallId: "display-1",
+      result: {},
+    }, hookContext);
+    await finalizeCard(sessionKey, { success: false, failed: true });
+
+    const terminalEdit = wire.calls.filter((call) => call.url.includes("/message/edit")).at(-1)?.body;
+    expect(terminalEdit).toMatchObject({ state: "error" });
   });
 
   it("captures visible reasoning but never captures it when visibility is off", async () => {

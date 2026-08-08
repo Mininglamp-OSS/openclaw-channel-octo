@@ -79,6 +79,7 @@ function scriptedReply(body) {
   const marker = allText.match(/(?:CHILD|PARENT)_E2E_OK:([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/FILES_E2E_WORKFLOW:([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/TOOL_DELIVERY_E2E:([0-9a-f-]{36})/i)?.[1] ??
+    allText.match(/DISPLAY_DELIVERY_E2E:([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/OpenClaw host E2E marker: ([0-9a-f-]{36})/i)?.[1] ??
     allText.match(/Ordinary user follow-up for ([0-9a-f-]{36})/i)?.[1];
   if (!marker) return { text: "E2E_SCRIPT_ERROR: missing marker" };
@@ -119,6 +120,35 @@ function scriptedReply(body) {
     }
     // Terminal turn with no assistant text at all.
     return { text: "", reasoning: "The answer is already delivered." };
+  }
+
+  // Same terminal shape as the production report, but through the Octo-owned
+  // display-card tool: the side effect succeeds and the model returns NO_REPLY.
+  if (allText.includes(`DISPLAY_DELIVERY_E2E:${marker}`)) {
+    if (toolMessages.length === 0) {
+      return {
+        tool: "exec",
+        arguments: {
+          command: "sleep 2 && printf DISPLAY_DELIVERY_PREFLIGHT_OK",
+          yieldMs: 5_000,
+          timeout: 15,
+          background: false,
+        },
+        reasoning: "Check the current time source before rendering the card.",
+        delayMs: 1_200,
+      };
+    }
+    if (toolMessages.length === 1) {
+      return {
+        tool: "octo_send_display_card",
+        arguments: {
+          title: `DISPLAY_DELIVERY_E2E:${marker}`,
+          blocks: [{ type: "text", text: "The requested display card was delivered." }],
+        },
+        reasoning: "Deliver the requested answer as an Octo display card.",
+      };
+    }
+    return { text: "NO_REPLY", reasoning: "The display card already contains the answer." };
   }
 
   if (allText.includes(`FILES_E2E_WORKFLOW:${marker}`)) {
@@ -356,6 +386,14 @@ function buildPrompt(kind, marker, childDelaySeconds, targetUid) {
       "The message tool already delivered the answer, so end the turn with no final text at all.",
     ].join(" ");
   }
+  if (kind === "display-card-delivery") {
+    return [
+      `DISPLAY_DELIVERY_E2E:${marker}.`,
+      "First call exec exactly once to verify the source.",
+      "After exec succeeds, call octo_send_display_card exactly once with the marker in its title.",
+      "The display card is the answer, so finish with NO_REPLY and no user-visible final text.",
+    ].join(" ");
+  }
   if (kind === "followup") {
     return `Ordinary user follow-up for ${marker}. Do not call tools. Reply exactly FOLLOWUP_E2E_OK:${marker}`;
   }
@@ -408,7 +446,8 @@ export default {
     const runRequest = async (params) => {
       try {
         const kind = params.kind === "followup" || params.kind === "configure-reasoning" ||
-          params.kind === "file-tools" || params.kind === "tool-delivery"
+          params.kind === "file-tools" || params.kind === "tool-delivery" ||
+          params.kind === "display-card-delivery"
           ? params.kind
           : "spawn";
         const marker = requiredString(params, "marker");
