@@ -298,6 +298,14 @@ describe("标题失败时的原因", () => {
     expect("error" in r && r.error, "5 个字符的标题被告知超过 4000 字符")
       .not.toContain("too long");
   });
+  it("归约策略主动扣下 → 说被清洗扣留,不冒充 URL 解析失败", () => {
+    const r = buildInteractiveCard({
+      title: "credential:tok@vault retry with tok",
+      buttons: [button],
+    } as never);
+    expect("error" in r && r.error).toContain("withheld by sanitization");
+    expect("error" in r && r.error).not.toContain("could not be parsed");
+  });
   // 超长、有空白、但切口之后那段敏感 —— 界拒的理由是内容不是长度,报错也要这么说。
   it("超长但敏感尾巴 → 说敏感,不说长度", () => {
     const title = `deploy notes ${"word ".repeat(900)} AKIAIOSFODNN7EXAMPLE`;
