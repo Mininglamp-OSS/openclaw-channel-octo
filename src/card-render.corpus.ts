@@ -555,6 +555,15 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
     note: "R8 已知未修:非 ASCII 用户名,两条 userinfo 正则的用户名类都是 ASCII。main 上 read 渲染同一串",
   },
   {
+    input: "а:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@host.example",
+    expect: {
+      read: "а:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@host.example",
+      grep: "",
+      exec: "",
+    },
+    note: "R8 已知未修:西里尔字母用户名(单字符 `а`,U+0430)。与上一行同一成因,分开钉是因为它不是 CJK —— 「放宽用户名类」的修法要同时面对这两种,而放宽正是 R7 打开 CJK 整句删除的那一步",
+  },
+  {
     input: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@[fe80::1%eth0]",
     expect: {
       read: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@[fe80::1%eth0]",
