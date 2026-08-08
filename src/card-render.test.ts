@@ -1054,6 +1054,15 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
     const alphabet = "eyJa0_-.:/";
     let state = 0x5eed1234;
     let legacyMatches = 0;
+    let legacyNonMatches = 0;
+    const checkEquivalent = (input: string): void => {
+      const expected = legacy.test(input);
+      if (expected) legacyMatches++;
+      else legacyNonMatches++;
+      expect(isSensitive(input, false), JSON.stringify(input)).toBe(expected);
+    };
+
+    // 保留宽随机背景,专门找意料之外的状态机分岔。
     for (let sample = 0; sample < 20_000; sample++) {
       state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
       const length = state % 80;
@@ -1062,11 +1071,29 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
         state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
         input += alphabet[state % alphabet.length];
       }
-      const expected = legacy.test(input);
-      if (expected) legacyMatches++;
-      expect(isSensitive(input, false), JSON.stringify(input)).toBe(expected);
+      checkEquivalent(input);
     }
-    expect(legacyMatches, "随机对拍没有覆盖任何 JWT 正例,全 false 的实现也会通过").toBeGreaterThan(100);
+
+    // 随机串几乎不可能碰出完整 JWT。结构化扫三段长度的 7/8 边界、run 内起始偏移和错误分隔符,
+    // 同时制造足量正例与只差一个条件的近似反例,避免全 false 的实现通过这道等价护栏。
+    for (const prefix of ["", "x", "a0_-", "/"]) {
+      for (const first of [7, 8, 9, 16]) {
+        for (const middle of [7, 8, 9, 16]) {
+          for (const tail of [0, 1, 2, 8]) {
+            for (const firstSep of [".", "..", "/"]) {
+              for (const secondSep of [".", "..", ":"]) {
+                checkEquivalent(
+                  `${prefix}eyJ${"a".repeat(first)}${firstSep}` +
+                  `${"b".repeat(middle)}${secondSep}${"c".repeat(tail)} end`,
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+    expect(legacyMatches, "等价对拍没有覆盖足量 JWT 正例,全 false 的实现也会通过").toBeGreaterThan(100);
+    expect(legacyNonMatches, "等价对拍没有覆盖足量 JWT 反例,全 true 的实现也会通过").toBeGreaterThan(20_000);
 
     // 若每个 run 都用无上界的 indexOf("eyJ", start),前面的 20 000 个短 run 会反复扫描到
     // 最后那个 eyJ,总成本退化成二次方。真正的 run-local 扫描只读每个字符常数次。

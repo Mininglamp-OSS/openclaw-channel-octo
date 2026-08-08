@@ -206,8 +206,11 @@ with input.** Three limits sit around it:
 The JWT detector is no longer a separate bounded tier. Its old regex was
 quadratic on dotless `eyJ`-dense input; a run-based scanner now implements the
 same match language in linear time. A deterministic 20 000-case comparison
-checks it against the old regex, and adversarial tests cover both dense starts and
-many short runs before a distant match.
+checks random background against the old regex; another 2 304 structured cases
+cross the 7/8-character segment boundary, run-local start offsets and invalid
+separators. The test requires substantial positive and negative populations, so
+an implementation that always returns one side cannot pass. Adversarial tests
+also cover both dense starts and many short runs before a distant match.
 
 **The per-card budget charges what is processed.** The reduction body charges up
 to 4000 units per block. Discarded-tail scans are metered on the predicate at one
