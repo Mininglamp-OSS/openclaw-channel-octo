@@ -988,10 +988,12 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
       const s = `${kept} ${"pad ".repeat(pads)}AKIAIOSFODNN7EXAMPLE`;
       expect(reduceUrlsInText(s), `AKIA 在${where}(TAIL_SCAN_MAX 之外)没有让整串扣下`).toBe("");
     }
-    // 但线性档也不是无界的:尾巴收进 RAW_INPUT_MAX,再远就够不着了。这是可以说出口的边界。
+    // **这里曾经断言「再远就够不着了,这是可以说出口的边界」。那个边界就是评审第十轮的 P0-1。**
+    // 尾巴当时被 `tailScanWindow(..., RAW_INPUT_MAX)` 开了窗,于是超过 `2 × RAW_INPUT_MAX` 的
+    // 信号任何一档都看不见,而 `def63bb` 折叠整串、看得见 —— 一条被写成「已知边界」的 fail-open。
+    // 线性档现在真的看整条(窗口只留给 JWT 那档),两边一致。
     const beyond = `${kept} ${"pad ".repeat(20_000)}AKIAIOSFODNN7EXAMPLE`;
-    expect(reduceUrlsInText(beyond), "RAW_INPUT_MAX 之外仍然够不着,这是已知边界").toBe(kept);
-    expect(reduceUrlsInText(beyond)).not.toContain("AKIA");
+    expect(reduceUrlsInText(beyond), "128 KiB 之外的 AKIA 仍要让整串扣下 —— 与 def63bb 一致").toBe("");
   });
 
   it("有界档(JWT)才是收窄到 TAIL_SCAN_MAX 的那一条", () => {

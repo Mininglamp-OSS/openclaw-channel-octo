@@ -42,7 +42,7 @@ const FIXTURES = [
 ] as const;
 
 /**
- * 当前**已知未修**的回归类别,按维度描述。
+ * 当前**已知未修**的回归类别。
  *
  * 每一条都带实测数量。数量对不上就变红 —— 这样「修了一半」和「新开了一个口子」都看得见,
  * 而不是被一句「反正在豁免里」盖掉。修好之后这一条会因为 `matched === 0` 变红,提示把它删掉:
@@ -52,67 +52,64 @@ const FIXTURES = [
 interface KnownOpen {
   id: string;
   note: string;
-  when: (d: Dims) => boolean;
+  /**
+   * **谓词吃的是整个 hit,不只是维度。** 维度谓词写起来省事,但它描述的是「哪些输入」而不是
+   * 「什么机制」—— 下面这条豁免要表达的是「base 自己也在泄漏,只是被截断了」,那是 base/head
+   * 两个输出之间的关系,维度里根本没有这个信息。用维度近似它就会顺带盖住同维度下真正的回归。
+   */
+  when: (h: Hit) => boolean;
   regressions: number;
 }
 
 const KNOWN_OPEN: KnownOpen[] = [
   {
-    id: "R10-P0-1",
+    id: "R11-截断错位",
     note:
-      "collapseForReduction 的输入无界,却把尾巴喂给了 tailScanWindow —— 超过 2×RAW_INPUT_MAX 的" +
-      "扣留信号任何一档都看不见。def63bb 无此窗口。修法:整条尾巴给 p.linear,只给 p.bounded 开窗。",
-    when: (d) => d.signal === "keywordFar",
-    regressions: 95,
-  },
-  {
-    id: "R10-Q2",
-    note:
-      "poison 的 base 兼容判定是 MAIN_PASS3_RE.test(m) —— 「出现过」而不是「吃掉整段」。" +
-      "嵌一个 base 能归约的 DSN 进去就能压掉 poison。修法:要求 main 的正则消费掉整个 m。",
-    when: (d) => d.pw === "nestedDsn",
-    regressions: 74,
-  },
-  {
-    id: "R10-Q3",
-    note:
-      "poison 只问 isSensitiveHere.linear,而 JWT_RE 住在 hasBoundedSecretShape 里,于是被删 span " +
-      "里的 JWT 不算扣留信号。def63bb 上 JWT 属于永远生效的前缀集。修法:改用 .all。",
-    when: (d) => d.pw === "jwt" || d.user === "jwtName",
-    regressions: 229,
+      "两边都在泄漏,head 多露几个字符。base 没能归约前缀(反而造出一个小写化的假主机 —— " +
+      "本 PR 的逐字比对关掉的正是那一路),输出更长,于是 read 摘要在 secret 中间截断;head 归约" +
+      "成功、前缀更短,整份外部副本落进了 64 字符窗口。真正的洞是 read sink 对外部副本没有守卫" +
+      "(generic=false 跳过高熵档,见 UNFIXED 组末尾那四行),不是这几处修复引入的,也没有" +
+      "「既归约得更好、又少露字符」的改法。\n" +
+      "      **判据按机制写而不是按维度写**:要求 base 自己已经露出 secret 的前 12 个字符、" +
+      "且它的输出确实被截断了。所以它吞不掉任何一条真正的「base 干净 / head 泄漏」。",
+    when: (h) => h.base.endsWith("…") && h.base.includes(h.row.secret.slice(0, 12)),
+    regressions: 5,
   },
 ];
-
 /**
  * 过度隐藏的类别与实测数量。方向安全(藏多了不泄漏),所以这里钉数量而不是禁止 ——
  * 但数量必须精确:悄悄多藏 200 组和悄悄少藏 200 组都该有人看一眼。
  */
-const OVER_HIDE: Array<{ id: string; note: string; when: (d: Dims) => boolean; count: number }> = [
+const OVER_HIDE: Array<{ id: string; note: string; when: (h: Hit) => boolean; count: number }> = [
   // **顺序即归因,首个匹配胜出。** 开着的 finding 排在刻意代价前面 —— 一条既是嵌套 DSN、
   // 用户名又是 JWT 的行,该记在 finding 头上,而不是记成「我们本来就想藏」。
   // 第一版顺序反了,结果 Q2 那一格是 0,变成一条断言不到任何东西的豁免。
   {
-    id: "R10-Q2 连带",
-    note: "嵌套 DSN,与凭据回归里的 Q2 同源,修 Q2 时会一起变",
-    when: (d) => d.pw === "nestedDsn",
+    id: "刻意/嵌套 DSN",
+    note:
+      "Q2 修好之后的**预期效果**:base 把 `credential:pw/u:p@a.example.com@vault` 归约成 " +
+      "`https://vault …` 并渲染出口令,head 认出这一段 main 不会整段归约、且带着扣留信号,整行扣下。",
+    when: ({ row }) => row.dims.pw === "nestedDsn",
     count: 18,
   },
   {
-    id: "R10-Q3 连带",
-    note: "JWT 作口令或用户名时 head 的守卫触发而 base 不触发,与 Q3 同源",
-    when: (d) => d.pw === "jwt" || d.user === "jwtName",
-    count: 212,
+    id: "刻意/JWT 在被删 span 里",
+    note:
+      "Q3 修好之后的**预期效果**:被删 span 里的 JWT 现在算扣留信号(poison 改问 .all)," +
+      "head 整行扣下,而 base 渲染。修复前这一格是 212,修复后 252 —— 多出来的正是被关掉的那些泄漏。",
+    when: ({ row }) => row.dims.pw === "jwt" || row.dims.user === "jwtName",
+    count: 252,
   },
   {
     id: "刻意/超 256 口令",
     note: "hasOverlongUserinfo:超长 userinfo 整行扣下,是本 PR 明确选择的代价",
-    when: (d) => d.pw === "overlong",
+    when: ({ row }) => row.dims.pw === "overlong",
     count: 1116,
   },
   {
     id: "刻意/IDN 与纯数字主机",
     note: "R11:这两类走到逐字比对,new URL() 规范化后的主机不在输入里 → 删除,比渲染原文安全",
-    when: (d) => d.host === "idn" || d.host === "numeric",
+    when: ({ row }) => row.dims.host === "idn" || row.dims.host === "numeric",
     count: 28,
   },
 ];
@@ -124,14 +121,14 @@ interface Hit {
   head: string;
 }
 
-function classify<T extends { when: (d: Dims) => boolean; id: string }>(
+function classify<T extends { when: (h: Hit) => boolean; id: string }>(
   entries: T[],
   hits: Hit[],
 ): { counts: Map<string, number>; unclassified: Hit[] } {
   const counts = new Map(entries.map((e) => [e.id, 0]));
   const unclassified: Hit[] = [];
   for (const hit of hits) {
-    const entry = entries.find((e) => e.when(hit.row.dims));
+    const entry = entries.find((e) => e.when(hit));
     if (entry) counts.set(entry.id, counts.get(entry.id)! + 1);
     else unclassified.push(hit);
   }

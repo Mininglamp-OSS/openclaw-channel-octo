@@ -252,25 +252,44 @@ const MAIN_PASS3_RE =
 
 const OVERLONG_USERINFO_MAX = 256;
 const USERINFO_NAME_CHAR = /[A-Za-z0-9._%+-]/;
+const WS_SCAN_RE = /\s/g;
 function hasOverlongUserinfo(s: string): boolean {
-  for (const tok of s.split(/\s+/)) {
-    // **带 scheme 的 URL 不是裸 userinfo。** `https:` 的冒号前面是用户名字符,于是任何长过
-    // ~257 字符、又在别处含 `@` 的 URL(预签名、追踪、OAuth 回跳)都被当成超限 userinfo。
-    // 这个检查挪到归约**之前**以后,它让 reduceUrlsInText 直接返回 ""——整行在每个 sink 上
-    // 消失,而 main 渲染注册域(评审第九轮 P1-c)。pass 1 本来就会把这类 URL 归约掉,
-    // 轮不到这里判。
-    if (TOKEN_SCHEME_RE.test(tok)) continue;
-    const at = tok.lastIndexOf("@");
-    if (at < 2) continue;                        // `x:@` 起码要 3 个字符
-    // 找 userinfo 分隔冒号:前一个字符是用户名字符的那个 `:`(与归约正则的 `[…]+:` 对齐)。
-    let colon = -1;
-    for (let c = tok.indexOf(":"); c >= 0 && c < at; c = tok.indexOf(":", c + 1)) {
-      if (c > 0 && USERINFO_NAME_CHAR.test(tok[c - 1]!)) { colon = c; break; }
+  // **一次原生空白扫描,短 token 连 slice 都不做。**
+  //
+  // 判据是 `lastAt - colon - 1 > OVERLONG_USERINFO_MAX`,而 `colon >= 1`(冒号前要有用户名
+  // 字符),所以命中的 token 至少 260 个字符 —— 短于这个长度的 token **不可能**为真。先按长度
+  // 筛掉,再谈里面有什么。
+  //
+  // 为什么在意:线性档现在看整条尾巴(P0-1 的修法),这个函数就跑在 MB 级的串上了。
+  // 三版实测(4 MB,neutralizeEcho / sanitizeErrorText,def63bb 分别是 70 / 248 ms):
+  //     s.split(/\s+/)            散文 265 / 213 ms  ← 八十万个字符串分配
+  //     沿 @ 走 + 逐字符找边界      散文  69 /  76 ms,DSN 密集 189 / 195 ms  ← 每 token 数十次正则
+  //     本版(空白扫描 + 长度筛)     见下
+  // def63bb 没有这个函数,所以这里的每一毫秒都是本 PR 新加的,不能拿「base 也慢」搪塞。
+  // 没有 `@` 就不可能命中 —— 一次原生 indexOf 就能挡掉整条散文尾巴,连空白扫描都省了。
+  if (s.indexOf("@") < 0) return false;
+  const MIN_TOKEN = OVERLONG_USERINFO_MAX + 4;
+  WS_SCAN_RE.lastIndex = 0;
+  let from = 0;
+  for (;;) {
+    const m = WS_SCAN_RE.exec(s);
+    const to = m ? m.index : s.length;
+    if (to - from >= MIN_TOKEN) {
+      const tok = s.slice(from, to);
+      if (!TOKEN_SCHEME_RE.test(tok)) {          // 带 scheme 的 URL 不是裸 userinfo
+        const at = tok.lastIndexOf("@");
+        if (at >= 2) {                           // `x:@` 起码要 3 个字符
+          let colon = -1;
+          for (let c = tok.indexOf(":"); c >= 0 && c < at; c = tok.indexOf(":", c + 1)) {
+            if (c > 0 && USERINFO_NAME_CHAR.test(tok[c - 1]!)) { colon = c; break; }
+          }
+          if (colon >= 0 && at - colon - 1 > OVERLONG_USERINFO_MAX) return true;
+        }
+      }
     }
-    if (colon < 0) continue;
-    if (at - colon - 1 > OVERLONG_USERINFO_MAX) return true;
+    if (!m) return false;
+    from = WS_SCAN_RE.lastIndex;
   }
-  return false;
 }
 
 /** 必须设界的那一档。目前只有 JWT 一条(见 JWT_RE 上面那段)。 */
@@ -584,9 +603,20 @@ const DEFAULT_SENSITIVE: SensitivePredicate = sensitivePredicate(true);
  */
 function tailIsSensitive(tail: string, p: SensitivePredicate): boolean {
   if (!tail) return false;
+  // 线性档吃**原文**。折叠只有有界档需要:它的窗口只有 TAIL_SCAN_MAX 那么大,折叠比高时
+  // 4000 个原始字符可能全是空白,不折叠就什么也扫不到。而线性档看的是整条尾巴 —— 关键词与
+  // 前缀正则本来就与空白无关,高熵那条找的是连续串、折叠也不会把两段接起来。
+  //
+  // 这不只是省一次遍历。尾巴现在**无界**(见两个调用方去掉窗口的那段说明),先折叠一遍等于
+  // 为每次调用多分配一份整条尾巴的副本:实测 4 MB 散文经 neutralizeEcho,折叠 206 ms、
+  // 不折叠 78 ms,而 def63bb 是 69 ms —— 折叠那一版比 merge-base 慢 3 倍,是本 PR 自己
+  // 「不许比 base 慢」那条底线踩不过去的地方。
+  //
+  // 顺带把两个调用方对齐:collapseForReduction 此前先折叠再传,boundedForReduction 传原文 ——
+  // 又是同一条规则的两份拷贝,而且只有一份是对的。现在两边都传原文,折叠只在这里做一次。
   if (p.linear(tail)) return true;
   const win = tailScanWindow(tail, 0, TAIL_SCAN_MAX);
-  return win === null || p.bounded(win);
+  return win === null || p.bounded(win.replace(/\s+/g, " ").trim());
 }
 
 /**
@@ -685,10 +715,15 @@ export function collapseForReduction(
   if (kept.length === text.length) return collapsed;
   // 丢掉的那一段也要过谓词 —— 与 boundedForReduction 同一条规则。**尾巴是原文,先折叠再看**:
   // 折叠比高时(这个上限存在的理由就是它)4000 个原始字符可能全是空白,直接喂进去什么也扫不到。
-  // 两道窗口都走 tailScanWindow,所以两个末端都落在空白上,喂给谓词的量仍然有界(≤8000)。
-  const rawTail = tailScanWindow(text, kept.length, RAW_INPUT_MAX);
-  if (rawTail === null) return "";
-  return tailIsSensitive(rawTail.replace(/\s+/g, " ").trim(), isSensitiveHere) ? "" : collapsed;
+  //
+  // **整条尾巴,不开窗。** 上一版这里是 `tailScanWindow(text, kept.length, RAW_INPUT_MAX)`,
+  // 于是超过 `2 × RAW_INPUT_MAX` 的扣留信号任何一档都看不见(评审第十轮 P0-1)。
+  // 那个窗口在 boundedForReduction 里是无害的 —— 它的输入已经 ≤RAW_INPUT_MAX,窗口覆盖全部;
+  // 而**本函数的输入无界**,同一行代码在这里就变成了一道缺口。`def63bb` 没有这道窗口:它折叠
+  // 整串、把整个剩余部分交给守卫。分档在 tailIsSensitive 里 —— 线性档看整条,JWT 那档才开窗。
+  //
+  // 代价是线性扫描不再有界,所以它必须**计价**:见 card-blocks 的 metered.linear。
+  return tailIsSensitive(text.slice(kept.length), isSensitiveHere) ? "" : collapsed;
 }
 
 /**
@@ -779,10 +814,16 @@ export function boundedForReduction(
   const kept = cutOnWhitespace(s, REDUCE_INPUT_MAX);
   if (kept === null) return null;
   if (kept.length === s.length) return kept;
-  // 尾巴收进 RAW_INPUT_MAX(而不是 TAIL_SCAN_MAX):线性档要看完整条,只有 JWT 那档才需要
-  // 窗口 —— 分档在 tailIsSensitive 里。窗口末端也只能落在空白上,见 tailScanWindow。
-  const rawTail = tailScanWindow(s, kept.length, RAW_INPUT_MAX);
-  if (rawTail === null) return null;
+  // **整条尾巴,不开窗** —— 与 collapseForReduction 同一条规则,分档在 tailIsSensitive 里:
+  // 线性档看整条,只有 JWT 那档收进 TAIL_SCAN_MAX。
+  //
+  // 上一版这里是 `tailScanWindow(s, kept.length, RAW_INPUT_MAX)`,注释写着「线性档要看完整条」
+  // —— 那句话只在「输入已经 ≤RAW_INPUT_MAX」时成立,而**本函数是整条管线的唯一入口**:
+  // `reduceUrlsInText` 把调用方的原串直接交给它。`neutralizeEcho`(表单回显,本文件里信任
+  // 边界最低的一路)就是这样,于是超过 `2 × RAW_INPUT_MAX` 的关键词在那一路仍然看不见 ——
+  // 评审第十轮 P0-1 在 collapseForReduction 那边修掉之后,这 22 组还留在 echo 上。
+  // 同一句注释在两个函数里各写了一遍,而只有一处的前提成立:又是「第二份没镜像上」。
+  const rawTail = s.slice(kept.length);
   return tailIsSensitive(rawTail, isSensitiveHere) ? null : kept;
 }
 
@@ -836,7 +877,16 @@ export function reduceUrlsInText(
   //     `user:<36字符>@vault retry with <其中12字符>`。用 isSensitiveHere 就没有这个缺口。
   let poisoned = false;
   const poisonIfNewShapeCarriesSignal = (m: string, _host: string): void => {
-    if (!MAIN_PASS3_RE.test(m) && isSensitiveHere.linear(m)) poisoned = true;
+    // **`.exec()[0] === m`,不是 `.test(m)`。** 要问的是「main 会不会归约**这一段**」,而
+    // `test` 回答的是「main 的形状在这段里出现过没有」—— 嵌一个 base 能归约的 DSN 进去就能
+    // 压掉 poison:`credential:pw/u:p@a.example.com@vault retry with pw`,base 扣下、本分支
+    // 渲染出 `pw`(评审第十轮 Q2)。这里不另写一条带锚的正则 —— 「第二份该镜像第一份的规则
+    // 没镜像上」正是这条分支反复出问题的成因,所以仍然用同一份快照,只改提问方式。
+    if (MAIN_PASS3_RE.exec(m)?.[0] === m) return;
+    // **`.all` 而不是 `.linear`。** JWT_RE 住在 hasBoundedSecretShape 里,只问线性档等于说
+    // 「被删 span 里的 JWT 不算扣留信号」,而 def63bb 上 JWT 属于永远生效的前缀集
+    // (评审第十轮 Q3)。m 的长度由 SCHEMELESS_USERINFO_RE 自身封顶,有界档在这里不失控。
+    if (isSensitiveHere.all(m)) poisoned = true;
   };
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。

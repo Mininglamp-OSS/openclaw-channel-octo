@@ -157,6 +157,12 @@ export interface BuildDisplayCardResult {
 export const REDUCE_BUDGET_PER_CARD = 120_000;
 
 /**
+ * 线性档按 `字符数 / 这个除数` 计价 —— 预算的单位是有界档的字符,两档单价差三个数量级。
+ * 取值理由与实测数字见 `metered.linear` 处的注释。取 2 的幂只是为了好记。
+ */
+const LINEAR_CHARGE_DIVISOR = 128;
+
+/**
  * 群卡片全员可见 → 与 summarizeToolParams/sanitizeErrorText 同套:
  *   1. 折叠空白;
  *   2. 内嵌 URL 降级为 `scheme://注册域`(丢子域/path/query/userinfo,杀 webhook/预签名/隧道
@@ -191,7 +197,35 @@ function sanitize(text: string, ctx: RenderCtx): string | null {
   // 实测 0.74 ms,200 块合计 ~100 ms,不值得为它记账。预算耗尽时谓词直接返回 true,
   // fail-closed 方向天生正确:没钱再查了,就当它敏感。
   const metered: SensitivePredicate = {
-    linear: plain.linear,
+    // **线性档现在也计价。** 上一版这里是 `plain.linear`,理由写着「线性档每次 ≤64 KiB、
+    // 实测 0.74 ms,不值得记账」—— 那个上界随 collapseForReduction 去掉尾部窗口而消失了
+    // (评审第十轮 P0-1 的修法),现在一块可以把整条尾巴喂进线性档,长度无界。
+    //
+    // 不计价的后果不是「算便宜了」,是**预算整条不生效**:collapseForReduction 因线性档命中
+    // 而返回 "" 时,bounded 一次没被调用,`cost` 那行在早退之前 —— 这一块扫了 64 KiB 切割
+    // 加一整条尾巴,却一分不付,`exhausted` 不翻转、预算提示不出现(评审第十轮 Q4)。
+    // 200 块实测 base 887 ms / 修前 head 1407 ms,而这条 PR 加预算管的就是这根轴。
+    //
+    // **两档不同价,除数由实测定。** 预算的单位是「喂给有界档的字符数」,而两档的单价差了
+    // 三个数量级 —— 同一台机器实测:
+    //
+    //     线性档   散文 29 ms/MB、DSN 密集 12、无空白 base64 8
+    //     有界档   无点 base64(JWT 最坏形状)64 KiB 处 3389 ms → 54 231 ms/MB,且**超线性**
+    //              (256 KiB 那格两分钟没跑完)
+    //
+    // 1:1 收费会把线性档高估约两千倍,后果不是"偏保守"而是**误伤**:一块 1 MB 的普通长文本
+    // 一次就吃掉十倍预算,整张卡片只剩一条超预算提示。除以 LINEAR_CHARGE_DIVISOR 之后,
+    // 120 000 的预算约等于 15 MB 线性扫描 ≈ 440 ms —— 与同一笔预算在有界档上买到的时间同量级。
+    // 仍然比公允价贵十几倍,方向安全。
+    linear: (t) => {
+      const charge = Math.ceil(t.length / LINEAR_CHARGE_DIVISOR);
+      if (charge > ctx.reduce.left) {
+        ctx.reduce.exhausted = true;
+        return true;
+      }
+      ctx.reduce.left -= charge;
+      return plain.linear(t);
+    },
     bounded: (t) => {
       if (t.length > ctx.reduce.left) {
         ctx.reduce.exhausted = true;

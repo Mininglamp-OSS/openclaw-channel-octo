@@ -92,12 +92,13 @@ export const LEAK_CORPUS: CorpusRow[] = [
   },
   {
     input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(33_000) + " token",
-    expect: {
-      grep: "https://localhost word word word word word word word word word w…",
-      read: "https://localhost word word word word word word word word word w…",
-      exec: "",
-    },
-    note: "R8-P1:关键词落在线性档 RAW_INPUT_MAX 触及范围之外(136 KB)",
+    expect: { grep: "", read: "", exec: "" },
+    // **这一行的期望值曾经是 `https://localhost word word…`,而 base 上是空。** 也就是说它把
+    // 一个 fail-open 钉成了「现在是什么」——note 里甚至写明了机制(关键词够不着)。它能一直绿,
+    // 是因为本组的判据是「口令子串不出现」,而归约把 DSN 变成了主机,`hunter2` 确实不在输出里;
+    // 「base 藏不藏得住」这一问从来没对它提过。评审第十轮 P0-1 就是这一类,差分 parity 组现在
+    // 覆盖了这条边界。修法见 collapseForReduction / boundedForReduction:整条尾巴给线性档。
+    note: "R8-P1:关键词落在 128 KiB 之外(136 KB)。曾经钉着 head 的泄漏输出,现在与 base 同为空",
   },
   {
     input: "PASSPHRASE='correct horse battery staple' gpg --sign x",
@@ -292,10 +293,10 @@ export const LEAK_CORPUS: CorpusRow[] = [
     // 这一条钉住「前提」对这类形状也成立 —— 不然 collapseForReduction 的 128 KiB 触及上限
     // 又会变成泄漏(远处关键词够不着、而近处的 `@1` DSN 守卫认不出)。
     input: "alice:hunter2@1 " + "x ".repeat(80_000) + " token",
-    // `@1` 前缀被删,剩下的 `x x x…` 是无害填充,截到 SUMMARY_MAX 加省略号。判据是**口令不出现**
-    // (本组的子串断言盯着 `hunter2`);等值这一栏只是把「删掉凭据后剩什么」如实记下。
-    expect: { grep: "x ".repeat(32) + "…", read: "x ".repeat(32) + "…" },
-    note: "R11-P1:纯数字单标签 + 128 KiB 外的关键词。去掉字母要求让它走到逐字比对被删",
+    // 同上:这一行的注释写着它要钉住「128 KiB 触及上限又会变成泄漏」这件事,而它当时的期望值
+    // (`x x x…`)记录的正是**没钉住**的那个状态 —— base 上整行是空。现在两边都空。
+    expect: { grep: "", read: "", exec: "" },
+    note: "R11-P1:纯数字单标签 + 128 KiB 外的关键词。曾经钉着 head 的填充输出,现在与 base 同为空",
   },
 ];
 
