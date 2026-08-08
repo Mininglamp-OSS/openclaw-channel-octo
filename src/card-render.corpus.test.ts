@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { summarizeToolParams, reduceUrlsInText, sanitizeErrorText } from "./card-render.js";
 import { REDUCE_INPUT_MAX, SUMMARY_MAX, boundedForReduction } from "./card-render.js";
 import { LEAK_CORPUS, BENIGN_CORPUS, COST_CORPUS, REWRITE_CORPUS, UNFIXED_CORPUS, PERF_CORPUS, PARITY_CORPUS, type CorpusRow, type ParitySink } from "./card-render.corpus.js";
+import { fabricatedHosts } from "./__tests__/fixtures/parity-space.js";
 
 const PARAM: Record<string, (s: string) => Record<string, unknown>> = {
   grep: (s) => ({ pattern: s }),
@@ -77,7 +78,7 @@ describe("摘要管线形状语料", () => {
 
   // 这一组断言的是**本 PR 没有改变**这些形状 —— 期望值是 main 的行为,不是"正确"的行为。
   // 前四行在 main 上就是明文泄漏,留给 userinfo 那条后续 PR;放在这里是为了让它们进造串检测。
-  it("UNFIXED:留给后续 PR 的形状,本 PR 未改变其行为", () => {
+  it("UNFIXED:留给后续 PR 的形状,以及刻意改成删除的造串哨兵", () => {
     assertRows(UNFIXED_CORPUS);
   });
 
@@ -98,11 +99,14 @@ describe("摘要管线形状语料", () => {
         // **「4 个以上字母数字连排」这条规则看不见点分地址。** `1.0.0.0` / `1.2.0.3` 拆开
         // 全是单字符,循环体一次都不执行,行照样绿 —— 而这正是 `new URL()` 规范化造出来的
         // 那一类串。所以再加一条:归约发出的每个 `scheme://主机` 里的主机,必须逐字出现在输入里。
-        for (const host of run(row, tool).match(/https?:\/\/([^\s,)\]]+)/g) ?? []) {
-          const bare = host.replace(/^https?:\/\//, "").replace(/[:/].*$/, "");
-          expect(row.input, `${tool} ${JSON.stringify(row.input)} 归约出的主机 ${bare} 不在输入里`)
-            .toContain(bare);
-        }
+        //
+        // **主机提取用 parity runner 那一份,不在这里再写一遍。** 上一版这里是
+        //     host.replace(/^https?:\/\//, "").replace(/[:/].*$/, "")
+        // 它把 `https://[::1]` 削成 `[`,于是 `toContain("[")` 对所有方括号 IPv6 恒真 ——
+        // 那一行**正是为了进这条检测**才搬进 LEAK 组的,却在检测里空转(评审第十轮 Q6)。
+        // 「第二份本该镜像第一份的规则没镜像上」是这条分支反复出问题的成因,所以这里只留一份。
+        const fake = fabricatedHosts(row.input, run(row, tool));
+        expect([...fake], `${tool} ${JSON.stringify(row.input)} 归约出的主机不在输入里`).toEqual([]);
       }
     }
   });
