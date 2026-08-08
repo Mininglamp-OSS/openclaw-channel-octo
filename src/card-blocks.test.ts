@@ -1135,14 +1135,14 @@ describe("单卡片归约预算", () => {
     expect(body(rich), "rich 比较趟绕过了同一预算").toHaveLength(31);
 
     const timed = (blocks: typeof textBlocks | typeof richBlocks): number => {
-      buildDisplayCard({ caps: FULL_CAPS, blocks });
+      // 上面的 text/rich 行为断言已经各跑过一次并完成 JIT warmup,这里不再额外重复一整卡。
       const t0 = performance.now();
       buildDisplayCard({ caps: FULL_CAPS, blocks });
       return performance.now() - t0;
     };
     const textMs = timed(textBlocks);
     const richMs = timed(richBlocks);
-    // 这里测的是会真正启动 preflight 的可达形状;具体范围在修复后独立 warmed 重量并写回。
+    // 修复后独立 warmed 测量(3 次):text 922–950 ms,中位 929;rich 1851–1889,中位 1859。
     // 宽阈值只挡预算失效/分钟级回归;毫秒级的重复扫描由 parity 里的 base 比值单独看守。
     expect(textMs, `text:200 块 × 点密集 3905 字符耗时 ${textMs.toFixed(0)} ms`).toBeLessThan(3500);
     expect(richMs, `rich:200 块 × 点密集 3905 字符耗时 ${richMs.toFixed(0)} ms`).toBeLessThan(5000);

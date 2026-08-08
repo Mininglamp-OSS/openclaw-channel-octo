@@ -102,7 +102,7 @@ export interface BuildDisplayCardOptions {
   budgetMarker?: BudgetMarker;
 }
 
-/** dropped → 卡面文案 + plain 兜底文案(plain 略去括号里的原因,与正文行宽对齐)。 */
+/** dropped → 卡面文案 + plain 兜底文案;两者都明确这只是服务端限制额外丢掉的组数。 */
 export type DropMarker = (dropped: number) => { text: string; plain: string };
 
 /**

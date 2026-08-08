@@ -221,25 +221,29 @@ produces the marker. The initial whitespace collapse over at most 64 KiB happens
 before that charge and is not separately metered. `RAW_INPUT_MAX` and the
 200-block limit still bound it, but the budget is not an exact CPU-work ledger.
 
-The budget is an availability limit, not a time guarantee. A 4000-character
-period-separated run (`a.a.a…`) is the measured worst shape: every dot creates a
-new word-boundary start for the quadratic scheme-less pass. After gating the
-pass-2 evidence preflight on its necessary `//` and `@` delimiters, warmed local
-measurements for 200 inputs are about **0.55 seconds** for text blocks and
-**1.0 second** for all-rich blocks (observed 0.50–0.59 / 0.97–1.16 seconds).
-The rich comparison pass and the initial collapse are not metered. The visible
-cost is equally important: 200 benign 4 KB blocks become 30 content blocks plus
-one explicit budget notice. This is part of the `needs-human-review` product
-trade-off, not a security regression; absolute timings are indicative, while
-the test also compares the reducer against the frozen base in-process.
+The budget is an availability limit, not a time guarantee. The measured worst
+reachable shape is a 4000-character period-separated run (`a.a.a…`) followed by
+a protocol-relative URL containing `@`: every dot creates a new word-boundary
+start for the quadratic scheme-less pass, and the URL makes the evidence
+preflight necessary. Warmed local measurements for 200 inputs are about **0.93
+seconds** for text blocks and **1.86 seconds** for all-rich blocks (observed
+0.92–0.95 / 1.85–1.89 seconds). The active reducer is about 1.78× the frozen
+merge base; a `//`/`@` substring pair that pass 2 does not rewrite stays near
+base at about 1.34×. The rich comparison pass and initial collapse are not
+metered. The visible cost is equally important: 200 benign 4 KB blocks become
+30 content blocks plus one explicit budget notice. On payload-capped profiles,
+limit fitting reserves that notice and reports its own additional dropped-group
+count separately. This is part of the `needs-human-review` product trade-off,
+not a security regression; absolute timings are indicative, while in-process
+base ratios and structural output assertions guard the mechanism.
 
 **Discarded tails have no partial-visibility window.** If the entire tail is at
 most 64 KiB, the caller's complete sensitivity predicate scans it. If it is one
 code unit longer, the operation fails closed before allocating a slice. This
 restores the invariant that no keyword, known prefix, JWT, or generic secret shape
 used by the merge base becomes invisible merely because it sits farther from the
-cut, while keeping unmetered summary and error sinks independent of original input
-size.
+cut, while keeping the reduction and discarded-tail work independent of original
+input size.
 
 The distinction matters because a retained prefix may itself contain a credential
 shape the downstream guard does not recognize. A distant `token` or short JWT can
@@ -255,11 +259,12 @@ candidate: after complete scheme URLs are consumed, a preflight uses the same
 scheme-less userinfo matcher and poison predicate as the final userinfo pass.
 That prevents a protocol-relative JWT prefix from disappearing and exposing a
 later copy of its password. The final pass still repeats the same check for
-shapes formed by earlier rewrites. The preflight runs only when `//` and `@` are
-both present — necessary conditions supplied by the two passes themselves, not
-a second username/host grammar — and both scans stay inside the 4000-character
+shapes formed by earlier rewrites. Pass 2 is computed first without mutating the
+preflight input; the extra scan runs only when pass 2 actually changed the string
+and the original contained `@`. Both scans stay inside the 4000-character
 reduction bound. The generated performance corpus includes the period-separated
-shape, with and without an unrelated `@`.
+shape alone, with inert `//`/`@` substrings, and with a real protocol-relative
+rewrite containing `@`.
 After those passes, one default-deny choke point withholds any remaining
 scheme-less whitespace token whose first `:` precedes its last `@`. That closes
 non-ASCII and punctuation-terminated usernames, IPv6 zone IDs and empty hosts
@@ -411,9 +416,12 @@ Those three are where the bound is *visible*, not where it *acts*: it lives insi
 `reduceUrlsInText`, so all eleven callers change at long input. Three change in a way
 "long text gets truncated" does not predict — a rich text block loses per-segment
 styling (the safer output, and it closes a `card ⊋ plain` divergence `main` has),
-an authored interactive card rejects an over-long title with the neutral reason
+a short authored title emptied by poison/default-deny receives the neutral reason
 “withheld by sanitization”, and a debug value and a reasoning step both yield `""`
-rather than a truncation.
+rather than a truncation. Over-long nonblank titles still report the length or a
+sensitive discarded tail specifically. An all-whitespace value beyond 4000
+characters cannot be proven blank inside the bound, so authored titles use the
+neutral withheld reason and action-status display names render `[redacted]`.
 
 ## Architecture
 
