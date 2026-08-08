@@ -203,6 +203,53 @@ describe("summarizeToolParams", () => {
     expect(summarizeToolParams("fetch", { url: "not a url" })).toBe("");
   });
 
+  it("所有摘要策略在 trim/split/URL parse 前拒绝超过 raw 上限的参数", () => {
+    // 这些输入在当前实现上都会先做整串工作,然后才撞到下游的 REDUCE_INPUT_MAX / RAW_INPUT_MAX:
+    // query/shell 先 trim,path 还会 split 出成千上万个段,url 则先 parse 整条 URL。边界必须住在
+    // 共享取值处,否则只修 firstString.trim 仍会漏掉 path split 与 url parse。
+    const path = "root/" + "segment/".repeat(Math.ceil(RAW_INPUT_MAX / 8)) + "file";
+    const query = "TODO " + " ".repeat(RAW_INPUT_MAX);
+    const command = "git " + " ".repeat(RAW_INPUT_MAX);
+    const url = "https://docs.example.com/" + "x".repeat(RAW_INPUT_MAX);
+    for (const value of [path, query, command, url]) expect(value.length).toBeGreaterThan(RAW_INPUT_MAX);
+
+    const originalTrim = String.prototype.trim;
+    const originalSplit = String.prototype.split;
+    let maxTrimmedLength = 0;
+    let maxSplitLength = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      maxTrimmedLength = Math.max(maxTrimmedLength, this.length);
+      return originalTrim.call(this);
+    });
+    const split = vi.spyOn(String.prototype, "split").mockImplementation(function (
+      this: string,
+      separator?: string | RegExp,
+      limit?: number,
+    ) {
+      maxSplitLength = Math.max(maxSplitLength, this.length);
+      return originalSplit.call(this, separator, limit);
+    });
+
+    let got: string[] = [];
+    try {
+      got = [
+        summarizeToolParams("read", { path }),
+        summarizeToolParams("grep", { pattern: query }),
+        summarizeToolParams("exec", { command }),
+        summarizeToolParams("fetch", { url }),
+      ];
+    } finally {
+      split.mockRestore();
+      trim.mockRestore();
+    }
+
+    expect(got).toEqual(["", "", "", ""]);
+    expect(maxTrimmedLength, `trim 收到了 ${maxTrimmedLength} 字符的原始参数`)
+      .toBeLessThanOrEqual(RAW_INPUT_MAX);
+    expect(maxSplitLength, `split 收到了 ${maxSplitLength} 字符的原始参数`)
+      .toBeLessThanOrEqual(RAW_INPUT_MAX);
+  });
+
   it("归约后残留的 schemeless name:secret@ token 一律 fail closed", () => {
     const residual = [
       "用户:hunter2Kx@host.example",
