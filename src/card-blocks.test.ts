@@ -1095,31 +1095,34 @@ describe("单卡片归约预算", () => {
   //
   // 换成真的会跑完整条管线的形状,并且**先断言它确实跑了** —— 形状一旦再退化成短路,
   // 下面两条内容断言先红,而不是计时安静地变成 0 ms。
-  it("最坏形状:预算把它压住,而且形状确实跑完了管线", () => {
-    // 每块 3905 字符(≤4000,界不截断),主体是一个 3900 字符的纯字母长词:第 1 趟的
-    // `[a-z][a-z0-9+.-]*://` 在没有 `://` 的长串上是二次的,单次实测 ~29 ms。不带 `mk` 的
+  it("最坏形状:预算把 text/rich 都压住,而且形状确实跑完了管线", () => {
+    // 每块 3905 字符(≤4000,界不截断),主体是一个 3900 字符的点密集长词:每个点后都给
+    // schemeless userinfo 正则一个新的单词边界起点,它会反复回退找并不存在的冒号。不带 `mk` 的
     // `b${i} ` 前缀 —— 带上就 4005 > 4000,界会把 kept 砍成两个字符,又变成测空气。
-    const blocks = Array.from({ length: 200 }, (_, i) => ({
-      type: "text" as const,
-      text: "ghijklmnopqrstuvwxyz".repeat(195).slice(0, 3900) + ` blk${i}`,
-    }));
-    const { card } = buildDisplayCard({ blocks });
-    const rendered = body({ card });
+    const values = Array.from({ length: 200 }, (_, i) => "a.".repeat(1950) + ` blk${i}`);
+    const textBlocks = values.map((text) => ({ type: "text" as const, text }));
+    const richBlocks = values.map((text) => ({ type: "rich" as const, segments: [{ text }] }));
+    const text = buildDisplayCard({ caps: FULL_CAPS, blocks: textBlocks });
+    const rich = buildDisplayCard({ caps: FULL_CAPS, blocks: richBlocks });
+    const rendered = body(text);
     // 30 个内容块(120000 / 4000)+ 1 条超预算提示。数字对上,才说明每块真按 4000 计了费。
     expect(rendered, "形状退化了:没有按每块 4000 字符计费").toHaveLength(31);
     expect((rendered[0] as { text: string }).text.length, "首块被截短了,管线没有跑在 3900 字符上")
       .toBe(3905);
+    expect(body(rich), "rich 比较趟绕过了同一预算").toHaveLength(31);
 
-    buildDisplayCard({ blocks });
-    const t0 = performance.now();
-    buildDisplayCard({ blocks });
-    const ms = performance.now() - t0;
-    // 实测(独立进程,5 次):main 5383–7114 ms,本分支 819–856 ms。预算管的是**字符不是时间**
-    // —— 30 次 × ~29 ms,所以天花板是 0.9 秒而不是"百毫秒",这个数字写在 README 里。
-    // 阈值取 3500:同一进程里跑在别的用例后面时,GC 争用实测能把它推到 2046 ms,2500 太贴脸;
-    // 而 main 的下限是 5383,3500 仍然稳稳卡在两者中间 —— 预算失效会红,CI 抖动不会。
-    expect(ms, `200 块 × 3905 字符最坏形状耗时 ${ms.toFixed(0)} ms`).toBeLessThan(3500);
-  });
+    const timed = (blocks: typeof textBlocks | typeof richBlocks): number => {
+      buildDisplayCard({ caps: FULL_CAPS, blocks });
+      const t0 = performance.now();
+      buildDisplayCard({ caps: FULL_CAPS, blocks });
+      return performance.now() - t0;
+    };
+    const textMs = timed(textBlocks);
+    const richMs = timed(richBlocks);
+    // 宽阈值只挡预算失效/分钟级回归;毫秒级的重复扫描由 parity 里的 base 比值单独看守。
+    expect(textMs, `text:200 块 × 点密集 3905 字符耗时 ${textMs.toFixed(0)} ms`).toBeLessThan(3500);
+    expect(richMs, `rich:200 块 × 点密集 3905 字符耗时 ${richMs.toFixed(0)} ms`).toBeLessThan(5000);
+  }, 15_000);
 });
 
 describe("展开按钮标签与摘要去重", () => {

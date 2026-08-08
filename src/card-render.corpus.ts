@@ -650,6 +650,14 @@ export const PERF_CORPUS: PerfRow[] = [
     reachesPasses: true,
     note: "R1:走第 1 趟 scheme 正则,与上面几行代价完全不同",
   },
+  {
+    label: "点密集、无 pass-2 形状",
+    input: "a.".repeat(2000),
+    reachesPasses: true,
+    note:
+      "R13:每个点后都有新的单词边界,schemeless userinfo 正则会从每个边界回退找冒号;" +
+      "preflight 若无条件再跑一遍,head 就比 base 多付整趟二次成本",
+  },
   // 这两行钉住本 PR 的两个上限。加它们是因为对抗评审点出:**修复本身一行都没被钉住** ——
   // 整组里没有任何一行「超过 64 KiB 且含空白」,于是 collapseForReduction 的切口路径零覆盖;
   // 尾部扫描那个二次方也没有一行会在 main 上超时。修复不被自己的语料覆盖,下一次改动就没有红。

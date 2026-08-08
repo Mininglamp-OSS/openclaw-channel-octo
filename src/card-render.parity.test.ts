@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -189,6 +189,41 @@ describe("与 def63bb 的差分 parity", () => {
     const h = runSink(head, headEcho, "read", input);
     expect(b, `这个用例不是 base-clean,不能证明回归。base=${JSON.stringify(b)}`).not.toContain(secret);
     expect(h, `head 渲染了 base 没露出的口令。head=${JSON.stringify(h)}`).not.toContain(secret);
+  });
+
+  it("没有 protocol-relative pass 的点密集输入,归约成本保持接近 base", () => {
+    const medianMs = (fn: () => unknown): number => {
+      for (let i = 0; i < 3; i++) fn();
+      const samples: number[] = [];
+      for (let i = 0; i < 7; i++) {
+        const start = performance.now();
+        fn();
+        samples.push(performance.now() - start);
+      }
+      return samples.sort((a, b) => a - b)[Math.floor(samples.length / 2)]!;
+    };
+    for (const [label, input] of [
+      ["无 @", "a.".repeat(2000)],
+      ["只有无关 @", "a.".repeat(1999) + "a@"],
+    ] as const) {
+      const baseMs = medianMs(() => base.reduceUrlsInText(input));
+      const headMs = medianMs(() => head.reduceUrlsInText(input));
+      expect(
+        headMs,
+        `${label}:head ${headMs.toFixed(1)} ms / base ${baseMs.toFixed(1)} ms,` +
+          "没有 pass 2 候选却多跑了整趟 schemeless 扫描",
+      ).toBeLessThan(baseMs * 1.45);
+    }
+  });
+
+  it("没有 protocol-relative pass 时不启动 userinfo preflight", () => {
+    const matchAll = vi.spyOn(String.prototype, "matchAll");
+    try {
+      head.reduceUrlsInText("a.".repeat(1999) + "a@");
+      expect(matchAll, "只有无关 @、没有 //,却仍启动了整趟 preflight").not.toHaveBeenCalled();
+    } finally {
+      matchAll.mockRestore();
+    }
   });
 
   const rows = generateParitySpace();

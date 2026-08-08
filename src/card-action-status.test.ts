@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderCardActionStatus } from "./card-action-status.js";
+import { REDUCE_INPUT_MAX } from "./card-render.js";
 
 /** Collect every `text` string in a rendered card, in-memory (single backslashes, no JSON escaping). */
 function collectText(node: unknown, acc: string[] = []): string[] {
@@ -141,6 +142,31 @@ describe("renderCardActionStatus", () => {
     const texts = collectText(rendered.card).join("\n") + "\n" + rendered.plain;
     expect(texts, "275 字符口令明文进了群卡片").not.toContain(pw);
     expect(texts).toContain("[redacted]");
+  });
+
+  it("超长 operator 的空白判定不在 raw string 上 trim", () => {
+    const originalTrim = String.prototype.trim;
+    let maxTrimmedLength = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      maxTrimmedLength = Math.max(maxTrimmedLength, this.length);
+      return originalTrim.call(this);
+    });
+    try {
+      const operator = "x" + " ".repeat(1_000_000);
+      const rendered = renderCardActionStatus({
+        card: { type: "AdaptiveCard", version: "1.5", body: [] },
+        plain: "",
+        inputs: {},
+        operator,
+        actionLabel: "确认",
+        status: "completed",
+      });
+      expect(collectText(rendered.card).join("\n")).toContain("[redacted]");
+      expect(maxTrimmedLength, `trim 收到了 ${maxTrimmedLength} 字符的原始值`)
+        .toBeLessThanOrEqual(REDUCE_INPUT_MAX);
+    } finally {
+      trim.mockRestore();
+    }
   });
 
   it("普通提交值与显示名不被加转义(无回归)", () => {

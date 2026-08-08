@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildInteractiveCard } from "./card-author.js";
 import { CARD_INTERACTIVE_PROFILE } from "./types.js";
 import { cardPayloadBytes } from "./card-limits.js";
+import { REDUCE_INPUT_MAX } from "./card-render.js";
 
 const caps = {
   elements: new Set(["TextBlock"]),
@@ -304,5 +305,23 @@ describe("标题失败时的原因", () => {
     const r = buildInteractiveCard({ title, buttons: [button] } as never);
     expect("error" in r && r.error).toContain("must not contain sensitive data");
     expect("error" in r && r.error).not.toContain("too long");
+  });
+
+  it("超长标题的空白判定不在 raw string 上 trim", () => {
+    const originalTrim = String.prototype.trim;
+    let maxTrimmedLength = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      maxTrimmedLength = Math.max(maxTrimmedLength, this.length);
+      return originalTrim.call(this);
+    });
+    try {
+      const title = "x" + " ".repeat(1_000_000);
+      const r = buildInteractiveCard({ title, buttons: [button] } as never);
+      expect("error" in r && r.error).toContain("must not contain sensitive data");
+      expect(maxTrimmedLength, `trim 收到了 ${maxTrimmedLength} 字符的原始值`)
+        .toBeLessThanOrEqual(REDUCE_INPUT_MAX);
+    } finally {
+      trim.mockRestore();
+    }
   });
 });
