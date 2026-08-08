@@ -66,9 +66,8 @@ export const LEAK_CORPUS: CorpusRow[] = [
     note: "R8:IPv6 方括号主机。按 `:` 切主机会切成 `[`,整行被打空 —— 现在取到 `]` 为止",
   },
   {
-    // R7:收窄尾部扫描时漏掉的那个前提。守卫抓不住单标签 userinfo(此前在 UNFIXED 组),
-    // 当时压住整串的只有 4000 字符之外那个 `token` —— 把整个守卫收进 TAIL_SCAN_MAX 之后,
-    // 这三个 sink 全部渲染出明文口令。现在只有 JWT 那一档收窄,关键词档看完整条尾巴。
+    // R7:旧窗口漏掉的前提。守卫抓不住单标签 userinfo时,压住整串的只有 4000 字符之外的 token。
+    // 现在额度内完整检查,超额直接 fail closed,不再按 detector 分档。
     input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + " token",
     expect: { grep: "", read: "", exec: "" },
     note: "R7:切口之外的关键词必须仍然压得住 kept 里守卫认不出的凭据",
@@ -84,11 +83,11 @@ export const LEAK_CORPUS: CorpusRow[] = [
   {
     input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + "eyJabcdefgh.abcdefgh.abc",
     expect: {
-      grep: "https://localhost word word word word word word word word word w…",
-      read: "https://localhost word word word word word word word word word w…",
+      grep: "",
+      read: "",
       exec: "",
     },
-    note: "R8-P0:短的低熵 JWT 落在 TAIL_SCAN_MAX 之外 —— 熵检测看不见它,JWT_RE 够不着它",
+    note: "R11-P0-1:短低熵 JWT 在旧 4000 字符窗口外。线性 JWT authority 现在完整检查额度内尾巴",
   },
   {
     input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(33_000) + " token",
@@ -97,7 +96,7 @@ export const LEAK_CORPUS: CorpusRow[] = [
     // 一个 fail-open 钉成了「现在是什么」——note 里甚至写明了机制(关键词够不着)。它能一直绿,
     // 是因为本组的判据是「口令子串不出现」,而归约把 DSN 变成了主机,`hunter2` 确实不在输出里;
     // 「base 藏不藏得住」这一问从来没对它提过。评审第十轮 P0-1 就是这一类,差分 parity 组现在
-    // 覆盖了这条边界。修法见 collapseForReduction / boundedForReduction:整条尾巴给线性档。
+    // 覆盖了这条边界。修法见 collapseForReduction / boundedForReduction 的统一额度规则。
     note: "R8-P1:关键词落在 128 KiB 之外(136 KB)。曾经钉着 head 的泄漏输出,现在与 base 同为空",
   },
   {
@@ -298,6 +297,20 @@ export const LEAK_CORPUS: CorpusRow[] = [
     expect: { grep: "", read: "", exec: "" },
     note: "R11-P1:纯数字单标签 + 128 KiB 外的关键词。曾经钉着 head 的填充输出,现在与 base 同为空",
   },
+  // R11:归约 pass 之后仍残留 `name:…@` 的 token 在唯一收口处 default-deny。这里用低熵口令,
+  // 证明结果不是 generic 高熵兜底碰巧挡住;read 的 generic=false 同样必须为空。
+  ...[
+    "用户:hunter2Kx@host.example",
+    "а:hunter2Kx@host.example",
+    "u:hunter2Kx@[fe80::1%eth0]",
+    "u:hunter2Kx@",
+    '"user":hunter2Kx@db.example.com',
+    "[postgres]:hunter2Kx@db.example.com",
+  ].map((input): CorpusRow => ({
+    input,
+    expect: { grep: "", read: "", exec: "" },
+    note: "R11:未识别的残余 userinfo token 在 reduction choke point 整段扣下",
+  })),
 ];
 
 /** 普通内容不该被误伤成空白。 */
@@ -328,11 +341,6 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     note: "R4b:裸数字单标签。与上面两行形状一致,无法区分 —— query 剥离那条已移出本分支,这行记录的是移出后的行为",
   },
   {
-    input: "email:\\s*\\S+@\\S+",
-    expect: { grep: "email:\\s*\\S+@\\S+" },
-    note: "R4c:搜邮箱是常规操作。曾被 userinfo 兜底整串打空",
-  },
-  {
     input: "sed 's:a:b@c:g'",
     expect: { exec: "sed" },
     note: "既有:与 DSN 形状无法区分,shell 有程序名可退",
@@ -354,14 +362,6 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     input: "word ".repeat(900) + "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
     expect: { read: "word ".repeat(12) + "word…" },
     note: "R6:尾部 git SHA 的普通长文本。main 的 read 渲染它、grep 扣下它 —— main 自己就按策略分岔,所以界不能有一个写死的判定",
-  },
-  // R11:无空白的长 minified JSON,里面有个邮箱。hasOverlongUserinfo 若只看「有冒号、有 @、
-  // 中间超 256」,这一整块会被打空(评审第七轮 P2)—— JSON 的 `":"` 冒号前面是 `"` 不是用户名
-  // 字符,不该算 userinfo 分隔符。要求冒号紧挨用户名字符之后,这条恢复渲染。
-  {
-    input: '{"detail":"' + "z".repeat(300) + '","owner":"ops@example.com"}',
-    expect: { grep: '{"detail":"' + "z".repeat(53) + "…", read: '{"detail":"' + "z".repeat(53) + "…" },
-    note: "R11:minified JSON 不是 DSN。冒号前是 `\"` 不是用户名字符,不触发超限 userinfo 扣留",
   },
 ];
 
@@ -388,33 +388,53 @@ export const BENIGN_CORPUS: CorpusRow[] = [
  * 要加一行,得先去 main 上量;量出来是空,就说明这行根本不属于这一组。
  */
 export interface CostRow extends CorpusRow {
-  /** 同一输入在 `main`(b1e3def)上 grep 策略的实测输出。必须非空 —— 否则这行记录不到代价。 */
+  /** 同一输入在 merge-base `def63bb` 上 grep 策略的实测输出。必须非空。 */
   mainRenders: string;
+  /** 代价来自输入边界,还是 residual userinfo 的统一 default-deny。 */
+  cost: "input-bound" | "residual-userinfo";
 }
 
 export const COST_CORPUS: CostRow[] = [
   {
+    input: "email:\\s*\\S+@\\S+",
+    expect: { grep: "" },
+    mainRenders: "email:\\s*\\S+@\\S+",
+    cost: "residual-userinfo",
+    note: "R11 default-deny 代价:邮箱 grep 与残余 userinfo 同形,安全收口整段扣下",
+  },
+  {
+    input: '{"detail":"' + "z".repeat(300) + '","owner":"ops@example.com"}',
+    expect: { grep: "", read: "" },
+    mainRenders: '{"detail":"' + "z".repeat(53) + "…",
+    cost: "residual-userinfo",
+    note: "R11 default-deny 代价:无空白 minified JSON 与残余 userinfo 同形,安全收口整段扣下",
+  },
+  {
     input: "https://example.com/" + "z".repeat(4100),
     expect: { grep: "", read: "" },
     mainRenders: "https://example.com",
+    cost: "input-bound",
     note: "R5-P1:超长无空白 URL。main 上第 1 趟线性,0.8 ms 归约成注册域",
   },
   {
     input: "https://s3.amazonaws.com/b/k?X-Amz-Signature=" + "a".repeat(4000),
     expect: { grep: "", read: "" },
     mainRenders: "https://amazonaws.com",
+    cost: "input-bound",
     note: "R5-P1:预签名 URL,现实形状。read 策略在 main 上渲染 65 字符的 path+query",
   },
   {
     input: "z".repeat(4100),
     expect: { grep: "", read: "" },
     mainRenders: "z".repeat(64) + "…",
+    cost: "input-bound",
     note: "R5-P2:空白边界截断的代价本体。**必须用非十六进制字符** —— `\"a\"×4100` 在 main 上也是空(isSensitive 长 hex 分支),那一行空转了整整一轮评审",
   },
   {
     input: "zq".repeat(2050),
     expect: { grep: "", read: "" },
     mainRenders: "zq".repeat(32) + "…",
+    cost: "input-bound",
     note: "R5-P2:同上,展示块形态。main 渲染 4100 字符,这里整块不渲染",
   },
   // R6:界按 **UTF-16 code unit** 计,而 CJK 散文不含 ASCII 空白 —— 一整段中文就是一个不可切
@@ -424,6 +444,7 @@ export const COST_CORPUS: CostRow[] = [
     input: "中".repeat(4100),
     expect: { grep: "", read: "" },
     mainRenders: "中".repeat(64) + "…",
+    cost: "input-bound",
     note: "R6-P1:普通中文长文本。4100 units,无 ASCII 空白 → 整段不渲染",
   },
   // 子代理评审找出的一类,**这一组此前一行都没覆盖**:上面每行都是"无空白长 token",而这一类
@@ -435,18 +456,21 @@ export const COST_CORPUS: CostRow[] = [
       + "see https://docs.example.com/troubleshooting/connection-refused-timeouts",
     expect: { grep: "" },
     mainRenders: "connection refused after 3 retries word word word word word word…",
+    cost: "input-bound",
     note: "R6-审:长错误文本 + 尾部文档链接。**只在 generic 那一侧被打空** —— read(generic=false)不套用高熵检测,两边都渲染,故不列。sanitizeErrorText 也走高熵那一路:main 121 字符,这里空",
   },
   {
     input: "word ".repeat(900) + "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234",
     expect: { grep: "" },
     mainRenders: "word ".repeat(12) + "word…",
+    cost: "input-bound",
     note: "R6-审:webhook 在**尾部**。同样内容放在开头时正常渲染(那正是删掉 card-blocks 预检修好的),放尾部则被界的守卫扣下 —— 两个方向都要有行,否则读者以为整类都好了",
   },
   {
     input: "😀".repeat(2001),
     expect: { grep: "", read: "" },
     mainRenders: "😀".repeat(32) + "…",
+    cost: "input-bound",
     note: "R6-P1:星平面字符每个 2 units,所以 **2001 个** emoji 就越界 —— 文档说的「4000 字符」在这里是 2000 个。`\"😀\"×1999`(3998 units)仍正常渲染",
   },
 ];
@@ -479,19 +503,10 @@ export const REWRITE_CORPUS: CorpusRow[] = [
 ];
 
 /**
- * **本 PR 不修**、留给 userinfo 那条后续 PR 的形状。期望值 = `main` 的行为。
- *
- * 为什么明确列出来而不是省略:这一组是 `SCHEMELESS_USERINFO_RE` 的单标签放宽 + 配套 fail-closed
- * 兜底要覆盖的面。那一对在四轮里两次把缺陷改成了更糟的缺陷 —— 放宽归约会把
- * `nginx:1.21@sha256:1234abcd` 改写成输入里不存在的 `https://sha256abcd`,收紧兜底又会让一个
- * 尾随逗号整条绕过它 —— 所以整对摘出去单独评审了。
- *
- * 但形状必须留在表里:它们同时进造串检测,谁再动那对正则,这里会立刻指出改写方向对不对。
- * 前四行是 `main` 上就存在的明文泄漏,**不是本 PR 引入的**,也不是本 PR 声称修好的。
+ * 仍未修的 shell 赋值折叠形状,以及已经安全删除但必须继续参加造串检测的哨兵。
+ * 前三行与 merge base 相同;后五行要求任何未来放宽都不能重新发出输入中不存在的主机。
  */
 export const UNFIXED_CORPUS: CorpusRow[] = [
-  // (原先这里有四行单标签/IPv6/口令带斜杠的明文泄漏。它们**已经修好**,搬到 LEAK 组了 ——
-  //  见那边的 R8 段。留这条注释是因为上面那段说明还在讲这一对正则的历史。)
   // 赋值折叠漏掉的一类:值以 SHELL_BREAK 里的字符开头(`(`、`;`、`|`、`&`、`<`、`>`、反引号)。
   // `(?:SHELL_WORD_ATOM)*` 匹配零个原子,折叠只写出 `NAME=_`,值的其余部分留在串里,跳过循环
   // 又落回值的第二个词 —— 正是折叠这条改动要关的那个失败。
@@ -517,8 +532,8 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
   },
   {
     input: "nginx:1.21@sha256:1234abcd",
-    expect: { grep: "nginx:1.21@sha256:1234abcd" },
-    note: "造串哨兵:放宽单标签分支时曾被改写成 `https://sha256abcd`,输入里没有这个串",
+    expect: { grep: "" },
+    note: "造串哨兵:default-deny 删除残余 token,不允许改写成输入里没有的 `https://sha256abcd`",
   },
   {
     input: "3:4@2/x",
@@ -539,51 +554,6 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
     input: "a:b@0x7f.1",
     expect: { grep: "" },
     note: "R9 造串哨兵:十六进制被 new URL() 展开成 `127.0.0.1`",
-  },
-  // 第八/九轮点出的一类:`user:pass@host`,其中 host 是归约的两条 userinfo 正则都匹配不上的
-  // 形状(非 ASCII 用户名、IPv6 zone-id、空 host)。`path` 策略直接展示原文,而它走 generic=false
-  // 档、跳过高熵那一层,于是口令原样出现在卡片上。
-  //
-  // **main 上逐字相同**(见每行 note 的实测),不是本 PR 引入的。不在这里关掉是因为几种关法都会
-  // 撞上「不许回归」:放宽用户名字符类会重新打开 CJK 整句删除;一条「凡是残留 userinfo 形状就
-  // 整行扣下」会把钉住的良性行 `email:\s*\S+@\S+` 打空;要区分这两者就得引入第三份 userinfo
-  // 匹配规则 —— 而「第二份/第三份本该镜像第一份的表却没镜像上」正是这条分支反复出问题的成因。
-  // 钉在这里,让它进造串检测、并且一旦行为变化就变红,修法留给独立改动。
-  {
-    input: "用户:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@host.example",
-    expect: {
-      read: "用户:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@host.example",
-      grep: "",
-      exec: "",
-    },
-    note: "R8 已知未修:非 ASCII 用户名,两条 userinfo 正则的用户名类都是 ASCII。main 上 read 渲染同一串",
-  },
-  {
-    input: "а:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@host.example",
-    expect: {
-      read: "а:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@host.example",
-      grep: "",
-      exec: "",
-    },
-    note: "R8 已知未修:西里尔字母用户名(单字符 `а`,U+0430)。与上一行同一成因,分开钉是因为它不是 CJK —— 「放宽用户名类」的修法要同时面对这两种,而放宽正是 R7 打开 CJK 整句删除的那一步",
-  },
-  {
-    input: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@[fe80::1%eth0]",
-    expect: {
-      read: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@[fe80::1%eth0]",
-      grep: "",
-      exec: "",
-    },
-    note: "R8 已知未修:IPv6 zone-id 的 `%eth0` 不在括号内主机类里。main 上 read 渲染同一串",
-  },
-  {
-    input: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@",
-    expect: {
-      read: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@",
-      grep: "",
-      exec: "",
-    },
-    note: "R8 已知未修:空 host,`@` 后没有主机可归约。main 上 read 渲染同一串",
   },
 ];
 
@@ -686,17 +656,14 @@ export const PERF_CORPUS: PerfRow[] = [
   {
     label: "超过 64 KiB 且含空白 —— 折叠切口路径",
     input: "word ".repeat(20_000),
-    reachesPasses: true,
-    note: "R8:唯一一行会真的走到 collapseForReduction 的空白切口(其余超长行全无空白,长度判定处就短路了)",
+    reachesPasses: false,
+    note: "R11:direct reduce 的 discarded tail 超过 64 KiB,在进入管线前 fail closed",
   },
   {
     label: "空白 + 64 KiB 无点 base64",
     input: "x " + "eyJ".repeat(21_845),
-    // main 上没有这道守卫,它**跑完了**整条管线,实测 426 ms —— 超过本组 300 ms 的预算。
-    // 现在切口之后是一整块 65 KB 无空白 token,tailScanWindow fail closed,守卫处就拒了。
-    // 标注是 false 正说明修复生效:这一行钉的是"这个形状不再贵",不是"这几趟有界"。
-    reachesPasses: false,
-    note: "R8:尾部扫描的二次方形状 —— main 426 ms,本分支在守卫处短路,3 ms",
+    reachesPasses: true,
+    note: "R11:旧 JWT 正则的二次方形状。线性 scanner 允许它在固定 64 KiB tail 额度内完成",
   },
   // 赋值折叠的对抗形状。它此前一行都没有 —— ASSIGNMENT_VALUE_RE / SHELL_WORD_ATOM 是本 PR 新加的
   // 正则,而 `SHELL_WORD_ATOM` 是 `(?:A|B|C|D|E)*` 这种嵌套重复,正是灾难性回溯的经典形状。

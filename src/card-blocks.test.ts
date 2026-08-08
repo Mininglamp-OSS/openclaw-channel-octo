@@ -1028,43 +1028,24 @@ describe("单卡片归约预算", () => {
     }
   });
 
-  it("线性档命中让整块扣下时,也要计价 —— 否则预算整条不生效", () => {
-    // 评审第十轮 Q4:`collapseForReduction` 因**线性档**命中而返回 "" 时,`bounded` 一次没被
-    // 调用,而 `cost` 那行在早退之前 —— 这一块扫了 64 KiB 切割加一整条尾巴,却一分不付。
-    // 200 块下来 `exhausted` 始终不翻转、提示不出现,实测 base 525 ms / 修前 830 ms,
-    // 而这条 PR 加预算管的就是这根轴。
-    //
-    // **断言提示出现,不断言耗时。** 计时断言在 CI 上会抖,而且「慢」是症状、「没计价」才是缺陷;
-    // 提示出不出现是那个缺陷的直接观测。反向验证过:把 linear 换回 `plain.linear`,这条变红。
-    const text = "h ".repeat(32_768) + "x".repeat(120_000) + " token";
-    const { card } = buildDisplayCard({ blocks: mk(200, text) });
-    expect(JSON.stringify(card), "线性档扫了 200 块却一分没付,预算没耗尽").toContain("脱敏预算");
-  });
-
-  it("超长块按管线真正处理的量计费,不按原长", () => {
-    // **断言内容,不断言元素个数**:块被打掉时,超预算提示正好补上元素位,个数仍是 1 —— 第一版
-    // 就是这么绿错的。
+  it("discarded tail 超过固定额度时整块 fail closed,并耗尽卡片预算", () => {
     const { card } = buildDisplayCard({ blocks: [{ type: "text", text: "word ".repeat(200_000) }] });
     const first = body({ card })[0] as { text?: string } | undefined;
-    expect(first?.text, "超长块被预算打掉了").toMatch(/^word word/);
-    expect(first?.text).not.toContain("脱敏预算");
+    expect(first?.text, "超长块没有按固定输入成本 fail closed").toContain("脱敏预算");
+    expect(first?.text).not.toMatch(/^word word/);
+  });
 
-    // 单块看不出差别 —— RAW_INPUT_MAX 已经把折叠后长度压到 ≤64 KiB,按原长计费也进得来。
-    // 差别在**多块**:按原长计,两块 64 KiB 就超 120000,只进得去 1 块。
-    //
-    // 一块 100 KB 现在收三笔,每笔约 4000,因为它确实被扫了三次 ≤4000 的量:折叠那一步的尾部
-    // 扫描、归约本身、归约那一步的尾部扫描(窗口末端要对齐空白,所以每笔略多于 4000)。
-    // 120000 / ~12005 → **9 块**。上一版能进 20 块,是因为两次尾部扫描一分钱没收 ——
-    // 而那正是 200 块 14.8 秒(main 14.6 秒,两边持平)那个洞的来源。
-    const big = "word ".repeat(20_000);              // 100 KB → 折叠后被 RAW_INPUT_MAX 截到 64 KiB
-    const fit = buildDisplayCard({ blocks: mk(9, big) });
-    expect(body(fit), "多个大块被按原长收费饿死了").toHaveLength(9);
-    expect(JSON.stringify(fit), "9 块就该刚好装下").not.toContain("脱敏预算");
+  it("额度内的超长块按实际扫描量计费,不按原长", () => {
+    // 100 KB 输入的两段 discarded tail 都不超过 64 KiB,所以实际收费是归约的 4000 字符,
+    // 加两次线性尾扫折算后的约 751 单位,而不是原始 100 000 字符。
+    const big = "word ".repeat(20_000);
+    const fit = buildDisplayCard({ blocks: mk(25, big) });
+    expect(body(fit), "多个大块被按原长收费饿死了").toHaveLength(25);
+    expect(JSON.stringify(fit), "25 块应恰好仍在实际扫描预算内").not.toContain("脱敏预算");
     // 按原长计费的话两块就超预算,只进得去 1 块 —— 这才是这条测试要挡的那个改法。
     expect(2 * big.length, "按原长计,两块就该超预算").toBeGreaterThan(REDUCE_BUDGET_PER_CARD);
-    // **两侧都要钉。** 上面那条只挡"多收",少收一分钱它照样绿(反向验证时把尾部扫描的计价
-    // 改成扣 0,它没红)。第 10 块必须超出去 —— 这一条挡的是"少收"。
-    expect(JSON.stringify(buildDisplayCard({ blocks: mk(10, big) })), "第 10 块也装下了,尾部扫描的账没收")
+    // 两侧都钉:第 26 块必须触发预算,否则尾部扫描没有入账。
+    expect(JSON.stringify(buildDisplayCard({ blocks: mk(26, big) })), "第 26 块也装下了,尾部扫描的账没收")
       .toContain("脱敏预算");
   });
 
@@ -1159,12 +1140,10 @@ describe("展开按钮标签与摘要去重", () => {
   });
 });
 
-describe("预算耗尽之后不再做工", () => {
-  it("空白密集 + 无点 base64 尾巴:计价按扫描量,整卡有界", () => {
-    // 评审复现的形状。折叠后每块只剩 `b0 x`,按折叠后长度计费就是 4 块钱,200 块也耗不尽预算 ——
-    // 可每块仍把 7800 字符的无点 base64 喂进二次方的 JWT 正则。实测 main 14609 ms / 修复前
-    // 14793 ms(**两边持平**,预算对它完全没生效),按扫描量计价之后 372 ms。
-    // 阈值 3000:远低于失效时的量级,又给足 CI 抖动。
+describe("预算耗尽后的早退与线性 JWT 成本", () => {
+  it("空白密集 + 无点 base64 尾巴:线性扫描后 200 块仍完整且耗时有界", () => {
+    // 旧 JWT 正则在这 200 块上要约 15 秒;换成单一线性 authority 后,每块约 7800 字符的
+    // 无点 base64 尾巴不再需要靠耗尽预算才能止损。所有块都应保留,同时仍守住宽松的 3 秒上限。
     const blocks = Array.from({ length: 200 }, (_, i) => ({
       type: "text" as const,
       text: `b${i} x` + " ".repeat(65_535) + "eyJ".repeat(2600) + " tailend zzz",
@@ -1173,15 +1152,14 @@ describe("预算耗尽之后不再做工", () => {
     const t0 = performance.now();
     const { card } = buildDisplayCard({ blocks });
     const ms = performance.now() - t0;
-    // 前提:预算必须真的触发,否则这条测的只是"这台机器快"。
-    expect(JSON.stringify({ card }), "预算没触发,这个形状又白嫖了").toContain("脱敏预算");
-    expect(body({ card }).length, "200 块全渲染出来了,预算没起作用").toBeLessThan(40);
+    expect(JSON.stringify({ card }), "线性形状不应再靠预算提示截断").not.toContain("脱敏预算");
+    expect(body({ card }), "线性 scanner 仍误删了内容块").toHaveLength(200);
     expect(ms, `200 块 × 空白密集+无点 base64 耗时 ${ms.toFixed(0)} ms`).toBeLessThan(3000);
   });
 
 
   it("代价不随块数增长 —— 耗尽之后每块仍要折叠一次是白付的", () => {
-    // 计费跑在折叠**之后**,所以耗尽之后不早退的话,每个块还要付一次最多 64 KiB 的折叠。
+    // 预算一旦耗尽,后续块若不早退,仍会白付一次最多 64 KiB 的切割/扫描。
     // 用**比值**而不是绝对毫秒:机器快慢不影响它,而缺陷的信号非常清楚 ——
     // 实测有早退 66/70/67/64 ms(30/60/120/200 块,元素数从第 30 块起就钉死),
     // 无早退 69/119/230/369 ms。比值 1.0 对 5.3。

@@ -135,6 +135,9 @@ export const SUMMARY_MAX = 64;
  */
 export const REDUCE_INPUT_MAX = 4000;
 
+/** 折叠前最多保留的原始输入,也是任一截断点允许完整检查的最大 discarded tail。 */
+export const RAW_INPUT_MAX = 64 * 1024;
+
 /**
  * 敏感串守卫模式。群卡片对全体成员可见 —— 摘要一旦命中即整串隐藏(fail-safe:
  * 宁可误伤含 "token" 字样的正常文本,也不泄露 token/密钥/口令)。
@@ -164,26 +167,62 @@ const SECRET_PREFIX_RES: RegExp[] = [
   /dop_v1_[A-Fa-f0-9]{32,}/,                            // DigitalOcean PAT
 ];
 
+/** `[A-Za-z0-9_-]`,按 charCode 判断以免在长串上创建临时子串。 */
+function isBase64UrlCode(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    code === 95 || code === 45
+  );
+}
+
 /**
- * JWT。**单独拎出来,因为整个守卫里只有它不是线性的。**
+ * JWT 的线性扫描器,语义等同于旧的
+ * `eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+`。
  *
- * 在没有点号的长 base64 串上,每个 `eyJ` 都是一个起点,各自向后扫到底找 `.`,于是代价是二次的。
- * 实测(单条正则,`"eyJ"` 重复):
- *
- *     4000  19 ms      8000  80 ms      32000  1230 ms      64000  (分钟级)
- *
- * 其余每一条都便宜且线性 —— 同一批输入下 64 KB 上的实测:SECRET_RE 0.07 ms,11 条前缀正则
- * 各 ≤0.02 ms,长 hex 0.14 ms,高熵 0.41 ms。
- *
- * **试过把它改成线性,失败了,记在这里免得下一个人再试一遍。** 把 `[A-Za-z0-9_-]{8,}` 用
- * lookahead 捕获 + 反向引用模拟成占有型量词(`(?=([A-Za-z0-9_-]{8,}))\1`),语义等价
- * (8 个用例 + 20000 条随机串对拍全一致),但**只快 2 倍,仍然是干净的二次方**:代价不在
- * 单个起点内部的回溯,在起点的**数量**。真要线性得手写一个按点号扫描的匹配器 —— 那是把一条
- * 正则换成一份手写实现,而这条分支上出问题的地方几乎全是「同一条规则被实现了第二遍」。
- *
- * 所以界加在它身上,不加在输入上:线性档喂整条尾巴,这一条只喂 TAIL_SCAN_MAX 的窗口。
+ * 旧正则在 `"eyJ"` 密集、没有点号的串上,会从每个起点扫到尾再回退,是二次方。这里把输入拆成
+ * base64url run,只保留前两个 run 与分隔符状态;每个 run 内再做一次局部扫描,每个字符最多读两遍。
+ * 这是旧规则的**替换**,不是旁路的第二份判据 —— 生产代码只剩这一处 JWT authority。
  */
-const JWT_RE = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/;
+function hasJwtShape(s: string): boolean {
+  interface Run { length: number; jwtHead: boolean }
+  let older: Run | null = null;
+  let previous: Run | null = null;
+  let dotBeforePrevious = false;
+  let previousEnd = -1;
+  let i = 0;
+
+  while (i < s.length) {
+    while (i < s.length && !isBase64UrlCode(s.charCodeAt(i))) i++;
+    if (i >= s.length) break;
+    const start = i;
+    while (i < s.length && isBase64UrlCode(s.charCodeAt(i))) i++;
+    const end = i;
+    const dotBefore = previousEnd >= 0 && start === previousEnd + 1 && s.charCodeAt(previousEnd) === 46;
+    let jwtHead = false;
+    for (let candidate = start; candidate + 11 <= end; candidate++) {
+      if (
+        s.charCodeAt(candidate) === 101 &&
+        s.charCodeAt(candidate + 1) === 121 &&
+        s.charCodeAt(candidate + 2) === 74
+      ) {
+        jwtHead = true;
+        break;
+      }
+    }
+    const current: Run = { length: end - start, jwtHead };
+
+    if (older?.jwtHead && previous !== null && dotBeforePrevious && previous.length >= 8 && dotBefore) {
+      return true;
+    }
+    older = previous;
+    previous = current;
+    dotBeforePrevious = dotBefore;
+    previousEnd = end;
+  }
+  return false;
+}
 
 /** 长 hex(md5/sha/hex 密钥)。也命中 git object/docker digest 等常见路径,故仅用于 query/url。 */
 const LONG_HEX_RE = /\b[0-9a-fA-F]{32,}\b/;
@@ -208,18 +247,17 @@ function hasGenericSecretShape(s: string): boolean {
  * 群卡片对全员可见,任一命中即隐藏。
  */
 export function isSensitive(s: string, generic: boolean): boolean {
-  // 两档的**并集**就是原来那三项检查,按构造相等 —— 拆开是为了让尾部扫描能分别对待代价,
-  // 不是为了改判定。任何一档漏掉一条正则,这里立刻就少一项,不需要靠第二处断言去发现。
-  return hasLinearSecretShape(s, generic) || hasBoundedSecretShape(s);
+  return hasSecretShape(s, generic);
 }
 
 /**
- * 代价与长度成正比的那一档:关键词 + 11 条明确前缀 + (generic 时)长 hex/高熵。
- * 64 KB 上实测合计 0.74 ms,1 MB 11.6 ms —— 可以喂完整条尾巴。
+ * 单一敏感判定 authority:关键词、明确前缀、JWT、超长 userinfo,以及 generic 档的长 hex/高熵。
+ * 每一项都与输入长度成正比;discarded tail 的固定额度由 tailIsSensitive 统一执行。
  */
-function hasLinearSecretShape(s: string, generic: boolean): boolean {
+function hasSecretShape(s: string, generic: boolean): boolean {
   if (SECRET_RE.test(s)) return true;
   if (SECRET_PREFIX_RES.some((re) => re.test(s))) return true;
+  if (hasJwtShape(s)) return true;
   if (hasOverlongUserinfo(s)) return true;
   return generic && hasGenericSecretShape(s);
 }
@@ -240,7 +278,8 @@ function hasLinearSecretShape(s: string, generic: boolean): boolean {
  * 只匹配 `[A-Za-z0-9._%+-]+:` 开头这一点 —— 否则一段无空白的 minified JSON
  * (`{"level":"error","detail":"<300 z>","owner":"ops@example.com"}`)里,第一个冒号前面是
  * `"`,却因为「有冒号、有 @、中间超 256」被整块打空(评审第七轮 P2)。要求冒号前是用户名字符,
- * JSON 那些 `":"` 全部被跳过,而 `alice:<300>@host` 照样命中。
+ * JSON 那些 `":"` 全部被这个 detector 跳过,而 `alice:<300>@host` 照样命中。归约收口处更宽的
+ * residual-userinfo default-deny 仍会扣下同形 JSON;那是独立且已记录的产品代价。
  */
 /**
  * `def63bb` 的 pass 3,**逐字抄下来**。poison 要问的是「main 当初会不会归约这一段」,
@@ -260,8 +299,8 @@ function hasOverlongUserinfo(s: string): boolean {
   // 字符),所以命中的 token 至少 260 个字符 —— 短于这个长度的 token **不可能**为真。先按长度
   // 筛掉,再谈里面有什么。
   //
-  // 为什么在意:线性档现在看整条尾巴(P0-1 的修法),这个函数就跑在 MB 级的串上了。
-  // 三版实测(4 MB,neutralizeEcho / sanitizeErrorText,def63bb 分别是 70 / 248 ms):
+  // 为什么在意:discarded tail 在额度内会完整检查,这个函数经常跑在 64 KiB 串上。
+  // 三版实测(4 MB 原型,neutralizeEcho / sanitizeErrorText,def63bb 分别是 70 / 248 ms):
   //     s.split(/\s+/)            散文 265 / 213 ms  ← 八十万个字符串分配
   //     沿 @ 走 + 逐字符找边界      散文  69 /  76 ms,DSN 密集 189 / 195 ms  ← 每 token 数十次正则
   //     本版(空白扫描 + 长度筛)     见下
@@ -292,33 +331,15 @@ function hasOverlongUserinfo(s: string): boolean {
   }
 }
 
-/** 必须设界的那一档。目前只有 JWT 一条(见 JWT_RE 上面那段)。 */
-function hasBoundedSecretShape(s: string): boolean {
-  return JWT_RE.test(s);
-}
-
-/**
- * 调用方自己的敏感判定,**按代价分成两档**。
- *
- * 上一版这里是一个不透明的 `(s) => boolean`,于是尾部扫描只能对整个守卫设界,而守卫里
- * 只有 JWT 一条贵 —— 结果是为了那一条,把便宜的关键词检测也一起关在 4000 字符之外,
- * 泄漏了 base 会扣下的凭据(见 boundedForReduction)。
- *
- * 两档由**同一个工厂**构造,`all` 就是两档之和,所以不存在「下游守卫与尾部守卫分岔」。
- */
-export interface SensitivePredicate {
-  linear(s: string): boolean;
-  bounded(s: string): boolean;
-  all(s: string): boolean;
-}
+/** 调用方自己的敏感判定。所有 detector 都是线性的,因此不再按成本拆成两份 authority。 */
+export type SensitivePredicate = ((s: string) => boolean) & {
+  /** discarded tail 超过固定额度、未执行扫描时通知有预算状态的调用方。 */
+  onLimit?: () => void;
+};
 
 /** 按 generic 档构造谓词。query/url 用 true,path/shell 用 false。 */
 export function sensitivePredicate(generic: boolean): SensitivePredicate {
-  return {
-    linear: (s) => hasLinearSecretShape(s, generic),
-    bounded: hasBoundedSecretShape,
-    all: (s) => isSensitive(s, generic),
-  };
+  return (s) => isSensitive(s, generic);
 }
 
 /**
@@ -460,6 +481,14 @@ function isDsnShapedToken(t: string): boolean {
   const colon = t.indexOf(":");
   return colon >= 0 && colon < host;
 }
+
+/**
+ * Pass 结束后仍含 `name:…@` 的无 scheme token,说明归约规则没有认出它。此时不再枚举用户名/主机
+ * 字符类,而是在唯一收口处整段扣下。输出已被 boundedForReduction 收进 4000 字符,这里的分词有界。
+ */
+function hasResidualDsnShapedToken(s: string): boolean {
+  return s.split(/\s+/).some((token) => token !== "" && isDsnShapedToken(token));
+}
 const ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
@@ -590,40 +619,21 @@ const SCHEMELESS_HOST_PATH_RE =
 const DEFAULT_SENSITIVE: SensitivePredicate = sensitivePredicate(true);
 
 /**
- * 被丢掉的那一段是否敏感。**两处尾部扫描共用这一份** —— 折叠那一处和归约那一处。
+ * 两个截断点共用的 discarded-tail 规则:在额度内就完整检查,超过额度直接 fail closed。
  *
- * 分档的理由和数字见 JWT_RE:线性档看整条尾巴(和 main 一样),只有 JWT 那一档收进
- * TAIL_SCAN_MAX 的窗口。上一版对整个守卫设界,于是
- *
- *     "alice:hunter2@localhost " + "word "×900 + "pad "×1300 + " token"
- *
- * 里那个 4000 字符之外的 `token` 不再压住整串,而 `alice:hunter2@localhost` 是本仓
- * `UNFIXED_CORPUS` 里记着的、守卫**抓不住**的形状 —— 于是明文口令渲染进了群卡片。
- * 「渲染的永远只有 kept,而 kept 自己要过守卫」这句话,前提是守卫抓得住 kept 里的东西。
+ * 不能再开一个「只看前 N 字符、忽略更远内容」的窗口:base 据以扣留整串的信号可能就在窗口外。
+ * 也不能无界扫描:unmetered 的参数摘要和错误文本会把原始输入长度直接变成事件循环停顿。这里先用
+ * `source.length - from` 判定,超额时连 `slice` 都不做;因此实际交给谓词的量恒 ≤64 KiB。
  */
-function tailIsSensitive(tail: string, p: SensitivePredicate): boolean {
-  if (!tail) return false;
-  // 线性档吃**原文**。折叠只有有界档需要:它的窗口只有 TAIL_SCAN_MAX 那么大,折叠比高时
-  // 4000 个原始字符可能全是空白,不折叠就什么也扫不到。而线性档看的是整条尾巴 —— 关键词与
-  // 前缀正则本来就与空白无关,高熵那条找的是连续串、折叠也不会把两段接起来。
-  //
-  // 这不只是省一次遍历。尾巴现在**无界**(见两个调用方去掉窗口的那段说明),先折叠一遍等于
-  // 为每次调用多分配一份整条尾巴的副本:实测 4 MB 散文经 neutralizeEcho,折叠 206 ms、
-  // 不折叠 78 ms,而 def63bb 是 69 ms —— 折叠那一版比 merge-base 慢 3 倍,是本 PR 自己
-  // 「不许比 base 慢」那条底线踩不过去的地方。
-  //
-  // 顺带把两个调用方对齐:collapseForReduction 此前先折叠再传,boundedForReduction 传原文 ——
-  // 又是同一条规则的两份拷贝,而且只有一份是对的。现在两边都传原文,折叠只在这里做一次。
-  if (p.linear(tail)) return true;
-  const win = tailScanWindow(tail, 0, TAIL_SCAN_MAX);
-  return win === null || p.bounded(win.replace(/\s+/g, " ").trim());
+function tailIsSensitive(source: string, from: number, p: SensitivePredicate): boolean {
+  const length = source.length - from;
+  if (length <= 0) return false;
+  if (length > RAW_INPUT_MAX) {
+    p.onLimit?.();
+    return true;
+  }
+  return p(source.slice(from));
 }
-
-/**
- * 界丢掉的那一段,最多喂给谓词多少字符。见 boundedForReduction 里那段说明 ——
- * 谓词里的正则不保证线性,所以喂进去的量必须自己有界。
- */
-const TAIL_SCAN_MAX = REDUCE_INPUT_MAX;
 
 /**
  * **按长度截断的唯一实现。** 切口只能落在空白上:归约靠锚点定位,盲切会把锚点切掉,于是本该
@@ -640,34 +650,6 @@ export function cutOnWhitespace(s: string, max: number): string | null {
   const cut = s.slice(0, max + 1);
   const lastSpace = cut.search(/\s\S*$/);
   return lastSpace < 0 ? null : cut.slice(0, lastSpace);
-}
-
-/**
- * 取 `s` 从 `from` 起、约 `max` 个字符喂给敏感判定。**窗口末端也只能落在空白上。**
- *
- * 上一版这里是裸 `slice`,于是跨过窗口边界的 token 被切成碎片、正则匹配不上,等于没扫:
- * `AKIAIOSFODNN7EXAMPLE` 起点落在 7986 时窗口只盖住 20 个字符里的 14 个,而
- * `/AKIA[0-9A-Z]{12,}/` 要 16 个 —— 于是 base 掩掉的输入在这里照渲。
- *
- * 方向必须是**往前延**,不是往回缩:缩到上一个空白会把那个 token 整个排除在窗口外,漏得更多。
- * 延长再多给 `max` 个字符;还找不到空白就说明尾巴是一整块无空白 token —— 返回 null,fail closed。
- */
-function tailScanWindow(s: string, from: number, max: number): string | null {
-  if (from >= s.length) return "";
-  const end = from + max;
-  if (end >= s.length) return s.slice(from);
-  // `max + 1` 与 cutOnWhitespace 同一条边界约定:空白正好落在窗口末端那一位时也要找得到。
-  // 上一版这里是 `end + max`,于是空白恰好在 `end + max` 的输入被判成「没有空白」→ fail closed。
-  // 方向安全,但**这条 PR 的论点就是两条截断规则同源不会分岔,而边界约定正是它们唯一还在
-  // 分岔的地方** —— 评审点出来的,对。
-  const ws = s.slice(end, end + max + 1).search(/\s/);
-  if (ws >= 0) return s.slice(from, end + ws);
-  // 延长窗口里没有空白,但它已经吃到串尾 —— 那个 token 到此为止,整段收进来就是完整的,
-  // 长度仍然有界:**≤2×max + 1**(不是 2×max —— 延长窗口自己是 `max + 1` 长,吃到尾时整段
-  // 都还回去,评审量到过 8001)。预算按这个长度计价,所以这个 +1 也进了账,无害但要说准。
-  // 第一版这里直接 fail closed,把「尾巴只比窗口多 1 个字符」也判成超长 token,
-  // `"x X=" + "'a"×1999` 这类本该跑完管线的输入被整块拒掉。
-  return end + max + 1 >= s.length ? s.slice(from) : null;
 }
 
 /**
@@ -695,8 +677,6 @@ function tailScanWindow(s: string, from: number, max: number): string | null {
  *   - 折叠比高时(大量连续空白、对齐排版),64 KiB 原文可能只折出几千字符,此时后面的内容
  *     **会**被丢掉。方向是安全的(少渲染),但它是一处真实的可用性代价,不是"不改变输出"。
  */
-export const RAW_INPUT_MAX = 64 * 1024;
-
 /**
  * 折叠空白,并且**先把原串收进上限**。
  *
@@ -713,17 +693,10 @@ export function collapseForReduction(
   if (kept === null) return "";
   const collapsed = kept.replace(/\s+/g, " ").trim();
   if (kept.length === text.length) return collapsed;
-  // 丢掉的那一段也要过谓词 —— 与 boundedForReduction 同一条规则。**尾巴是原文,先折叠再看**:
-  // 折叠比高时(这个上限存在的理由就是它)4000 个原始字符可能全是空白,直接喂进去什么也扫不到。
-  //
-  // **整条尾巴,不开窗。** 上一版这里是 `tailScanWindow(text, kept.length, RAW_INPUT_MAX)`,
-  // 于是超过 `2 × RAW_INPUT_MAX` 的扣留信号任何一档都看不见(评审第十轮 P0-1)。
-  // 那个窗口在 boundedForReduction 里是无害的 —— 它的输入已经 ≤RAW_INPUT_MAX,窗口覆盖全部;
-  // 而**本函数的输入无界**,同一行代码在这里就变成了一道缺口。`def63bb` 没有这道窗口:它折叠
-  // 整串、把整个剩余部分交给守卫。分档在 tailIsSensitive 里 —— 线性档看整条,JWT 那档才开窗。
-  //
-  // 代价是线性扫描不再有界,所以它必须**计价**:见 card-blocks 的 metered.linear。
-  return tailIsSensitive(text.slice(kept.length), isSensitiveHere) ? "" : collapsed;
+  // 丢掉的原文也走与 boundedForReduction 相同的规则:≤64 KiB 就完整检查,再长直接 fail closed。
+  // 不能只看一个窗口,否则窗口外的关键词/JWT 会从 base 的扣留下变成 head 的放行;也不能扫描
+  // 无界原文,否则未计费的参数摘要和错误文本仍会随输入长度阻塞事件循环。
+  return tailIsSensitive(text, kept.length, isSensitiveHere) ? "" : collapsed;
 }
 
 /**
@@ -790,22 +763,9 @@ export function collapseForReduction(
  *
  * 用可用性换泄漏是这条管线不做的交易,所以守卫维持查原文。代价钉在 COST_CORPUS。
  *
- * **但扫多长是有界的(TAIL_SCAN_MAX)。** 上一版把整条尾巴喂给谓词,而谓词里的 JWT 正则
- * `eyJ…{8,}\.…` 在**没有点的长串**上是二次的:`eyJ` 每出现一次都是一个起点,每个起点都要
- * 贪心扫到串尾再逐字符回退找 `.`。于是这道守卫自己成了它要防的那种停顿 ——
- * 单个 block 实测,计费只收 4000 却:
- *
- *      15 KB     90 ms
- *      30 KB    354 ms
- *      60 KB   1404 ms
- *     120 KB   5710 ms      ← 干净的 4× 每翻倍
- *
- * 修法不是去改那条正则(这条分支已经证明追着正则改会一直有下一个),而是**限定喂给它的量**:
- * 与界本身同一个数,4000 字符。
- *
- * 这条规则要能说出口:**切口之后 4000 字符以外的凭据,不再导致前面那段安全内容被一起扣下。**
- * 它不会让凭据被渲染出来 —— 渲染的永远只有 kept,而 kept 自己要过下游那道守卫。被放弃的只是
- * 「因为远处有东西,所以连近处也不显示」这一层 fail-closed。
+ * 扫描量仍有固定上限:discarded tail ≤64 KiB 时完整检查,超过就不分配、不扫描并直接 fail closed。
+ * JWT 已由旧的二次正则替换为语义等价的线性 run scanner,所以所有 detector 共用这一条规则,
+ * 不再有「某一档只能看 4000 字符」的距离轴。
  */
 export function boundedForReduction(
   s: string,
@@ -814,17 +774,8 @@ export function boundedForReduction(
   const kept = cutOnWhitespace(s, REDUCE_INPUT_MAX);
   if (kept === null) return null;
   if (kept.length === s.length) return kept;
-  // **整条尾巴,不开窗** —— 与 collapseForReduction 同一条规则,分档在 tailIsSensitive 里:
-  // 线性档看整条,只有 JWT 那档收进 TAIL_SCAN_MAX。
-  //
-  // 上一版这里是 `tailScanWindow(s, kept.length, RAW_INPUT_MAX)`,注释写着「线性档要看完整条」
-  // —— 那句话只在「输入已经 ≤RAW_INPUT_MAX」时成立,而**本函数是整条管线的唯一入口**:
-  // `reduceUrlsInText` 把调用方的原串直接交给它。`neutralizeEcho`(表单回显,本文件里信任
-  // 边界最低的一路)就是这样,于是超过 `2 × RAW_INPUT_MAX` 的关键词在那一路仍然看不见 ——
-  // 评审第十轮 P0-1 在 collapseForReduction 那边修掉之后,这 22 组还留在 echo 上。
-  // 同一句注释在两个函数里各写了一遍,而只有一处的前提成立:又是「第二份没镜像上」。
-  const rawTail = s.slice(kept.length);
-  return tailIsSensitive(rawTail, isSensitiveHere) ? null : kept;
+  // 与 collapseForReduction 共用同一条 discarded-tail 规则,不再各自维护窗口算法。
+  return tailIsSensitive(s, kept.length, isSensitiveHere) ? null : kept;
 }
 
 /**
@@ -883,10 +834,9 @@ export function reduceUrlsInText(
     // 渲染出 `pw`(评审第十轮 Q2)。这里不另写一条带锚的正则 —— 「第二份该镜像第一份的规则
     // 没镜像上」正是这条分支反复出问题的成因,所以仍然用同一份快照,只改提问方式。
     if (MAIN_PASS3_RE.exec(m)?.[0] === m) return;
-    // **`.all` 而不是 `.linear`。** JWT_RE 住在 hasBoundedSecretShape 里,只问线性档等于说
-    // 「被删 span 里的 JWT 不算扣留信号」,而 def63bb 上 JWT 属于永远生效的前缀集
-    // (评审第十轮 Q3)。m 的长度由 SCHEMELESS_USERINFO_RE 自身封顶,有界档在这里不失控。
-    if (isSensitiveHere.all(m)) poisoned = true;
+    // 直接问调用方的单一 authority;JWT、高熵与关键词都不能在被删 span 里静默消失。
+    // m 的长度由 SCHEMELESS_USERINFO_RE 自身封顶,这里不会重新打开无界扫描。
+    if (isSensitiveHere(m)) poisoned = true;
   };
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。
@@ -934,7 +884,9 @@ export function reduceUrlsInText(
     prefix + (originDomain(`https://${hostAndPath}`) ?? "")
   ));
   // 新归约的 host 形状里带着 main 据以整行扣下的关键词/前缀 → 与 main 一样整行扣下。
-  return poisoned ? "" : out;
+  // 仍残留 `name:…@` 的 token 则说明所有归约 pass 都没认出它:在单一 choke point default-deny,
+  // 一次覆盖非 ASCII 用户名、标点用户名、IPv6 zone-id、空 host,不再扩第四份字符类。
+  return poisoned || hasResidualDsnShapedToken(out) ? "" : out;
 }
 
 /** url 策略:取 url 参数并降级为注册域。 */
@@ -976,7 +928,7 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
     reduceUrlsInText(collapseForReduction(v, sensitiveHere), sensitiveHere),
     sensitiveHere,
   );
-  if (!s || sensitiveHere.all(s)) return "";
+  if (!s || sensitiveHere(s)) return "";
   return s.length > SUMMARY_MAX ? s.slice(0, SUMMARY_MAX) + "…" : s;
 }
 
@@ -1018,7 +970,7 @@ export function sanitizeErrorText(err?: string): string {
   let s = collapseForReduction(err, ERROR_TEXT_SENSITIVE);
   if (!s) return "";
   s = collapseForReduction(reduceUrlsInText(s, ERROR_TEXT_SENSITIVE), ERROR_TEXT_SENSITIVE); // URL 降级可能留下空隙
-  if (!s || ERROR_TEXT_SENSITIVE.all(s)) return "";
+  if (!s || ERROR_TEXT_SENSITIVE(s)) return "";
   return s.length > ERROR_MAX ? s.slice(0, ERROR_MAX) + "…" : s;
 }
 
@@ -1029,15 +981,12 @@ const BENIGN_ERROR_HASH_RE =
 /**
  * 错误文本这一档:非 generic + 一条构建哈希豁免后的高熵检测。
  *
- * 与 sensitivePredicate 一样按代价分两档,而且**分法必须一致** —— 豁免后的高熵检测是线性的
- * (`hasGenericSecretShape` 64 KB 实测 0.41 ms),所以它归线性档,跟着整条尾巴走;JWT 仍归
- * 有界档。`all` 是两档之和,与拆分前的语义按构造相等。
+ * 与 sensitivePredicate 共用同一套 detector,只在 generic 高熵判定前去掉已标注的构建哈希。
+ * JWT 也由 hasSecretShape 的单一线性 scanner 处理,不存在第二份判据。
  */
-const ERROR_TEXT_SENSITIVE: SensitivePredicate = {
-  linear: (s) => hasLinearSecretShape(s, false) || hasGenericSecretShape(s.replace(BENIGN_ERROR_HASH_RE, "")),
-  bounded: hasBoundedSecretShape,
-  all: (s) => ERROR_TEXT_SENSITIVE.linear(s) || ERROR_TEXT_SENSITIVE.bounded(s),
-};
+const ERROR_TEXT_SENSITIVE: SensitivePredicate = (s) => (
+  hasSecretShape(s, false) || hasGenericSecretShape(s.replace(BENIGN_ERROR_HASH_RE, ""))
+);
 
 /** 工具名 label 展示上限。MCP 工具名可能很长,防其撑爆卡片。 */
 const LABEL_MAX = 40;

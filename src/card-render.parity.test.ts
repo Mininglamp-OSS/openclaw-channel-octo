@@ -88,29 +88,43 @@ const OVER_HIDE: Array<{ id: string; note: string; when: (h: Hit) => boolean; co
     id: "刻意/嵌套 DSN",
     note:
       "Q2 修好之后的**预期效果**:base 把 `credential:pw/u:p@a.example.com@vault` 归约成 " +
-      "`https://vault …` 并渲染出口令,head 认出这一段 main 不会整段归约、且带着扣留信号,整行扣下。",
+      "`https://vault …` 并渲染出口令,head 整行扣下。按维度首个匹配归类,其中包含与 " +
+      "residual-userinfo default-deny 重叠的行。",
     when: ({ row }) => row.dims.pw === "nestedDsn",
-    count: 18,
+    count: 320,
   },
   {
     id: "刻意/JWT 在被删 span 里",
     note:
-      "Q3 修好之后的**预期效果**:被删 span 里的 JWT 现在算扣留信号(poison 改问 .all)," +
+      "Q3 修好之后的**预期效果**:被删 span 里的 JWT 现在也交给调用方的单一敏感判定," +
       "head 整行扣下,而 base 渲染。修复前这一格是 212,修复后 252 —— 多出来的正是被关掉的那些泄漏。",
     when: ({ row }) => row.dims.pw === "jwt" || row.dims.user === "jwtName",
     count: 252,
   },
   {
     id: "刻意/超 256 口令",
-    note: "hasOverlongUserinfo:超长 userinfo 整行扣下,是本 PR 明确选择的代价",
+    note: "超长口令维度的全部 over-hide;包含 hasOverlongUserinfo 与后置 default-deny 的重叠",
     when: ({ row }) => row.dims.pw === "overlong",
-    count: 1116,
+    count: 1836,
   },
   {
     id: "刻意/IDN 与纯数字主机",
-    note: "R11:这两类走到逐字比对,new URL() 规范化后的主机不在输入里 → 删除,比渲染原文安全",
+    note: "IDN/纯数字主机维度的全部 over-hide;逐字比对删除与后置 default-deny 均为安全方向",
     when: ({ row }) => row.dims.host === "idn" || row.dims.host === "numeric",
-    count: 28,
+    count: 356,
+  },
+  {
+    id: "刻意/残余 userinfo default-deny",
+    note:
+      "head 在归约收口处扣下仍带 colon…@ 的 token。按 base 实际输出归类,而不是再复制生产字符类;" +
+      "覆盖非 ASCII/标点用户名、IPv6 zone-id、空 host 及同形普通坐标。这里是未被前面重叠维度" +
+      "先归类的 1790 条;本次 default-deny 使总 over-hide 相比 9d25997 增加 3140 条。",
+    when: ({ base }) => base.split(/\s+/).some((token) => {
+      const at = token.lastIndexOf("@");
+      const colon = token.indexOf(":");
+      return at > 0 && colon >= 0 && colon < at;
+    }),
+    count: 1790,
   },
 ];
 

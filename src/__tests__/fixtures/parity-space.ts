@@ -84,7 +84,7 @@ const SIGNALS: Record<string, (s: string) => string> = {
   keywordNear: (s) => s + " token",
   keywordFar: (s) => s + " " + "x ".repeat(70_000) + "token",
   // R11-P0-1:短 JWT 只由原 JWT 规则识别,不触发关键词或 32+ 高熵兜底。
-  // 放到归约切口 4000 字符之外,证明有界档不能静默忽略远端信号。
+  // 放到归约切口 4000 字符之外,证明任何 detector 都不能静默忽略远端信号。
   jwtFar: (s) => s + " " + "x ".repeat(5000) + "eyJabcdefgh.abcdefgh.abc",
 };
 

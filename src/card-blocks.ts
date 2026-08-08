@@ -150,15 +150,13 @@ export interface BuildDisplayCardResult {
  *     普通英文散文   200 块    47 ms
  *     冒号密集      200 块  1084 ms      ← 同样 800 KB,形状差 23 倍
  *
- * 所以按**字符**计,不按块计。计的是 `min(折叠后长度, REDUCE_INPUT_MAX)` —— 超出上限的部分
- * 由界自己截掉、由 RAW_INPUT_MAX 挡住,不该按原长收费,否则一个超长块会独吞预算,而它今天
- * 是能正常渲染的。
+ * 所以按**字符**计,不按块计。归约主体按 `min(折叠后长度, REDUCE_INPUT_MAX)` 收费,额度内的
+ * discarded tail 按实际扫描量折算;tail 超过 RAW_INPUT_MAX 时直接耗尽并 fail closed。
  */
 export const REDUCE_BUDGET_PER_CARD = 120_000;
 
 /**
- * 线性档按 `字符数 / 这个除数` 计价 —— 预算的单位是有界档的字符,两档单价差三个数量级。
- * 取值理由与实测数字见 `metered.linear` 处的注释。取 2 的幂只是为了好记。
+ * 线性 detector 扫描按 `字符数 / 这个除数` 折算到归约预算。取 2 的幂只是为了好记。
  */
 const LINEAR_CHARGE_DIVISOR = 128;
 
@@ -177,65 +175,23 @@ const LINEAR_CHARGE_DIVISOR = 128;
  */
 function sanitize(text: string, ctx: RenderCtx): string | null {
   const generic = ctx.generic;
-  // 预算耗尽之后一个字都不要再折叠。计费跑在折叠**之后**(要按管线真正处理的量计,见下面),
-  // 于是耗尽之后每个块仍要付一次最多 64 KiB 的折叠:实测 200 个 120 KB 块里有 170 个是白付的,
-  // 元素数从第 30 块起就钉死在 31,耗时却还在线性往上走(54 → 265 ms)。
+  // 预算耗尽之后一个字都不要再折叠。否则后续每块仍要白付一次最多 64 KiB 的切割/扫描,
+  // 元素数已经不变,耗时却继续随块数增长。
   if (ctx.reduce.exhausted) return null;
   const plain = sensitivePredicate(generic);
-  // **计价的是被扫描的量,不是活下来的量。**
-  //
-  // 上一版按折叠后长度计费,而计费又跑在折叠**之后**。于是这个形状整条路白嫖:
-  //
-  //     `b${i} x` + " "×65535 + "eyJ"×2600 + " tailend zzz"
-  //
-  // 折叠后只剩 `b0 x`,收 4 块钱,200 块也耗不尽 12 万的预算 —— 可每一块仍然把 7800 字符的
-  // 无点 base64 喂进了二次方的 JWT 正则。实测 200 块 14793 ms(main 14609 ms),**两边持平**,
-  // 也就是说这条预算对它自己要挡的那个形状完全没生效,而 README 还写着 0.9 秒的天花板。
-  //
-  // 现在在**谓词上计量**:所有扫描点都已经穿过谓词(这正是当初把谓词铺到每一层的用处),
-  // 包一层就自动覆盖全部调用点,不用再铺一遍管道。只对有界档计价 —— 线性档每次 ≤64 KiB、
-  // 实测 0.74 ms,200 块合计 ~100 ms,不值得为它记账。预算耗尽时谓词直接返回 true,
-  // fail-closed 方向天生正确:没钱再查了,就当它敏感。
-  const metered: SensitivePredicate = {
-    // **线性档现在也计价。** 上一版这里是 `plain.linear`,理由写着「线性档每次 ≤64 KiB、
-    // 实测 0.74 ms,不值得记账」—— 那个上界随 collapseForReduction 去掉尾部窗口而消失了
-    // (评审第十轮 P0-1 的修法),现在一块可以把整条尾巴喂进线性档,长度无界。
-    //
-    // 不计价的后果不是「算便宜了」,是**预算整条不生效**:collapseForReduction 因线性档命中
-    // 而返回 "" 时,bounded 一次没被调用,`cost` 那行在早退之前 —— 这一块扫了 64 KiB 切割
-    // 加一整条尾巴,却一分不付,`exhausted` 不翻转、预算提示不出现(评审第十轮 Q4)。
-    // 200 块实测 base 887 ms / 修前 head 1407 ms,而这条 PR 加预算管的就是这根轴。
-    //
-    // **两档不同价,除数由实测定。** 预算的单位是「喂给有界档的字符数」,而两档的单价差了
-    // 三个数量级 —— 同一台机器实测:
-    //
-    //     线性档   散文 29 ms/MB、DSN 密集 12、无空白 base64 8
-    //     有界档   无点 base64(JWT 最坏形状)64 KiB 处 3389 ms → 54 231 ms/MB,且**超线性**
-    //              (256 KiB 那格两分钟没跑完)
-    //
-    // 1:1 收费会把线性档高估约两千倍,后果不是"偏保守"而是**误伤**:一块 1 MB 的普通长文本
-    // 一次就吃掉十倍预算,整张卡片只剩一条超预算提示。除以 LINEAR_CHARGE_DIVISOR 之后,
-    // 120 000 的预算约等于 15 MB 线性扫描 ≈ 440 ms —— 与同一笔预算在有界档上买到的时间同量级。
-    // 仍然比公允价贵十几倍,方向安全。
-    linear: (t) => {
-      const charge = Math.ceil(t.length / LINEAR_CHARGE_DIVISOR);
-      if (charge > ctx.reduce.left) {
-        ctx.reduce.exhausted = true;
-        return true;
-      }
-      ctx.reduce.left -= charge;
-      return plain.linear(t);
-    },
-    bounded: (t) => {
-      if (t.length > ctx.reduce.left) {
-        ctx.reduce.exhausted = true;
-        return true;
-      }
-      ctx.reduce.left -= t.length;
-      return plain.bounded(t);
-    },
-    all: (t) => metered.linear(t) || metered.bounded(t),
+  // **计价的是被扫描的量,不是活下来的量。** 所有 discarded-tail 扫描都穿过这个谓词;
+  // JWT 已是线性 scanner,所以统一按字符数折算。预算不足时返回 sensitive,超出 64 KiB 的 tail
+  // 则由 onLimit 直接耗尽,两条路径都 fail closed。
+  const metered: SensitivePredicate = (t) => {
+    const charge = Math.ceil(t.length / LINEAR_CHARGE_DIVISOR);
+    if (charge > ctx.reduce.left) {
+      ctx.reduce.exhausted = true;
+      return true;
+    }
+    ctx.reduce.left -= charge;
+    return plain(t);
   };
+  metered.onLimit = () => { ctx.reduce.exhausted = true; };
   // 传 metered 的只有下面这两个管线函数,而它们把谓词**只**用在尾部扫描上 —— 所以计价口径是
   // 「尾巴扫了多少」。本函数自己那道下游守卫用 plain,不计价:它的输入按构造 ≤4000,已经被
   // 下面那笔 min(长度, 4000) 计过一次了,再收一次会让正常卡片的容量直接减半。
@@ -262,7 +218,7 @@ function sanitize(text: string, ctx: RenderCtx): string | null {
   // 这种空白充裕、归约后完全安全的内容被整块丢掉(main 渲染 4517 字符)。
   s = collapseForReduction(reduceUrlsInText(s, metered), metered);
   if (!s) return null;
-  if (plain.all(s)) return null;
+  if (plain(s)) return null;
   return s;
 }
 

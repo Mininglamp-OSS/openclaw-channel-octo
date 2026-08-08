@@ -12,6 +12,7 @@ import {
   collapseForReduction,
   boundedForReduction,
   REDUCE_INPUT_MAX,
+  RAW_INPUT_MAX,
   fmtDuration,
   stepLine,
   cardSupports,
@@ -995,25 +996,17 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
 });
 
 describe("归约管线的输入有界(每一处都自己有界,不靠调用方)", () => {
-  // 界丢掉的那一段要过一遍守卫,但**喂给守卫的量本身必须有界** —— 守卫里的正则不保证线性
-  // (JWT 那条在无点长串上是二次的:单块 120 KB 实测 5548 ms)。这里断言的是那条规则的
-  // **可观察形式**,不是耗时:切口之后 TAIL_SCAN_MAX 以内的凭据仍然让整串扣下,以外的不再。
-  // **界只加在 JWT 那一条上,不加在整个守卫上。** 上一版对整个守卫设界,理由是「守卫里的正则
-  // 不保证线性」—— 那句话是对的,但它只对**一条**成立。逐条实测(64 KB):SECRET_RE 0.07 ms、
-  // 11 条前缀正则各 ≤0.02 ms、长 hex 0.14 ms、高熵 0.41 ms、**JWT 分钟级**。为了那一条把其余
-  // 全部关在 4000 字符之外,泄漏了 main 会扣下的凭据(见下一条)。
-  it("线性档看完整条尾巴,不受 TAIL_SCAN_MAX 限制", () => {
+  // discarded tail 在固定额度内由同一个线性 authority 完整检查;超过额度直接 fail closed。
+  // 下面先钉旧窗口之外的前缀信号,再单独钉 JWT 与超额路径。
+  it("额度内的 discarded tail 完整检查,不因信号离切口较远而放行", () => {
     const kept = "word ".repeat(800).trim();          // 3999 字符,切口落在这里
     for (const [pads, where] of [[200, "尾巴第 ~800 位"], [1200, "尾巴第 ~4800 位"]] as [number, string][]) {
       const s = `${kept} ${"pad ".repeat(pads)}AKIAIOSFODNN7EXAMPLE`;
-      expect(reduceUrlsInText(s), `AKIA 在${where}(TAIL_SCAN_MAX 之外)没有让整串扣下`).toBe("");
+      expect(reduceUrlsInText(s), `AKIA 在${where}没有让整串扣下`).toBe("");
     }
-    // **这里曾经断言「再远就够不着了,这是可以说出口的边界」。那个边界就是评审第十轮的 P0-1。**
-    // 尾巴当时被 `tailScanWindow(..., RAW_INPUT_MAX)` 开了窗,于是超过 `2 × RAW_INPUT_MAX` 的
-    // 信号任何一档都看不见,而 `def63bb` 折叠整串、看得见 —— 一条被写成「已知边界」的 fail-open。
-    // 线性档现在真的看整条(窗口只留给 JWT 那档),两边一致。
+    // 再远时 discarded tail 已超过额度,结果仍是 fail closed,但不再扫描无界原文。
     const beyond = `${kept} ${"pad ".repeat(20_000)}AKIAIOSFODNN7EXAMPLE`;
-    expect(reduceUrlsInText(beyond), "128 KiB 之外的 AKIA 仍要让整串扣下 —— 与 def63bb 一致").toBe("");
+    expect(reduceUrlsInText(beyond), "超额尾巴必须 fail closed").toBe("");
   });
 
   it("短 JWT 无论离切口多远,都不能从 base 的扣留变成 head 的放行", () => {
@@ -1028,9 +1021,24 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
   it("丢弃段超过固定扫描额度时直接 fail closed,不扫描无界原文", () => {
     const kept = "db_pass hunter2Kx " + "word ".repeat(800);
     const input = kept + "plain ".repeat(12_000);
-    expect(input.length).toBeGreaterThan(64 * 1024);
+    expect(input.length).toBeGreaterThan(RAW_INPUT_MAX);
     expect(boundedForReduction(input)).toBeNull();
     expect(reduceUrlsInText(input)).toBe("");
+  });
+
+  it("未计费的摘要与错误 sink 对超额原文保持固定成本", () => {
+    // Reviewer 在旧实现上量到 16 MiB 约 300 ms、64 MiB 超 1 秒。输入构造放在计时外;
+    // 当前路径只切前 64 KiB、按剩余长度 fail closed,不读取那 16 MiB tail。
+    const input = "db_pass hunter2Kx " + "plain ".repeat(Math.ceil((16 * 1024 * 1024) / 6));
+    for (const [label, fn] of [
+      ["sanitizeErrorText", () => sanitizeErrorText(input)],
+      ["summarizeToolParams/grep", () => summarizeToolParams("grep", { pattern: input })],
+    ] as const) {
+      const t0 = performance.now();
+      expect(fn()).toBe("");
+      const elapsed = performance.now() - t0;
+      expect(elapsed, `${label} / 16 MiB 耗时 ${elapsed.toFixed(1)} ms`).toBeLessThan(150);
+    }
   });
 
   it("JWT 判定在密集 eyJ 起点上保持线性成本", () => {
@@ -1039,6 +1047,30 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
     expect(isSensitive(adversarial, true)).toBe(false);
     const elapsed = performance.now() - t0;
     expect(elapsed, `15 KB 无点 eyJ 串耗时 ${elapsed.toFixed(1)} ms`).toBeLessThan(40);
+  });
+
+  it("JWT 线性扫描器与原规则等价,且不会从短 run 反复搜索远端 eyJ", () => {
+    const legacy = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/;
+    const alphabet = "eyJa0_-.:/";
+    let state = 0x5eed1234;
+    for (let sample = 0; sample < 20_000; sample++) {
+      state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+      const length = state % 80;
+      let input = "";
+      for (let i = 0; i < length; i++) {
+        state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+        input += alphabet[state % alphabet.length];
+      }
+      expect(isSensitive(input, false), JSON.stringify(input)).toBe(legacy.test(input));
+    }
+
+    // 若每个 run 都用无上界的 indexOf("eyJ", start),前面的 20 000 个短 run 会反复扫描到
+    // 最后那个 eyJ,总成本退化成二次方。真正的 run-local 扫描只读每个字符常数次。
+    const manyRuns = "a.".repeat(20_000) + "eyJabcdefgh.abcdefgh.abc";
+    const t0 = performance.now();
+    expect(isSensitive(manyRuns, false)).toBe(true);
+    const elapsed = performance.now() - t0;
+    expect(elapsed, `短 run + 远端 eyJ 耗时 ${elapsed.toFixed(1)} ms`).toBeLessThan(100);
   });
 
   it("切口之后的关键词仍然压得住 kept 里守卫抓不住的凭据", () => {
@@ -1095,45 +1127,17 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
     expect(summarizeToolParams("exec", { command: "x".repeat(5000) })).toBe("");
   });
 
-  it("扫描窗口的末端与切口用同一条边界约定(max + 1)", () => {
-    // cutOnWhitespace 特意搜 `max + 1`,好让空白正好落在 max 那一位时也找得到;tailScanWindow
-    // 当初漏了这个 `+1`,于是空白恰好落在窗口末端的输入被判成"没有空白"→ fail closed。
-    // 方向安全,但这条 PR 的论点就是两条截断规则同源不会分岔 —— 边界约定正是它们唯一还在
-    // 分岔的地方,评审点出来的。
-    const kept = "word ".repeat(800).trim();          // 3999 字符,切口落在这里
-    const at = (spaceIndex: number) => {
-      const gap = spaceIndex - kept.length - 1;       // kept + " " + "y"×gap + " ok"
-      return boundedForReduction(`${kept} ${"y".repeat(gap)} ok`);
-    };
-    // 末端是**延长窗口**的末端:第一段窗口 [kept, kept+max) 之后还要再找 max+1 个字符,
-    // 所以临界点在 kept + 2×max,不是 kept + max。
-    const windowEnd = kept.length + 2 * REDUCE_INPUT_MAX;
-    expect(at(windowEnd - 1), "窗口内的空白").not.toBeNull();
-    expect(at(windowEnd), "空白正好落在窗口末端 —— 少了 +1 就在这里判成无空白").not.toBeNull();
-    expect(at(windowEnd + 1), "空白确实在窗口之外,fail closed 是对的").toBeNull();
-  });
-
-  it("尾部扫描窗口的末端也只能落在空白上", () => {
-    // 裸 slice 会把跨过窗口边界的 token 切成碎片,正则匹配不上,等于没扫。
-    //
-    // **用的必须是有界档认得、线性档认不得的 token。** 上一版这条用 AKIA,而守卫按代价拆开
-    // 之后 AKIA 归线性档、线性档看完整条尾巴 —— 于是无论窗口末端怎么算,三条断言都绿,
-    // 有界档在这个输入上**根本没被调用**。把窗口换成裸 slice 也照样全绿:这条测试当时已经
-    // 失去了被测对象,和本文件里那条卡片级计时测试当初的失效方式一模一样。
-    //
-    // 短的低熵 JWT 正好满足:`hasGenericSecretShape` 要 32+ 混合串,它只有 24 个字符,
-    // 线性档抓不到;`JWT_RE` 抓得到,而那一条是唯一收进窗口的。
-    const jwt = "eyJabcdefgh.abcdefgh.abc";
+  it("discarded tail 在 64 KiB 内完整扫描,多一个字符就 fail closed", () => {
     const head = "word ".repeat(800).trim();            // 3999,切口落在它后面那个空格上
-    // JWT 起点落在尾巴的 3985–4000 之间时,裸切只盖住它的一部分而延长窗口盖得全 —— 实测
-    // 这一段的每个位置,两种实现都判得不一样。取中间那个。
-    const s = `${head} ${"p".repeat(3990)}${jwt} tail`;
-    expect(boundedForReduction(s), "跨窗口边界的 JWT 被切碎、漏过了守卫").toBeNull();
-    // 对照:同一个 JWT 挪到窗口之外,按设计就该够不着(这是 TAIL_SCAN_MAX 唯一还管着的事)。
-    // 填充**必须带空白** —— 第一版写的是连续的 `p`,于是整条尾巴是一个无空白长 token,
-    // tailScanWindow 直接 fail closed 返回 null,对照组是"因为无空白被扣下"而不是
-    // "因为够不着 JWT",看着通过其实什么也没对照到。
-    expect(boundedForReduction(`${head} ${"p ".repeat(4000)}${jwt} tail`)).not.toBeNull();
+    const maxTail = RAW_INPUT_MAX;
+    expect(boundedForReduction(`${head} ${"p".repeat(maxTail - 1)}`), "恰好 64 KiB 的良性尾巴")
+      .not.toBeNull();
+    expect(boundedForReduction(`${head} ${"p".repeat(maxTail)}`), "尾巴超过额度一个字符")
+      .toBeNull();
+
+    const jwt = "eyJabcdefgh.abcdefgh.abc";
+    const jwtAtEnd = `${head} ${"p".repeat(maxTail - 1 - jwt.length)}${jwt}`;
+    expect(boundedForReduction(jwtAtEnd), "额度最后一个完整 token 也必须被检查").toBeNull();
   });
 });
 

@@ -72,13 +72,17 @@ describe("摘要管线形状语料", () => {
       for (const [tool, want] of Object.entries(row.expect)) {
         expect(want, `${at} 的 ${tool} 期望值非空,它不属于 COST 组`).toBe("");
       }
-      expect(row.input.length, `${at} 不超过上限,进不了这一组`).toBeGreaterThan(REDUCE_INPUT_MAX);
+      if (row.cost === "input-bound") {
+        expect(row.input.length, `${at} 不超过上限,进不了 input-bound 代价`).toBeGreaterThan(REDUCE_INPUT_MAX);
+      }
     }
+    expect(new Set(COST_CORPUS.map((row) => row.cost))).toEqual(
+      new Set(["input-bound", "residual-userinfo"]),
+    );
   });
 
-  // 这一组断言的是**本 PR 没有改变**这些形状 —— 期望值是 main 的行为,不是"正确"的行为。
-  // 前四行在 main 上就是明文泄漏,留给 userinfo 那条后续 PR;放在这里是为了让它们进造串检测。
-  it("UNFIXED:留给后续 PR 的形状,以及刻意改成删除的造串哨兵", () => {
+  // 前三行是仍与 base 相同的 shell 漏洞;其余是刻意删除并继续参加造串检测的哨兵。
+  it("UNFIXED:仍未修的 shell 形状,以及刻意删除的造串哨兵", () => {
     assertRows(UNFIXED_CORPUS);
   });
 
