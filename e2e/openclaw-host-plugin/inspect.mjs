@@ -68,7 +68,7 @@ function findParentTranscript() {
     const serialized = JSON.stringify(rows);
     if (serialized.includes(marker) &&
         (serialized.includes("sessions_yield") || serialized.includes("FILES_E2E_WORKFLOW") ||
-          serialized.includes("TOOL_DELIVERY_E2E"))) {
+          serialized.includes("TOOL_DELIVERY_E2E") || serialized.includes("DISPLAY_DELIVERY_E2E"))) {
       return { file, rows };
     }
   }

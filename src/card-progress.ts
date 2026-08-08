@@ -115,8 +115,8 @@ interface CardEntry {
    */
   pendingMessageToolCallIds?: Set<string>;
   /**
-   * 本 run 已通过 `message` 工具向本卡频道成功投递过内容。等价于 OpenClaw core 的
-   * messaging delivery evidence,`finalizeCard` 据此不把这类 turn 误判为失败。
+   * 本 run 已通过 `message` 或 Octo 自有卡片工具向本卡频道成功投递过内容。
+   * `finalizeCard` 据此不把这类 turn 误判为失败。
    */
   deliveredByTool?: boolean;
 }
@@ -1236,6 +1236,25 @@ export function markCardAnswering(sessionKey: string): void {
 /** OpenClaw core 的 messaging 工具规范名(`normalizeCliMessagingToolName`)。 */
 const MESSAGING_TOOL_NAME = "message";
 
+function isOutputCardTool(
+  toolName: string | undefined,
+): toolName is typeof DISPLAY_CARD_TOOL_NAME | typeof INTERACTIVE_CARD_TOOL_NAME {
+  return toolName === DISPLAY_CARD_TOOL_NAME || toolName === INTERACTIVE_CARD_TOOL_NAME;
+}
+
+/**
+ * Octo 卡片工具把失败编码在 `details: null` 的普通 ToolResult 中，host 不一定会填
+ * after_tool_call.error。因此只认两个工具各自的成功 envelope，不能单看 `error` 缺失。
+ */
+function outputCardToolDelivered(toolName: string, result: unknown): boolean {
+  const details = asRecord(asRecord(result)?.details);
+  if (!details || typeof details.channel_id !== "string" || !details.channel_id.trim()) return false;
+  if (toolName === DISPLAY_CARD_TOOL_NAME) {
+    return typeof details.message_id === "string" && typeof details.client_msg_no === "string";
+  }
+  return toolName === INTERACTIVE_CARD_TOOL_NAME && details.sent === true;
+}
+
 /**
  * 判断一次 `message` 工具调用是否**就是**向本卡频道投递可见内容。
  *
@@ -1404,7 +1423,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     if (!claimRun(entry, ctx)) return; // 超时 run 的迟到 hook 落到新 run 的卡 → 丢弃
     // P1-h:agent 展示卡工具的产出**就是那张卡本身**,不该再有旁边的"正在处理/已中断"进度卡噪音。
     // 该工具不计入进度、不触发发卡。混合 turn 里其它真实工具照常显示,仅不含这步。
-    if (e.toolName === DISPLAY_CARD_TOOL_NAME || e.toolName === INTERACTIVE_CARD_TOOL_NAME) {
+    if (isOutputCardTool(e.toolName)) {
       // 仍要收尾上一轮 running thinking —— 否则思考步 duration 会把 display-card 的执行时长吞进去。
       endRunningThinking(entry, Date.now());
       return;
@@ -1496,7 +1515,13 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     if (!entry || entry.skip) return;
     if (!claimRun(entry, ctx)) return; // 同 §before_tool_call:外来 run 的迟到 after 事件 → 丢弃
     // P1-h:与 before_tool_call 对称,避免 display-card 触发 scheduleFlush 而误发进度卡。
-    if (e.toolName === DISPLAY_CARD_TOOL_NAME || e.toolName === INTERACTIVE_CARD_TOOL_NAME) return;
+    if (isOutputCardTool(e.toolName)) {
+      if (!e.error && outputCardToolDelivered(e.toolName, e.result)) {
+        entry.deliveredByTool = true;
+        dbg(`${e.toolName} delivered to this card session=${sk}`);
+      }
+      return;
+    }
     // 回填终态。优先按 toolCallId 精确匹配 running 步骤;若 toolCallId 存在但没命中
     // running(过期/重复投递的 after 事件),直接丢弃,**不**回退按名匹配 —— 否则会把仍
     // 在跑的并发同名步骤误标为终态。仅当 toolCallId 缺失(旧 host)才回退「最后一个同名 running」。
