@@ -827,7 +827,7 @@ export function reduceUrlsInText(
   //     那是**假的**:外部副本可以是被删长串的**子串**,自身短于 32 字符触发不了高熵检测 ——
   //     `user:<36字符>@vault retry with <其中12字符>`。用 isSensitiveHere 就没有这个缺口。
   let poisoned = false;
-  const poisonIfNewShapeCarriesSignal = (m: string, _host: string): void => {
+  const poisonIfNewShapeCarriesSignal = (m: string): void => {
     // **`.exec()[0] === m`,不是 `.test(m)`。** 要问的是「main 会不会归约**这一段**」,而
     // `test` 回答的是「main 的形状在这段里出现过没有」—— 嵌一个 base 能归约的 DSN 进去就能
     // 压掉 poison:`credential:pw/u:p@a.example.com@vault retry with pw`,base 扣下、本分支
@@ -841,6 +841,13 @@ export function reduceUrlsInText(
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。
   let out = s.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, (m) => originDomain(m) ?? "");
+  // 后面的 pass 2 也会改写文本,并可能只消费一个 pass-3 候选的前半段。若敏感信号恰好在
+  // 被消费的那一段里,等 pass 3 callback 再问已经太晚:它看到的是信号消失后新拼出的候选。
+  // 因此在 pass 2 之前先用**同一份 pass-3 matcher 与同一个 poison 判据**保存证据。完整的
+  // scheme URL 已由 pass 1 消费,不会把本来可以安全归约的 URL 误判成裸 userinfo。
+  for (const match of out.matchAll(SCHEMELESS_USERINFO_RE)) {
+    poisonIfNewShapeCarriesSignal(match[0]);
+  }
   // 2. 协议相对 `//host/path`:补 https 后降级(secret 可能在 path)。
   out = out.replace(PROTOCOL_RELATIVE_RE, (_m, p1: string) => {
     const url = _m.slice(p1.length); // 去掉前导分隔符
@@ -875,7 +882,7 @@ export function reduceUrlsInText(
     // **比对的是 `host`,不是整段 `m`。** `m` 含 userinfo,也就是口令 —— 拿归约结果去它里面找,
     // 口令里塞一份小写主机名就能满足检查:`a:akiaiosfodnn7example@AKIAIOSFODNN7EXAMPLE` 会渲染出
     // `https://akiaiosfodnn7example`,第 2 类那条小写化泄漏原样复活。必须只在 `host` 上比。
-    poisonIfNewShapeCarriesSignal(m, host);
+    poisonIfNewShapeCarriesSignal(m);
     if (reduced === null) return "";
     return host.includes(reduced.slice("https://".length)) ? reduced : "";
   });

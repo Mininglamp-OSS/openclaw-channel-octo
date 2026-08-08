@@ -69,11 +69,12 @@ const KNOWN_OPEN: KnownOpen[] = [
       "本 PR 的逐字比对关掉的正是那一路),输出更长,于是 read 摘要在 secret 中间截断;head 归约" +
       "成功、前缀更短,整份外部副本落进了 64 字符窗口。真正的洞是 read sink 对外部副本没有守卫" +
       "(generic=false 跳过高熵档,见 UNFIXED 组末尾那四行),不是这几处修复引入的,也没有" +
-      "「既归约得更好、又少露字符」的改法。\n" +
+      "「既归约得更好、又少露字符」的改法。pass 2 前保存敏感证据顺带关掉了原来 5 组中的" +
+      "4 组;剩下这一组不经过那条破坏证据的路径。\n" +
       "      **判据按机制写而不是按维度写**:要求 base 自己已经露出 secret 的前 12 个字符、" +
       "且它的输出确实被截断了。所以它吞不掉任何一条真正的「base 干净 / head 泄漏」。",
     when: (h) => h.base.endsWith("…") && h.base.includes(h.row.secret.slice(0, 12)),
-    regressions: 5,
+    regressions: 1,
   },
 ];
 /**
@@ -85,21 +86,32 @@ const OVER_HIDE: Array<{ id: string; note: string; when: (h: Hit) => boolean; co
   // 用户名又是 JWT 的行,该记在 finding 头上,而不是记成「我们本来就想藏」。
   // 第一版顺序反了,结果 Q2 那一格是 0,变成一条断言不到任何东西的豁免。
   {
+    id: "刻意/pass 2 前保存敏感证据",
+    note:
+      "pass 2 会消费 protocol-relative JWT 主机的前半段,让后半段在 pass 3 形成新的 userinfo。" +
+      "preflight 在信号消失前与 pass 3 共用 matcher/helper 并整行扣下;这 30 组 base 只渲染了" +
+      "不含外部口令的截断前缀,因此属于修复换来的安全方向可读性代价。",
+    when: ({ row }) => row.dims.signal === "jwtDestroyedByPass2",
+    count: 45,
+  },
+  {
     id: "刻意/嵌套 DSN",
     note:
       "Q2 修好之后的**预期效果**:base 把 `credential:pw/u:p@a.example.com@vault` 归约成 " +
       "`https://vault …` 并渲染出口令,head 整行扣下。按维度首个匹配归类,其中包含与 " +
-      "residual-userinfo default-deny 重叠的行。",
+      "residual-userinfo default-deny 重叠的行。pass 2 preflight 又使 72 组同类输入在信号被改写前" +
+      "扣下,所以本格由 320 增至 392。",
     when: ({ row }) => row.dims.pw === "nestedDsn",
-    count: 320,
+    count: 392,
   },
   {
     id: "刻意/JWT 在被删 span 里",
     note:
       "Q3 修好之后的**预期效果**:被删 span 里的 JWT 现在也交给调用方的单一敏感判定," +
-      "head 整行扣下,而 base 渲染。修复前这一格是 212,修复后 252 —— 多出来的正是被关掉的那些泄漏。",
+      "head 整行扣下,而 base 渲染。Q3 修复把 212 增至 252;pass 2 preflight 再增加 89 组," +
+      "现为 341。",
     when: ({ row }) => row.dims.pw === "jwt" || row.dims.user === "jwtName",
-    count: 252,
+    count: 341,
   },
   {
     id: "刻意/超 256 口令",
