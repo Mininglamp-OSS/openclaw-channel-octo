@@ -8,6 +8,7 @@ import {
   summarizeToolParams,
   sanitizeErrorText,
   reduceUrlsInText,
+  isSensitive,
   collapseForReduction,
   boundedForReduction,
   REDUCE_INPUT_MAX,
@@ -199,6 +200,25 @@ describe("summarizeToolParams", () => {
     // 多段有效后缀多保留一段。
     expect(summarizeToolParams("fetch", { url: "https://x.example.com.cn/p" })).toBe("https://example.com.cn");
     expect(summarizeToolParams("fetch", { url: "not a url" })).toBe("");
+  });
+
+  it("归约后残留的 schemeless name:secret@ token 一律 fail closed", () => {
+    const residual = [
+      "用户:hunter2Kx@host.example",
+      "а:hunter2Kx@host.example",
+      "u:hunter2Kx@[fe80::1%eth0]",
+      "u:hunter2Kx@",
+      '"user":hunter2Kx@db.example.com',
+      "[postgres]:hunter2Kx@db.example.com",
+    ];
+    for (const input of residual) {
+      expect(reduceUrlsInText(input), input).toBe("");
+      expect(summarizeToolParams("read", { file_path: input }), input).toBe("");
+      expect(sanitizeErrorText(input), input).toBe("");
+    }
+
+    // 已识别的 DSN 仍走原来的安全归约,default-deny 只处理 pass 之后的 residue。
+    expect(reduceUrlsInText("user:hunter2Kx@db.example.com")).toBe("https://example.com");
   });
   it("检索类取 query/pattern", () => {
     expect(summarizeToolParams("grep", { pattern: "TODO", path: "/x" })).toBe("TODO");
@@ -996,15 +1016,29 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
     expect(reduceUrlsInText(beyond), "128 KiB 之外的 AKIA 仍要让整串扣下 —— 与 def63bb 一致").toBe("");
   });
 
-  it("有界档(JWT)才是收窄到 TAIL_SCAN_MAX 的那一条", () => {
+  it("短 JWT 无论离切口多远,都不能从 base 的扣留变成 head 的放行", () => {
     const kept = "word ".repeat(800).trim();
     const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij";
     const near = `${kept} ${"pad ".repeat(200)}${jwt}`;
     const far  = `${kept} ${"pad ".repeat(1200)}${jwt}`;
-    expect(reduceUrlsInText(near), "窗口内的 JWT 应让整串扣下").toBe("");
-    expect(reduceUrlsInText(far), "窗口外的 JWT 不再连累前面那段").toBe(kept);
-    // 被放弃的只是"因为远处有东西连近处也不显示";远处那段本来就渲染不出来。
-    expect(reduceUrlsInText(far)).not.toContain("eyJ");
+    expect(reduceUrlsInText(near), "切口附近的 JWT 应让整串扣下").toBe("");
+    expect(reduceUrlsInText(far), "切口 4000 字符外的 JWT 也必须让整串扣下").toBe("");
+  });
+
+  it("丢弃段超过固定扫描额度时直接 fail closed,不扫描无界原文", () => {
+    const kept = "db_pass hunter2Kx " + "word ".repeat(800);
+    const input = kept + "plain ".repeat(12_000);
+    expect(input.length).toBeGreaterThan(64 * 1024);
+    expect(boundedForReduction(input)).toBeNull();
+    expect(reduceUrlsInText(input)).toBe("");
+  });
+
+  it("JWT 判定在密集 eyJ 起点上保持线性成本", () => {
+    const adversarial = "eyJ".repeat(5000);
+    const t0 = performance.now();
+    expect(isSensitive(adversarial, true)).toBe(false);
+    const elapsed = performance.now() - t0;
+    expect(elapsed, `15 KB 无点 eyJ 串耗时 ${elapsed.toFixed(1)} ms`).toBeLessThan(40);
   });
 
   it("切口之后的关键词仍然压得住 kept 里守卫抓不住的凭据", () => {

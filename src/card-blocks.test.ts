@@ -74,6 +74,16 @@ describe("heading / text block", () => {
     expect(body({ card })[0]).toEqual({ type: "TextBlock", text: "正文", wrap: true });
   });
 
+  it("展示卡也扣下残余 userinfo 与切口之外的短 JWT", () => {
+    const residual = "用户:hunter2Kx@host.example";
+    const farJwt = "db_pass hunter2Kx " + "pad ".repeat(2200) + "eyJabcdefgh.abcdefgh.abc";
+    for (const text of [residual, farJwt]) {
+      const rendered = buildDisplayCard({ blocks: [{ type: "text", text }] });
+      const all = JSON.stringify(rendered.card) + rendered.plain;
+      expect(all, text.slice(0, 80)).not.toContain("hunter2Kx");
+    }
+  });
+
   it("跨截断点的密钥不出现在渲染结果里", () => {
     // 归约管线对超过 REDUCE_INPUT_MAX(4000 字符)的输入会截断,而 text block **没有渲染上限**
     // —— 与摘要(64)、错误(120)、debug 串(512)不同,长文本会整段渲染。于是横跨截断点的密钥

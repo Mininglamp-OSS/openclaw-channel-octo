@@ -83,6 +83,9 @@ const SIGNALS: Record<string, (s: string) => string> = {
   keywordInSpan: (s) => s.replace(/^(\/*)/, "$1credential:"),
   keywordNear: (s) => s + " token",
   keywordFar: (s) => s + " " + "x ".repeat(70_000) + "token",
+  // R11-P0-1:短 JWT 只由原 JWT 规则识别,不触发关键词或 32+ 高熵兜底。
+  // 放到归约切口 4000 字符之外,证明有界档不能静默忽略远端信号。
+  jwtFar: (s) => s + " " + "x ".repeat(5000) + "eyJabcdefgh.abcdefgh.abc",
 };
 
 export function generateParitySpace(): Row[] {
@@ -131,7 +134,7 @@ export function generateParitySpace(): Row[] {
     ["PASSPHRASE=hunter2Kx gpg --sign x", "hunter2Kx"],
   ];
   for (const [i, [text, secret]] of INLINE.entries()) {
-    for (const signal of ["none", "keywordNear", "keywordFar"]) {
+    for (const signal of ["none", "keywordNear", "keywordFar", "jwtFar"]) {
       push({ user: "n/a", pw: `inline${i}`, host: "n/a", copy: "inline", wrap: "bare", signal },
         SIGNALS[signal]!(text), secret);
     }
