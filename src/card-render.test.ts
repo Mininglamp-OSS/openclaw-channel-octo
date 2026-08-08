@@ -1053,6 +1053,7 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
     const legacy = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/;
     const alphabet = "eyJa0_-.:/";
     let state = 0x5eed1234;
+    let legacyMatches = 0;
     for (let sample = 0; sample < 20_000; sample++) {
       state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
       const length = state % 80;
@@ -1061,8 +1062,11 @@ describe("归约管线的输入有界(每一处都自己有界,不靠调用方)"
         state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
         input += alphabet[state % alphabet.length];
       }
-      expect(isSensitive(input, false), JSON.stringify(input)).toBe(legacy.test(input));
+      const expected = legacy.test(input);
+      if (expected) legacyMatches++;
+      expect(isSensitive(input, false), JSON.stringify(input)).toBe(expected);
     }
+    expect(legacyMatches, "随机对拍没有覆盖任何 JWT 正例,全 false 的实现也会通过").toBeGreaterThan(100);
 
     // 若每个 run 都用无上界的 indexOf("eyJ", start),前面的 20 000 个短 run 会反复扫描到
     // 最后那个 eyJ,总成本退化成二次方。真正的 run-local 扫描只读每个字符常数次。
