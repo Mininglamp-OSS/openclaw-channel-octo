@@ -1023,7 +1023,7 @@ describe("单卡片归约预算", () => {
       expect(plain, `${maxPayloadBytes}:plain 里没有预算提示`).toContain("… 部分内容未渲染");
 
       const renderedContent = texts.filter((text) => text === COLON_DENSE).length;
-      const dropText = texts.find((text) => text.includes("超出服务端限制")) ?? "";
+      const dropText = texts.find((text) => text.includes("服务端限制")) ?? "";
       const serverDropped = Number(dropText.match(/省略 (\d+) 项/)?.[1] ?? Number.NaN);
       // 预算先允许 30 个完整内容块;容量拟合只应给这 30 个候选记账。预算提示是保留项,
       // 不能被算成「省略 1 项」,更不能顶掉预算耗尽这个真实原因。

@@ -391,7 +391,12 @@ const PROCESS_ACTIONS = new Set([
 
 /** enum 策略:只渲染白名单内的动作名。 */
 function summarizeEnum(p: Record<string, unknown>, allowed: ReadonlySet<string>): string {
-  const raw = firstString(p, ["action"]).trim();
+  // `firstString` 会先在原串上 trim 以判断非空;这里是本 PR 新增的调用点,不能让一个本来只有
+  // 十来个字符的枚举摘要重新获得随原始输入增长的同步成本。超界直接少显示一个词(fail closed),
+  // 只有完整输入落在归约额度内时才 trim。
+  const value = p.action;
+  if (typeof value !== "string" || value.length > REDUCE_INPUT_MAX) return "";
+  const raw = value.trim();
   return allowed.has(raw) ? raw : "";
 }
 const SUMMARY_STRATEGY: Record<string, SummaryStrategy> = {
@@ -855,21 +860,23 @@ export function reduceUrlsInText(
   let out = s.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, (m) => originDomain(m) ?? "");
   // 后面的 pass 2 也会改写文本,并可能只消费一个 pass-3 候选的前半段。若敏感信号恰好在
   // 被消费的那一段里,等 pass 3 callback 再问已经太晚:它看到的是信号消失后新拼出的候选。
-  // 因此在 pass 2 之前先用**同一份 pass-3 matcher 与同一个 poison 判据**保存证据。完整的
-  // scheme URL 已由 pass 1 消费,不会把本来可以安全归约的 URL 误判成裸 userinfo。
-  // 只有 pass 2 可能运行(`//`)且存在 userinfo 必需分隔符(`@`)时才值得付这整趟扫描。
-  // 这是两个 pass 自己的必要条件,不复制用户名/口令/host 字符类;点密集普通文本因此只跑最终
-  // pass 3 那一次,而真正的 pass-order 形状仍由同一个 matcher/helper 保存证据。
-  if (out.indexOf("//") >= 0 && out.indexOf("@") >= 0) {
-    for (const match of out.matchAll(SCHEMELESS_USERINFO_RE)) {
+  // 因此先**算出** pass 2 的结果,但仍在修改前的字符串上用同一份 pass-3 matcher / poison
+  // 判据保存证据。replace/originDomain 都是纯计算,先算结果不会改变 preflight 看到的输入。
+  const beforePass2 = out;
+  const afterPass2 = beforePass2.replace(PROTOCOL_RELATIVE_RE, (_m, p1: string) => {
+    const url = _m.slice(p1.length); // 去掉前导分隔符
+    return p1 + (originDomain(`https:${url}`) ?? "");
+  });
+  // substring `//` 不是 pass 2 候选:`" // @ "` 会满足旧 gate 却一个字符都不改,白跑第二遍
+  // 二次扫描。只有 pass 2 **实际改写**且原串含 userinfo 必需分隔符时才保存证据。`@` 不会由
+  // pass 2 凭空产生,所以这两个条件不会跳过任何能形成 pass-order userinfo 的输入。
+  if (afterPass2 !== beforePass2 && beforePass2.indexOf("@") >= 0) {
+    for (const match of beforePass2.matchAll(SCHEMELESS_USERINFO_RE)) {
       poisonIfNewShapeCarriesSignal(match[0]);
     }
   }
   // 2. 协议相对 `//host/path`:补 https 后降级(secret 可能在 path)。
-  out = out.replace(PROTOCOL_RELATIVE_RE, (_m, p1: string) => {
-    const url = _m.slice(p1.length); // 去掉前导分隔符
-    return p1 + (originDomain(`https:${url}`) ?? "");
-  });
+  out = afterPass2;
   // 3. 无 scheme 的 userinfo DSN(`user:pass@host…`):只留注册域,丢 userinfo/path。
   out = out.replace(SCHEMELESS_USERINFO_RE, (m) => {
     const afterAt = m.slice(m.lastIndexOf("@") + 1);

@@ -124,14 +124,14 @@ export const EN_BUDGET_MARKER: BudgetMarker = () => ({
 });
 
 const DEFAULT_DROP_MARKER: DropMarker = (dropped) => ({
-  text: `… 省略 ${dropped} 项(超出服务端限制)`,
-  plain: `… 省略 ${dropped} 项`,
+  text: `… 因服务端限制另省略 ${dropped} 项`,
+  plain: `… 因服务端限制另省略 ${dropped} 项`,
 });
 
 /** 英文卡面用的截断提示(进度卡)。 */
 export const EN_DROP_MARKER: DropMarker = (dropped) => ({
-  text: `… ${dropped} more items dropped (server limit)`,
-  plain: `… ${dropped} more items dropped`,
+  text: `… ${dropped} additional items dropped by server limits`,
+  plain: `… ${dropped} additional items dropped by server limits`,
 });
 
 export interface BuildDisplayCardResult {
@@ -243,23 +243,36 @@ function fitRenderedGroups(
   groups: Rendered[],
   caps: CardCaps | undefined,
   dropMarker: DropMarker,
+  reservedTail?: Rendered,
 ): { body: Record<string, unknown>[]; plainLines: string[] } {
   if (!caps?.maxNodes && !caps?.maxDepth && !caps?.maxPayloadBytes) {
     return {
-      body: groups.flatMap((group) => group.elements),
-      plainLines: groups.flatMap((group) => group.plainLines),
+      body: [...groups.flatMap((group) => group.elements), ...(reservedTail?.elements ?? [])],
+      plainLines: [...groups.flatMap((group) => group.plainLines), ...(reservedTail?.plainLines ?? [])],
     };
   }
 
   const body: Record<string, unknown>[] = [];
   const plainLines: string[] = [];
   const accepted: Rendered[] = [];
+  const reservedElements = reservedTail?.elements ?? [];
+  const reservedPlainLines = reservedTail?.plainLines ?? [];
+  // 预算提示不是普通内容组:每次拟合都先给它留空间,但保持它最终出现在卡片尾部。这样服务端
+  // payload/node 上限不能优先把「为什么后续内容消失」这句话裁掉,drop 数也只计算内容组。
+  const fitsWithReservedTail = (
+    candidateBody: Record<string, unknown>[],
+    candidatePlainLines: string[],
+  ): boolean => cardFitsLimits(
+    adaptiveCard([...candidateBody, ...reservedElements]),
+    [...candidatePlainLines, ...reservedPlainLines].join("\n"),
+    caps,
+  );
   let dropped = 0;
   for (let i = 0; i < groups.length; i++) {
     const group = groups[i];
     const nextBody = [...body, ...group.elements];
     const nextPlain = [...plainLines, ...group.plainLines];
-    if (cardFitsLimits(adaptiveCard(nextBody), nextPlain.join("\n"), caps)) {
+    if (fitsWithReservedTail(nextBody, nextPlain)) {
       accepted.push(group);
       body.push(...group.elements);
       plainLines.push(...group.plainLines);
@@ -273,7 +286,7 @@ function fitRenderedGroups(
     while (true) {
       const { text: markerText, plain: markerPlain } = dropMarker(dropped);
       const marker = textBlock(markerText);
-      if (cardFitsLimits(adaptiveCard([...body, marker]), [...plainLines, markerPlain].join("\n"), caps)) {
+      if (fitsWithReservedTail([...body, marker], [...plainLines, markerPlain])) {
         body.push(marker);
         plainLines.push(markerPlain);
         break;
@@ -285,6 +298,9 @@ function fitRenderedGroups(
       dropped++;
     }
   }
+
+  body.push(...reservedElements);
+  plainLines.push(...reservedPlainLines);
 
   // An impossibly small payload/depth budget may not fit even the marker. Empty output makes
   // the caller fail closed instead of sending a payload the server will reject.
@@ -887,12 +903,14 @@ export function buildDisplayCard(opts: BuildDisplayCardOptions): BuildDisplayCar
     firstRendered.plainLines.shift();
   }
   groups.push(...renderedGroups.filter((group) => group.elements.length > 0 || group.plainLines.length > 0));
-  // 预算用尽时说一句,而不是让内容静默消失。
+  // 预算用尽时说一句,而不是让内容静默消失。提示作为 reserved tail 交给 limit fitting:
+  // 它始终占着自己的 payload/node 空间,不会正好因为卡片太大而成为第一个被裁掉的组。
+  let budgetNotice: Rendered | undefined;
   if (ctx.reduce.exhausted && cardSupports(caps, "TextBlock")) {
     const { text, plain } = budgetMarker();
-    groups.push({ elements: [textBlock(text)], plainLines: [plain] });
+    budgetNotice = { elements: [textBlock(text)], plainLines: [plain] };
   }
-  const { body, plainLines } = fitRenderedGroups(groups, caps, dropMarker);
+  const { body, plainLines } = fitRenderedGroups(groups, caps, dropMarker, budgetNotice);
   const card = adaptiveCard(body);
   return { card, plain: plainLines.join("\n") };
 }
