@@ -179,9 +179,10 @@ function sanitize(text: string, ctx: RenderCtx): string | null {
   // 元素数已经不变,耗时却继续随块数增长。
   if (ctx.reduce.exhausted) return null;
   const plain = sensitivePredicate(generic);
-  // **计价的是被扫描的量,不是活下来的量。** 所有 discarded-tail 扫描都穿过这个谓词;
-  // JWT 已是线性 scanner,所以统一按字符数折算。预算不足时返回 sensitive,超出 64 KiB 的 tail
-  // 则由 onLimit 直接耗尽,两条路径都 fail closed。
+  // discarded-tail 的 detector 扫描都穿过这个谓词,所以那一段按实际扫描量折算;JWT 已是线性
+  // scanner。注意前面的 collapseForReduction 自己还会折叠最多 64 KiB kept,那一步发生在本函数
+  // 知道折叠后长度之前、没有另收费;它靠 RAW_INPUT_MAX + 块数界有界,预算不是精确 CPU 账本。
+  // 预算不足时返回 sensitive,超出 64 KiB 的 tail 由 onLimit 直接耗尽,两条路径都 fail closed。
   const metered: SensitivePredicate = (t) => {
     const charge = Math.ceil(t.length / LINEAR_CHARGE_DIVISOR);
     if (charge > ctx.reduce.left) {
@@ -405,7 +406,7 @@ function renderRich(segments: RichSegment[], ctx: RenderCtx): Rendered {
   // 走 boundedForReduction,单次有上限),**预算不是**:预算在 sanitize 里只扣一次,而 rich
   // 这条路跑两趟。实测同样计费下 200 块冒号密集 text 517 ms / rich 1011 ms,1.96×。
   // 也就是说 rich 块占满的卡片,实际天花板是 README 里那个数字的两倍。这是已知的、可接受的
-  // (两倍于 0.9 秒仍远好于 main 的 5.4 秒),但它得写下来,而不是被一句"预算兜着"盖过去。
+  // (约 1.0 秒,仍在固定输入界内),但它得写下来,而不是被一句"预算兜着"盖过去。
   const noReducibleUrl = reduceUrlsInText(joined) === joined;
   if (noReducibleUrl && cardSupports(ctx.caps, "RichTextBlock")) {
     return {

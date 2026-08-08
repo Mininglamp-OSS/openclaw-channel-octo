@@ -503,8 +503,8 @@ export const REWRITE_CORPUS: CorpusRow[] = [
 ];
 
 /**
- * 仍未修的 shell 赋值折叠形状,以及已经安全删除但必须继续参加造串检测的哨兵。
- * 前三行与 merge base 相同;后五行要求任何未来放宽都不能重新发出输入中不存在的主机。
+ * 仍未修的 shell 赋值折叠 / read 外部副本形状,以及已经安全删除但必须继续参加造串检测的哨兵。
+ * 前四行是明确披露的残留;后五行要求任何未来放宽都不能重新发出输入中不存在的主机。
  */
 export const UNFIXED_CORPUS: CorpusRow[] = [
   // 赋值折叠漏掉的一类:值以 SHELL_BREAK 里的字符开头(`(`、`;`、`|`、`&`、`<`、`>`、反引号)。
@@ -529,6 +529,13 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
     input: "MY_CREDS=<alpha hunter2 charlie",
     expect: { exec: "hunter2" },
     note: "R5-P2:值以 `<` 开头,同一成因",
+  },
+  {
+    input: "user:Ab3xY9zQ1wKpAb3xY9zQ1wKpAb3xY9zQ1wKp@vault retry with Ab3xY9zQ1wKp",
+    expect: { read: "https://vault retry with Ab3xY9zQ1wKp" },
+    note:
+      "R13 read 外部副本残留:base 已露出副本前 12 字符并截断;head 正确缩短前缀后," +
+      "完整副本落进 64 字符窗口。生成式 parity 另以 base/head 关系精确计数为 1",
   },
   {
     input: "nginx:1.21@sha256:1234abcd",
@@ -730,8 +737,9 @@ export const PERF_CORPUS: PerfRow[] = [
  *   3. **长 URL 带 `@`** —— 反方向:不许把 main 渲染的内容整行打空。
  *
  * **两个字段都是逐 sink 实测的,不是「应该」。** 一开始我把它们写成两个布尔,跑起来才发现两边
- * 都不成立:第 4 行的口令在 main 的 `read` 上**本来就是明文**(见 UNFIXED 组末尾那三行的同一类
- * 成因),一条「任何 sink 都不许出现」会把一个 main 也有的洞算到本 PR 头上;而第 7 行在 main 的
+ * 都不成立:第 4 行的口令在 main 的 `read` 上**本来就是明文**(同类外部副本残留同时由 UNFIXED
+ * 的 `R13 read 外部副本残留` 独立行和生成式 parity 的 `R11-截断错位` 机制谓词钉住),一条
+ * 「任何 sink 都不许出现」会把一个 main 也有的洞算到本 PR 头上;而第 7 行在 main 的
  * `exec` 上就是空(shell 策略只取程序名),一条「哪个 sink 都不许打空」会把它判红。所以两个字段
  * 都是 sink 列表,值从 `def63bb` 上量出来粘贴。
  */

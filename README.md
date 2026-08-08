@@ -212,20 +212,26 @@ separators. The test requires substantial positive and negative populations, so
 an implementation that always returns one side cannot pass. Adversarial tests
 also cover both dense starts and many short runs before a distant match.
 
-**The per-card budget charges what is processed.** The reduction body charges up
-to 4000 units per block. Discarded-tail scans are metered on the predicate at one
-unit per 128 UTF-16 code units; a tail over 64 KiB is not scanned and immediately
-exhausts the card budget. A 100 KB prose block therefore costs about 4751 units,
-so 25 such blocks fit and the 26th produces the budget marker. Charging the raw
-100 KB would allow only one block.
+**The per-card budget meters the reduction body and discarded-tail predicates,
+not every bounded step.** The reduction body charges up to 4000 units per block.
+Discarded-tail scans are metered at one unit per 128 UTF-16 code units; a tail
+over 64 KiB is not scanned and immediately exhausts the budget. A 100 KB prose
+block therefore costs about 4751 units, so 25 such blocks fit and the 26th
+produces the marker. The initial whitespace collapse over at most 64 KiB happens
+before that charge and is not separately metered. `RAW_INPUT_MAX` and the
+200-block limit still bound it, but the budget is not an exact CPU-work ledger.
 
 The budget is an availability limit, not a time guarantee. A 4000-character
-unbroken lowercase run still exercises a quadratic reduction pass inside the
-per-call bound. The measured worst card remains about **0.9 seconds**, or about
-**1.8 seconds** for all-rich blocks because their comparison pass is not metered.
-Its visible cost is equally important: 200 benign 4 KB blocks become 30 content
-blocks plus one explicit budget notice. This is part of the `needs-human-review`
-product trade-off, not a security regression.
+period-separated run (`a.a.a…`) is the measured worst shape: every dot creates a
+new word-boundary start for the quadratic scheme-less pass. After gating the
+pass-2 evidence preflight on its necessary `//` and `@` delimiters, warmed local
+measurements for 200 inputs are about **0.55 seconds** for text blocks and
+**1.0 second** for all-rich blocks (observed 0.50–0.59 / 0.97–1.16 seconds).
+The rich comparison pass and the initial collapse are not metered. The visible
+cost is equally important: 200 benign 4 KB blocks become 30 content blocks plus
+one explicit budget notice. This is part of the `needs-human-review` product
+trade-off, not a security regression; absolute timings are indicative, while
+the test also compares the reducer against the frozen base in-process.
 
 **Discarded tails have no partial-visibility window.** If the entire tail is at
 most 64 KiB, the caller's complete sensitivity predicate scans it. If it is one
@@ -249,8 +255,11 @@ candidate: after complete scheme URLs are consumed, a preflight uses the same
 scheme-less userinfo matcher and poison predicate as the final userinfo pass.
 That prevents a protocol-relative JWT prefix from disappearing and exposing a
 later copy of its password. The final pass still repeats the same check for
-shapes formed by earlier rewrites, and both scans stay inside the 4000-character
-reduction bound.
+shapes formed by earlier rewrites. The preflight runs only when `//` and `@` are
+both present — necessary conditions supplied by the two passes themselves, not
+a second username/host grammar — and both scans stay inside the 4000-character
+reduction bound. The generated performance corpus includes the period-separated
+shape, with and without an unrelated `@`.
 After those passes, one default-deny choke point withholds any remaining
 scheme-less whitespace token whose first `:` precedes its last `@`. That closes
 non-ASCII and punctuation-terminated usernames, IPv6 zone IDs and empty hosts
@@ -262,6 +271,20 @@ an address, package coordinates, timestamps and some prose can share the same
 outputs beside the new empty result; the generated parity space pins the exact
 over-hide counts. Deciding whether that legibility cost is acceptable is the
 remaining product-owner review.
+
+Two residual disclosure classes are explicit rather than hidden in test-only
+notes:
+
+- One `read`-summary truncation-alignment comparison remains. Base already emits
+  at least the first 12 characters of the external secret and ends in `…`; head's
+  shorter, correct reduction lets the full external copy fit in the 64-character
+  window. The generated differential guard admits exactly this one
+  mechanism-matched case. A future read-sink external-copy guard is required to
+  remove it without reverting the safer host reduction.
+- Passes 1, 2 and 4 can delete a keyword that caused the whole line to be
+  withheld, then expose an external low-entropy copy. Those passes are identical
+  to the merge base, so this is base-identical rather than a regression from this
+  branch; it remains a separate sanitizer-hardening follow-up.
 
 Relaxing that pass is where this branch has historically broken things. How the
 failure modes are closed — by the verbatim-host check, not by the shape of the
@@ -388,9 +411,9 @@ Those three are where the bound is *visible*, not where it *acts*: it lives insi
 `reduceUrlsInText`, so all eleven callers change at long input. Three change in a way
 "long text gets truncated" does not predict — a rich text block loses per-segment
 styling (the safer output, and it closes a `card ⊋ plain` divergence `main` has),
-an authored interactive card rejects an over-long title with a message naming the
-wrong cause, and a debug value and a reasoning step both yield `""` rather than a
-truncation.
+an authored interactive card rejects an over-long title with the neutral reason
+“withheld by sanitization”, and a debug value and a reasoning step both yield `""`
+rather than a truncation.
 
 ## Architecture
 

@@ -1119,6 +1119,7 @@ describe("单卡片归约预算", () => {
     };
     const textMs = timed(textBlocks);
     const richMs = timed(richBlocks);
+    // 修复后独立 warmed 测量(3 次):text 501–586 ms,中位 546;rich 971–1161,中位 989。
     // 宽阈值只挡预算失效/分钟级回归;毫秒级的重复扫描由 parity 里的 base 比值单独看守。
     expect(textMs, `text:200 块 × 点密集 3905 字符耗时 ${textMs.toFixed(0)} ms`).toBeLessThan(3500);
     expect(richMs, `rich:200 块 × 点密集 3905 字符耗时 ${richMs.toFixed(0)} ms`).toBeLessThan(5000);
