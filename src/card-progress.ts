@@ -28,8 +28,10 @@ import {
   getBotCardProfile,
   peekBotCardProfile,
 } from "./card-profile-cache.js";
+import { deriveCardCaps } from "./card-caps.js";
 import { summarizeToolParams, SUBAGENT_WAIT_STEP_TOOL, type CardStep, type CardProgressState } from "./card-render.js";
 import {
+  HOST_NO_SUMMARY_PLACEHOLDER,
   buildReasoningProcessId,
   buildReasoningProcessWireData,
   selectReasoningProcessTemplate,
@@ -101,6 +103,8 @@ interface CardEntry {
   flushAbort?: AbortController;
   /** Server-selected ref, pinned for every frame of a Registry-authored message. */
   templateRef?: CardTemplateRef;
+  /** Server-advertised complete type-17 payload limit, pinned with the selected template ref. */
+  maxPayloadBytes?: number;
   /** Next positive CAS value for a Registry edit. */
   nextCardSeq: number;
   /** Stable for every frame, including paused continuation runs. */
@@ -271,7 +275,12 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
     if (ctx.accountId) requestCardEventPolling(ctx.accountId);
     const m = await getBotCardProfileForCaller(ctx, signal);
     if (signal?.aborted) throw signal.reason;
-    return !!reasoningTemplateForProfile(m);
+    const outcome = reasoningTemplateForProfile(m);
+    // 成因必须在这里报:调用方拿到 false 就 `entry.skip = true` 并 return,永远走不到
+    // resolveEntryDeliveryMode —— 那边的同款日志只是 profile 在 gate 与 resolve 之间被
+    // 失效时的兜底。不报的话,「卡片没了」在运维手上没有任何线索。
+    if (!outcome.ref) logReasoningTemplateSkip(ctx, outcome.reason, m.config?.reasoning_template_ref);
+    return !!outcome.ref;
   } catch (err: unknown) {
     // 探测自己被限流时,把窗口记下来 —— 否则后续每个工具事件都会再探一次,而这条路径打的
     // 正是刚刚拒绝我们的那个桶。
@@ -285,12 +294,87 @@ async function gateEnabled(ctx: CardContext, signal?: AbortSignal): Promise<bool
   }
 }
 
-function reasoningTemplateForProfile(manifest: CardProfileManifest): CardTemplateRef | null {
-  if (!manifest.available || manifest.config?.reasoning_enabled !== true) return null;
-  return selectReasoningProcessTemplate(
+/**
+ * 没有可用模板时为什么没有 —— 卡片会因此完全不发,而这几种成因在现象上**完全一样**
+ * (卡片凭空消失)。#204 之后这一点比以前严重:模板不可用曾经退回本地渲染,用户至少看得见
+ * 进度;现在是彻底没卡,运维手上没有任何线索。
+ */
+type ReasoningTemplateSkipReason =
+  /** profile 还没探到(首帧前 gate 失败/被取消)。 */
+  | "no-profile"
+  /** 端点未部署(available:false)。 */
+  | "endpoint-unavailable"
+  /** 服务端为该 bot 关掉了推理卡(config.reasoning_enabled !== true)—— 配置如此,不是故障。 */
+  | "reasoning-disabled"
+  /**
+   * 服务端说开着,但 templating/ref 与本消费者的契约不匹配。这是**契约不一致**,不是正常状态:
+   * selectReasoningProcessTemplate 把十余种不兼容原因收敛成一个 null,所以只能报到这一层。
+   */
+  | "template-incompatible"
+  /**
+   * `available: true` 却没有 `config`。这是**契约不一致**(config 在类型上可选,但一个可用的
+   * 端点应当给出),不是「配置如此」—— 混进 reasoning-disabled 会又造出一个静默消失的场景。
+   */
+  | "config-missing";
+
+/** 契约不一致的成因走 warn(该被看见);其余是正常配置状态,走 dbg 不刷日志。 */
+const CONTRACT_MISMATCH_REASONS = new Set<ReasoningTemplateSkipReason>([
+  "template-incompatible",
+  "config-missing",
+]);
+
+/**
+ * 已 warn 过的 (bot, 成因, 模板 ref) 组合 → 该条目的过期时刻。
+ *
+ * 三件事共同决定了这个形状:
+ *  - **要去重**:profile 按 bot 缓存,日志不缓存的话,持续广告不兼容模板的服务端会在每个产卡的
+ *    turn 上 warn 一次、无限重复。
+ *  - **要过期**:「warn 过一次就永远不再说」意味着修好之后再次损坏时是静默的 —— 而这条信号的
+ *    全部意义就是「卡片为什么没有」的唯一线索,恢复后再复发反而无声是错的默认。
+ *  - **key 要带模板 ref**:只带成因的话,服务端从坏模板 A 修好、之后换成另一个坏模板 B,会被
+ *    旧条目压住而无声。
+ */
+const warnedTemplateSkips = new Map<string, number>();
+const TEMPLATE_SKIP_WARN_TTL_MS = 60_000;
+
+/** 「卡片为什么没有」的唯一线索。 */
+function logReasoningTemplateSkip(
+  ctx: CardContext,
+  reason: ReasoningTemplateSkipReason,
+  offendingRef?: CardTemplateRef | null,
+): void {
+  const refLabel = offendingRef ? `${offendingRef.id}@${offendingRef.version}` : "-";
+  const message = `no reasoning template; progress card skipped (${reason}; ref=${refLabel})`;
+  if (!CONTRACT_MISMATCH_REASONS.has(reason)) {
+    dbg(message);
+    return;
+  }
+  const key = JSON.stringify([ctx.apiUrl, ctx.botToken, reason, refLabel]);
+  const now = Date.now();
+  const expiresAt = warnedTemplateSkips.get(key);
+  if (expiresAt !== undefined && expiresAt > now) {
+    dbg(`${message}; already warned`);
+    return;
+  }
+  // 顺手清掉过期项,避免这张表随部署见过的凭据无界增长。
+  for (const [existing, deadline] of warnedTemplateSkips) {
+    if (deadline <= now) warnedTemplateSkips.delete(existing);
+  }
+  warnedTemplateSkips.set(key, now + TEMPLATE_SKIP_WARN_TTL_MS);
+  warn(message);
+}
+
+function reasoningTemplateForProfile(
+  manifest: CardProfileManifest,
+): { ref: CardTemplateRef } | { ref: null; reason: ReasoningTemplateSkipReason } {
+  if (!manifest.available) return { ref: null, reason: "endpoint-unavailable" };
+  if (!manifest.config) return { ref: null, reason: "config-missing" };
+  if (manifest.config.reasoning_enabled !== true) return { ref: null, reason: "reasoning-disabled" };
+  const ref = selectReasoningProcessTemplate(
     manifest.templating,
     manifest.config.reasoning_template_ref,
   );
+  return ref ? { ref } : { ref: null, reason: "template-incompatible" };
 }
 
 function apiErrorMessage(error: unknown): string {
@@ -309,12 +393,17 @@ function errorCodeFromApiError(error: unknown): string | undefined {
 function resolveEntryDeliveryMode(entry: CardEntry): void {
   if (entry.templateRef) return;
   const profile = peekBotCardProfile(entry.ctx);
-  const templateRef = profile ? reasoningTemplateForProfile(profile) : null;
-  if (templateRef) {
-    entry.templateRef = templateRef;
-    dbg(`selected Registry reasoning template ${templateRef.id}@${templateRef.version}`);
+  const outcome = profile
+    ? reasoningTemplateForProfile(profile)
+    : { ref: null as null, reason: "no-profile" as const };
+  if (outcome.ref) {
+    entry.templateRef = outcome.ref;
+    entry.maxPayloadBytes = deriveCardCaps(profile!).maxPayloadBytes;
+    dbg(`selected Registry reasoning template ${outcome.ref.id}@${outcome.ref.version}`);
     return;
   }
+  // gate 已经报过成因了;这里只在 profile 于 gate 与 resolve 之间被失效时兜底。
+  logReasoningTemplateSkip(entry.ctx, outcome.reason, profile?.config?.reasoning_template_ref);
   entry.skip = true;
 }
 
@@ -474,8 +563,13 @@ async function editEntryProgress(params: {
   const { entry, state } = params;
   const messageId = entry.messageId;
   if (!messageId) return false;
-  const data = buildReasoningProcessWireData(state);
   const templateRef = entry.templateRef;
+  const data = templateRef
+    ? buildReasoningProcessWireData(state, templateRef.version, {
+        templateRef,
+        maxPayloadBytes: entry.maxPayloadBytes,
+      })
+    : null;
   if (!data || !templateRef) return false;
   const previous = entry.templateEditPromise;
   const work = (async (): Promise<boolean> => {
@@ -611,12 +705,15 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
     const state = entryProgressState(sessionKey, entry);
     if (!entry.messageId) {
       if (!isCurrentEntry(sessionKey, entry)) return;
-      const data = buildReasoningProcessWireData(state);
+      if (!entry.templateRef) return;
+      const data = buildReasoningProcessWireData(state, entry.templateRef.version, {
+        templateRef: entry.templateRef,
+        maxPayloadBytes: entry.maxPayloadBytes,
+      });
       if (!data) {
-        dbg("Registry first frame deferred: no phases with actions yet");
+        dbg("Registry first frame deferred: no phases with actions or payload exceeds the minimum wire size");
         return;
       }
-      if (!entry.templateRef) return;
       const res = await sendTemplateCardMessage({
         apiUrl: entry.ctx.apiUrl,
         botToken: entry.ctx.botToken,
@@ -1029,6 +1126,8 @@ export function clearCard(sessionKey: string): void {
 
 /** 测试辅助:清空全部状态。 */
 export function _resetCardProgressForTests(): void {
+  // 去重集合是模块级的,不清会跨测试泄漏(第二个用例拿不到本该出现的 warn)。
+  warnedTemplateSkips.clear();
   for (const e of new Set([...cards.values(), ...pausedCards.values()])) {
     if (e.flushTimer) clearTimeout(e.flushTimer);
     if (e.pausedExpiryTimer) clearTimeout(e.pausedExpiryTimer);
@@ -1060,6 +1159,17 @@ function endRunningThinking(entry: CardEntry, now: number): void {
 }
 
 const MAX_REASONING_CAPTURE = 4_000;
+
+/** 该 session 最近的 __thinking__ 步骤是否已经捕获到文本(用于避免 snapshot 冲掉它)。 */
+function hasCapturedReasoning(sessionKey: string): boolean {
+  const entry = cards.get(sessionKey);
+  if (!entry) return false;
+  for (let index = entry.steps.length - 1; index >= 0; index--) {
+    const step = entry.steps[index];
+    if (step?.tool === "__thinking__") return !!step.thought?.trim();
+  }
+  return false;
+}
 
 /** Capture OpenClaw's user-visible reasoning lane without sending it as a normal message. */
 export function recordCardReasoning(
@@ -1344,13 +1454,33 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     }
     const message = asRecord(root?.lastAssistant);
     if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
-    const thought = message.content
+    // 签名有、文本空的 thinking block 也要计入,否则这条车道会把「推理了但拿不到内容」退化成
+    // 「压根没推理」—— 四态区分在只经由本车道可见的 provider 上就白做了。宿主在别处会为这种
+    // block 合成一句英文占位,这里用同一个常量对齐,让下游 resolveReasoningThought 归类为
+    // no-summary。
+    const blocks = message.content
       .map((part) => asRecord(part))
-      .filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
-      .map((part) => part!.thinking as string)
+      .filter((part) => part?.type === "thinking");
+    const realText = blocks
+      .map((part) => (typeof part!.thinking === "string" ? part!.thinking : ""))
+      .filter((text) => text.trim())
       .join("\n")
       .trim();
-    if (thought) recordCardReasoning(sk!, thought, { snapshot: true });
+    if (realText) {
+      recordCardReasoning(sk!, realText, { snapshot: true });
+      return;
+    }
+    // 全是「签名有、文本空」的 block 时才代入占位句,否则这条车道会把「推理了但拿不到内容」
+    // 退化成「压根没推理」,四态区分在只经由本车道可见的 provider 上就白做了。
+    //
+    // 但 snapshot 是**无条件替换**:若流式车道已经捕获到真实文本,直接替换会把它冲掉,把一个
+    // 我们本来拿到了推理的 phase 报成「没有可见摘要」。本车道的存在前提是流式车道什么都没给,
+    // 所以只在该步骤尚无捕获时才代入。
+    const signed = blocks.some((part) =>
+      typeof part!.thinkingSignature === "string" && String(part!.thinkingSignature).trim());
+    if (signed && !hasCapturedReasoning(sk!)) {
+      recordCardReasoning(sk!, HOST_NO_SUMMARY_PLACEHOLDER, { snapshot: true });
+    }
   });
 
   api.on("after_tool_call", (event: unknown, ctx: unknown) => {

@@ -52,6 +52,7 @@ function profile(opts: {
   reasoningEnabled?: boolean;
   configuredVersion?: string | null;
   catalogVersions?: string[];
+  maxPayloadBytes?: number;
 } = {}): Record<string, unknown> {
   const reasoningEnabled = opts.reasoningEnabled ?? true;
   const configuredVersion = opts.configuredVersion === undefined ? "0.3.0" : opts.configuredVersion;
@@ -72,6 +73,9 @@ function profile(opts: {
       wire: "template-ref/v1",
       templates: (opts.catalogVersions ?? ["0.3.0"]).map(template),
     },
+    ...(opts.maxPayloadBytes === undefined ? {} : {
+      limits: { max_payload_bytes: opts.maxPayloadBytes },
+    }),
   };
 }
 
@@ -195,6 +199,53 @@ describe("server-driven Registry reasoning progress", () => {
       .toHaveProperty("template_ref.version", "0.3.0");
   });
 
+  it("keeps the actual Registry send and edit envelopes within the advertised UTF-8 byte limit", async () => {
+    const maxPayloadBytes = 16_384;
+    const wire = mockFetch({
+      profile: profile({
+        configuredVersion: "0.4.0",
+        catalogVersions: ["0.4.0"],
+        maxPayloadBytes,
+      }),
+    });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "payload-limit";
+    const hookContext = { sessionKey, runId: "run-1" };
+    setCardContext(sessionKey, context({ reasoningVisibility: "on" }));
+    handlers.before_agent_run?.({}, hookContext);
+
+    for (let index = 0; index < 6; index++) {
+      handlers.model_call_started?.({ callId: `model-${index}` }, hookContext);
+      recordCardReasoning(sessionKey, "界".repeat(4_000), { snapshot: true });
+      handlers.before_tool_call?.({ toolName: "read", toolCallId: `tool-${index}` }, hookContext);
+    }
+    await vi.advanceTimersByTimeAsync(900);
+
+    const sent = wire.calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload;
+    expect(sent).toBeDefined();
+    expect(new TextEncoder().encode(JSON.stringify(sent)).byteLength)
+      .toBeLessThanOrEqual(maxPayloadBytes);
+
+    handlers.model_call_started?.({ callId: "model-edit" }, hookContext);
+    recordCardReasoning(sessionKey, "界".repeat(4_000), { snapshot: true });
+    handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-edit" }, hookContext);
+    await vi.advanceTimersByTimeAsync(900);
+
+    const edit = wire.calls.find((call) => call.url.includes("/message/edit"))?.body;
+    expect(edit).toBeDefined();
+    const {
+      message_id: _messageId,
+      channel_id: _channelId,
+      channel_type: _channelType,
+      ...editedEnvelope
+    } = edit!;
+    expect(editedEnvelope).toHaveProperty("card_seq");
+    expect(editedEnvelope).toHaveProperty("transient", true);
+    expect(new TextEncoder().encode(JSON.stringify(editedEnvelope)).byteLength)
+      .toBeLessThanOrEqual(maxPayloadBytes);
+  });
+
   it("does not send when reasoning is disabled", async () => {
     const wire = mockFetch({ profile: profile({ reasoningEnabled: false }) });
     global.fetch = wire.fetch as typeof fetch;
@@ -204,6 +255,91 @@ describe("server-driven Registry reasoning progress", () => {
 
     expect(wire.calls.some((call) => call.url.includes("/card/profile"))).toBe(true);
     expect(wire.calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+  });
+
+  /**
+   * 卡片完全不发时,这几种成因在现象上一模一样(卡片凭空消失)。#204 之后更严重:模板不可用
+   * 曾经退回本地渲染,用户至少看得见进度;现在没有任何输出。所以「服务端关掉了」与「服务端说
+   * 开着但模板用不了」必须在日志上可区分 —— 后者是契约不一致,该走 warn 被看见;前者是正常
+   * 配置状态,不该刷日志。
+   *
+   * 两种成因分成两个用例:profile 按 bot 缓存,同一个 botToken 复用同一份缓存,写在一个用例里
+   * 第二半会读到第一半的 profile(实测两次都报 reasoning-disabled)。
+   */
+  it("keeps a server-disabled reasoning card out of the warn log", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wire = mockFetch({ profile: profile({ reasoningEnabled: false }) });
+    global.fetch = wire.fetch as typeof fetch;
+    setCardContext("reason-disabled", context());
+    await triggerFirstFrame(makeApi(), "reason-disabled");
+
+    expect(wire.calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+    // 正常配置状态,不该刷 warn。
+    expect(warnSpy.mock.calls.flat().join("\n")).toBe("");
+  });
+
+  it("warns with the reason when the server enables reasoning but its template is unusable", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wire = mockFetch({ profile: profile({ configuredVersion: "9.9.9" }) });
+    global.fetch = wire.fetch as typeof fetch;
+    setCardContext("reason-incompatible", context());
+    await triggerFirstFrame(makeApi(), "reason-incompatible");
+
+    expect(wire.calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+    const warned = warnSpy.mock.calls.flat().join("\n");
+    expect(warned).toContain("progress card skipped");
+    expect(warned).toContain("template-incompatible");
+  });
+
+  it("warns when an available profile carries no config at all", async () => {
+    // config 在类型上可选。`available: true` 却没有 config 是契约不一致,不是「配置如此」——
+    // 混进 reasoning-disabled 会又造出一个静默消失的场景。
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { config: _dropped, ...withoutConfig } = profile() as Record<string, unknown>;
+    const wire = mockFetch({ profile: withoutConfig });
+    global.fetch = wire.fetch as typeof fetch;
+    setCardContext("no-config", context({ botToken: "bot-no-config" }));
+    await triggerFirstFrame(makeApi(), "no-config");
+
+    expect(wire.calls.some((call) => call.url.includes("/sendMessage"))).toBe(false);
+    expect(warnSpy.mock.calls.flat().join("\n")).toContain("config-missing");
+  });
+
+  it("warns once per bot for a persistent template mismatch, not once per turn", async () => {
+    // profile 按 bot 缓存,日志不缓存的话,持续广告不兼容模板的服务端会在每个产卡 turn 上 warn。
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wire = mockFetch({ profile: profile({ configuredVersion: "9.9.9" }) });
+    global.fetch = wire.fetch as typeof fetch;
+    for (const key of ["dup-1", "dup-2", "dup-3"]) {
+      setCardContext(key, context({ botToken: "bot-dup" }));
+      await triggerFirstFrame(makeApi(), key);
+    }
+    const hits = warnSpy.mock.calls.flat().filter((line) =>
+      String(line).includes("template-incompatible")).length;
+    expect(hits).toBe(1);
+  });
+
+  it("warns again after the dedup window, so a recurrence is not silent", async () => {
+    // 「warn 过一次就永远不再说」意味着修好之后再次损坏时是静默的 —— 而这条信号的全部意义
+    // 就是「卡片为什么没有」的唯一线索。
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const hits = (): number => warnSpy.mock.calls.flat()
+      .filter((line) => String(line).includes("template-incompatible")).length;
+    const wire = mockFetch({ profile: profile({ configuredVersion: "9.9.9" }) });
+    global.fetch = wire.fetch as typeof fetch;
+
+    setCardContext("ttl-1", context({ botToken: "bot-ttl" }));
+    await triggerFirstFrame(makeApi(), "ttl-1");
+    expect(hits()).toBe(1);
+
+    setCardContext("ttl-2", context({ botToken: "bot-ttl" }));
+    await triggerFirstFrame(makeApi(), "ttl-2");
+    expect(hits()).toBe(1); // 窗口内不重复
+
+    await vi.advanceTimersByTimeAsync(61_000);
+    setCardContext("ttl-3", context({ botToken: "bot-ttl" }));
+    await triggerFirstFrame(makeApi(), "ttl-3");
+    expect(hits()).toBe(2); // 窗口过后再次可见
   });
 
   it.each([
@@ -849,5 +985,96 @@ describe("progress frames under rate limiting", () => {
 
     clearCard("cool-10");
     expect(vi.getTimerCount()).toBeLessThan(armed);
+  });
+});
+
+/**
+ * llm_output 车道:宿主持久化的 lastAssistant 快照。它存在的前提是**流式车道什么都没给**
+ * (见 card-progress.ts 该 hook 上方注释)。评审指出整个 hook 此前没有任何测试 —— 把它整块
+ * revert 掉套件仍然全绿,而它正是上一轮那个覆盖回归所在的位置。
+ */
+describe("llm_output reasoning capture lane", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetCardProgressForTests();
+  });
+
+  afterEach(() => {
+    _resetCardProgressForTests();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    global.fetch = originalFetch;
+  });
+
+  const thinking = (thought: string, signature?: string) => ({
+    type: "thinking",
+    ...(thought ? { thinking: thought } : { thinking: "" }),
+    ...(signature ? { thinkingSignature: signature } : {}),
+  });
+
+  async function cardThought(
+    setup: (handlers: Record<string, Hook>, ctx: { sessionKey: string; runId?: string }) => void,
+  ): Promise<string> {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "llm-lane-" + Math.random().toString(36).slice(2, 8);
+    setCardContext(sessionKey, context({ reasoningVisibility: "stream" }));
+    const hookCtx = { sessionKey, runId: "run-1" };
+    handlers.before_agent_run?.({}, hookCtx);
+    handlers.model_call_started?.({ callId: "model-1" }, hookCtx);
+    setup(handlers, hookCtx);
+    handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    const sent = wire.calls.find((call) => call.url.includes("/sendMessage"))?.body?.payload as
+      { data?: { phases?: Array<{ thought: string }> } } | undefined;
+    return sent?.data?.phases?.[0]?.thought ?? "";
+  }
+
+  it("records real thinking text from the snapshot", async () => {
+    expect(await cardThought((handlers, ctx) => {
+      handlers.llm_output?.({ lastAssistant: { role: "assistant", content: [thinking("Checking the reducer.")] } }, ctx);
+    })).toBe("Checking the reducer.");
+  });
+
+  it("reports a signed block with no text as reasoned-without-summary", async () => {
+    // 否则这条车道会把「推理了但拿不到内容」退化成「压根没推理」。
+    expect(await cardThought((handlers, ctx) => {
+      handlers.llm_output?.({ lastAssistant: { role: "assistant", content: [thinking("", "sig-abc")] } }, ctx);
+    })).toBe("Reasoned without a visible summary");
+  });
+
+  it("does not let a signed empty snapshot clobber text the streaming lane already captured", async () => {
+    // snapshot 是无条件替换。上一轮的回归:Anthropic 的 redacted_thinking 作为最后一个 block 时,
+    // 会把已经捕获到的真实推理冲成「没有可见摘要」。
+    expect(await cardThought((handlers, ctx) => {
+      recordCardReasoning(ctx.sessionKey, "Checking the reducer.");
+      handlers.llm_output?.({ lastAssistant: { role: "assistant", content: [thinking("", "sig-abc")] } }, ctx);
+    })).toBe("Checking the reducer.");
+  });
+
+  it("keeps real text when the snapshot mixes it with a signed empty block", async () => {
+    expect(await cardThought((handlers, ctx) => {
+      handlers.llm_output?.({
+        lastAssistant: { role: "assistant", content: [thinking("", "sig-abc"), thinking("Checking the reducer.")] },
+      }, ctx);
+    })).toBe("Checking the reducer.");
+  });
+
+  it("ignores the snapshot when reasoning visibility is off", async () => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("llm-lane-off", context({ reasoningVisibility: "off" }));
+    const hookCtx = { sessionKey: "llm-lane-off", runId: "run-1" };
+    handlers.before_agent_run?.({}, hookCtx);
+    handlers.model_call_started?.({ callId: "model-1" }, hookCtx);
+    handlers.llm_output?.({ lastAssistant: { role: "assistant", content: [thinking("private thought")] } }, hookCtx);
+    handlers.before_tool_call?.({ toolName: "read", toolCallId: "tool-1" }, hookCtx);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(JSON.stringify(wire.calls.find((call) => call.url.includes("/sendMessage"))?.body))
+      .not.toContain("private thought");
   });
 });

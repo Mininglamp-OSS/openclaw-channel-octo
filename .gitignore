@@ -13,3 +13,6 @@ CLAUDE.md
 *.bak2
 openclaw-channel-octo-*.tgz
 .idea/
+
+# macOS
+.DS_Store
