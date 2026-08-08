@@ -617,7 +617,23 @@ describe("server-driven Registry reasoning progress", () => {
     await triggerFirstFrame(handlers, sessionKey);
     handlers.after_tool_call?.({ toolName: "read", toolCallId: "tool-1", result: {} }, hookContext);
     handlers.before_tool_call?.({ toolName, toolCallId: "card-tool-1" }, hookContext);
-    handlers.after_tool_call?.({ toolName, toolCallId: "card-tool-1", result: {} }, hookContext);
+    handlers.after_tool_call?.({
+      toolName,
+      toolCallId: "card-tool-1",
+      result: toolName === DISPLAY_CARD_TOOL_NAME
+        ? {
+            content: [{ type: "text", text: "sent display card" }],
+            details: {
+              message_id: "display-card-1",
+              channel_id: "group-1",
+              client_msg_no: "display-client-1",
+            },
+          }
+        : {
+            content: [{ type: "text", text: "sent interactive card" }],
+            details: { sent: true, message_id: "interactive-card-1", channel_id: "group-1" },
+          },
+    }, hookContext);
     await finalizeCard(sessionKey, { success: false });
 
     const terminalEdit = wire.calls.filter((call) => call.url.includes("/message/edit")).at(-1)?.body;
@@ -641,7 +657,10 @@ describe("server-driven Registry reasoning progress", () => {
     handlers.after_tool_call?.({
       toolName: DISPLAY_CARD_TOOL_NAME,
       toolCallId: "display-1",
-      error: "send rejected",
+      result: {
+        content: [{ type: "text", text: "Error: send rejected" }],
+        details: null,
+      },
     }, hookContext);
     await finalizeCard(sessionKey, { success: false });
 
@@ -666,7 +685,14 @@ describe("server-driven Registry reasoning progress", () => {
     handlers.after_tool_call?.({
       toolName: DISPLAY_CARD_TOOL_NAME,
       toolCallId: "display-1",
-      result: {},
+      result: {
+        content: [{ type: "text", text: "sent display card" }],
+        details: {
+          message_id: "display-card-1",
+          channel_id: "group-1",
+          client_msg_no: "display-client-1",
+        },
+      },
     }, hookContext);
     await finalizeCard(sessionKey, { success: false, failed: true });
 
