@@ -426,11 +426,19 @@ function shortenPath(p: string): string {
   return `…/${segs[segs.length - 2]}/${segs[segs.length - 1]}`;
 }
 
-/** 取 keys 中首个非空字符串值。 */
+/**
+ * 取 keys 中首个非空字符串值,但不让摘要提取在原始参数上重新获得无界成本。
+ *
+ * 这道界必须住在共享取值处:调用方在归约之前还会 trim、按路径 split、解析 URL。只把界放进
+ * reduceUrlsInText 或 summarizeShell,仍挡不住那些更早的步骤。超过 raw 额度直接少显示一条摘要
+ * (fail closed);只有完整值落在额度内时才 trim。
+ */
 function firstString(p: Record<string, unknown>, keys: string[]): string {
   for (const k of keys) {
     const v = p[k];
-    if (typeof v === "string" && v.trim()) return v;
+    if (typeof v !== "string") continue;
+    if (v.length > RAW_INPUT_MAX) return "";
+    if (v.trim()) return v;
   }
   return "";
 }
