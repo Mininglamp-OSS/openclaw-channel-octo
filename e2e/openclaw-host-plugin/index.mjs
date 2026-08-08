@@ -142,7 +142,10 @@ function scriptedReply(body) {
       return {
         tool: "octo_send_display_card",
         arguments: {
-          title: `DISPLAY_DELIVERY_E2E:${marker}`,
+          // A full UUID intentionally looks secret-like to the display-card
+          // sanitizer. Keep the run marker unique without testing against a
+          // value that production is expected to remove.
+          title: `DISPLAY_DELIVERY_E2E_RUN:${marker.slice(0, 8)}`,
           blocks: [{ type: "text", text: "The requested display card was delivered." }],
         },
         reasoning: "Deliver the requested answer as an Octo display card.",
@@ -390,7 +393,7 @@ function buildPrompt(kind, marker, childDelaySeconds, targetUid) {
     return [
       `DISPLAY_DELIVERY_E2E:${marker}.`,
       "First call exec exactly once to verify the source.",
-      "After exec succeeds, call octo_send_display_card exactly once with the marker in its title.",
+      "After exec succeeds, call octo_send_display_card exactly once with a short run marker in its title.",
       "The display card is the answer, so finish with NO_REPLY and no user-visible final text.",
     ].join(" ");
   }

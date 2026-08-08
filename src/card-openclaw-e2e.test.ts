@@ -461,8 +461,9 @@ suite("OpenClaw display-card delivery E2E", () => {
       "exec",
       "octo_send_display_card",
     ]);
+    const displayMarker = `DISPLAY_DELIVERY_E2E_RUN:${marker.slice(0, 8)}`;
     const displayCard = completed.cards.find((card) =>
-      card.templateRef?.id !== "ai.reasoning-process" && cardText(card).includes(marker));
+      card.templateRef?.id !== "ai.reasoning-process" && cardText(card).includes(displayMarker));
     expect(displayCard, "the requested display card should be delivered").toBeDefined();
 
     const reasoningCard = completed.cards.find((card) =>
