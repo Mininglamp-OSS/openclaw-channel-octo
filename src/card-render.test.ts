@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   OCTO_CARD_LAYOUTS,
   detectOctoCardLayout,
@@ -1205,5 +1205,22 @@ describe("process 工具的摘要", () => {
     expect(summarizeToolParams("process", { action: "rm -rf /" })).toBe("");
     expect(summarizeToolParams("process", { action: "未来新增的动作" })).toBe("");
     expect(summarizeToolParams("process", {})).toBe("");
+  });
+
+  it("超长 action 不在 raw string 上 trim", () => {
+    const originalTrim = String.prototype.trim;
+    let maxTrimmedLength = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      maxTrimmedLength = Math.max(maxTrimmedLength, this.length);
+      return originalTrim.call(this);
+    });
+    try {
+      const got = summarizeToolParams("process", { action: " ".repeat(1_000_000) + "kill" });
+      expect(maxTrimmedLength, `trim 收到了 ${maxTrimmedLength} 字符的原始 action`)
+        .toBeLessThanOrEqual(REDUCE_INPUT_MAX);
+      expect(got).toBe("");
+    } finally {
+      trim.mockRestore();
+    }
   });
 });

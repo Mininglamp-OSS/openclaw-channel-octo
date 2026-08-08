@@ -665,6 +665,18 @@ export const PERF_CORPUS: PerfRow[] = [
       "R13:每个点后都有新的单词边界,schemeless userinfo 正则会从每个边界回退找冒号;" +
       "preflight 若无条件再跑一遍,head 就比 base 多付整趟二次成本",
   },
+  {
+    label: "点密集 + 无效 // 与 @",
+    input: "a.".repeat(1997) + " // @",
+    reachesPasses: true,
+    note: "R14:两个 substring 同时存在但 pass 2 没有匹配。不能因此重跑整趟 userinfo preflight",
+  },
+  {
+    label: "点密集 + 真实 pass 2 + @",
+    input: "a.".repeat(1978) + " //host.example/x?owner=ops@example.com",
+    reachesPasses: true,
+    note: "R14:真实 protocol-relative 改写会启动 preflight,这是 README 必须披露的可达成本上限",
+  },
   // 这两行钉住本 PR 的两个上限。加它们是因为对抗评审点出:**修复本身一行都没被钉住** ——
   // 整组里没有任何一行「超过 64 KiB 且含空白」,于是 collapseForReduction 的切口路径零覆盖;
   // 尾部扫描那个二次方也没有一行会在 main 上超时。修复不被自己的语料覆盖,下一次改动就没有红。

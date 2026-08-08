@@ -1010,6 +1010,28 @@ describe("单卡片归约预算", () => {
     expect(plain).toContain("EN budget plain");
   });
 
+  it("预算提示在 payload cap 下保留,服务端省略计数不包含预算提示", () => {
+    for (const maxPayloadBytes of [131_072, 65_536]) {
+      const caps = {
+        elements: new Set(["TextBlock"]),
+        maxPayloadBytes,
+      } as CardCaps & { maxPayloadBytes: number };
+      const { card, plain } = buildDisplayCard({ caps, blocks: mk(200, COLON_DENSE) });
+      const texts = body({ card }).map((e) => (e as { text?: string }).text ?? "");
+      expect(texts, `${maxPayloadBytes}:预算提示被 limit fitting 丢掉了`)
+        .toContain("… 部分内容超出本卡片的脱敏预算,未渲染");
+      expect(plain, `${maxPayloadBytes}:plain 里没有预算提示`).toContain("… 部分内容未渲染");
+
+      const renderedContent = texts.filter((text) => text === COLON_DENSE).length;
+      const dropText = texts.find((text) => text.includes("超出服务端限制")) ?? "";
+      const serverDropped = Number(dropText.match(/省略 (\d+) 项/)?.[1] ?? Number.NaN);
+      // 预算先允许 30 个完整内容块;容量拟合只应给这 30 个候选记账。预算提示是保留项,
+      // 不能被算成「省略 1 项」,更不能顶掉预算耗尽这个真实原因。
+      expect(renderedContent + serverDropped, `${maxPayloadBytes}:服务端省略数把预算提示也算进去了`)
+        .toBe(30);
+    }
+  });
+
   it("真实体量的卡片一个元素都不少", () => {
     // 这几种是预算**不该**碰到的。给足余量:20 × 4000 = 80000,离 120000 还有三分之一,
     // 不是靠掐着上限刚好通过(上一版 30 × 3999 = 119970,任何一处多花 30 字符就翻车)。
@@ -1096,10 +1118,11 @@ describe("单卡片归约预算", () => {
   // 换成真的会跑完整条管线的形状,并且**先断言它确实跑了** —— 形状一旦再退化成短路,
   // 下面两条内容断言先红,而不是计时安静地变成 0 ms。
   it("最坏形状:预算把 text/rich 都压住,而且形状确实跑完了管线", () => {
-    // 每块 3905 字符(≤4000,界不截断),主体是一个 3900 字符的点密集长词:每个点后都给
-    // schemeless userinfo 正则一个新的单词边界起点,它会反复回退找并不存在的冒号。不带 `mk` 的
-    // `b${i} ` 前缀 —— 带上就 4005 > 4000,界会把 kept 砍成两个字符,又变成测空气。
-    const values = Array.from({ length: 200 }, (_, i) => "a.".repeat(1950) + ` blk${i}`);
+    // 每块 3902–3904 字符(≤4000,界不截断),主体是点密集长词;末尾的 protocol-relative URL
+    // **真的会被 pass 2 改写**且带 @,所以会走安全所需的 preflight。这才是可达最坏形状,
+    // 不是 substring gate 恰好短路的校准形状。
+    const values = Array.from({ length: 200 }, (_, i) =>
+      "a.".repeat(1929) + ` //host.example/x?owner=ops@example.com blk${i}`);
     const textBlocks = values.map((text) => ({ type: "text" as const, text }));
     const richBlocks = values.map((text) => ({ type: "rich" as const, segments: [{ text }] }));
     const text = buildDisplayCard({ caps: FULL_CAPS, blocks: textBlocks });
@@ -1108,7 +1131,7 @@ describe("单卡片归约预算", () => {
     // 30 个内容块(120000 / 4000)+ 1 条超预算提示。数字对上,才说明每块真按 4000 计了费。
     expect(rendered, "形状退化了:没有按每块 4000 字符计费").toHaveLength(31);
     expect((rendered[0] as { text: string }).text.length, "首块被截短了,管线没有跑在 3900 字符上")
-      .toBe(3905);
+      .toBeGreaterThan(3800);
     expect(body(rich), "rich 比较趟绕过了同一预算").toHaveLength(31);
 
     const timed = (blocks: typeof textBlocks | typeof richBlocks): number => {
@@ -1119,7 +1142,7 @@ describe("单卡片归约预算", () => {
     };
     const textMs = timed(textBlocks);
     const richMs = timed(richBlocks);
-    // 修复后独立 warmed 测量(3 次):text 501–586 ms,中位 546;rich 971–1161,中位 989。
+    // 这里测的是会真正启动 preflight 的可达形状;具体范围在修复后独立 warmed 重量并写回。
     // 宽阈值只挡预算失效/分钟级回归;毫秒级的重复扫描由 parity 里的 base 比值单独看守。
     expect(textMs, `text:200 块 × 点密集 3905 字符耗时 ${textMs.toFixed(0)} ms`).toBeLessThan(3500);
     expect(richMs, `rich:200 块 × 点密集 3905 字符耗时 ${richMs.toFixed(0)} ms`).toBeLessThan(5000);

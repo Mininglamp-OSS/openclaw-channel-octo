@@ -193,23 +193,42 @@ describe("与 def63bb 的差分 parity", () => {
     expect(h, `head 渲染了 base 没露出的口令。head=${JSON.stringify(h)}`).not.toContain(secret);
   });
 
-  it("没有 protocol-relative pass 的点密集输入,归约成本保持接近 base", () => {
-    const medianMs = (fn: () => unknown): number => {
+  const pairedMedianMs = (baseFn: () => unknown, headFn: () => unknown): [number, number] => {
+    for (let i = 0; i < 3; i++) {
+      baseFn();
+      headFn();
+    }
+    const baseSamples: number[] = [];
+    const headSamples: number[] = [];
+    const measure = (fn: () => unknown): number => {
+      const start = performance.now();
       for (let i = 0; i < 3; i++) fn();
-      const samples: number[] = [];
-      for (let i = 0; i < 7; i++) {
-        const start = performance.now();
-        fn();
-        samples.push(performance.now() - start);
-      }
-      return samples.sort((a, b) => a - b)[Math.floor(samples.length / 2)]!;
+      return (performance.now() - start) / 3;
     };
+    // 交错测量顺序,每个 sample 又批量跑 3 次:避免 base 永远先测带来的 JIT/调度单边偏差。
+    for (let i = 0; i < 7; i++) {
+      if (i % 2 === 0) {
+        baseSamples.push(measure(baseFn));
+        headSamples.push(measure(headFn));
+      } else {
+        headSamples.push(measure(headFn));
+        baseSamples.push(measure(baseFn));
+      }
+    }
+    const median = (xs: number[]): number => xs.sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
+    return [median(baseSamples), median(headSamples)];
+  };
+
+  it("pass 2 没有实际改写时,点密集输入的归约成本保持接近 base", () => {
     for (const [label, input] of [
       ["无 @", "a.".repeat(2000)],
       ["只有无关 @", "a.".repeat(1999) + "a@"],
+      ["只有无效 // 与 @", "a.".repeat(1997) + " // @"],
     ] as const) {
-      const baseMs = medianMs(() => base.reduceUrlsInText(input));
-      const headMs = medianMs(() => head.reduceUrlsInText(input));
+      const [baseMs, headMs] = pairedMedianMs(
+        () => base.reduceUrlsInText(input),
+        () => head.reduceUrlsInText(input),
+      );
       expect(
         headMs,
         `${label}:head ${headMs.toFixed(1)} ms / base ${baseMs.toFixed(1)} ms,` +
@@ -218,14 +237,18 @@ describe("与 def63bb 的差分 parity", () => {
     }
   });
 
-  it("没有 protocol-relative pass 时不启动 userinfo preflight", () => {
-    const matchAll = vi.spyOn(String.prototype, "matchAll");
-    try {
-      head.reduceUrlsInText("a.".repeat(1999) + "a@");
-      expect(matchAll, "只有无关 @、没有 //,却仍启动了整趟 preflight").not.toHaveBeenCalled();
-    } finally {
-      matchAll.mockRestore();
-    }
+  it("真实 pass-2 + @ 形状的可达成本受控且输出与 base 一致", () => {
+    const input = "a.".repeat(1978) + " //host.example/x?owner=ops@example.com";
+    expect(input.length).toBeLessThanOrEqual(head.REDUCE_INPUT_MAX);
+    expect(head.reduceUrlsInText(input)).toBe(base.reduceUrlsInText(input));
+    const [baseMs, headMs] = pairedMedianMs(
+      () => base.reduceUrlsInText(input),
+      () => head.reduceUrlsInText(input),
+    );
+    expect(
+      headMs,
+      `真实 preflight:head ${headMs.toFixed(1)} ms / base ${baseMs.toFixed(1)} ms`,
+    ).toBeLessThan(baseMs * 2.4);
   });
 
   const rows = generateParitySpace();
