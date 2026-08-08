@@ -88,6 +88,26 @@ const SIGNALS: Record<string, (s: string) => string> = {
   jwtFar: (s) => s + " " + "x ".repeat(5000) + "eyJabcdefgh.abcdefgh.abc",
 };
 
+/**
+ * pass 2 会把这些 protocol-relative host 的 JWT 第三段截在纯字母前缀处并先行归约;
+ * 剩下的字母数字段又恰好成为 pass 3 的用户名。它覆盖的是**两个 pass 的交互**,不是某个
+ * 单独维度:敏感信号在 pass 2 消失、外部口令副本随后从 generic=false sink 渲染。
+ */
+const PASS2_JWT_PREFIXES = [
+  `eyJabcdefgh.${"b".repeat(64)}.abc4w9WgXcQ`,
+  `eyJAAAAAAAA.${"C".repeat(72)}.ccc1tail`,
+  `eyJ12345678.${"d".repeat(80)}.xyz9rest`,
+  `eyJabcdefgh.${"E".repeat(96)}.def2more`,
+  `eyJAbCdEf12.${"g".repeat(128)}.qrs3suffix`,
+];
+
+const PASS2_EXTERNAL_SECRETS: Record<string, string> = {
+  passphrase: "correcthorsebattery",
+  plain: PWS.plain!,
+  withSlash: PWS.withSlash!,
+  entropy36: PWS.entropy36!,
+};
+
 export function generateParitySpace(): Row[] {
   const rows: Row[] = [];
   const push = (dims: Dims, input: string, secret: string): void => {
@@ -119,6 +139,27 @@ export function generateParitySpace(): Row[] {
     for (const host of Object.keys(HOSTS)) {
       for (const wrap of Object.keys(WRAPS)) {
         for (const signal of ["keywordInSpan", "keywordNear"]) mk("ascii", pw, host, "full", wrap, signal);
+      }
+    }
+  }
+  // pass-order 交互切片:5 个可被 pass 2 部分消费的 JWT host × 4 种口令 × 3 种新 pass-3 host。
+  // 不能只在 WRAPS/PWS/HOSTS 各自有一个值就算覆盖 —— 第十三轮 P0 正是这些维度单独都在、
+  // 组合却不在,于是 30k 次差分仍然全绿。
+  for (const [prefixIndex, prefix] of PASS2_JWT_PREFIXES.entries()) {
+    for (const [pw, secret] of Object.entries(PASS2_EXTERNAL_SECRETS)) {
+      for (const host of ["singleLabel", "ipv6", "numeric"]) {
+        push(
+          {
+            user: `pass2JwtPrefix${prefixIndex}`,
+            pw,
+            host,
+            copy: "full",
+            wrap: "protocolRelativePoison",
+            signal: "jwtDestroyedByPass2",
+          },
+          `//${prefix}:${secret}@${HOSTS[host]}/x retry with ${secret}`,
+          secret,
+        );
       }
     }
   }

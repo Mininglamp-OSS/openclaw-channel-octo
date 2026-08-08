@@ -221,6 +221,24 @@ describe("summarizeToolParams", () => {
     // 已识别的 DSN 仍走原来的安全归约,default-deny 只处理 pass 之后的 residue。
     expect(reduceUrlsInText("user:hunter2Kx@db.example.com")).toBe("https://example.com");
   });
+
+  it("前序归约不能删掉新 userinfo 形状赖以扣留整行的信号", () => {
+    const password = "correcthorsebattery";
+    // 中段刻意拉长:base 的 read 摘要会在口令之前截断;head 若先删 JWT 再把 DSN 归约成短 host,
+    // 外部副本反而完整落进 64 字符窗口。这才是严格的 base-clean/head-leak,不是双方本来都泄漏。
+    const jwtHost = `eyJabcdefgh.${"b".repeat(80)}.abc4w9WgXcQ`;
+    const input = `//${jwtHost}:${password}@vault/x retry with ${password}`;
+
+    // pass 2 会把 protocol-relative JWT host 先归约掉;pass 3 若只看改写后的残串,就看不到
+    // base 用来扣留整行的 JWT,并把后面的低熵口令副本渲染进 generic=false 的 read sink。
+    expect(reduceUrlsInText(input), "归约入口本身必须在信号消失前 fail closed").toBe("");
+    expect(summarizeToolParams("read", { file_path: input }), "群可见 read 摘要不得渲染外部口令副本")
+      .toBe("");
+
+    // Preflight 只保护后来会进入新 pass-3 形状的候选,不能把正常 URL 降级改成整行扣下。
+    expect(reduceUrlsInText("//docs.example.com/guide/getting-started")).toBe("https://example.com");
+    expect(reduceUrlsInText(`https://${jwtHost}:${password}@vault/x`)).toBe("https://vault");
+  });
   it("检索类取 query/pattern", () => {
     expect(summarizeToolParams("grep", { pattern: "TODO", path: "/x" })).toBe("TODO");
     expect(summarizeToolParams("web_search", { query: "how to" })).toBe("how to");

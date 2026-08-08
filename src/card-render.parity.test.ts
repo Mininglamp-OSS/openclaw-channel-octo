@@ -168,6 +168,17 @@ describe("与 def63bb 的差分 parity", () => {
     }
   });
 
+  it("pass 2 删除 JWT 信号后,head 不能渲染 base 完全没露出的外部口令", () => {
+    const secret = "correcthorsebattery";
+    const input =
+      `//eyJabcdefgh.${"b".repeat(80)}.abc4w9WgXcQ:${secret}@vault/x ` +
+      `retry with ${secret}`;
+    const b = runSink(base, baseEcho, "read", input);
+    const h = runSink(head, headEcho, "read", input);
+    expect(b, `这个用例不是 base-clean,不能证明回归。base=${JSON.stringify(b)}`).not.toContain(secret);
+    expect(h, `head 渲染了 base 没露出的口令。head=${JSON.stringify(h)}`).not.toContain(secret);
+  });
+
   const rows = generateParitySpace();
   const regressions: Hit[] = [];
   const overHides: Hit[] = [];
@@ -196,6 +207,8 @@ describe("与 def63bb 的差分 parity", () => {
     // 越界尾部是 P0-1 所在的边界,而在它进来之前,整个语料最长的一行是 375 字符。
     const far = rows.filter((r) => r.input.length > 131_072);
     expect(far.length, "没有任何一行越过 2×RAW_INPUT_MAX").toBeGreaterThanOrEqual(30);
+    const passOrder = rows.filter((r) => r.dims.signal === "jwtDestroyedByPass2");
+    expect(passOrder.length, "pass 2 删信号 × 新 pass 3 × 外部副本的交互切片退化了").toBe(60);
     // 嵌套 DSN / JWT / 含 `/` 口令 / 非 ASCII 用户名 —— 每一类都曾经是护栏的盲点。
     for (const [label, pred] of [
       ["嵌套 DSN 口令", (r: Row) => r.dims.pw === "nestedDsn"],
