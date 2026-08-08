@@ -290,11 +290,11 @@ describe("标题失败时的原因", () => {
     const r = buildInteractiveCard({ title: "   ", buttons: [button] } as never);
     expect("error" in r && r.error).toContain("is required");
   });
-  // 归约返回空还有第三个原因,而上面三条一条都盖不到它 —— 反向验证时把长度判据改成恒真,
-  // 这一组全绿,说明「短标题被告知超过 4000 字符」这个缺陷当时没有任何断言看得见。
-  it("短的不可解析 URL → 说 URL,不说长度", () => {
+  // 归约返回空可能是 URL 解析失败,也可能是 poison/default-deny 主动扣下。调用方拿不到精确原因,
+  // 就用中性且真实的“被清洗扣留”,不能把所有分支都冒充成 URL 解析失败或长度问题。
+  it("短的不可解析 URL → 中性说明被清洗扣留,不说长度", () => {
     const r = buildInteractiveCard({ title: "http://[", buttons: [button] } as never);
-    expect("error" in r && r.error).toContain("could not be parsed");
+    expect("error" in r && r.error).toContain("withheld by sanitization");
     expect("error" in r && r.error, "5 个字符的标题被告知超过 4000 字符")
       .not.toContain("too long");
   });
