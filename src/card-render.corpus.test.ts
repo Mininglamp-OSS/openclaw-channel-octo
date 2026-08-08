@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { summarizeToolParams, reduceUrlsInText, sanitizeErrorText } from "./card-render.js";
 import { REDUCE_INPUT_MAX, SUMMARY_MAX, boundedForReduction } from "./card-render.js";
-import { LEAK_CORPUS, BENIGN_CORPUS, COST_CORPUS, REWRITE_CORPUS, UNFIXED_CORPUS, PERF_CORPUS, type CorpusRow } from "./card-render.corpus.js";
+import { LEAK_CORPUS, BENIGN_CORPUS, COST_CORPUS, REWRITE_CORPUS, UNFIXED_CORPUS, PERF_CORPUS, PARITY_CORPUS, type CorpusRow, type ParitySink } from "./card-render.corpus.js";
 
 const PARAM: Record<string, (s: string) => Record<string, unknown>> = {
   grep: (s) => ({ pattern: s }),
@@ -105,6 +105,40 @@ describe("摘要管线形状语料", () => {
         }
       }
     }
+  });
+
+  // 与 main 的扣留对等性。这一组不比对字面量 —— 它比对的是**方向**:main 藏住的这里也要藏住,
+  // main 干净地渲染出来的这里不许打空。两个字段都是从 def63bb 上逐 sink 量出来的。
+  //
+  // 为什么它值得单独一组:六条 blocking finding 是同一个形状,而**只有并排跑才看得见**。
+  // 第八轮我用一次性脚本跑过、报告「0 回归」,第九轮评审在同一份代码上找到 120 条 —— 脚本和
+  // 代码有同一批盲点。所以护栏进套件之外还有第二条要求:它必须带上当初漏掉的那几类形状,
+  // 见语料里的三个「盲点」小节。
+  it("PARITY:不弱于 def63bb —— main 藏住的这里藏住,main 渲染的这里不打空", () => {
+    const sink = (tool: ParitySink, input: string): string =>
+      tool === "error" ? sanitizeErrorText(input) : summarizeToolParams(tool, PARAM[tool]!(input));
+    for (const row of PARITY_CORPUS) {
+      const at = JSON.stringify(row.input.slice(0, 44));
+      for (const tool of row.mainHides) {
+        expect(row.secret, `${at} 列了 mainHides 却没有 secret,这一行断言不到东西`).toBeTruthy();
+        expect(sink(tool, row.input), `${tool} ${at}\n      note: ${row.note}`).not.toContain(row.secret!);
+      }
+      for (const tool of row.mainRenders) {
+        expect(sink(tool, row.input), `${tool} ${at} 被整行打空,main 上是非空的\n      note: ${row.note}`)
+          .not.toBe("");
+      }
+      // 两个列表都空的行断言不到任何东西 —— 它会随代码漂移而静默失去主体,正是这条分支上
+      // 反复出现的第二类缺陷(测试丢了自己的被测对象)。
+      expect(row.mainHides.length + row.mainRenders.length, `${at} 两个列表都是空的,这一行什么都没断言`)
+        .toBeGreaterThan(0);
+    }
+    // 三类盲点各自至少要有一行,否则这组会退化回第八轮那个「跟代码同盲点」的护栏。
+    expect(PARITY_CORPUS.filter((r) => r.secret?.includes("/")).length,
+      "没有任何一行的口令含 `/` —— 120 条回归的那一类不在覆盖里").toBeGreaterThan(0);
+    expect(PARITY_CORPUS.filter((r) => r.secret && r.input.split(r.secret).length > 2).length,
+      "没有任何一行的外部副本是被删串的子串").toBeGreaterThan(0);
+    expect(PARITY_CORPUS.filter((r) => r.mainRenders.length > 0).length,
+      "没有任何一行测反方向 —— 过度隐藏不在覆盖里").toBeGreaterThan(0);
   });
 
   // 每一行标注的 reachesPasses 必须与实际一致。空白边界截断落地后,超过上限且前 4000 字符

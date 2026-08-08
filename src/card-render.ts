@@ -242,10 +242,24 @@ function hasLinearSecretShape(s: string, generic: boolean): boolean {
  * `"`,却因为「有冒号、有 @、中间超 256」被整块打空(评审第七轮 P2)。要求冒号前是用户名字符,
  * JSON 那些 `":"` 全部被跳过,而 `alice:<300>@host` 照样命中。
  */
+/**
+ * `def63bb` 的 pass 3,**逐字抄下来**。poison 要问的是「main 当初会不会归约这一段」,
+ * 那就问 main 的规则本身,不要再复刻一遍 —— 上一版只复刻了 host 半边、漏掉口令类不含 `/`,
+ * 整个「口令含 `/`」的族因此判错。这条只读不改,是一份历史快照。
+ */
+const MAIN_PASS3_RE =
+  /\b[A-Za-z0-9._%+-]+:[^\s/]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:\/[^\s]*)?/;
+
 const OVERLONG_USERINFO_MAX = 256;
 const USERINFO_NAME_CHAR = /[A-Za-z0-9._%+-]/;
 function hasOverlongUserinfo(s: string): boolean {
   for (const tok of s.split(/\s+/)) {
+    // **带 scheme 的 URL 不是裸 userinfo。** `https:` 的冒号前面是用户名字符,于是任何长过
+    // ~257 字符、又在别处含 `@` 的 URL(预签名、追踪、OAuth 回跳)都被当成超限 userinfo。
+    // 这个检查挪到归约**之前**以后,它让 reduceUrlsInText 直接返回 ""——整行在每个 sink 上
+    // 消失,而 main 渲染注册域(评审第九轮 P1-c)。pass 1 本来就会把这类 URL 归约掉,
+    // 轮不到这里判。
+    if (TOKEN_SCHEME_RE.test(tok)) continue;
     const at = tok.lastIndexOf("@");
     if (at < 2) continue;                        // `x:@` 起码要 3 个字符
     // 找 userinfo 分隔冒号:前一个字符是用户名字符的那个 `:`(与归约正则的 `[…]+:` 对齐)。
@@ -809,13 +823,20 @@ export function reduceUrlsInText(
   // 评审第八轮的 P1-a:`credential:tok@vault retry with tok`,main 扣下,本分支渲染
   // `https://vault retry with tok`。**只发生在 main 没归约、而本分支新归约的那些 host 形状上**
   // (main 的 pass 3 只认带点 host);带点的 main 也归约,两边一致,不在此列。
-  // 判据就用「main 当初据以扣下的那个信号」= 关键词 + 明确前缀 + 超限 userinfo(非 generic 档,
-  // 不含高熵 —— 高熵那份在被删的 span 里、删掉即消失,不会在别处留副本,不需要它)。命中即
-  // 让整条归约结果落空,与 main 同样整行扣下。
+  // **两个判据都直接问,不再自己建模。** 上一版把它们写成了手工近似,两处都错了(评审第九轮):
+  //
+  //   - 「main 会不会归约这一段」曾写成 `/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(host)` ——
+  //     只复刻了 main pass 3 的 **host** 半边,漏掉它的口令类 `[^\s/]+` **不含 `/`**。于是
+  //     「口令含 `/`」整类被判成「main 也归约」,poison 不触发:
+  //     `credential:pa/ss@db.example.com retry with pa/ss` main 扣下、本分支渲染出 `pa/ss`。
+  //     实测这一类 120 条 sink 级回归、45 个不同输入。现在直接拿 main 那条正则逐字来判。
+  //   - 「这一段带没带信号」曾写死 `hasLinearSecretShape(m, false)`,丢掉了 generic 高熵档 ——
+  //     而调用方自己的谓词就在作用域里。理由曾写成「高熵那份在被删的 span 里、删掉即消失」,
+  //     那是**假的**:外部副本可以是被删长串的**子串**,自身短于 32 字符触发不了高熵检测 ——
+  //     `user:<36字符>@vault retry with <其中12字符>`。用 isSensitiveHere 就没有这个缺口。
   let poisoned = false;
-  const poisonIfNewShapeCarriesSignal = (m: string, host: string): void => {
-    const mainWouldReduce = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(host);
-    if (!mainWouldReduce && hasLinearSecretShape(m, false)) poisoned = true;
+  const poisonIfNewShapeCarriesSignal = (m: string, _host: string): void => {
+    if (!MAIN_PASS3_RE.test(m) && isSensitiveHere.linear(m)) poisoned = true;
   };
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。

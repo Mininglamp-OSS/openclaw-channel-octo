@@ -536,6 +536,42 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
     expect: { grep: "" },
     note: "R9 造串哨兵:十六进制被 new URL() 展开成 `127.0.0.1`",
   },
+  // 第八/九轮点出的一类:`user:pass@host`,其中 host 是归约的两条 userinfo 正则都匹配不上的
+  // 形状(非 ASCII 用户名、IPv6 zone-id、空 host)。`path` 策略直接展示原文,而它走 generic=false
+  // 档、跳过高熵那一层,于是口令原样出现在卡片上。
+  //
+  // **main 上逐字相同**(见每行 note 的实测),不是本 PR 引入的。不在这里关掉是因为几种关法都会
+  // 撞上「不许回归」:放宽用户名字符类会重新打开 CJK 整句删除;一条「凡是残留 userinfo 形状就
+  // 整行扣下」会把钉住的良性行 `email:\s*\S+@\S+` 打空;要区分这两者就得引入第三份 userinfo
+  // 匹配规则 —— 而「第二份/第三份本该镜像第一份的表却没镜像上」正是这条分支反复出问题的成因。
+  // 钉在这里,让它进造串检测、并且一旦行为变化就变红,修法留给独立改动。
+  {
+    input: "用户:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@host.example",
+    expect: {
+      read: "用户:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@host.example",
+      grep: "",
+      exec: "",
+    },
+    note: "R8 已知未修:非 ASCII 用户名,两条 userinfo 正则的用户名类都是 ASCII。main 上 read 渲染同一串",
+  },
+  {
+    input: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@[fe80::1%eth0]",
+    expect: {
+      read: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@[fe80::1%eth0]",
+      grep: "",
+      exec: "",
+    },
+    note: "R8 已知未修:IPv6 zone-id 的 `%eth0` 不在括号内主机类里。main 上 read 渲染同一串",
+  },
+  {
+    input: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@",
+    expect: {
+      read: "u:Ab3xY9zQ1wKpQ7mN2vT5bR8sD4fG6hJ0kL@",
+      grep: "",
+      exec: "",
+    },
+    note: "R8 已知未修:空 host,`@` 后没有主机可归约。main 上 read 渲染同一串",
+  },
 ];
 
 /**
@@ -688,5 +724,104 @@ export const PERF_CORPUS: PerfRow[] = [
     input: "x " + Array.from({ length: 200 }, (_, i) => `V${i}='a'`).join(""),
     reachesPasses: true,
     note: "R5-nit:`(^|[SHELL_BREAK])` 前导在同一串上反复命中,测的是匹配次数而不是单次回溯",
+  },
+];
+
+/**
+ * **与 `def63bb` 的扣留对等性(parity)。** 这一组的判据不是「输出等于某个字面量」,而是
+ * **「本 head 至少和 main 藏得一样多」** —— 凡是 main 会扣下的凭据子串,本 head 也不许渲染。
+ *
+ * 为什么要单独一组:这条分支九轮评审里,有六条 blocking 是同一个形状 ——「为性能加的界/为修一个
+ * 洞加的判据,静默削弱了另一处脱敏」,而且**只有把行为与 main 逐 sink 并排跑才看得见**。
+ * 第八轮我用一次性脚本跑过一遍、报告「0 回归」,第九轮评审在同样的代码上找到 120 条 —— 因为
+ * 那个脚本和代码有**同一批盲点**。所以它必须进套件,而且必须带上当初漏掉的那几类形状:
+ *
+ *   1. **口令含 `/`** —— main 的 pass 3 口令类是 `[^\s/]+`,它同样不归约;而本分支放宽后归约了,
+ *      删掉的 span 里若有关键词,整行就从「扣下」变成「渲染」。
+ *   2. **外部副本是被删串的子串** —— 副本自身短于 32 字符,触发不了高熵检测。
+ *   3. **长 URL 带 `@`** —— 反方向:不许把 main 渲染的内容整行打空。
+ *
+ * **两个字段都是逐 sink 实测的,不是「应该」。** 一开始我把它们写成两个布尔,跑起来才发现两边
+ * 都不成立:第 4 行的口令在 main 的 `read` 上**本来就是明文**(见 UNFIXED 组末尾那三行的同一类
+ * 成因),一条「任何 sink 都不许出现」会把一个 main 也有的洞算到本 PR 头上;而第 7 行在 main 的
+ * `exec` 上就是空(shell 策略只取程序名),一条「哪个 sink 都不许打空」会把它判红。所以两个字段
+ * 都是 sink 列表,值从 `def63bb` 上量出来粘贴。
+ */
+export type ParitySink = "error" | "grep" | "read" | "exec";
+
+export interface ParityRow {
+  input: string;
+  /** 必须不出现在结果里的凭据子串。只测反方向(不许打空)的行不带这个字段。 */
+  secret?: string;
+  /** `def63bb` 上**藏住了** `secret` 的 sink(实测)。本 head 在这些 sink 上也必须藏住。 */
+  mainHides: ParitySink[];
+  /**
+   * `def63bb` 上渲染出**非空且不含 `secret`** 的 sink(实测)。本 head 不许把这些打空。
+   *
+   * 「不含 secret」这半个条件是必须的:main 泄漏、本 head 打空,那是修好了,不是过度隐藏 ——
+   * 第 6 行(R12 那条)正是这样,少了这半个条件它会因为自己的修复而变红。
+   */
+  mainRenders: ParitySink[];
+  note: string;
+}
+
+export const PARITY_CORPUS: ParityRow[] = [
+  // 盲点 1:口令含 `/`。main 的 pass3 口令类不含 `/`,所以 main 也不归约、整行靠关键词扣下。
+  {
+    input: "credential:pa/ss@db.example.com retry with pa/ss",
+    secret: "pa/ss",
+    mainHides: ["error", "grep", "read", "exec"],
+    mainRenders: [],
+    note: "R13:口令含 `/`。mainWouldReduce 只建模 host 半边时,这一类 poison 不触发(120 条回归的来源)",
+  },
+  {
+    input: "password:aB3/xY9z@db.example.com fallback aB3/xY9z",
+    secret: "aB3/xY9z",
+    mainHides: ["error", "grep", "read", "exec"],
+    mainRenders: [],
+    note: "R13:同上,另一个关键词与口令构成",
+  },
+  {
+    input: "credential:pa/ss@10.0.0.5 retry with pa/ss",
+    secret: "pa/ss",
+    mainHides: ["error", "grep", "read", "exec"],
+    mainRenders: [],
+    note: "R13:同上,全数字 host",
+  },
+  // 盲点 2:外部副本是被删长串的子串,自身短于高熵阈值。
+  {
+    input: "user:Ab3xY9zQ1wKpAb3xY9zQ1wKpAb3xY9zQ1wKp@vault retry with Ab3xY9zQ1wKp",
+    secret: "Ab3xY9zQ1wKp",
+    mainHides: ["error", "grep", "exec"],
+    mainRenders: [],
+    note: "R13:36 字符触发高熵、外部那份 12 字符不触发。poison 写死非 generic 档时漏掉",
+  },
+  // 已修的几类,留在这里防回退。
+  {
+    input: "credential:tok9Fk2Lp@vault retry with tok9Fk2Lp",
+    secret: "tok9Fk2Lp",
+    mainHides: ["error", "grep", "read", "exec"],
+    mainRenders: [],
+    note: "R12:关键词在被删的 span 里(第八轮 P1-a)",
+  },
+  {
+    input: "alice:hunter2" + "h".repeat(250) + "/x:b@localhost",
+    secret: "hunter2hhhh",
+    mainHides: ["error", "grep", "exec"],
+    mainRenders: [],
+    note: "R12:超 256 口令含 `/`,归约重启点吃掉 `@`(第八轮 P1-b)",
+  },
+  // 盲点 3:反方向 —— main 渲染的内容不许被整行打空。
+  {
+    input: "https://example.com/path?" + "a".repeat(260) + "=ops@example.net",
+    mainHides: [],
+    mainRenders: ["error", "grep", "read"],
+    note: "R13:长 URL 带 `@`。归约前的 hasOverlongUserinfo 把 `https:` 冒号当分隔符 → 整行消失(第九轮 P1-c)",
+  },
+  {
+    input: "GET https://api.example.com/v1/items?filter=" + "z".repeat(300) + "&contact=ops@example.com 200 OK",
+    mainHides: [],
+    mainRenders: ["error", "grep", "read", "exec"],
+    note: "R13:同上,查询参数里的 `@`",
   },
 ];
