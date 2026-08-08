@@ -1,4 +1,8 @@
-import { reduceUrlsInText, isSensitive } from "./card-render.js";
+import {
+  isDefinitelyBlankWithinReductionBound,
+  isSensitive,
+  reduceUrlsInText,
+} from "./card-render.js";
 
 export type CardActionStatus = "processing" | "completed" | "error";
 
@@ -25,7 +29,10 @@ function neutralizeEcho(value: string): string {
   // 归约把一段**非空**内容整个清空,只可能是因为它敏感(超限 userinfo、切不出空白的超长串、
   // 或新形状带着关键词被 poisoned)—— reduceUrlsInText 对良性内容只会降级,不会清空。所以
   // 「非空进、空出」= 敏感,和下面 isSensitive 命中同样退回 `[redacted]`,而不是显示成空白。
-  if (isSensitive(reduced, true) || (value.trim() !== "" && reduced.trim() === "")) return "[redacted]";
+  if (
+    isSensitive(reduced, true) ||
+    (reduced.trim() === "" && !isDefinitelyBlankWithinReductionBound(value))
+  ) return "[redacted]";
   return reduced.replace(/[\\`*_~\[\]<]/g, "\\$&");
 }
 

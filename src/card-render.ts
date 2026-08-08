@@ -653,6 +653,18 @@ export function cutOnWhitespace(s: string, max: number): string | null {
 }
 
 /**
+ * 原串是否能在归约额度内被**确定**为空白。
+ *
+ * 调用方不能直接 `s.trim()` 来区分「空输入」与「归约后被扣下」:那会重新把成本绑回原始输入
+ * 长度。只有整串都落在 REDUCE_INPUT_MAX 内时才下空白结论;超长输入即使保留前缀全是空白,
+ * 尾部也没有被检查,因此返回 false 让调用方 fail closed。trim 面对的量恒 ≤4000。
+ */
+export function isDefinitelyBlankWithinReductionBound(s: string): boolean {
+  const bounded = cutOnWhitespace(s, REDUCE_INPUT_MAX);
+  return bounded !== null && bounded.length === s.length && bounded.trim() === "";
+}
+
+/**
  * 归约之前那一步空白折叠的输入上限。
  *
  * `REDUCE_INPUT_MAX` 管的是管线,但把文本送进管线之前先要对**原串**折叠空白,而那一步没有
@@ -845,8 +857,13 @@ export function reduceUrlsInText(
   // 被消费的那一段里,等 pass 3 callback 再问已经太晚:它看到的是信号消失后新拼出的候选。
   // 因此在 pass 2 之前先用**同一份 pass-3 matcher 与同一个 poison 判据**保存证据。完整的
   // scheme URL 已由 pass 1 消费,不会把本来可以安全归约的 URL 误判成裸 userinfo。
-  for (const match of out.matchAll(SCHEMELESS_USERINFO_RE)) {
-    poisonIfNewShapeCarriesSignal(match[0]);
+  // 只有 pass 2 可能运行(`//`)且存在 userinfo 必需分隔符(`@`)时才值得付这整趟扫描。
+  // 这是两个 pass 自己的必要条件,不复制用户名/口令/host 字符类;点密集普通文本因此只跑最终
+  // pass 3 那一次,而真正的 pass-order 形状仍由同一个 matcher/helper 保存证据。
+  if (out.indexOf("//") >= 0 && out.indexOf("@") >= 0) {
+    for (const match of out.matchAll(SCHEMELESS_USERINFO_RE)) {
+      poisonIfNewShapeCarriesSignal(match[0]);
+    }
   }
   // 2. 协议相对 `//host/path`:补 https 后降级(secret 可能在 path)。
   out = out.replace(PROTOCOL_RELATIVE_RE, (_m, p1: string) => {

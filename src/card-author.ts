@@ -1,5 +1,14 @@
 import { cardFitsLimits } from "./card-limits.js";
-import { boundedForReduction, cardSupports, cutOnWhitespace, isSensitive, reduceUrlsInText, REDUCE_INPUT_MAX, type CardCaps } from "./card-render.js";
+import {
+  boundedForReduction,
+  cardSupports,
+  cutOnWhitespace,
+  isDefinitelyBlankWithinReductionBound,
+  isSensitive,
+  reduceUrlsInText,
+  REDUCE_INPUT_MAX,
+  type CardCaps,
+} from "./card-render.js";
 import { CARD_INTERACTIVE_PROFILE } from "./types.js";
 
 export interface CardButtonSpec {
@@ -85,10 +94,10 @@ function cleanTextWithReason(value: unknown, max: number): { text: string } | { 
   if (typeof value !== "string") return { reason: "must be a string" };
   const reduced = reduceUrlsInText(value).trim();
   if (!reduced) {
-    if (!value.trim()) return { reason: "is required" };
-    // **归约返回空有三个原因,不能用一句话全包。** 上一版把「不是空白」一律报成长度问题,于是
-    // 5 个字符的 `a://:` 被告知「over 4000 characters」—— 上一个版本报错报反了方向,这一版
-    // 换了个方向报反,同样把作者指向查不到东西的地方。三个原因逐个问**规则本人**,不重写判据:
+    if (isDefinitelyBlankWithinReductionBound(value)) return { reason: "is required" };
+    // **归约返回空有多个原因,不能把它们全冒充成同一个具体原因。** 上一版把「不是空白」一律
+    // 报成长度问题,5 个字符的 `a://:` 被告知「over 4000 characters」;后来又把 poison、
+    // residual default-deny 和 URL 解析失败全报成 URL 问题。能从同一 authority 确定的两类先问:
     if (value.length > REDUCE_INPUT_MAX) {
       // 1. 超长且前 4000 字符里切不出空白 —— 界整段拒掉,确实是长度问题。
       if (cutOnWhitespace(value, REDUCE_INPUT_MAX) === null) {
@@ -99,8 +108,9 @@ function cleanTextWithReason(value: unknown, max: number): { text: string } | { 
       // 2. 切得出空白,但切口之后那一段敏感 —— 这是内容问题,不是长度问题。
       if (boundedForReduction(value) === null) return { reason: "must not contain sensitive data" };
     }
-    // 3. 界放行,归约仍然清空 —— 第 1 趟里 `new URL()` 解析失败,整段被抹掉。
-    return { reason: "contains a URL that could not be parsed" };
+    // 3. 界放行而归约仍清空:可能是 URL 解析失败,也可能是 poison / residual default-deny。
+    // reduceUrlsInText 的公开契约没有暴露更细原因;与其复制三套规则,给出中性且真实的说明。
+    return { reason: "was withheld by sanitization" };
   }
   if (isSensitive(reduced, true)) return { reason: "must not contain sensitive data" };
   return { text: reduced.length > max ? `${reduced.slice(0, max)}…` : reduced };
