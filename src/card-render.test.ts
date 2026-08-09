@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   OCTO_CARD_LAYOUTS,
   detectOctoCardLayout,
@@ -8,6 +8,11 @@ import {
   summarizeToolParams,
   sanitizeErrorText,
   reduceUrlsInText,
+  isSensitive,
+  collapseForReduction,
+  boundedForReduction,
+  REDUCE_INPUT_MAX,
+  RAW_INPUT_MAX,
   fmtDuration,
   stepLine,
   cardSupports,
@@ -196,6 +201,90 @@ describe("summarizeToolParams", () => {
     // 多段有效后缀多保留一段。
     expect(summarizeToolParams("fetch", { url: "https://x.example.com.cn/p" })).toBe("https://example.com.cn");
     expect(summarizeToolParams("fetch", { url: "not a url" })).toBe("");
+  });
+
+  it("所有摘要策略在 trim/split/URL parse 前拒绝超过 raw 上限的参数", () => {
+    // 这些输入在当前实现上都会先做整串工作,然后才撞到下游的 REDUCE_INPUT_MAX / RAW_INPUT_MAX:
+    // query/shell 先 trim,path 还会 split 出成千上万个段,url 则先 parse 整条 URL。边界必须住在
+    // 共享取值处,否则只修 firstString.trim 仍会漏掉 path split 与 url parse。
+    const path = "root/" + "segment/".repeat(Math.ceil(RAW_INPUT_MAX / 8)) + "file";
+    const query = "TODO " + " ".repeat(RAW_INPUT_MAX);
+    const command = "git " + " ".repeat(RAW_INPUT_MAX);
+    const url = "https://docs.example.com/" + "x".repeat(RAW_INPUT_MAX);
+    for (const value of [path, query, command, url]) expect(value.length).toBeGreaterThan(RAW_INPUT_MAX);
+
+    const originalTrim = String.prototype.trim;
+    const originalSplit = String.prototype.split;
+    let maxTrimmedLength = 0;
+    let maxSplitLength = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      maxTrimmedLength = Math.max(maxTrimmedLength, this.length);
+      return originalTrim.call(this);
+    });
+    const split = vi.spyOn(String.prototype, "split").mockImplementation(function (
+      this: string,
+      separator?: string | RegExp,
+      limit?: number,
+    ) {
+      maxSplitLength = Math.max(maxSplitLength, this.length);
+      return originalSplit.call(this, separator, limit);
+    });
+
+    let got: string[] = [];
+    try {
+      got = [
+        summarizeToolParams("read", { path }),
+        summarizeToolParams("grep", { pattern: query }),
+        summarizeToolParams("exec", { command }),
+        summarizeToolParams("fetch", { url }),
+      ];
+    } finally {
+      split.mockRestore();
+      trim.mockRestore();
+    }
+
+    expect(got).toEqual(["", "", "", ""]);
+    expect(maxTrimmedLength, `trim 收到了 ${maxTrimmedLength} 字符的原始参数`)
+      .toBeLessThanOrEqual(RAW_INPUT_MAX);
+    expect(maxSplitLength, `split 收到了 ${maxSplitLength} 字符的原始参数`)
+      .toBeLessThanOrEqual(RAW_INPUT_MAX);
+  });
+
+  it("归约后残留的 schemeless name:secret@ token 一律 fail closed", () => {
+    const residual = [
+      "用户:hunter2Kx@host.example",
+      "а:hunter2Kx@host.example",
+      "u:hunter2Kx@[fe80::1%eth0]",
+      "u:hunter2Kx@",
+      '"user":hunter2Kx@db.example.com',
+      "[postgres]:hunter2Kx@db.example.com",
+    ];
+    for (const input of residual) {
+      expect(reduceUrlsInText(input), input).toBe("");
+      expect(summarizeToolParams("read", { file_path: input }), input).toBe("");
+      expect(sanitizeErrorText(input), input).toBe("");
+    }
+
+    // 已识别的 DSN 仍走原来的安全归约,default-deny 只处理 pass 之后的 residue。
+    expect(reduceUrlsInText("user:hunter2Kx@db.example.com")).toBe("https://example.com");
+  });
+
+  it("前序归约不能删掉新 userinfo 形状赖以扣留整行的信号", () => {
+    const password = "correcthorsebattery";
+    // 中段刻意拉长:base 的 read 摘要会在口令之前截断;head 若先删 JWT 再把 DSN 归约成短 host,
+    // 外部副本反而完整落进 64 字符窗口。这才是严格的 base-clean/head-leak,不是双方本来都泄漏。
+    const jwtHost = `eyJabcdefgh.${"b".repeat(80)}.abc4w9WgXcQ`;
+    const input = `//${jwtHost}:${password}@vault/x retry with ${password}`;
+
+    // pass 2 会把 protocol-relative JWT host 先归约掉;pass 3 若只看改写后的残串,就看不到
+    // base 用来扣留整行的 JWT,并把后面的低熵口令副本渲染进 generic=false 的 read sink。
+    expect(reduceUrlsInText(input), "归约入口本身必须在信号消失前 fail closed").toBe("");
+    expect(summarizeToolParams("read", { file_path: input }), "群可见 read 摘要不得渲染外部口令副本")
+      .toBe("");
+
+    // Preflight 只保护后来会进入新 pass-3 形状的候选,不能把正常 URL 降级改成整行扣下。
+    expect(reduceUrlsInText("//docs.example.com/guide/getting-started")).toBe("https://example.com");
+    expect(reduceUrlsInText(`https://${jwtHost}:${password}@vault/x`)).toBe("https://vault");
   });
   it("检索类取 query/pattern", () => {
     expect(summarizeToolParams("grep", { pattern: "TODO", path: "/x" })).toBe("TODO");
@@ -968,5 +1057,217 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     expect(cardSupports({ inputs: new Set(["Input.Text"]) }, "Input.Number")).toBe(false);
     expect(cardSupports({ actions: new Set(["Action.ToggleVisibility"]) }, "Action.ToggleVisibility")).toBe(true);
     expect(cardSupports({ actions: new Set(["Action.Submit"]) }, "Action.ToggleVisibility")).toBe(false);
+  });
+});
+
+describe("归约管线的输入有界(每一处都自己有界,不靠调用方)", () => {
+  // discarded tail 在固定额度内由同一个线性 authority 完整检查;超过额度直接 fail closed。
+  // 下面先钉旧窗口之外的前缀信号,再单独钉 JWT 与超额路径。
+  it("额度内的 discarded tail 完整检查,不因信号离切口较远而放行", () => {
+    const kept = "word ".repeat(800).trim();          // 3999 字符,切口落在这里
+    for (const [pads, where] of [[200, "尾巴第 ~800 位"], [1200, "尾巴第 ~4800 位"]] as [number, string][]) {
+      const s = `${kept} ${"pad ".repeat(pads)}AKIAIOSFODNN7EXAMPLE`;
+      expect(reduceUrlsInText(s), `AKIA 在${where}没有让整串扣下`).toBe("");
+    }
+    // 再远时 discarded tail 已超过额度,结果仍是 fail closed,但不再扫描无界原文。
+    const beyond = `${kept} ${"pad ".repeat(20_000)}AKIAIOSFODNN7EXAMPLE`;
+    expect(reduceUrlsInText(beyond), "超额尾巴必须 fail closed").toBe("");
+  });
+
+  it("短 JWT 无论离切口多远,都不能从 base 的扣留变成 head 的放行", () => {
+    const kept = "word ".repeat(800).trim();
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij";
+    const near = `${kept} ${"pad ".repeat(200)}${jwt}`;
+    const far  = `${kept} ${"pad ".repeat(1200)}${jwt}`;
+    expect(reduceUrlsInText(near), "切口附近的 JWT 应让整串扣下").toBe("");
+    expect(reduceUrlsInText(far), "切口 4000 字符外的 JWT 也必须让整串扣下").toBe("");
+  });
+
+  it("丢弃段超过固定扫描额度时直接 fail closed,不扫描无界原文", () => {
+    const kept = "db_pass hunter2Kx " + "word ".repeat(800);
+    const input = kept + "plain ".repeat(12_000);
+    expect(input.length).toBeGreaterThan(RAW_INPUT_MAX);
+    expect(boundedForReduction(input)).toBeNull();
+    expect(reduceUrlsInText(input)).toBe("");
+  });
+
+  it("未计费的摘要与错误 sink 对超额原文保持固定成本", () => {
+    // Reviewer 在旧实现上量到 16 MiB 约 300 ms、64 MiB 超 1 秒。输入构造放在计时外;
+    // 当前路径只切前 64 KiB、按剩余长度 fail closed,不读取那 16 MiB tail。
+    const input = "db_pass hunter2Kx " + "plain ".repeat(Math.ceil((16 * 1024 * 1024) / 6));
+    for (const [label, fn] of [
+      ["sanitizeErrorText", () => sanitizeErrorText(input)],
+      ["summarizeToolParams/grep", () => summarizeToolParams("grep", { pattern: input })],
+    ] as const) {
+      const t0 = performance.now();
+      expect(fn()).toBe("");
+      const elapsed = performance.now() - t0;
+      expect(elapsed, `${label} / 16 MiB 耗时 ${elapsed.toFixed(1)} ms`).toBeLessThan(150);
+    }
+  });
+
+  it("JWT 判定在密集 eyJ 起点上保持线性成本", () => {
+    const adversarial = "eyJ".repeat(5000);
+    const t0 = performance.now();
+    expect(isSensitive(adversarial, true)).toBe(false);
+    const elapsed = performance.now() - t0;
+    expect(elapsed, `15 KB 无点 eyJ 串耗时 ${elapsed.toFixed(1)} ms`).toBeLessThan(40);
+  });
+
+  it("JWT 线性扫描器与原规则等价,且不会从短 run 反复搜索远端 eyJ", () => {
+    const legacy = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/;
+    const alphabet = "eyJa0_-.:/";
+    let state = 0x5eed1234;
+    let legacyMatches = 0;
+    let legacyNonMatches = 0;
+    const checkEquivalent = (input: string): void => {
+      const expected = legacy.test(input);
+      if (expected) legacyMatches++;
+      else legacyNonMatches++;
+      expect(isSensitive(input, false), JSON.stringify(input)).toBe(expected);
+    };
+
+    // 保留宽随机背景,专门找意料之外的状态机分岔。
+    for (let sample = 0; sample < 20_000; sample++) {
+      state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+      const length = state % 80;
+      let input = "";
+      for (let i = 0; i < length; i++) {
+        state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+        input += alphabet[state % alphabet.length];
+      }
+      checkEquivalent(input);
+    }
+
+    // 随机串几乎不可能碰出完整 JWT。结构化扫三段长度的 7/8 边界、run 内起始偏移和错误分隔符,
+    // 同时制造足量正例与只差一个条件的近似反例,避免全 false 的实现通过这道等价护栏。
+    for (const prefix of ["", "x", "a0_-", "/"]) {
+      for (const first of [7, 8, 9, 16]) {
+        for (const middle of [7, 8, 9, 16]) {
+          for (const tail of [0, 1, 2, 8]) {
+            for (const firstSep of [".", "..", "/"]) {
+              for (const secondSep of [".", "..", ":"]) {
+                checkEquivalent(
+                  `${prefix}eyJ${"a".repeat(first)}${firstSep}` +
+                  `${"b".repeat(middle)}${secondSep}${"c".repeat(tail)} end`,
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+    expect(legacyMatches, "等价对拍没有覆盖足量 JWT 正例,全 false 的实现也会通过").toBeGreaterThan(100);
+    expect(legacyNonMatches, "等价对拍没有覆盖足量 JWT 反例,全 true 的实现也会通过").toBeGreaterThan(20_000);
+
+    // 若每个 run 都用无上界的 indexOf("eyJ", start),前面的 20 000 个短 run 会反复扫描到
+    // 最后那个 eyJ,总成本退化成二次方。真正的 run-local 扫描只读每个字符常数次。
+    const manyRuns = "a.".repeat(20_000) + "eyJabcdefgh.abcdefgh.abc";
+    const t0 = performance.now();
+    expect(isSensitive(manyRuns, false)).toBe(true);
+    const elapsed = performance.now() - t0;
+    expect(elapsed, `短 run + 远端 eyJ 耗时 ${elapsed.toFixed(1)} ms`).toBeLessThan(100);
+  });
+
+  it("切口之后的关键词仍然压得住 kept 里守卫抓不住的凭据", () => {
+    // 这是收窄整个守卫时漏掉的那个前提:「渲染的永远只有 kept,而 kept 自己要过守卫」——
+    // 只在守卫抓得住 kept 里的东西时成立。`alice:hunter2@localhost` 是本仓 UNFIXED_CORPUS
+    // 记着的、守卫**抓不住**的形状,当时压住它的只有 4000 字符之外那个 `token`。
+    const leaky = "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + " token";
+    expect(leaky.length).toBeGreaterThan(8000);
+    expect(sanitizeErrorText(leaky)).toBe("");
+    expect(summarizeToolParams("grep", { pattern: leaky })).toBe("");
+  });
+
+  it("折叠空白之前先把原串收进 RAW_INPUT_MAX", () => {
+    // 折叠跑在界**之前**,所以界救不了它 —— 实测 32–92 ms/MB。
+    const head = "word ".repeat(20_000);                  // 100 KB,已超 64 KiB
+    // 64 KiB 之后的**普通**内容不参与输出。注意这一条只说"不参与输出",不说"中性" ——
+    // 见下一条:它参与判定。
+    expect(collapseForReduction(head + "TAILMARKER"))
+      .toBe(collapseForReduction(head));
+    // 上限之内的内容一字不差。
+    expect(collapseForReduction("a  b\n\nc")).toBe("a b c");
+    expect(collapseForReduction("x".repeat(1000))).toBe("x".repeat(1000));
+  });
+
+  it("折叠丢掉的那一段也要过谓词 —— 否则截断自己变成泄漏路径", () => {
+    // 上一版这里断言的是「尾巴被丢掉」,而那**正是缺陷本身**:它把一个 fail-open 的行为
+    // 写成了期望值。boundedForReduction 会检查自己丢掉的那一段,collapseForReduction 当时
+    // 只镜像了切口规则、没镜像这道守卫 —— 又一次「第二处该照着第一处写,却没有」。
+    //
+    // 压住整串的关键词落在 64 KiB 之外:折叠比 ~12,所以折叠后它离渲染出来的内容并不远,
+    // 「远处的东西不再压住近处」那条豁免在这里不成立。
+    const leaky = `user:hunter2@localhost ${("x" + " ".repeat(23)).repeat(3000)} y token`;
+    expect(leaky.length).toBeGreaterThan(64 * 1024);
+    expect(collapseForReduction(leaky), "被丢掉的 token 关键词没有参与判定").toBe("");
+    expect(sanitizeErrorText(leaky)).toBe("");
+    // 同样的串,尾巴不敏感时照常渲染 —— 这道守卫不是"超过 64 KiB 一律打空"。
+    const benign = `user hunter2 localhost ${("x" + " ".repeat(23)).repeat(3000)} y done`;
+    expect(collapseForReduction(benign)).not.toBe("");
+  });
+
+  it("exec 的程序名扫描自己有界,而且界的代价说得出口", () => {
+    // summarizeShell 跑在归约那道界**之上**,所以 REDUCE_INPUT_MAX 管不到它:4 MB 的 command
+    // 实测 201 ms,只为读出一个词。它现在自己先切一刀。
+    //
+    // 这一刀**有可观察的代价**,不是纯优化 —— 所以断言它,而不是只测耗时(耗时断言在 4 MB
+    // 这个量级上要么慢得不能进套件,要么松得抓不到东西)。程序名落在切口之后就读不到了:
+    const many = "A=1 ".repeat(1200) + "docker";      // 4806 字符,程序名在 4800 之后
+    expect(many.length).toBeGreaterThan(4000);
+    expect(summarizeToolParams("exec", { command: many }), "切口之后的程序名不该被读出来").toBe("");
+    // 切口之内一切如常 —— 这道界不是"超长就打空"。
+    const few = "A=1 ".repeat(100) + "docker";
+    expect(summarizeToolParams("exec", { command: few })).toBe("docker");
+    // 4000 字符以上的单 token 不可能是程序名,切不出空白就整条返回空。
+    expect(summarizeToolParams("exec", { command: "x".repeat(5000) })).toBe("");
+  });
+
+  it("discarded tail 在 64 KiB 内完整扫描,多一个字符就 fail closed", () => {
+    const head = "word ".repeat(800).trim();            // 3999,切口落在它后面那个空格上
+    const maxTail = RAW_INPUT_MAX;
+    expect(boundedForReduction(`${head} ${"p".repeat(maxTail - 1)}`), "恰好 64 KiB 的良性尾巴")
+      .not.toBeNull();
+    expect(boundedForReduction(`${head} ${"p".repeat(maxTail)}`), "尾巴超过额度一个字符")
+      .toBeNull();
+
+    const jwt = "eyJabcdefgh.abcdefgh.abc";
+    const jwtAtEnd = `${head} ${"p".repeat(maxTail - 1 - jwt.length)}${jwt}`;
+    expect(boundedForReduction(jwtAtEnd), "额度最后一个完整 token 也必须被检查").toBeNull();
+  });
+});
+
+describe("process 工具的摘要", () => {
+  // 它此前映射到 `"shell"`,而 shell 策略读的是 `command`/`cmd` —— `process` 根本没有这两个
+  // 字段(参数是 `action` + `sessionId` 等),于是这个工具的摘要**恒为空串**。
+  it("渲染白名单内的动作名", () => {
+    expect(summarizeToolParams("process", { action: "kill", sessionId: "s1" })).toBe("kill");
+    expect(summarizeToolParams("process", { action: "list" })).toBe("list");
+    expect(summarizeToolParams("process", { action: "send-keys", keys: ["a"] })).toBe("send-keys");
+  });
+
+  it("认不出的动作退回空串,而不是原样渲染", () => {
+    // 上游 schema 把 action 声明成 Type.String,枚举只写在 description 里、并不强制,而
+    // openclaw 的依赖是范围不是 pin。所以失败模式选在"少显示一个词"这一侧。
+    expect(summarizeToolParams("process", { action: "rm -rf /" })).toBe("");
+    expect(summarizeToolParams("process", { action: "未来新增的动作" })).toBe("");
+    expect(summarizeToolParams("process", {})).toBe("");
+  });
+
+  it("超长 action 不在 raw string 上 trim", () => {
+    const originalTrim = String.prototype.trim;
+    let maxTrimmedLength = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      maxTrimmedLength = Math.max(maxTrimmedLength, this.length);
+      return originalTrim.call(this);
+    });
+    try {
+      const got = summarizeToolParams("process", { action: " ".repeat(1_000_000) + "kill" });
+      expect(maxTrimmedLength, `trim 收到了 ${maxTrimmedLength} 字符的原始 action`)
+        .toBeLessThanOrEqual(REDUCE_INPUT_MAX);
+      expect(got).toBe("");
+    } finally {
+      trim.mockRestore();
+    }
   });
 });

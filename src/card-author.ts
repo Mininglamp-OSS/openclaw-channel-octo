@@ -1,5 +1,14 @@
 import { cardFitsLimits } from "./card-limits.js";
-import { cardSupports, isSensitive, reduceUrlsInText, type CardCaps } from "./card-render.js";
+import {
+  boundedForReduction,
+  cardSupports,
+  cutOnWhitespace,
+  isDefinitelyBlankWithinReductionBound,
+  isSensitive,
+  reduceUrlsInText,
+  REDUCE_INPUT_MAX,
+  type CardCaps,
+} from "./card-render.js";
 import { CARD_INTERACTIVE_PROFILE } from "./types.js";
 
 export interface CardButtonSpec {
@@ -76,11 +85,40 @@ function failure(error: string): BuildFailure {
   return { ok: false, error };
 }
 
-function cleanText(value: unknown, max: number): string | null {
-  if (typeof value !== "string") return null;
+/**
+ * 清洗一段作者提供的文本。返回 null 表示不可用;`reason` 说明**为什么**不可用 ——
+ * 归约在自己的 `max` 截断之前跑,所以一个超长且不含空白的标题会被界整段拒掉,而调用方原本
+ * 一律报「含敏感信息」,把作者指向了错误的方向。
+ */
+function cleanTextWithReason(value: unknown, max: number): { text: string } | { reason: string } {
+  if (typeof value !== "string") return { reason: "must be a string" };
   const reduced = reduceUrlsInText(value).trim();
-  if (!reduced || isSensitive(reduced, true)) return null;
-  return reduced.length > max ? `${reduced.slice(0, max)}…` : reduced;
+  if (!reduced) {
+    if (isDefinitelyBlankWithinReductionBound(value)) return { reason: "is required" };
+    // **归约返回空有多个原因,不能把它们全冒充成同一个具体原因。** 上一版把「不是空白」一律
+    // 报成长度问题,5 个字符的 `a://:` 被告知「over 4000 characters」;后来又把 poison、
+    // residual default-deny 和 URL 解析失败全报成 URL 问题。能从同一 authority 确定的两类先问:
+    if (value.length > REDUCE_INPUT_MAX) {
+      // 1. 超长且前 4000 字符里切不出空白 —— 界整段拒掉,确实是长度问题。
+      if (cutOnWhitespace(value, REDUCE_INPUT_MAX) === null) {
+        return {
+          reason: `is too long to sanitize (over ${REDUCE_INPUT_MAX} characters with no whitespace to break on)`,
+        };
+      }
+      // 2. 切得出空白,但切口之后那一段敏感 —— 这是内容问题,不是长度问题。
+      if (boundedForReduction(value) === null) return { reason: "must not contain sensitive data" };
+    }
+    // 3. 界放行而归约仍清空:可能是 URL 解析失败,也可能是 poison / residual default-deny。
+    // reduceUrlsInText 的公开契约没有暴露更细原因;与其复制三套规则,给出中性且真实的说明。
+    return { reason: "was withheld by sanitization" };
+  }
+  if (isSensitive(reduced, true)) return { reason: "must not contain sensitive data" };
+  return { text: reduced.length > max ? `${reduced.slice(0, max)}…` : reduced };
+}
+
+function cleanText(value: unknown, max: number): string | null {
+  const r = cleanTextWithReason(value, max);
+  return "text" in r ? r.text : null;
 }
 
 function sanitizeData(value: unknown, key = "", depth = 0): unknown {
@@ -106,8 +144,9 @@ export function buildInteractiveCard(
   spec: InteractiveCardSpec,
   caps?: CardCaps,
 ): BuiltInteractiveCard | BuildFailure {
-  const title = cleanText(spec.title, MAX_TITLE);
-  if (!title) return failure("title is required and must not contain sensitive data");
+  const titleResult = cleanTextWithReason(spec.title, MAX_TITLE);
+  if (!("text" in titleResult)) return failure(`title ${titleResult.reason}`);
+  const title = titleResult.text;
   if (caps && !cardSupports(caps, "TextBlock")) return failure("TextBlock is not supported");
   if (caps && !cardSupports(caps, "Action.Submit")) return failure("Action.Submit is not supported");
 

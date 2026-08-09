@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildInteractiveCard } from "./card-author.js";
 import { CARD_INTERACTIVE_PROFILE } from "./types.js";
 import { cardPayloadBytes } from "./card-limits.js";
+import { REDUCE_INPUT_MAX } from "./card-render.js";
 
 const caps = {
   elements: new Set(["TextBlock"]),
@@ -269,5 +270,66 @@ describe("buildInteractiveCard", () => {
     expect(buildInteractiveCard({
       title: "确认", buttons: [{ id: "ok", label: "确定" }], inputs: [{ id: "note", label: "备注" }],
     }, { ...caps, maxInputsBytes: 1 })).toEqual(expect.objectContaining({ error: "input definitions exceed max_inputs_bytes" }));
+  });
+});
+
+describe("标题失败时的原因", () => {
+  const button = { id: "b", label: "ok", value: "v" };
+  // 归约跑在 cleanText 自己的 max 截断**之前**,所以一个超长且不含空白的标题会被界整段拒掉。
+  // 之前一律报「含敏感信息」,把作者指向了错误的方向 —— 真实原因是长度。
+  it("超长无空白 → 说长度,不说敏感", () => {
+    const r = buildInteractiveCard({ title: "T".repeat(4100), buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("too long to sanitize");
+    expect("error" in r && r.error).not.toContain("sensitive");
+  });
+  it("真敏感 → 说敏感", () => {
+    const r = buildInteractiveCard({ title: "my password is hunter2", buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("must not contain sensitive data");
+  });
+  it("空 → 说必填", () => {
+    const r = buildInteractiveCard({ title: "   ", buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("is required");
+  });
+  // 归约返回空可能是 URL 解析失败,也可能是 poison/default-deny 主动扣下。调用方拿不到精确原因,
+  // 就用中性且真实的“被清洗扣留”,不能把所有分支都冒充成 URL 解析失败或长度问题。
+  it("短的不可解析 URL → 中性说明被清洗扣留,不说长度", () => {
+    const r = buildInteractiveCard({ title: "http://[", buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("withheld by sanitization");
+    expect("error" in r && r.error, "5 个字符的标题被告知超过 4000 字符")
+      .not.toContain("too long");
+  });
+  it("归约策略主动扣下 → 说被清洗扣留,不冒充 URL 解析失败", () => {
+    const r = buildInteractiveCard({
+      title: "credential:tok@vault retry with tok",
+      buttons: [button],
+    } as never);
+    expect("error" in r && r.error).toContain("withheld by sanitization");
+    expect("error" in r && r.error).not.toContain("could not be parsed");
+  });
+  // 超长、有空白、但切口之后那段敏感 —— 界拒的理由是内容不是长度,报错也要这么说。
+  it("超长但敏感尾巴 → 说敏感,不说长度", () => {
+    const title = `deploy notes ${"word ".repeat(900)} AKIAIOSFODNN7EXAMPLE`;
+    expect(title.length).toBeGreaterThan(4000);
+    const r = buildInteractiveCard({ title, buttons: [button] } as never);
+    expect("error" in r && r.error).toContain("must not contain sensitive data");
+    expect("error" in r && r.error).not.toContain("too long");
+  });
+
+  it("超长标题的空白判定不在 raw string 上 trim", () => {
+    const originalTrim = String.prototype.trim;
+    let maxTrimmedLength = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      maxTrimmedLength = Math.max(maxTrimmedLength, this.length);
+      return originalTrim.call(this);
+    });
+    try {
+      const title = "x" + " ".repeat(1_000_000);
+      const r = buildInteractiveCard({ title, buttons: [button] } as never);
+      expect("error" in r && r.error).toContain("must not contain sensitive data");
+      expect(maxTrimmedLength, `trim 收到了 ${maxTrimmedLength} 字符的原始值`)
+        .toBeLessThanOrEqual(REDUCE_INPUT_MAX);
+    } finally {
+      trim.mockRestore();
+    }
   });
 });

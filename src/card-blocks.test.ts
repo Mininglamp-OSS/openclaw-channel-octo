@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildDisplayCard, validateDisplayBlocks, type DisplayBlock } from "./card-blocks.js";
+import { buildDisplayCard, validateDisplayBlocks, REDUCE_BUDGET_PER_CARD, type DisplayBlock } from "./card-blocks.js";
 import type { CardCaps } from "./card-render.js";
 
 /**
@@ -72,6 +72,16 @@ describe("heading / text block", () => {
   it("text → 普通 TextBlock(wrap)", () => {
     const { card } = buildDisplayCard({ blocks: [{ type: "text", text: "正文" }] });
     expect(body({ card })[0]).toEqual({ type: "TextBlock", text: "正文", wrap: true });
+  });
+
+  it("展示卡也扣下残余 userinfo 与切口之外的短 JWT", () => {
+    const residual = "用户:hunter2Kx@host.example";
+    const farJwt = "db_pass hunter2Kx " + "pad ".repeat(2200) + "eyJabcdefgh.abcdefgh.abc";
+    for (const text of [residual, farJwt]) {
+      const rendered = buildDisplayCard({ blocks: [{ type: "text", text }] });
+      const all = JSON.stringify(rendered.card) + rendered.plain;
+      expect(all, text.slice(0, 80)).not.toContain("hunter2Kx");
+    }
   });
 
   it("跨截断点的密钥不出现在渲染结果里", () => {
@@ -964,5 +974,347 @@ describe("validateDisplayBlocks 结构上限(不可信输入)", () => {
     expect(out[0].type).toBe("facts");
     const items = (out[0] as { items: unknown[] }).items;
     expect(items.length).toBeLessThanOrEqual(200); // 受 MAX_TOTAL_BLOCKS 约束
+  });
+});
+
+describe("单卡片归约预算", () => {
+  const mk = (n: number, text: string) => Array.from({ length: n }, () => ({ type: "text" as const, text }));
+  // 归约管线在这种形状上最贵(实测 200 块 1084 ms,普通散文同样体积只要 47 ms)。
+  // REDUCE_INPUT_MAX 管单次、RAW_INPUT_MAX 管折叠、MAX_TOTAL_BLOCKS 管块数,都不管累计代价。
+  const COLON_DENSE = "a:".repeat(1999) + " x";   // 4000 字符,刚好占满一次调用的额度
+
+  // 断言的是**元素个数**,不是耗时。上一版写的是「200 块耗时不超过 50 块的 1.5 倍」,那种断言
+  // 在共享 CI 上会被一次 GC 掀翻,而它想守的性质本来就是可直接观察的:通过预算的块数与提交
+  // 多少块无关。
+  it("超预算的块不渲染,通过的块数与提交多少块无关", () => {
+    const at50 = body(buildDisplayCard({ blocks: mk(50, COLON_DENSE) })).length;
+    const at200 = body(buildDisplayCard({ blocks: mk(200, COLON_DENSE) })).length;
+    expect(at50).toBe(at200);                       // 都是 30 块 + 1 条提示
+    expect(at200).toBe(120_000 / 4000 + 1);
+  });
+
+  it("超预算时说明原因,而不是让内容静默消失", () => {
+    const { card } = buildDisplayCard({ blocks: mk(200, COLON_DENSE) });
+    const texts = body({ card }).map((e) => (e as { text?: string }).text ?? "");
+    expect(texts.some((s) => s.includes("超出本卡片的脱敏预算"))).toBe(true);
+  });
+
+  it("提示走 marker 钩子,整卡英文化的调用方不会被塞进一句中文", () => {
+    const { card, plain } = buildDisplayCard({
+      blocks: mk(200, COLON_DENSE),
+      budgetMarker: () => ({ text: "EN budget notice", plain: "EN budget plain" }),
+    });
+    const texts = body({ card }).map((e) => (e as { text?: string }).text ?? "");
+    expect(texts).toContain("EN budget notice");
+    expect(texts.some((s) => s.includes("脱敏预算"))).toBe(false);
+    expect(plain).toContain("EN budget plain");
+  });
+
+  it("预算提示在 payload cap 下保留,服务端省略计数不包含预算提示", () => {
+    for (const maxPayloadBytes of [131_072, 65_536]) {
+      const caps = {
+        elements: new Set(["TextBlock"]),
+        maxPayloadBytes,
+      } as CardCaps & { maxPayloadBytes: number };
+      const { card, plain } = buildDisplayCard({ caps, blocks: mk(200, COLON_DENSE) });
+      const texts = body({ card }).map((e) => (e as { text?: string }).text ?? "");
+      expect(texts, `${maxPayloadBytes}:预算提示被 limit fitting 丢掉了`)
+        .toContain("… 部分内容超出本卡片的脱敏预算,未渲染");
+      expect(plain, `${maxPayloadBytes}:plain 里没有预算提示`).toContain("… 部分内容未渲染");
+
+      const renderedContent = texts.filter((text) => text === COLON_DENSE).length;
+      const dropText = texts.find((text) => text.includes("服务端限制")) ?? "";
+      const serverDropped = Number(dropText.match(/省略 (\d+) 项/)?.[1] ?? Number.NaN);
+      // 预算先允许 30 个完整内容块;容量拟合只应给这 30 个候选记账。预算提示是保留项,
+      // 不能被算成「省略 1 项」,更不能顶掉预算耗尽这个真实原因。
+      expect(renderedContent + serverDropped, `${maxPayloadBytes}:服务端省略数把预算提示也算进去了`)
+        .toBe(30);
+    }
+  });
+
+  it("真实体量的卡片一个元素都不少", () => {
+    // 这几种是预算**不该**碰到的。给足余量:20 × 4000 = 80000,离 120000 还有三分之一,
+    // 不是靠掐着上限刚好通过(上一版 30 × 3999 = 119970,任何一处多花 30 字符就翻车)。
+    for (const [label, n, text] of [
+      ["200 块 × 200 字符英文", 200, "word ".repeat(40)],
+      ["200 块 × 200 字符中文", 200, "这是一段普通的中文说明文字。".repeat(14)],
+      ["20 块 × 4000 字符英文", 20, "word ".repeat(800)],
+      ["20 块 × 4000 字符中文", 20, "这是一段普通的中文说明文字。".repeat(285)],
+    ] as [string, number, string][]) {
+      // **个数之外还要断言没有提示。** 元素个数分不清「一个都没少」和「少了一个、提示正好补上
+      // 元素位」—— 实测 n=31 时 elements=31 而内容块只有 30,`toHaveLength(31)` 照样绿。
+      // 这个坑在隔壁那条测试里已经写下来并修过一次,而这两条就在它旁边、当时没跟着改。
+      const card = buildDisplayCard({ blocks: mk(n, text) });
+      expect(body(card), `${label} 被预算误伤`).toHaveLength(n);
+      expect(JSON.stringify(card), `${label} 有块被预算打掉,提示补上了元素位`).not.toContain("脱敏预算");
+    }
+  });
+
+  it("discarded tail 超过固定额度时整块 fail closed,并耗尽卡片预算", () => {
+    const { card } = buildDisplayCard({ blocks: [{ type: "text", text: "word ".repeat(200_000) }] });
+    const first = body({ card })[0] as { text?: string } | undefined;
+    expect(first?.text, "超长块没有按固定输入成本 fail closed").toContain("脱敏预算");
+    expect(first?.text).not.toMatch(/^word word/);
+  });
+
+  it("额度内的超长块按实际扫描量计费,不按原长", () => {
+    // 100 KB 输入的两段 discarded tail 都不超过 64 KiB,所以实际收费是归约的 4000 字符,
+    // 加两次线性尾扫折算后的约 751 单位,而不是原始 100 000 字符。
+    const big = "word ".repeat(20_000);
+    const fit = buildDisplayCard({ blocks: mk(25, big) });
+    expect(body(fit), "多个大块被按原长收费饿死了").toHaveLength(25);
+    expect(JSON.stringify(fit), "25 块应恰好仍在实际扫描预算内").not.toContain("脱敏预算");
+    // 按原长计费的话两块就超预算,只进得去 1 块 —— 这才是这条测试要挡的那个改法。
+    expect(2 * big.length, "按原长计,两块就该超预算").toBeGreaterThan(REDUCE_BUDGET_PER_CARD);
+    // 两侧都钉:第 26 块必须触发预算,否则尾部扫描没有入账。
+    expect(JSON.stringify(buildDisplayCard({ blocks: mk(26, big) })), "第 26 块也装下了,尾部扫描的账没收")
+      .toContain("脱敏预算");
+  });
+
+  // renderRich 曾在 sanitize 之外又跑一遍整条管线,于是 rich 的实际代价是 text 的两倍
+  // (200 块 612 ms vs 305 ms),而预算只扣一次 —— 进度卡的明细体整个由 rich 块构成,那条路上
+  // 的天花板因此是文档写的两倍。改成拿 `clean` 与折叠后的输入比,省掉那一趟。
+  //
+  // **这一条钉不住那个成本。** 少跑一趟管线只改耗时,不改任何可观察的输出,而计时比值断言在
+  // 共享 CI 上会被一次 GC 掀翻。所以这里钉的是**重构没有改变行为**(那才是重构的风险),
+  // 耗时那一头交给下面那条百毫秒量级的兜底。
+  it("rich 块与 text 块渲染结果一致(重构未改变行为)", () => {
+    const rich = Array.from({ length: 200 }, () => ({ type: "rich" as const, segments: [{ text: COLON_DENSE }] }));
+    expect(body(buildDisplayCard({ caps: FULL_CAPS, blocks: rich })))
+      .toHaveLength(body(buildDisplayCard({ caps: FULL_CAPS, blocks: mk(200, COLON_DENSE) })).length);
+    // 多空格的富文本不该因为改了判据而白白降级成单个 TextBlock。
+    const spaced = buildDisplayCard({ caps: FULL_CAPS, blocks: [{ type: "rich", segments: [{ text: "a  b" }, { text: " c" }] }] });
+    expect((body(spaced)[0] as { type: string }).type).toBe("RichTextBlock");
+  });
+
+  it("collapsible 的 summarySegments 不被重复计费", () => {
+    // 上一版 rawSummary 先 sanitize 一次,renderRich 里又一次 —— 同一段文本收两次费。
+    //
+    // 规模是算出来的,不是随手取的:每块正常花 摘要 3995 + 正文 3995 ≈ 7990,双重计费则
+    // ≈ 11985。取 12 块 —— 正常 95 880 装得下,双重计费 143 820 装不下。断言的是**有无
+    // summarySegments 的结果一致**,而不是某个绝对数,这样它守的就是"多收了一次费"本身。
+    const chunk = "word ".repeat(799).trim();  // ~3995 字符
+    const make = (withSegments: boolean) => Array.from({ length: 12 }, () => ({
+      type: "collapsible" as const,
+      summary: chunk,
+      ...(withSegments ? { summarySegments: [{ text: chunk }] } : {}),
+      blocks: [{ type: "text" as const, text: chunk }],
+    }));
+    const plain = buildDisplayCard({ caps: FULL_CAPS, blocks: make(false) });
+    const rich = buildDisplayCard({ caps: FULL_CAPS, blocks: make(true) });
+    expect(body(rich).length, "带 summarySegments 时预算被多收了一次")
+      .toBe(body(plain).length);
+    expect(JSON.stringify(rich.card)).not.toContain("脱敏预算");
+  });
+
+  // 计时只留一条,它守的是"分钟级回归"这一档,不参与毫秒级的判断。
+  //
+  // **上一版这条测的是空气。** 用的形状是 `"x " + "eyJ".repeat(40_000)` —— 唯一的空白在下标 1,
+  // 于是 RAW_INPUT_MAX 的切口把每个 120 KB 的块折成**单个字符 `"x"`**,200 块实测 68 ms,而
+  // 断言写的是 5000 ms。当初钉住这个修复的形状,在修复落地之后自己失去了被测对象:它测的不再是
+  // "最坏形状有多贵",而是"短路生效了没有"。这正是 PERF_CORPUS 里 `reachesPasses` 那条断言
+  // 要防的漂移,而这条卡片级的测试当时没跟着一起加。
+  //
+  // 换成真的会跑完整条管线的形状,并且**先断言它确实跑了** —— 形状一旦再退化成短路,
+  // 下面两条内容断言先红,而不是计时安静地变成 0 ms。
+  it("最坏形状:预算把 text/rich 都压住,而且形状确实跑完了管线", () => {
+    // 每块 3902–3904 字符(≤4000,界不截断),主体是点密集长词;末尾的 protocol-relative URL
+    // **真的会被 pass 2 改写**且带 @,所以会走安全所需的 preflight。这才是可达最坏形状,
+    // 不是 substring gate 恰好短路的校准形状。
+    const values = Array.from({ length: 200 }, (_, i) =>
+      "a.".repeat(1929) + ` //host.example/x?owner=ops@example.com blk${i}`);
+    const textBlocks = values.map((text) => ({ type: "text" as const, text }));
+    const richBlocks = values.map((text) => ({ type: "rich" as const, segments: [{ text }] }));
+    const text = buildDisplayCard({ caps: FULL_CAPS, blocks: textBlocks });
+    const rich = buildDisplayCard({ caps: FULL_CAPS, blocks: richBlocks });
+    const rendered = body(text);
+    // 30 个内容块(120000 / 4000)+ 1 条超预算提示。数字对上,才说明每块真按 4000 计了费。
+    expect(rendered, "形状退化了:没有按每块 4000 字符计费").toHaveLength(31);
+    expect((rendered[0] as { text: string }).text.length, "首块被截短了,管线没有跑在 3900 字符上")
+      .toBeGreaterThan(3800);
+    expect(body(rich), "rich 比较趟绕过了同一预算").toHaveLength(31);
+
+    const timed = (blocks: typeof textBlocks | typeof richBlocks): number => {
+      // 上面的 text/rich 行为断言已经各跑过一次并完成 JIT warmup,这里不再额外重复一整卡。
+      const t0 = performance.now();
+      buildDisplayCard({ caps: FULL_CAPS, blocks });
+      return performance.now() - t0;
+    };
+    const textMs = timed(textBlocks);
+    const richMs = timed(richBlocks);
+    // 修复后独立 warmed 测量(3 次):text 922–950 ms,中位 929;rich 1851–1889,中位 1859。
+    // 宽阈值只挡预算失效/分钟级回归;毫秒级的重复扫描由 parity 里的 base 比值单独看守。
+    expect(textMs, `text:200 块 × 点密集 3905 字符耗时 ${textMs.toFixed(0)} ms`).toBeLessThan(3500);
+    expect(richMs, `rich:200 块 × 点密集 3905 字符耗时 ${richMs.toFixed(0)} ms`).toBeLessThan(5000);
+  }, 15_000);
+});
+
+describe("展开按钮标签与摘要去重", () => {
+  it("actionLabel 与摘要相同就不重复显示,不同才采纳", () => {
+    const at = (summary: string, actionLabel: string) => {
+      const { card } = buildDisplayCard({
+        caps: FULL_CAPS,
+        blocks: [{ type: "collapsible", summary, actionLabel, blocks: [{ type: "text", text: "x" }] }],
+      });
+      return JSON.stringify(card);
+    };
+    expect(at("Build failed", "Build failed"), "标签与摘要相同,不该再显示一遍").toContain("展开");
+    expect(at("Build failed", "查看详情")).toContain("查看详情");
+    // 比的是**原文**摘要:空白差异会让两者判不相等,于是采纳 actionLabel。记录这个行为,
+    // 它是摘要重排那次改动带进来的,之前既没断言也没写进说明。
+    expect(at("Build  failed", "Build failed"), "空白差异让去重判不相等 —— 已知行为")
+      .toContain("Build failed");
+  });
+});
+
+describe("预算耗尽后的早退与线性 JWT 成本", () => {
+  it("空白密集 + 无点 base64 尾巴:线性扫描后 200 块仍完整且耗时有界", () => {
+    // 旧 JWT 正则在这 200 块上要约 15 秒;换成单一线性 authority 后,每块约 7800 字符的
+    // 无点 base64 尾巴不再需要靠耗尽预算才能止损。所有块都应保留,同时仍守住宽松的 3 秒上限。
+    const blocks = Array.from({ length: 200 }, (_, i) => ({
+      type: "text" as const,
+      text: `b${i} x` + " ".repeat(65_535) + "eyJ".repeat(2600) + " tailend zzz",
+    }));
+    buildDisplayCard({ blocks });
+    const t0 = performance.now();
+    const { card } = buildDisplayCard({ blocks });
+    const ms = performance.now() - t0;
+    expect(JSON.stringify({ card }), "线性形状不应再靠预算提示截断").not.toContain("脱敏预算");
+    expect(body({ card }), "线性 scanner 仍误删了内容块").toHaveLength(200);
+    expect(ms, `200 块 × 空白密集+无点 base64 耗时 ${ms.toFixed(0)} ms`).toBeLessThan(3000);
+  });
+
+
+  it("代价不随块数增长 —— 耗尽之后每块仍要折叠一次是白付的", () => {
+    // 预算一旦耗尽,后续块若不早退,仍会白付一次最多 64 KiB 的切割/扫描。
+    // 用**比值**而不是绝对毫秒:机器快慢不影响它,而缺陷的信号非常清楚 ——
+    // 实测有早退 66/70/67/64 ms(30/60/120/200 块,元素数从第 30 块起就钉死),
+    // 无早退 69/119/230/369 ms。比值 1.0 对 5.3。
+    const at = (n: number) => {
+      const blocks = Array.from({ length: n }, (_, i) => ({
+        type: "text" as const,
+        text: `b${i} ` + "word ".repeat(24_000),      // 单块 120 KB
+      }));
+      buildDisplayCard({ blocks });
+      const t0 = performance.now();
+      const { card } = buildDisplayCard({ blocks });
+      return { ms: performance.now() - t0, elements: body({ card }).length };
+    };
+    // 两个规模都必须**已经耗尽**才可比:30 块正好花完 120 000,还没有超预算提示,元素数是 30
+    // 而不是 31 —— 拿它当基准会在前提断言上先红,红的还是个假信号。从 40 块起才进耗尽路径。
+    const small = at(40);
+    const large = at(200);
+    // 前提:两者渲染出的元素数一样,也就是多出来的 160 块确实一个都没渲染。
+    expect(large.elements, "多出来的块渲染了,这一条测的不是耗尽路径").toBe(small.elements);
+    expect(large.ms / small.ms, `40 块 ${small.ms.toFixed(0)} ms → 200 块 ${large.ms.toFixed(0)} ms`)
+      .toBeLessThan(2.5);
+  });
+});
+
+describe("64 KiB 折叠上限本身不能变成泄漏面", () => {
+  // 这三条都是推送前的对抗评审找出来的,而且**都出自新加的那个上限**:一个为了性能加的截断,
+  // 如果不带上模块原有的规则,就会自己变成泄漏路径。
+  const SECRETS = [
+    "AKIAIOSFODNN7EXAMPLE",
+    "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij",
+  ];
+
+  it("展示卡这条路也要把谓词传进折叠 —— 不传就把压住凭据的关键词丢了", () => {
+    // 同一个缺陷在 card-render 那边有一条断言,但那条走的是 sanitizeErrorText。**这条路是
+    // sanitize**,它自己单独调一次 collapseForReduction,漏传谓词不会让那条断言变红 ——
+    // 反向验证时正是这里没红,才发现展示卡这条路没有覆盖。
+    const leaky = `user:hunter2@localhost ${("x" + " ".repeat(23)).repeat(3000)} y token`;
+    const { card, plain } = buildDisplayCard({ blocks: [{ type: "text", text: leaky }] });
+    expect(JSON.stringify(card), "64 KiB 之外的 token 没参与判定,口令渲染出来了")
+      .not.toContain("hunter2");
+    expect(plain).not.toContain("hunter2");
+  });
+
+  it("rich 段:64 KiB 之后的原文不许绕过清洗进 TextRun", () => {
+    // RichTextBlock 分支写出的是**每段原文**,不是清洗结果。所以样式判据一旦建立在 joined 的
+    // 有损视图上(比如折叠+截断之后的样子),超出那个视图的段就直接进卡片了。
+    // 触发条件不是"必须是空白块":前 64 KiB 折叠比超过约 20 就够,一张 80 列对齐、单元格大多
+    // 为空的报表就是这个比例。
+    for (const secret of SECRETS) {
+      const { card, plain } = buildDisplayCard({
+        caps: FULL_CAPS,
+        blocks: [{ type: "rich", segments: [
+          { text: "Deployment summary\n" + " ".repeat(64 * 1024) },
+          { text: `AWS key ${secret} for the runner`, bold: true },
+        ] }],
+      });
+      // 断言看**整张卡的 JSON**,不只是 text 字段 —— TextRun 的文本不在顶层 text 上。
+      const all = JSON.stringify(card) + plain;
+      for (let n = secret.length; n >= 8; n--) {
+        expect(all, `rich 段渲染出了 ${secret.slice(0, n)}`).not.toContain(secret.slice(0, n));
+      }
+    }
+  });
+
+  it("折叠的切口也只能落在空白上,否则归约的锚点被切掉", () => {
+    // boundedForReduction 早就立了这条规则(归约靠 `@host` 定位,盲切会把锚点切掉,于是口令
+    // 原样留下)。第一版把 64 KiB 的截断写成了裸 slice,同一个缺陷在新函数里复活:
+    //     " "×(64Ki-23) + "alice:Tr0ub4dor3xK9pWqZ@db.example.com/deploy"
+    //       main  "https://example.com"      裸切  "alice:Tr0ub4dor3xK9pWqZ"
+    for (const keep of [21, 23, 30]) {
+      const payload = "alice:Tr0ub4dor3xK9pWqZ@db.example.com/deploy";
+      const { card, plain } = buildDisplayCard({
+        blocks: [{ type: "text", text: " ".repeat(64 * 1024 - keep) + payload }],
+      });
+      const all = JSON.stringify(card) + plain;
+      expect(all, `keep=${keep} 渲染出了用户名`).not.toContain("alice:");
+      expect(all, `keep=${keep} 渲染出了口令前缀`).not.toContain("Tr0ub4dor3xK9pW");
+    }
+  });
+
+  it("collapsible 的摘要必须留在 plain 里", () => {
+    // plain 是每张卡都附带的兜底正文,而摘要正是折叠态唯一可见的那一行。第一版把 cleanSummary
+    // 置空去掉重复计费,却忘了 plain 还在拼它 —— 摘要变成空行,而当时的测试只数元素个数。
+    const { plain } = buildDisplayCard({
+      caps: FULL_CAPS,
+      blocks: [{
+        type: "collapsible",
+        summary: "Build failed on step 3",
+        summarySegments: [{ text: "Build failed on step 3", bold: true }],
+        blocks: [{ type: "text", text: "exit code 1" }],
+      }],
+    });
+    expect(plain).toBe("Build failed on step 3\nexit code 1");
+    expect(plain.startsWith("\n"), "摘要在 plain 里变成了空行").toBe(false);
+  });
+});
+
+describe("copy block 的字符判定跑在原始长度上", () => {
+  // 这一组记录的是一次**改对了理由、改错了做法**的回退。曾经把判据换成折叠后长度,理由是
+  // 「4001 个空格折叠后什么都不剩,却拿到一句『超过 4000 字符』」—— 理由成立,但那个改法同时
+  // 打开了一条泄漏路径和一笔 670× 的代价(见 renderCopy 里的说明)。回退了,下面两条钉住回退。
+  it("超长内容一律给提示,绝不把残值塞进复制按钮", () => {
+    // 这一条是回退的**理由本身**:折叠会在 RAW_INPUT_MAX 处截断,判折叠后长度时这个输入
+    // 折出 11 个字符、闸门放行,复制按钮拿到 `HEAD-MARKER` 而 `TAIL-MARKER` 无声消失。
+    const { card } = buildDisplayCard({
+      blocks: [{ type: "copy", text: "HEAD-MARKER" + "\n".repeat(70_000) + "TAIL-MARKER" }],
+    });
+    const json = JSON.stringify(card);
+    expect(json, "残值被塞进了复制按钮").not.toContain("HEAD-MARKER");
+    expect((body({ card })[0] as { text: string }).text).toContain("超过 4000 字符");
+  });
+  it("判定是 O(1),不按块长扫描", () => {
+    // 折叠后长度那一版在这里是每块一次最多 64 KiB 的正则扫描,而且 renderCopy 在 sanitize
+    // **之前**返回,这笔钱 REDUCE_BUDGET_PER_CARD 一分收不到:实测 0.40 ms → 269 ms。
+    // 余量给到 40 倍 —— 它守的是"判据又长回原长之外"这一档,不参与毫秒级判断。
+    const copy = Array.from({ length: 200 }, (_, i) => ({
+      type: "copy" as const,
+      text: `blk${i} ` + "connection refused after retries word ".repeat(3322), // 单块 ~123 KB
+    }));
+    buildDisplayCard({ blocks: copy });
+    const t0 = performance.now();
+    buildDisplayCard({ blocks: copy });
+    const ms = performance.now() - t0;
+    expect(ms, `200 个超长 copy 块耗时 ${ms.toFixed(1)} ms`).toBeLessThan(20);
+  });
+  it("真的超长仍然拒绝", () => {
+    const { card } = buildDisplayCard({ blocks: [{ type: "copy", text: "y".repeat(4001) }] });
+    expect((body({ card })[0] as { text: string }).text).toContain("超过 4000 字符");
   });
 });

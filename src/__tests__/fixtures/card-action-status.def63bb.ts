@@ -1,8 +1,24 @@
-import {
-  isDefinitelyBlankWithinReductionBound,
-  isSensitive,
-  reduceUrlsInText,
-} from "./card-render.js";
+/* eslint-disable */
+// @ts-nocheck
+/**
+ * **`def63bb` 的 `src/card-action-status.ts` 冻结快照。这个文件不是产品代码，永远不要改它。**
+ *
+ * 它存在的唯一理由:差分 runner(card-render.parity.test.ts)要能**执行** merge-base 的实现,
+ * 而不是把 merge-base 的行为**手抄**成期望值。这条分支上，手抄的护栏已经失效过两次 ——
+ * 第八轮的一次性脚本报「0 回归」而实际有 120 条，第九轮的 PARITY 语料组 8 行手写字面量而
+ * 第十轮的四类回归全部通过。两次的成因相同:挑行的人有多少盲点，护栏就有多少盲点。
+ * 基准可以被执行，这个性质才断掉。
+ *
+ * 来源:`git show def63bb:src/card-action-status.ts`。
+ * 除本段头注释与 `@ts-nocheck` 外,与原文的差异**只有一行 import 说明符**(指向同目录的 card-render 快照，而不是仓库当前的实现)。落地时已用 809 个输入 × 5 个 sink 与真实 def63bb 工作树逐组比对，0 差异。
+ *
+ * `@ts-nocheck` 是给「将来有人把 exclude 去掉」留的:旧代码未必过得了今天的类型设置,
+ * 而那时候的正确反应是恢复 exclude,不是去改这个快照。
+ * 本文件不进 tsc(见 tsconfig.json 的 exclude):它是旧代码的快照，不该被今天的类型设置约束，
+ * 也不该被编译进 dist 发出去。真的坏了 vitest 会在加载时直接报错。
+ * 内容哈希钉在 card-render.parity.test.ts 里 —— 改动一个字节，那条断言就变红。
+ */
+import { reduceUrlsInText } from "./card-render.def63bb.js";
 
 export type CardActionStatus = "processing" | "completed" | "error";
 
@@ -16,24 +32,9 @@ export type CardActionStatus = "processing" | "completed" | "error";
  * `reduceUrlsInText`), then backslash-escape the inline markdown control chars (CommonMark) so
  * no link / code / emphasis span can form. Authored strings (input labels, resolved choice
  * titles, the action label) are already sanitized at authoring time and are not routed here.
- *
- * **归约之后还要过一遍 `isSensitive`,和其它 sink 一样**(见 card-display-tool 的
- * `redactDebugValue`、reasoning-process 的思考清洗)。这条路是全树唯一「归约即脱敏、后面没有
- * 守卫」的 sink —— 于是任何**归约本身漏掉**的凭据(口令超 256 上限整条不匹配、非 ASCII 用户名
- * 逃过匹配)会原样渲染。评审第七轮的 P1:275 字符口令的 DSN 作显示名时明文进群卡片。
- * 补上守卫后,归约没盖住的那些形状退回 `[redacted]`,而不是明文。归约命中即敏感的输入
- * (`reduceUrlsInText` 已把它变成安全的注册域)照常显示,不受影响。
  */
 function neutralizeEcho(value: string): string {
-  const reduced = reduceUrlsInText(value);
-  // 归约把一段**非空**内容整个清空,只可能是因为它敏感(超限 userinfo、切不出空白的超长串、
-  // 或新形状带着关键词被 poisoned)—— reduceUrlsInText 对良性内容只会降级,不会清空。所以
-  // 「非空进、空出」= 敏感,和下面 isSensitive 命中同样退回 `[redacted]`,而不是显示成空白。
-  if (
-    isSensitive(reduced, true) ||
-    (reduced.trim() === "" && !isDefinitelyBlankWithinReductionBound(value))
-  ) return "[redacted]";
-  return reduced.replace(/[\\`*_~\[\]<]/g, "\\$&");
+  return reduceUrlsInText(value).replace(/[\\`*_~\[\]<]/g, "\\$&");
 }
 
 interface StatusParams {

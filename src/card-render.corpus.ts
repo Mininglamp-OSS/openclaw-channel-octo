@@ -16,7 +16,10 @@
  *   - REWRITE 归约改写了内容。**渲染结果里的每个字符都必须来自输入**(scheme 前缀除外)——
  *             凭空造串是本模块声明的最坏失败模式:输出看起来像脱敏过的,操作者却无从知道
  *             自己读到的是被改过的。
- *   - UNFIXED 本 PR 未改变其行为的形状。期望值 = main 的行为。
+ *   - UNFIXED 两类:(a) 本 PR **未改变**其行为的形状,期望值 = main 的行为;(b) 造串哨兵 ——
+ *             main 上 `new URL()` 会把它们规范成输入里没有的主机(`1.2.3`→`1.2.0.3`),
+ *             本 PR **刻意**改成整行删除。第十轮评审指出原来那句「本 PR 未改变其行为」
+ *             已经不描述这一组的内容了 —— 四行属于 (b),各自的 note 里写明。
  *   - PERF    耗时上限。这些函数都在同步路径上、无 try/catch。
  */
 
@@ -30,6 +33,72 @@ export interface CorpusRow {
 
 /** 凭据必须不出现在结果里。 */
 export const LEAK_CORPUS: CorpusRow[] = [
+  // R8:归约够不着、守卫也认不出的那四种 userinfo 形状。它们在 main 上是明文泄漏,此前挂在
+  // UNFIXED 组里。关掉它们是**方向性的选择**:评审两轮证明,只要这四种形状还在,「渲染的永远
+  // 只有 kept,而 kept 自己要过守卫」这句话就是假的,而尾部扫描的界建立在这句话上 ——
+  // 于是界放在 4000 还是 131072 都会漏,只是价钱不同。第四次收窄不如把前提修了。
+  {
+    input: "user:hunter2@localhost",
+    expect: { grep: "https://localhost" },
+    note: "R8:裸单标签主机的 DSN。归约此前要求带点,一趟都不匹配",
+  },
+  {
+    input: "/user:pass@localhost",
+    expect: { grep: "/https://localhost" },
+    note: "R8:前导 `/`",
+  },
+  {
+    input: "prefix/user:pa/ss@db.example.com",
+    expect: { grep: "prefix/https://example.com" },
+    note: "R8:主机带点,但口令里的 `/` 让归约此前的 `[^\\s/]+` 匹配不上",
+  },
+  {
+    // R9:`host:` 后面跟非数字,是 DSN 在错误串里最常见的写法。上一版前瞻把 `:` 一律排除,
+    // 于是这条整个匹配不上、口令原样渲染 —— 而排除 `:` 的理由(docker 摘要)现在由
+    // `(?!:\d)` 精确表达:`sha256:1234` 是冒号接数字,`localhost: refused` 不是。
+    input: "connect to user:hunter2@localhost: refused",
+    expect: { grep: "connect to https://localhost: refused" },
+    note: "R9:主机后带冒号的 DSN。前瞻排除 `:` 时这条不归约,口令明文渲染",
+  },
+  {
+    input: "user:hunter2@[::1]",
+    expect: { grep: "https://[::1]" },
+    note: "R8:IPv6 方括号主机。按 `:` 切主机会切成 `[`,整行被打空 —— 现在取到 `]` 为止",
+  },
+  {
+    // R7:旧窗口漏掉的前提。守卫抓不住单标签 userinfo时,压住整串的只有 4000 字符之外的 token。
+    // 现在额度内完整检查,超额直接 fail closed,不再按 detector 分档。
+    input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + " token",
+    expect: { grep: "", read: "", exec: "" },
+    note: "R7:切口之外的关键词必须仍然压得住 kept 里守卫认不出的凭据",
+  },
+  // R8:上面那一行只钉住了「关键词落在窗口外」这一种,而它恰好是当时已经过了的那一种。
+  // 下面两行是评审第三轮实际复现的两个形状 —— 收窄一次它们就复活一次,所以必须各自有一行。
+  // 注意期望值**不是空串**:前缀被归约成 `https://localhost` 之后,后面的普通词照常渲染。
+  // 判据不是「整串扣下」,是「口令不出现」—— 这一组的造串检测与 LEAK 的子串检测都盯着它。
+  //
+  // 两条期望值是**实测粘贴**的,不是手算的。手算这种字面量我在这条分支上已经错了三次
+  // (COST 组的 mainRenders 两次、这里一次),每次都是差一两个字符 —— 它们看着像是能推出来的,
+  // 而 SUMMARY_MAX 截断落在哪个词中间取决于前缀长度,推错了测试还会绿着接受一个错的真相。
+  {
+    input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(1300) + "eyJabcdefgh.abcdefgh.abc",
+    expect: {
+      grep: "",
+      read: "",
+      exec: "",
+    },
+    note: "R11-P0-1:短低熵 JWT 在旧 4000 字符窗口外。线性 JWT authority 现在完整检查额度内尾巴",
+  },
+  {
+    input: "alice:hunter2@localhost " + "word ".repeat(900) + "pad ".repeat(33_000) + " token",
+    expect: { grep: "", read: "", exec: "" },
+    // **这一行的期望值曾经是 `https://localhost word word…`,而 base 上是空。** 也就是说它把
+    // 一个 fail-open 钉成了「现在是什么」——note 里甚至写明了机制(关键词够不着)。它能一直绿,
+    // 是因为本组的判据是「口令子串不出现」,而归约把 DSN 变成了主机,`hunter2` 确实不在输出里;
+    // 「base 藏不藏得住」这一问从来没对它提过。评审第十轮 P0-1 就是这一类,差分 parity 组现在
+    // 覆盖了这条边界。修法见 collapseForReduction / boundedForReduction 的统一额度规则。
+    note: "R8-P1:关键词落在 128 KiB 之外(136 KB)。曾经钉着 head 的泄漏输出,现在与 base 同为空",
+  },
   {
     input: "PASSPHRASE='correct horse battery staple' gpg --sign x",
     expect: { exec: "gpg" },
@@ -171,6 +240,77 @@ export const LEAK_CORPUS: CorpusRow[] = [
     expect: { fetch: "https://host.com" },
     note: "既有:带 scheme 的 DSN 由第 1 趟 new URL() 剥掉 userinfo 与 query",
   },
+  // R9/R10:归约把主机小写化(WHATWG),而 AKIA/AIza 探测器大小写敏感 —— 归约会把唯一压着这个
+  // 凭据的信号自己毁掉。逐字比对**只比 host、不比整段**,大小写不同即不匹配,这条路断掉。
+  // 放在 LEAK(不是 UNFIXED)是因为它是凭据泄漏哨兵:除了逐行等值,本组的大小写不敏感子串
+  // 断言也盯着它 —— 上一版只有等值这一道,而子串那道又是大小写敏感的,小写输出照样过。
+  {
+    input: "a:b@AKIAIOSFODNN7EXAMPLE",
+    expect: { grep: "", read: "" },
+    note: "R9:new URL() 小写化主机,AKIA 探测器大小写敏感。逐字比对时不匹配,不发",
+  },
+  {
+    // 口令里塞一份小写主机名。逐字比对若比整段 `m`(含 userinfo),口令这份副本就满足它,
+    // 上一行那条泄漏原样复活 —— 上一版正是这么漏的,而当时套件分辨不出。必须只比 `host`。
+    input: "a:akiaiosfodnn7example@AKIAIOSFODNN7EXAMPLE",
+    expect: { grep: "", read: "" },
+    note: "R10:口令供给主机名绕过逐字比对。比 host 而非整段 m 才挡得住",
+  },
+  // R12(评审第八轮 P1-a):归约**删掉**它匹配的 span,而那个 span 里可能正有一个把整行压住的
+  // 关键词。删掉之后剩下的部分(含口令的另一份副本)就渲染出来 —— main 靠 `credential` 整行扣下,
+  // 本分支归约掉单标签 DSN、关键词随之消失,`retry with tok9Fk2Lp` 里的口令副本泄漏。
+  // 只发生在 main 没归约、本分支新归约的 host 形状上;判据是 main 据以扣下的那个信号(关键词/
+  // 前缀/超限 userinfo),命中即整行扣下,与 main 一致。见 reduceUrlsInText 的 poisoned 分支。
+  {
+    input: "credential:tok9Fk2Lp@vault retry with tok9Fk2Lp",
+    expect: { grep: "", read: "", exec: "" },
+    note: "R12-P1a:关键词在被删的 userinfo span 里,口令副本在句子别处。main 整行扣下",
+  },
+  {
+    input: "auth failed for user:secret@redis, fallback key Ab3xY9zQ1wKp",
+    expect: { grep: "", read: "" },
+    note: "R12-P1a:同一成因,`secret` 作触发词,回退键在句尾",
+  },
+  {
+    input: "alice:hunter2" + "h".repeat(250) + "/x:b@localhost",
+    expect: { grep: "", read: "" },
+    note: "R12-P1b:超 256 口令含 `/`,归约重启点吃掉 `@`,hasOverlongUserinfo 看不到 —— 归约前 span 里有超限 userinfo,poisoned 整行扣下",
+  },
+  // R11:评审第六轮的两个 P0/P1 —— 都是「为性能加的界静默削弱了脱敏」,而不是老问题重演。
+  {
+    // 口令超过 SCHEMELESS_USERINFO_RE 的 256 上限:整条正则匹配不上、DSN 原样流过归约。
+    // 上一版这里 fail-open,明文口令在五个群可见 sink 全渲染出来(阈值精确在 257,无长度前提)。
+    // hasOverlongUserinfo 补的那道 fail-closed 把它扣下。守卫**抓不住**这个纯字母口令
+    // (isSensitive 两档都 false),所以不能靠守卫,必须靠这道超限检测。
+    input: "connect failed for alice:" + "correcthorsebatterystaple".repeat(11).slice(0, 275) + "@db.example.com after 3 retries",
+    expect: { grep: "", read: "" },
+    note: "R11-P0:口令 275 字符 > 256。上一版 fail-open 渲染明文;现在超限即敏感,扣下",
+  },
+  {
+    // 纯数字单标签主机,守卫看不见(不含关键词/前缀/高熵),归约此前也够不着(要求含字母)。
+    // 去掉字母要求后它走到逐字比对:`new URL("https://1")` 规范成 `0.0.0.1`,不在输入里 → 删除。
+    // 这一条钉住「前提」对这类形状也成立 —— 不然 collapseForReduction 的 128 KiB 触及上限
+    // 又会变成泄漏(远处关键词够不着、而近处的 `@1` DSN 守卫认不出)。
+    input: "alice:hunter2@1 " + "x ".repeat(80_000) + " token",
+    // 同上:这一行的注释写着它要钉住「128 KiB 触及上限又会变成泄漏」这件事,而它当时的期望值
+    // (`x x x…`)记录的正是**没钉住**的那个状态 —— base 上整行是空。现在两边都空。
+    expect: { grep: "", read: "", exec: "" },
+    note: "R11-P1:纯数字单标签 + 128 KiB 外的关键词。曾经钉着 head 的填充输出,现在与 base 同为空",
+  },
+  // R11:归约 pass 之后仍残留 `name:…@` 的 token 在唯一收口处 default-deny。这里用低熵口令,
+  // 证明结果不是 generic 高熵兜底碰巧挡住;read 的 generic=false 同样必须为空。
+  ...[
+    "用户:hunter2Kx@host.example",
+    "а:hunter2Kx@host.example",
+    "u:hunter2Kx@[fe80::1%eth0]",
+    "u:hunter2Kx@",
+    '"user":hunter2Kx@db.example.com',
+    "[postgres]:hunter2Kx@db.example.com",
+  ].map((input): CorpusRow => ({
+    input,
+    expect: { grep: "", read: "", exec: "" },
+    note: "R11:未识别的残余 userinfo token 在 reduction choke point 整段扣下",
+  })),
 ];
 
 /** 普通内容不该被误伤成空白。 */
@@ -199,16 +339,6 @@ export const BENIGN_CORPUS: CorpusRow[] = [
     input: "8080?code=abc",
     expect: { grep: "8080?code=abc" },
     note: "R4b:裸数字单标签。与上面两行形状一致,无法区分 —— query 剥离那条已移出本分支,这行记录的是移出后的行为",
-  },
-  {
-    input: "email:\\s*\\S+@\\S+",
-    expect: { grep: "email:\\s*\\S+@\\S+" },
-    note: "R4c:搜邮箱是常规操作。曾被 userinfo 兜底整串打空",
-  },
-  {
-    input: "user:.*@example",
-    expect: { grep: "user:.*@example" },
-    note: "R4c:同上",
   },
   {
     input: "sed 's:a:b@c:g'",
@@ -258,33 +388,53 @@ export const BENIGN_CORPUS: CorpusRow[] = [
  * 要加一行,得先去 main 上量;量出来是空,就说明这行根本不属于这一组。
  */
 export interface CostRow extends CorpusRow {
-  /** 同一输入在 `main`(b1e3def)上 grep 策略的实测输出。必须非空 —— 否则这行记录不到代价。 */
+  /** 同一输入在 merge-base `def63bb` 上 grep 策略的实测输出。必须非空。 */
   mainRenders: string;
+  /** 代价来自输入边界,还是 residual userinfo 的统一 default-deny。 */
+  cost: "input-bound" | "residual-userinfo";
 }
 
 export const COST_CORPUS: CostRow[] = [
   {
+    input: "email:\\s*\\S+@\\S+",
+    expect: { grep: "" },
+    mainRenders: "email:\\s*\\S+@\\S+",
+    cost: "residual-userinfo",
+    note: "R11 default-deny 代价:邮箱 grep 与残余 userinfo 同形,安全收口整段扣下",
+  },
+  {
+    input: '{"detail":"' + "z".repeat(300) + '","owner":"ops@example.com"}',
+    expect: { grep: "", read: "" },
+    mainRenders: '{"detail":"' + "z".repeat(53) + "…",
+    cost: "residual-userinfo",
+    note: "R11 default-deny 代价:无空白 minified JSON 与残余 userinfo 同形,安全收口整段扣下",
+  },
+  {
     input: "https://example.com/" + "z".repeat(4100),
     expect: { grep: "", read: "" },
     mainRenders: "https://example.com",
+    cost: "input-bound",
     note: "R5-P1:超长无空白 URL。main 上第 1 趟线性,0.8 ms 归约成注册域",
   },
   {
     input: "https://s3.amazonaws.com/b/k?X-Amz-Signature=" + "a".repeat(4000),
     expect: { grep: "", read: "" },
     mainRenders: "https://amazonaws.com",
+    cost: "input-bound",
     note: "R5-P1:预签名 URL,现实形状。read 策略在 main 上渲染 65 字符的 path+query",
   },
   {
     input: "z".repeat(4100),
     expect: { grep: "", read: "" },
     mainRenders: "z".repeat(64) + "…",
+    cost: "input-bound",
     note: "R5-P2:空白边界截断的代价本体。**必须用非十六进制字符** —— `\"a\"×4100` 在 main 上也是空(isSensitive 长 hex 分支),那一行空转了整整一轮评审",
   },
   {
     input: "zq".repeat(2050),
     expect: { grep: "", read: "" },
     mainRenders: "zq".repeat(32) + "…",
+    cost: "input-bound",
     note: "R5-P2:同上,展示块形态。main 渲染 4100 字符,这里整块不渲染",
   },
   // R6:界按 **UTF-16 code unit** 计,而 CJK 散文不含 ASCII 空白 —— 一整段中文就是一个不可切
@@ -294,6 +444,7 @@ export const COST_CORPUS: CostRow[] = [
     input: "中".repeat(4100),
     expect: { grep: "", read: "" },
     mainRenders: "中".repeat(64) + "…",
+    cost: "input-bound",
     note: "R6-P1:普通中文长文本。4100 units,无 ASCII 空白 → 整段不渲染",
   },
   // 子代理评审找出的一类,**这一组此前一行都没覆盖**:上面每行都是"无空白长 token",而这一类
@@ -304,19 +455,22 @@ export const COST_CORPUS: CostRow[] = [
     input: "connection refused after 3 retries " + "word ".repeat(900)
       + "see https://docs.example.com/troubleshooting/connection-refused-timeouts",
     expect: { grep: "" },
-    mainRenders: "connection refused after 3 retries " + "word ".repeat(6) + "word…",
+    mainRenders: "connection refused after 3 retries word word word word word word…",
+    cost: "input-bound",
     note: "R6-审:长错误文本 + 尾部文档链接。**只在 generic 那一侧被打空** —— read(generic=false)不套用高熵检测,两边都渲染,故不列。sanitizeErrorText 也走高熵那一路:main 121 字符,这里空",
   },
   {
     input: "word ".repeat(900) + "https://hooks.slack.com/services/T00/B00/abcdEFGH1234abcdEFGH1234",
     expect: { grep: "" },
     mainRenders: "word ".repeat(12) + "word…",
+    cost: "input-bound",
     note: "R6-审:webhook 在**尾部**。同样内容放在开头时正常渲染(那正是删掉 card-blocks 预检修好的),放尾部则被界的守卫扣下 —— 两个方向都要有行,否则读者以为整类都好了",
   },
   {
     input: "😀".repeat(2001),
     expect: { grep: "", read: "" },
     mainRenders: "😀".repeat(32) + "…",
+    cost: "input-bound",
     note: "R6-P1:星平面字符每个 2 units,所以 **2001 个** emoji 就越界 —— 文档说的「4000 字符」在这里是 2000 个。`\"😀\"×1999`(3998 units)仍正常渲染",
   },
 ];
@@ -327,6 +481,20 @@ export const COST_CORPUS: CostRow[] = [
  * `https://sha256abcd`,`3:4@2/x` 曾被 new URL() 规范化成 `https://0.0.0.2`。
  */
 export const REWRITE_CORPUS: CorpusRow[] = [
+  // R8:单标签放宽的**误伤**,两条都记在这里而不是悄悄消化掉。方向安全(少渲染)、不造串
+  // (输出里每个字符都来自输入),但确实把可读内容改写了。之所以换得起:同样的形状既可能是
+  // `user:.*@example` 这样的 grep 模式,也可能是 `user:hunter2@example` 这样的真凭据,
+  // 光看形状分不开 —— 任何渲染前者的规则都会渲染后者。
+  {
+    input: "user:.*@example",
+    expect: { grep: "https://example" },
+    note: "R8 误伤:搜凭据的 grep 模式被当成 DSN 归约(原 BENIGN 行)",
+  },
+  {
+    input: "image:v1@registry/repo",
+    expect: { grep: "https://registry" },
+    note: "R8 误伤:docker 风格引用被当成 DSN 归约。仍是造串哨兵 —— `registry` 必须来自输入",
+  },
   {
     input: "user:pw@db.example.com:5432/prod",
     expect: { grep: "https://example.com" },
@@ -335,37 +503,10 @@ export const REWRITE_CORPUS: CorpusRow[] = [
 ];
 
 /**
- * **本 PR 不修**、留给 userinfo 那条后续 PR 的形状。期望值 = `main` 的行为。
- *
- * 为什么明确列出来而不是省略:这一组是 `SCHEMELESS_USERINFO_RE` 的单标签放宽 + 配套 fail-closed
- * 兜底要覆盖的面。那一对在四轮里两次把缺陷改成了更糟的缺陷 —— 放宽归约会把
- * `nginx:1.21@sha256:1234abcd` 改写成输入里不存在的 `https://sha256abcd`,收紧兜底又会让一个
- * 尾随逗号整条绕过它 —— 所以整对摘出去单独评审了。
- *
- * 但形状必须留在表里:它们同时进造串检测,谁再动那对正则,这里会立刻指出改写方向对不对。
- * 前四行是 `main` 上就存在的明文泄漏,**不是本 PR 引入的**,也不是本 PR 声称修好的。
+ * 仍未修的 shell 赋值折叠 / read 外部副本形状,以及已经安全删除但必须继续参加造串检测的哨兵。
+ * 前四行是明确披露的残留;后五行要求任何未来放宽都不能重新发出输入中不存在的主机。
  */
 export const UNFIXED_CORPUS: CorpusRow[] = [
-  {
-    input: "user:hunter2@localhost",
-    expect: { grep: "user:hunter2@localhost" },
-    note: "main 上的既有泄漏:裸单标签主机的 DSN。归约要求带点,一趟都不匹配",
-  },
-  {
-    input: "/user:pass@localhost",
-    expect: { grep: "/user:pass@localhost" },
-    note: "main 上的既有泄漏:前导 `/`",
-  },
-  {
-    input: "prefix/user:pa/ss@db.example.com",
-    expect: { grep: "prefix/user:pa/ss@db.example.com" },
-    note: "main 上的既有泄漏:主机带点,但口令里的 `/` 让归约的 `[^\\s/]+` 匹配不上",
-  },
-  {
-    input: "user:hunter2@[::1]",
-    expect: { grep: "user:hunter2@[::1]" },
-    note: "main 上的既有泄漏:IPv6 方括号主机",
-  },
   // 赋值折叠漏掉的一类:值以 SHELL_BREAK 里的字符开头(`(`、`;`、`|`、`&`、`<`、`>`、反引号)。
   // `(?:SHELL_WORD_ATOM)*` 匹配零个原子,折叠只写出 `NAME=_`,值的其余部分留在串里,跳过循环
   // 又落回值的第二个词 —— 正是折叠这条改动要关的那个失败。
@@ -390,19 +531,36 @@ export const UNFIXED_CORPUS: CorpusRow[] = [
     note: "R5-P2:值以 `<` 开头,同一成因",
   },
   {
+    input: "user:Ab3xY9zQ1wKpAb3xY9zQ1wKpAb3xY9zQ1wKp@vault retry with Ab3xY9zQ1wKp",
+    expect: { read: "https://vault retry with Ab3xY9zQ1wKp" },
+    note:
+      "R13 read 外部副本残留:base 已露出副本前 12 字符并截断;head 正确缩短前缀后," +
+      "完整副本落进 64 字符窗口。生成式 parity 另以 base/head 关系精确计数为 1",
+  },
+  {
     input: "nginx:1.21@sha256:1234abcd",
-    expect: { grep: "nginx:1.21@sha256:1234abcd" },
-    note: "造串哨兵:放宽单标签分支时曾被改写成 `https://sha256abcd`,输入里没有这个串",
+    expect: { grep: "" },
+    note: "造串哨兵:default-deny 删除残余 token,不允许改写成输入里没有的 `https://sha256abcd`",
   },
   {
     input: "3:4@2/x",
-    expect: { grep: "3:4@2/x" },
-    note: "造串哨兵:纯数字主机被 new URL() 规范化成 `https://0.0.0.2`",
+    expect: { grep: "" },
+    note: "R11 造串哨兵:纯数字主机 `2` 曾被 new URL() 规范成 `https://0.0.0.2`。去掉「单标签必须含字母」后它走到逐字比对 —— `0.0.0.2` 不在输入里 → 删除(比渲染原文更安全:不造串也不泄漏)",
   },
   {
-    input: "image:v1@registry/repo",
-    expect: { grep: "image:v1@registry/repo" },
-    note: "造串哨兵:`word:token@letter-host/path` 这一类的代表形状",
+    input: "a:b@1.2.3",
+    expect: { grep: "" },
+    note: "R9 造串哨兵:**带点**分支的同一条 new URL() 路径 —— `1.2.3` 被规范成 `1.2.0.3`。上一版只给无点分支加了「必须含字母」,这条漏在另一边",
+  },
+  {
+    input: "scope:name@1.0.0",
+    expect: { grep: "" },
+    note: "R9 造串哨兵:普通 npm/maven 坐标,曾被渲染成 `https://1.0.0.0`",
+  },
+  {
+    input: "a:b@0x7f.1",
+    expect: { grep: "" },
+    note: "R9 造串哨兵:十六进制被 new URL() 展开成 `127.0.0.1`",
   },
 ];
 
@@ -499,6 +657,41 @@ export const PERF_CORPUS: PerfRow[] = [
     reachesPasses: true,
     note: "R1:走第 1 趟 scheme 正则,与上面几行代价完全不同",
   },
+  {
+    label: "点密集、无 pass-2 形状",
+    input: "a.".repeat(2000),
+    reachesPasses: true,
+    note:
+      "R13:每个点后都有新的单词边界,schemeless userinfo 正则会从每个边界回退找冒号;" +
+      "preflight 若无条件再跑一遍,head 就比 base 多付整趟二次成本",
+  },
+  {
+    label: "点密集 + 无效 // 与 @",
+    input: "a.".repeat(1997) + " // @",
+    reachesPasses: true,
+    note: "R14:两个 substring 同时存在但 pass 2 没有匹配。不能因此重跑整趟 userinfo preflight",
+  },
+  {
+    label: "点密集 + 真实 pass 2 + @",
+    input: "a.".repeat(1978) + " //host.example/x?owner=ops@example.com",
+    reachesPasses: true,
+    note: "R14:真实 protocol-relative 改写会启动 preflight,这是 README 必须披露的可达成本上限",
+  },
+  // 这两行钉住本 PR 的两个上限。加它们是因为对抗评审点出:**修复本身一行都没被钉住** ——
+  // 整组里没有任何一行「超过 64 KiB 且含空白」,于是 collapseForReduction 的切口路径零覆盖;
+  // 尾部扫描那个二次方也没有一行会在 main 上超时。修复不被自己的语料覆盖,下一次改动就没有红。
+  {
+    label: "超过 64 KiB 且含空白 —— 折叠切口路径",
+    input: "word ".repeat(20_000),
+    reachesPasses: false,
+    note: "R11:direct reduce 的 discarded tail 超过 64 KiB,在进入管线前 fail closed",
+  },
+  {
+    label: "空白 + 64 KiB 无点 base64",
+    input: "x " + "eyJ".repeat(21_845),
+    reachesPasses: true,
+    note: "R11:旧 JWT 正则的二次方形状。线性 scanner 允许它在固定 64 KiB tail 额度内完成",
+  },
   // 赋值折叠的对抗形状。它此前一行都没有 —— ASSIGNMENT_VALUE_RE / SHELL_WORD_ATOM 是本 PR 新加的
   // 正则,而 `SHELL_WORD_ATOM` 是 `(?:A|B|C|D|E)*` 这种嵌套重复,正是灾难性回溯的经典形状。
   // 这里不回溯的理由是「星号后面没有东西,匹配永远能收尾」,但那是**推理**;这几行把它变成实测。
@@ -538,5 +731,105 @@ export const PERF_CORPUS: PerfRow[] = [
     input: "x " + Array.from({ length: 200 }, (_, i) => `V${i}='a'`).join(""),
     reachesPasses: true,
     note: "R5-nit:`(^|[SHELL_BREAK])` 前导在同一串上反复命中,测的是匹配次数而不是单次回溯",
+  },
+];
+
+/**
+ * **与 `def63bb` 的扣留对等性(parity)。** 这一组的判据不是「输出等于某个字面量」,而是
+ * **「本 head 至少和 main 藏得一样多」** —— 凡是 main 会扣下的凭据子串,本 head 也不许渲染。
+ *
+ * 为什么要单独一组:这条分支九轮评审里,有六条 blocking 是同一个形状 ——「为性能加的界/为修一个
+ * 洞加的判据,静默削弱了另一处脱敏」,而且**只有把行为与 main 逐 sink 并排跑才看得见**。
+ * 第八轮我用一次性脚本跑过一遍、报告「0 回归」,第九轮评审在同样的代码上找到 120 条 —— 因为
+ * 那个脚本和代码有**同一批盲点**。所以它必须进套件,而且必须带上当初漏掉的那几类形状:
+ *
+ *   1. **口令含 `/`** —— main 的 pass 3 口令类是 `[^\s/]+`,它同样不归约;而本分支放宽后归约了,
+ *      删掉的 span 里若有关键词,整行就从「扣下」变成「渲染」。
+ *   2. **外部副本是被删串的子串** —— 副本自身短于 32 字符,触发不了高熵检测。
+ *   3. **长 URL 带 `@`** —— 反方向:不许把 main 渲染的内容整行打空。
+ *
+ * **两个字段都是逐 sink 实测的,不是「应该」。** 一开始我把它们写成两个布尔,跑起来才发现两边
+ * 都不成立:第 4 行的口令在 main 的 `read` 上**本来就是明文**(同类外部副本残留同时由 UNFIXED
+ * 的 `R13 read 外部副本残留` 独立行和生成式 parity 的 `R11-截断错位` 机制谓词钉住),一条
+ * 「任何 sink 都不许出现」会把一个 main 也有的洞算到本 PR 头上;而第 7 行在 main 的
+ * `exec` 上就是空(shell 策略只取程序名),一条「哪个 sink 都不许打空」会把它判红。所以两个字段
+ * 都是 sink 列表,值从 `def63bb` 上量出来粘贴。
+ */
+export type ParitySink = "error" | "grep" | "read" | "exec";
+
+export interface ParityRow {
+  input: string;
+  /** 必须不出现在结果里的凭据子串。只测反方向(不许打空)的行不带这个字段。 */
+  secret?: string;
+  /** `def63bb` 上**藏住了** `secret` 的 sink(实测)。本 head 在这些 sink 上也必须藏住。 */
+  mainHides: ParitySink[];
+  /**
+   * `def63bb` 上渲染出**非空且不含 `secret`** 的 sink(实测)。本 head 不许把这些打空。
+   *
+   * 「不含 secret」这半个条件是必须的:main 泄漏、本 head 打空,那是修好了,不是过度隐藏 ——
+   * 第 6 行(R12 那条)正是这样,少了这半个条件它会因为自己的修复而变红。
+   */
+  mainRenders: ParitySink[];
+  note: string;
+}
+
+export const PARITY_CORPUS: ParityRow[] = [
+  // 盲点 1:口令含 `/`。main 的 pass3 口令类不含 `/`,所以 main 也不归约、整行靠关键词扣下。
+  {
+    input: "credential:pa/ss@db.example.com retry with pa/ss",
+    secret: "pa/ss",
+    mainHides: ["error", "grep", "read", "exec"],
+    mainRenders: [],
+    note: "R13:口令含 `/`。mainWouldReduce 只建模 host 半边时,这一类 poison 不触发(120 条回归的来源)",
+  },
+  {
+    input: "password:aB3/xY9z@db.example.com fallback aB3/xY9z",
+    secret: "aB3/xY9z",
+    mainHides: ["error", "grep", "read", "exec"],
+    mainRenders: [],
+    note: "R13:同上,另一个关键词与口令构成",
+  },
+  {
+    input: "credential:pa/ss@10.0.0.5 retry with pa/ss",
+    secret: "pa/ss",
+    mainHides: ["error", "grep", "read", "exec"],
+    mainRenders: [],
+    note: "R13:同上,全数字 host",
+  },
+  // 盲点 2:外部副本是被删长串的子串,自身短于高熵阈值。
+  {
+    input: "user:Ab3xY9zQ1wKpAb3xY9zQ1wKpAb3xY9zQ1wKp@vault retry with Ab3xY9zQ1wKp",
+    secret: "Ab3xY9zQ1wKp",
+    mainHides: ["error", "grep", "exec"],
+    mainRenders: [],
+    note: "R13:36 字符触发高熵、外部那份 12 字符不触发。poison 写死非 generic 档时漏掉",
+  },
+  // 已修的几类,留在这里防回退。
+  {
+    input: "credential:tok9Fk2Lp@vault retry with tok9Fk2Lp",
+    secret: "tok9Fk2Lp",
+    mainHides: ["error", "grep", "read", "exec"],
+    mainRenders: [],
+    note: "R12:关键词在被删的 span 里(第八轮 P1-a)",
+  },
+  {
+    input: "alice:hunter2" + "h".repeat(250) + "/x:b@localhost",
+    secret: "hunter2hhhh",
+    mainHides: ["error", "grep", "exec"],
+    mainRenders: [],
+    note: "R12:超 256 口令含 `/`,归约重启点吃掉 `@`(第八轮 P1-b)",
+  },
+  // 盲点 3:反方向 —— main 渲染的内容不许被整行打空。
+  {
+    input: "https://example.com/path?" + "a".repeat(260) + "=ops@example.net",
+    mainHides: [],
+    mainRenders: ["error", "grep", "read"],
+    note: "R13:长 URL 带 `@`。归约前的 hasOverlongUserinfo 把 `https:` 冒号当分隔符 → 整行消失(第九轮 P1-c)",
+  },
+  {
+    input: "GET https://api.example.com/v1/items?filter=" + "z".repeat(300) + "&contact=ops@example.com 200 OK",
+    mainHides: [],
+    mainRenders: ["error", "grep", "read", "exec"],
+    note: "R13:同上,查询参数里的 `@`",
   },
 ];

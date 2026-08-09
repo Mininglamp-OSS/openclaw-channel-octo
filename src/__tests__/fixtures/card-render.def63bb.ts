@@ -1,3 +1,25 @@
+/* eslint-disable */
+// @ts-nocheck
+/**
+ * **`def63bb` 的 `src/card-render.ts` 冻结快照。这个文件不是产品代码，永远不要改它。**
+ *
+ * 它存在的唯一理由:差分 runner(card-render.parity.test.ts)要能**执行** merge-base 的实现,
+ * 而不是把 merge-base 的行为**手抄**成期望值。这条分支上，手抄的护栏已经失效过两次 ——
+ * 第八轮的一次性脚本报「0 回归」而实际有 120 条，第九轮的 PARITY 语料组 8 行手写字面量而
+ * 第十轮的四类回归全部通过。两次的成因相同:挑行的人有多少盲点，护栏就有多少盲点。
+ * 基准可以被执行，这个性质才断掉。
+ *
+ * 来源:`git show def63bb:src/card-render.ts`。
+ * 除本段头注释与 `@ts-nocheck` 外,与原文的差异**只有三行 import 说明符**(相对路径抬两层,指向仓库现有的 types / card-blocks /
+ * card-limits)——那三个模块只被本文件下半段的进度卡渲染用到，差分调用的归约/守卫这半段
+ * 不碰它们。落地时已用 809 个输入 × 5 个 sink 与真实 def63bb 工作树逐组比对，0 差异。
+ *
+ * `@ts-nocheck` 是给「将来有人把 exclude 去掉」留的:旧代码未必过得了今天的类型设置,
+ * 而那时候的正确反应是恢复 exclude,不是去改这个快照。
+ * 本文件不进 tsc(见 tsconfig.json 的 exclude):它是旧代码的快照，不该被今天的类型设置约束，
+ * 也不该被编译进 dist 发出去。真的坏了 vitest 会在加载时直接报错。
+ * 内容哈希钉在 card-render.parity.test.ts 里 —— 改动一个字节，那条断言就变红。
+ */
 /**
  * InteractiveCard(=17) 进度卡渲染 —— 把 agent 运行状态渲染成 Adaptive Cards 1.5
  * JSON（octo/v1 profile 白名单:TextBlock/Container 等）。纯函数、无副作用、无
@@ -7,9 +29,9 @@
  * 帧内容:工具名友好化 + 参数摘要 + 耗时,让用户看清 agent 在做什么。
  * 视觉属性仅用端到端验证过的(weight/spacing/size/wrap),不用未验证的 color 以规避白名单。
  */
-import { CARD_VERSION } from "./types.js";
-import { buildDisplayCard, EN_BUDGET_MARKER, EN_DROP_MARKER, type DisplayBlock, type RichSegment } from "./card-blocks.js";
-import { cardFitsLimits, type CardLimits } from "./card-limits.js";
+import { CARD_VERSION } from "../../types.js";
+import { buildDisplayCard, EN_DROP_MARKER, type DisplayBlock, type RichSegment } from "../../card-blocks.js";
+import { cardFitsLimits, type CardLimits } from "../../card-limits.js";
 
 /**
  * Plain-text fallback for the progress / reasoning card. Deliberately not `CARD_PLACEHOLDER`:
@@ -111,7 +133,7 @@ export function resolveToolMeta(tool: string): { icon: string; label: string } {
   return { icon: TOOL_ICONS[tool] ?? "🔧", label: tool };
 }
 
-export const SUMMARY_MAX = 64;
+const SUMMARY_MAX = 64;
 /**
  * `reduceUrlsInText` 的输入长度上限。
  *
@@ -134,9 +156,6 @@ export const SUMMARY_MAX = 64;
  * 怎么截断见 boundedForReduction —— 切口必须落在空白上,那是这个上限能否安全存在的前提。
  */
 export const REDUCE_INPUT_MAX = 4000;
-
-/** 折叠前最多保留的原始输入,也是任一截断点允许完整检查的最大 discarded tail。 */
-export const RAW_INPUT_MAX = 64 * 1024;
 
 /**
  * 敏感串守卫模式。群卡片对全体成员可见 —— 摘要一旦命中即整串隐藏(fail-safe:
@@ -165,64 +184,8 @@ const SECRET_PREFIX_RES: RegExp[] = [
   /npm_[A-Za-z0-9]{30,}/,                               // npm automation token
   /shpat_[A-Fa-f0-9]{32,}/,                             // Shopify access token
   /dop_v1_[A-Fa-f0-9]{32,}/,                            // DigitalOcean PAT
+  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/, // JWT
 ];
-
-/** `[A-Za-z0-9_-]`,按 charCode 判断以免在长串上创建临时子串。 */
-function isBase64UrlCode(code: number): boolean {
-  return (
-    (code >= 48 && code <= 57) ||
-    (code >= 65 && code <= 90) ||
-    (code >= 97 && code <= 122) ||
-    code === 95 || code === 45
-  );
-}
-
-/**
- * JWT 的线性扫描器,语义等同于旧的
- * `eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+`。
- *
- * 旧正则在 `"eyJ"` 密集、没有点号的串上,会从每个起点扫到尾再回退,是二次方。这里把输入拆成
- * base64url run,只保留前两个 run 与分隔符状态;每个 run 内再做一次局部扫描,每个字符最多读两遍。
- * 这是旧规则的**替换**,不是旁路的第二份判据 —— 生产代码只剩这一处 JWT authority。
- */
-function hasJwtShape(s: string): boolean {
-  interface Run { length: number; jwtHead: boolean }
-  let older: Run | null = null;
-  let previous: Run | null = null;
-  let dotBeforePrevious = false;
-  let previousEnd = -1;
-  let i = 0;
-
-  while (i < s.length) {
-    while (i < s.length && !isBase64UrlCode(s.charCodeAt(i))) i++;
-    if (i >= s.length) break;
-    const start = i;
-    while (i < s.length && isBase64UrlCode(s.charCodeAt(i))) i++;
-    const end = i;
-    const dotBefore = previousEnd >= 0 && start === previousEnd + 1 && s.charCodeAt(previousEnd) === 46;
-    let jwtHead = false;
-    for (let candidate = start; candidate + 11 <= end; candidate++) {
-      if (
-        s.charCodeAt(candidate) === 101 &&
-        s.charCodeAt(candidate + 1) === 121 &&
-        s.charCodeAt(candidate + 2) === 74
-      ) {
-        jwtHead = true;
-        break;
-      }
-    }
-    const current: Run = { length: end - start, jwtHead };
-
-    if (older?.jwtHead && previous !== null && dotBeforePrevious && previous.length >= 8 && dotBefore) {
-      return true;
-    }
-    older = previous;
-    previous = current;
-    dotBeforePrevious = dotBefore;
-    previousEnd = end;
-  }
-  return false;
-}
 
 /** 长 hex(md5/sha/hex 密钥)。也命中 git object/docker digest 等常见路径,故仅用于 query/url。 */
 const LONG_HEX_RE = /\b[0-9a-fA-F]{32,}\b/;
@@ -247,99 +210,9 @@ function hasGenericSecretShape(s: string): boolean {
  * 群卡片对全员可见,任一命中即隐藏。
  */
 export function isSensitive(s: string, generic: boolean): boolean {
-  return hasSecretShape(s, generic);
-}
-
-/**
- * 单一敏感判定 authority:关键词、明确前缀、JWT、超长 userinfo,以及 generic 档的长 hex/高熵。
- * 每一项都与输入长度成正比;discarded tail 的固定额度由 tailIsSensitive 统一执行。
- */
-function hasSecretShape(s: string, generic: boolean): boolean {
   if (SECRET_RE.test(s)) return true;
   if (SECRET_PREFIX_RES.some((re) => re.test(s))) return true;
-  if (hasJwtShape(s)) return true;
-  if (hasOverlongUserinfo(s)) return true;
   return generic && hasGenericSecretShape(s);
-}
-
-/**
- * 一个 `user:pass@host` 里的 userinfo 段超过 SCHEMELESS_USERINFO_RE 的口令上限(256)时,
- * 那条正则整条匹配不上、DSN 原样流过归约 —— 而**这里必须把它当命中扣下,不能让它漏过去**。
- *
- * 上限本身是对的(它是 `a:b/c/…` 那条二次方的唯一解),问题是超限的失败方向:上一版超限 =
- * 不归约 = 明文渲染(评审第六轮的 P0,阈值精确在 257,无长度前提,五个群可见 sink 全中,
- * 且 path/shell 的 generic=false 连高熵兜底都不跑)。补一道 fail-closed:超限即敏感。
- *
- * **线性实现,不用正则。** 按空白分词,找一个「前面紧挨用户名字符的冒号」在先、`@` 在后,
- * 且中间那段(口令)超过 256 的 token,即命中。indexOf/lastIndexOf 都是线性。
- * 放在 generic 判定**之前**,所以 path/shell 也走它 —— 那正是漏得最狠的那条路。
- *
- * **分隔冒号必须紧挨用户名字符**(`[A-Za-z0-9._%+-]`),这是为了对齐 SCHEMELESS_USERINFO_RE
- * 只匹配 `[A-Za-z0-9._%+-]+:` 开头这一点 —— 否则一段无空白的 minified JSON
- * (`{"level":"error","detail":"<300 z>","owner":"ops@example.com"}`)里,第一个冒号前面是
- * `"`,却因为「有冒号、有 @、中间超 256」被整块打空(评审第七轮 P2)。要求冒号前是用户名字符,
- * JSON 那些 `":"` 全部被这个 detector 跳过,而 `alice:<300>@host` 照样命中。归约收口处更宽的
- * residual-userinfo default-deny 仍会扣下同形 JSON;那是独立且已记录的产品代价。
- */
-/**
- * `def63bb` 的 pass 3,**逐字抄下来**。poison 要问的是「main 当初会不会归约这一段」,
- * 那就问 main 的规则本身,不要再复刻一遍 —— 上一版只复刻了 host 半边、漏掉口令类不含 `/`,
- * 整个「口令含 `/`」的族因此判错。这条只读不改,是一份历史快照。
- */
-const MAIN_PASS3_RE =
-  /\b[A-Za-z0-9._%+-]+:[^\s/]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:\/[^\s]*)?/;
-
-const OVERLONG_USERINFO_MAX = 256;
-const USERINFO_NAME_CHAR = /[A-Za-z0-9._%+-]/;
-const WS_SCAN_RE = /\s/g;
-function hasOverlongUserinfo(s: string): boolean {
-  // **一次原生空白扫描,短 token 连 slice 都不做。**
-  //
-  // 判据是 `lastAt - colon - 1 > OVERLONG_USERINFO_MAX`,而 `colon >= 1`(冒号前要有用户名
-  // 字符),所以命中的 token 至少 260 个字符 —— 短于这个长度的 token **不可能**为真。先按长度
-  // 筛掉,再谈里面有什么。
-  //
-  // 为什么在意:discarded tail 在额度内会完整检查,这个函数经常跑在 64 KiB 串上。
-  // 三版实测(4 MB 原型,neutralizeEcho / sanitizeErrorText,def63bb 分别是 70 / 248 ms):
-  //     s.split(/\s+/)            散文 265 / 213 ms  ← 八十万个字符串分配
-  //     沿 @ 走 + 逐字符找边界      散文  69 /  76 ms,DSN 密集 189 / 195 ms  ← 每 token 数十次正则
-  //     本版(空白扫描 + 长度筛)     见下
-  // def63bb 没有这个函数,所以这里的每一毫秒都是本 PR 新加的,不能拿「base 也慢」搪塞。
-  // 没有 `@` 就不可能命中 —— 一次原生 indexOf 就能挡掉整条散文尾巴,连空白扫描都省了。
-  if (s.indexOf("@") < 0) return false;
-  const MIN_TOKEN = OVERLONG_USERINFO_MAX + 4;
-  WS_SCAN_RE.lastIndex = 0;
-  let from = 0;
-  for (;;) {
-    const m = WS_SCAN_RE.exec(s);
-    const to = m ? m.index : s.length;
-    if (to - from >= MIN_TOKEN) {
-      const tok = s.slice(from, to);
-      if (!TOKEN_SCHEME_RE.test(tok)) {          // 带 scheme 的 URL 不是裸 userinfo
-        const at = tok.lastIndexOf("@");
-        if (at >= 2) {                           // `x:@` 起码要 3 个字符
-          let colon = -1;
-          for (let c = tok.indexOf(":"); c >= 0 && c < at; c = tok.indexOf(":", c + 1)) {
-            if (c > 0 && USERINFO_NAME_CHAR.test(tok[c - 1]!)) { colon = c; break; }
-          }
-          if (colon >= 0 && at - colon - 1 > OVERLONG_USERINFO_MAX) return true;
-        }
-      }
-    }
-    if (!m) return false;
-    from = WS_SCAN_RE.lastIndex;
-  }
-}
-
-/** 调用方自己的敏感判定。所有 detector 都是线性的,因此不再按成本拆成两份 authority。 */
-export type SensitivePredicate = ((s: string) => boolean) & {
-  /** discarded tail 超过固定额度、未执行扫描时通知有预算状态的调用方。 */
-  onLimit?: () => void;
-};
-
-/** 按 generic 档构造谓词。query/url 用 true,path/shell 用 false。 */
-export function sensitivePredicate(generic: boolean): SensitivePredicate {
-  return (s) => isSensitive(s, generic);
 }
 
 /**
@@ -370,38 +243,10 @@ function registrableDomain(host: string): string {
  * 工具 → 摘要提取策略(allowlist)。未列出的工具(含 MCP、未知工具)一律**不显示摘要**,
  * 杜绝把任意参数直渲到群卡片的泄露面。
  */
-type SummaryStrategy = "path" | "shell" | "url" | "query" | "enum";
-
-/**
- * `process` 工具的动作白名单。
- *
- * 它此前映射到 `"shell"`,而 shell 策略读的是 `command`/`cmd` —— `process` 根本没有这两个字段
- * (它的参数是 `action` + `sessionId` 等),于是这个工具的摘要**恒为空串**。实测
- * `{action:"kill",sessionId:"x"}` → `""`。
- *
- * 取值抄自 vendored 的 `openclaw/dist/bash-tools.schemas-*.js`,而那里 `action` 声明的是
- * `Type.String`,枚举只写在 description 里、**并不被 schema 强制**。所以这里按白名单渲染:
- * 认得的动作原样显示,认不出的返回空串(退回只显示工具名)。上游新增动作时的失败模式是
- * **少显示一个词**,不是渲染出未知内容 —— 这是刻意选的那一侧,`openclaw` 的依赖声明是
- * `^2026.6.9` 这样的范围,不是 pin。
- */
-const PROCESS_ACTIONS = new Set([
-  "list", "poll", "log", "write", "send-keys", "submit", "paste", "kill", "clear", "remove",
-]);
-
-/** enum 策略:只渲染白名单内的动作名。 */
-function summarizeEnum(p: Record<string, unknown>, allowed: ReadonlySet<string>): string {
-  // `firstString` 会先在原串上 trim 以判断非空;这里是本 PR 新增的调用点,不能让一个本来只有
-  // 十来个字符的枚举摘要重新获得随原始输入增长的同步成本。超界直接少显示一个词(fail closed),
-  // 只有完整输入落在归约额度内时才 trim。
-  const value = p.action;
-  if (typeof value !== "string" || value.length > REDUCE_INPUT_MAX) return "";
-  const raw = value.trim();
-  return allowed.has(raw) ? raw : "";
-}
+type SummaryStrategy = "path" | "shell" | "url" | "query";
 const SUMMARY_STRATEGY: Record<string, SummaryStrategy> = {
   read: "path", write: "path", edit: "path", apply_patch: "path", ls: "path", find: "path", glob: "path",
-  exec: "shell", bash: "shell", shell: "shell", process: "enum",
+  exec: "shell", bash: "shell", shell: "shell", process: "shell",
   fetch: "url",
   web_search: "query", search: "query", grep: "query",
 };
@@ -426,19 +271,11 @@ function shortenPath(p: string): string {
   return `…/${segs[segs.length - 2]}/${segs[segs.length - 1]}`;
 }
 
-/**
- * 取 keys 中首个非空字符串值,但不让摘要提取在原始参数上重新获得无界成本。
- *
- * 这道界必须住在共享取值处:调用方在归约之前还会 trim、按路径 split、解析 URL。只把界放进
- * reduceUrlsInText 或 summarizeShell,仍挡不住那些更早的步骤。超过 raw 额度直接少显示一条摘要
- * (fail closed);只有完整值落在额度内时才 trim。
- */
+/** 取 keys 中首个非空字符串值。 */
 function firstString(p: Record<string, unknown>, keys: string[]): string {
   for (const k of keys) {
     const v = p[k];
-    if (typeof v !== "string") continue;
-    if (v.length > RAW_INPUT_MAX) return "";
-    if (v.trim()) return v;
+    if (typeof v === "string" && v.trim()) return v;
   }
   return "";
 }
@@ -482,9 +319,6 @@ const PROGRAM_TOKEN_RE = /^[A-Za-z0-9_./@:+-]+$/;
  * 用下标而不是正则,还顺带解决了代价:`[^@]*:[^@]*@` 在「冒号密集、没有 `@`」的 token 上是
  * 二次的,而 summarizeShell 跑在**归约那道界之上**,`REDUCE_INPUT_MAX` 管不到它 ——
  * `":"×131072` 实测 19 077 ms(main 4.3 ms)。indexOf/lastIndexOf 是线性的。
- *
- * (summarizeShell 现在自己设了界,那条超长 token 走不到这里;但线性的实现仍然是对的 ——
- * 界是第二道防线,不该让这个函数的正确性依赖调用方喂了多少。)
  */
 const TOKEN_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 function isDsnShapedToken(t: string): boolean {
@@ -493,14 +327,6 @@ function isDsnShapedToken(t: string): boolean {
   if (host <= 0) return false;
   const colon = t.indexOf(":");
   return colon >= 0 && colon < host;
-}
-
-/**
- * Pass 结束后仍含 `name:…@` 的无 scheme token,说明归约规则没有认出它。此时不再枚举用户名/主机
- * 字符类,而是在唯一收口处整段扣下。输出已被 boundedForReduction 收进 4000 字符,这里的分词有界。
- */
-function hasResidualDsnShapedToken(s: string): boolean {
-  return s.split(/\s+/).some((token) => token !== "" && isDsnShapedToken(token));
 }
 const ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
@@ -542,13 +368,7 @@ function foldAssignmentValues(cmd: string): string {
  * 含引号/空格/等号等异常字符的 token 一律判为可疑值片段 → 不展示。
  */
 function summarizeShell(p: Record<string, unknown>): string {
-  // **自己设界。** 这一步跑在归约那道界**之上**(见 summarizeToolParams:先取程序名,再折叠归约),
-  // 所以 REDUCE_INPUT_MAX 管不到它,而下面的 foldAssignmentValues + split 都按整串长度走:
-  // 4 MB 的 command 实测 91 ms。程序名必定在头一段里,后面再长也影响不到结果。
-  // 切口走 cutOnWhitespace —— 盲切会把程序名切成半截(`docker` → `doc`)渲染出去;
-  // 窗口内没有空白说明这是一个 4000 字符以上的单 token,不可能是程序名,返回空。
-  const bounded = cutOnWhitespace(firstString(p, ["command", "cmd"]), REDUCE_INPUT_MAX);
-  const cmd = (bounded ?? "").trim();
+  const cmd = firstString(p, ["command", "cmd"]).trim();
   if (!cmd) return "";
   // 先折叠赋值,再按空白取程序名。直接空白分词会把带引号的多词值切碎,跳过首个片段后落在值的
   // **第二个**词上,而那个词往往不含异常字符、能通过 PROGRAM_TOKEN_RE:
@@ -587,142 +407,26 @@ const PROTOCOL_RELATIVE_RE =
  * 无 scheme 的 userinfo DSN(`user:pass@host[:port][/path]`):userinfo 即明文口令。
  * 密码可含 `@`,按最后一个 `@` 分隔主机。
  *
- * **单标签主机、IPv6、口令带 `/` 都覆盖。** 这四种形状此前挂在 `UNFIXED_CORPUS` 上 ——
- * 归约够不着,守卫也认不出,于是 `user:hunter2@localhost` 原样渲染进群卡片。
- *
- * 关掉它们不是为了补一个洞,是为了让**一句话成立**:这条管线一直声称「渲染的永远只有 kept,
- * 而 kept 自己要过守卫」。只要单标签 userinfo 还在 UNFIXED 里,这句话就是假的 —— kept 可以
- * 装着明文口令大摇大摆走过守卫。评审两轮指出:前提是假的,那么「尾部扫描能伸多远」这个界
- * 放在哪里都是泄漏而不是取舍,因为无论界在 4000 还是 131072,总有一个更远的位置。
- * 收窄了三次都没关掉,第四次该改的是前提。
- *
- * 放宽会踩两个坑 —— 造串,和小写化泄漏。**它们由下面 pass 3 里那条「归约出的主机必须逐字
- * 出现在 host 里」的检查一并关掉,不在这条正则上解决。** 那才是承重的机制,说明写在检查那里。
- *
- * 这条正则里唯一为「坑」而写的是末尾的 `(?![A-Za-z0-9-])(?!:\d)`:要求匹配停在 token 边界上,
- * 且冒号后不是数字。它挡的是 `nginx:1.21@sha256:1234` 被切在词中间(sha256 的冒号接的是数字),
- * 而放行 `user:pw@localhost: refused`(冒号接的不是数字)—— 后者是 DSN 在错误串里最常见的写法。
- * **早先这里写的是 `(?![A-Za-z0-9:-])`,把冒号一律排除,于是那个最常见的形状整条匹配不上、
- * 口令原样渲染;评审第四轮点出。** `(?!:\d)` 才是那条规则的准确表述。
- *
- * 造串曾经试过用「单标签必须含字母 / 带点分支不受影响」来挡 —— **那个说法是错的,评审证伪:**
- * 前瞻会让带点分支回退成纯数字主机,`new URL()` 照样把它规范成输入里没有的地址。所以不靠
- * 分支形状,靠逐字比对(见 pass 3)。
- *
- * 代价是几种误伤,方向安全(少渲染)、不造串,记在 REWRITE 组里:`at 10:30@venue` →
- * `at https://venue`,`com.foo:bar:1.0@jar` → `https://jar`。误伤面比两行宽 ——
- * `word:number@word` 与 `word:word@word` 在工具输出里都常见,详见 README。凭据泄漏在群可见
- * sink 上,这笔换得起。
- *
- * **口令段有长度上限 256,那是为了不引入一条新的二次方。** 旧版口令写作 `[^\s/]+`,`/` 把
- * 长串切成短段;放开 `/` 之后,`a:b/c/a:b/c/…` 这种无 `@` 的长 token 上,每个起点都要扫到
- * token 末尾再回退 —— 实测 4000/16000/64000 字符是 5.0/74.9/1245.8 ms,干净的二次方,
- * 而旧版是平的 0.1 ms。加上限之后 1.3/4.7/17.5 ms,回到线性。
- * 代价:口令超过 256 字符的 DSN 不再被归约。那个长度本身已经是高熵串,交给守卫 ——
- * `LEAK_CORPUS` 里 3995 字符口令那两行正是这一类,它们靠守卫扣下,不靠归约。
+ * **只覆盖带点主机。** 单标签主机(`localhost`、compose 服务名)与配套的 fail-closed 兜底
+ * 曾经在这条分支上,四轮评审里两次把缺陷改成了更糟的缺陷 —— 放宽归约会把
+ * `nginx:1.21@sha256:…` 改写成输入里不存在的 `https://sha256abcd`,收紧兜底又会让一个尾随
+ * 逗号或引号整条绕过它。那一对已经摘出去单独评审(见 PR 说明),这里保持 main 的形状不变。
  */
 const SCHEMELESS_USERINFO_RE =
-  /\b[A-Za-z0-9._%+-]+:[^\s]{1,256}@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|[.\u002d\p{L}\p{N}]+)(?::\d+)?(?:\/[^\s]*)?(?![A-Za-z0-9-])(?!:\d)/gu;
+  /\b[A-Za-z0-9._%+-]+:[^\s/]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:\/[^\s]*)?/g;
 
 /** 任意无 scheme 的 `host.tld/path`:path 常承载 webhook token、签名或对象凭据。 */
 const SCHEMELESS_HOST_PATH_RE =
   /(^|[^A-Za-z0-9@._/:+-])([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?\/[^\s]+)/g;
 
+/**
+ * 调用方自己的敏感判定。界要用它去查**被丢掉的那一段** —— 见 boundedForReduction 里
+ * 「被丢掉的那一段要过一遍调用方自己的守卫」。
+ */
+export type SensitivePredicate = (s: string) => boolean;
+
 /** 缺省谓词取最严的一档:不知道调用方是谁时,宁可过度隐藏。 */
-const DEFAULT_SENSITIVE: SensitivePredicate = sensitivePredicate(true);
-
-/**
- * 两个截断点共用的 discarded-tail 规则:在额度内就完整检查,超过额度直接 fail closed。
- *
- * 不能再开一个「只看前 N 字符、忽略更远内容」的窗口:base 据以扣留整串的信号可能就在窗口外。
- * 也不能无界扫描:unmetered 的参数摘要和错误文本会把原始输入长度直接变成事件循环停顿。这里先用
- * `source.length - from` 判定,超额时连 `slice` 都不做;因此实际交给谓词的量恒 ≤64 KiB。
- */
-function tailIsSensitive(source: string, from: number, p: SensitivePredicate): boolean {
-  const length = source.length - from;
-  if (length <= 0) return false;
-  if (length > RAW_INPUT_MAX) {
-    p.onLimit?.();
-    return true;
-  }
-  return p(source.slice(from));
-}
-
-/**
- * **按长度截断的唯一实现。** 切口只能落在空白上:归约靠锚点定位,盲切会把锚点切掉,于是本该
- * 被剥掉的凭据原样留下;窗口里没有空白就返回 null,由调用方 fail closed。
- *
- * 这个函数存在的理由不是复用,是**消灭第二份**。这条分支上反复出现的缺陷是同一类 ——
- * 「第二处该镜像第一处的规则,没镜像上」:兜底正则的字符类与归约的分岔、DSN token 取第一个
- * `@` 而第 3 趟取最后一个、`collapseForReduction` 写成裸 slice。每次都是把规则**又写了一遍**
- * 而不是**用同一份**。三个截断点(64 KiB 折叠、4000 归约界、shell 程序名)现在共用这一份。
- */
-export function cutOnWhitespace(s: string, max: number): string | null {
-  if (s.length <= max) return s;
-  // +1:空白正好落在下标 max 时也要找得到,否则那一位被当成"窗口内无空白"。
-  const cut = s.slice(0, max + 1);
-  const lastSpace = cut.search(/\s\S*$/);
-  return lastSpace < 0 ? null : cut.slice(0, lastSpace);
-}
-
-/**
- * 原串是否能在归约额度内被**确定**为空白。
- *
- * 调用方不能直接 `s.trim()` 来区分「空输入」与「归约后被扣下」:那会重新把成本绑回原始输入
- * 长度。只有整串都落在 REDUCE_INPUT_MAX 内时才下空白结论;超长输入即使保留前缀全是空白,
- * 尾部也没有被检查,因此返回 false 让调用方 fail closed。trim 面对的量恒 ≤4000。
- */
-export function isDefinitelyBlankWithinReductionBound(s: string): boolean {
-  const bounded = cutOnWhitespace(s, REDUCE_INPUT_MAX);
-  return bounded !== null && bounded.length === s.length && bounded.trim() === "";
-}
-
-/**
- * 归约之前那一步空白折叠的输入上限。
- *
- * `REDUCE_INPUT_MAX` 管的是管线,但把文本送进管线之前先要对**原串**折叠空白,而那一步没有
- * 任何上限。实测(4 MB,同一台机器,形状不同差三倍):
- *
- *     普通散文  62 ms/MB    制表对齐  78    单空格密集  92    多空格密集  32
- *
- * 界救不了它,因为它跑在界之前 —— `sanitizeErrorText` 吃 4 MB 要 493 ms,而 200 个 1 MB 的
- * 块要 6673 ms。
- *
- * 取 64 KiB。**它不是"对输出中性"的** —— 上一版这么写,而且据此把切口写成了裸 slice,结果
- * 在折叠比高的输入上把归约的锚点切掉、渲染出完整口令。真实的性质弱一些,但足够:
- *
- *   - 切口**只落在空白上**(`cutOnWhitespace`),所以不会把 token 切开、不会切掉锚点;
- *   - 被丢掉的那一段**要过一遍调用方的谓词**(见下面的实现)。这一条是推送前的对抗评审补上的:
- *     上一版只镜像了 `boundedForReduction` 的切口规则,没镜像它的尾部守卫,于是
- *
- *         `user:hunter2@localhost ` + ("x" + " "×23)×3000 + ` y token`
- *
- *     里那个把整串压住的 `token` 落在 64 KiB 之外被切掉,base 渲染 `""`,而这里渲染出
- *     `user:hunter2@localhost` —— 一个**为了性能加的截断,自己变成了泄漏路径**。
- *   - 折叠比高时(大量连续空白、对齐排版),64 KiB 原文可能只折出几千字符,此时后面的内容
- *     **会**被丢掉。方向是安全的(少渲染),但它是一处真实的可用性代价,不是"不改变输出"。
- */
-/**
- * 折叠空白,并且**先把原串收进上限**。
- *
- * 三个把未截断文本送进管线的 sink 走它:`sanitize`(展示卡)、`sanitizeErrorText`、
- * `summarizeToolParams`。`reasoning-process` 与 `card-display-tool` 仍各自写着
- * `replace(/\s+/g, " ")`,但它们的输入在上游已有上限(思考文本 4000、debug 串 512),
- * 或者折叠跑在归约**之后**、面对的已是 ≤4000 的串 —— 逐个查过,不是遗漏。
- */
-export function collapseForReduction(
-  text: string,
-  isSensitiveHere: SensitivePredicate = DEFAULT_SENSITIVE,
-): string {
-  const kept = cutOnWhitespace(text, RAW_INPUT_MAX);
-  if (kept === null) return "";
-  const collapsed = kept.replace(/\s+/g, " ").trim();
-  if (kept.length === text.length) return collapsed;
-  // 丢掉的原文也走与 boundedForReduction 相同的规则:≤64 KiB 就完整检查,再长直接 fail closed。
-  // 不能只看一个窗口,否则窗口外的关键词/JWT 会从 base 的扣留下变成 head 的放行;也不能扫描
-  // 无界原文,否则未计费的参数摘要和错误文本仍会随输入长度阻塞事件循环。
-  return tailIsSensitive(text, kept.length, isSensitiveHere) ? "" : collapsed;
-}
+const DEFAULT_SENSITIVE: SensitivePredicate = (s) => isSensitive(s, true);
 
 /**
  * 超长输入的截断:**切口只能落在空白上**,切不到就整串不渲染。
@@ -750,7 +454,7 @@ export function collapseForReduction(
  *
  * 搜索范围取 `REDUCE_INPUT_MAX + 1` 而不是 `REDUCE_INPUT_MAX`:空白**正好落在下标 4000** 时,
  * 前 4000 字符已经是一个完整的、token 边界对齐的前缀,取 4000 会把它连同整串一起拒掉。
- * (`"a"×4000 + " " + "g"×100` 曾整串不渲染,而 `"a"×3999 + " " + …` 正常留下 3999 字符。)
+ * (`"a"×4000 + " " + "b"×100` 曾整串不渲染,而 `"a"×3999 + " " + …` 正常留下 3999 字符。)
  * 多取的那一个字符只用于**发现**切点,不会进入结果 —— 返回值长度恒 ≤ REDUCE_INPUT_MAX。
  *
  * **被丢掉的那一段要过一遍调用方自己的守卫。** 切开 token 不是界唯一能造成的伤害:守卫读的是
@@ -787,20 +491,17 @@ export function collapseForReduction(
  *       尾巴先定界再归约        isSensitive=false  ← 漏掉
  *
  * 用可用性换泄漏是这条管线不做的交易,所以守卫维持查原文。代价钉在 COST_CORPUS。
- *
- * 扫描量仍有固定上限:discarded tail ≤64 KiB 时完整检查,超过就不分配、不扫描并直接 fail closed。
- * JWT 已由旧的二次正则替换为语义等价的线性 run scanner,所以所有 detector 共用这一条规则,
- * 不再有「某一档只能看 4000 字符」的距离轴。
  */
 export function boundedForReduction(
   s: string,
   isSensitiveHere: SensitivePredicate = DEFAULT_SENSITIVE,
 ): string | null {
-  const kept = cutOnWhitespace(s, REDUCE_INPUT_MAX);
-  if (kept === null) return null;
-  if (kept.length === s.length) return kept;
-  // 与 collapseForReduction 共用同一条 discarded-tail 规则,不再各自维护窗口算法。
-  return tailIsSensitive(s, kept.length, isSensitiveHere) ? null : kept;
+  if (s.length <= REDUCE_INPUT_MAX) return s;
+  const cut = s.slice(0, REDUCE_INPUT_MAX + 1);
+  const lastSpace = cut.search(/\s\S*$/);
+  if (lastSpace < 0) return null;
+  const kept = cut.slice(0, lastSpace);
+  return isSensitiveHere(s.slice(kept.length)) ? null : kept;
 }
 
 /**
@@ -830,102 +531,24 @@ export function reduceUrlsInText(
   // 里都只挡住那一个调用方。`isSensitiveHere` 是调用方下游那道守卫,界用它检查自己丢掉了什么。
   const s = boundedForReduction(input, isSensitiveHere);
   if (s === null) return "";
-  // 超限 userinfo 必须在**归约之前**查。口令含 `/` 时,归约会在口令中间找到一个重启点
-  // (`…/x:b@host`),把原来那个真正超限的 `@` 吃掉;等归约跑完,post-reduction 的
-  // hasOverlongUserinfo 已经看不到那个 `@` 了(评审第八轮 P1-b)。在原串上查一次,与 main 一致
-  // (main 同样整行扣下),而且方向只会更严。
-  if (hasOverlongUserinfo(s)) return "";
-  // 归约会**删掉**它匹配的 span。如果那个 span 里有一个正压着整行的关键词/前缀,而这一行在
-  // main 上本来是靠它整行扣下的,删掉之后剩下的部分(可能含口令的另一份副本)就渲染出来了 ——
-  // 评审第八轮的 P1-a:`credential:tok@vault retry with tok`,main 扣下,本分支渲染
-  // `https://vault retry with tok`。**只发生在 main 没归约、而本分支新归约的那些 host 形状上**
-  // (main 的 pass 3 只认带点 host);带点的 main 也归约,两边一致,不在此列。
-  // **两个判据都直接问,不再自己建模。** 上一版把它们写成了手工近似,两处都错了(评审第九轮):
-  //
-  //   - 「main 会不会归约这一段」曾写成 `/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(host)` ——
-  //     只复刻了 main pass 3 的 **host** 半边,漏掉它的口令类 `[^\s/]+` **不含 `/`**。于是
-  //     「口令含 `/`」整类被判成「main 也归约」,poison 不触发:
-  //     `credential:pa/ss@db.example.com retry with pa/ss` main 扣下、本分支渲染出 `pa/ss`。
-  //     实测这一类 120 条 sink 级回归、45 个不同输入。现在直接拿 main 那条正则逐字来判。
-  //   - 「这一段带没带信号」曾写死 `hasLinearSecretShape(m, false)`,丢掉了 generic 高熵档 ——
-  //     而调用方自己的谓词就在作用域里。理由曾写成「高熵那份在被删的 span 里、删掉即消失」,
-  //     那是**假的**:外部副本可以是被删长串的**子串**,自身短于 32 字符触发不了高熵检测 ——
-  //     `user:<36字符>@vault retry with <其中12字符>`。用 isSensitiveHere 就没有这个缺口。
-  let poisoned = false;
-  const poisonIfNewShapeCarriesSignal = (m: string): void => {
-    // **`.exec()[0] === m`,不是 `.test(m)`。** 要问的是「main 会不会归约**这一段**」,而
-    // `test` 回答的是「main 的形状在这段里出现过没有」—— 嵌一个 base 能归约的 DSN 进去就能
-    // 压掉 poison:`credential:pw/u:p@a.example.com@vault retry with pw`,base 扣下、本分支
-    // 渲染出 `pw`(评审第十轮 Q2)。这里不另写一条带锚的正则 —— 「第二份该镜像第一份的规则
-    // 没镜像上」正是这条分支反复出问题的成因,所以仍然用同一份快照,只改提问方式。
-    if (MAIN_PASS3_RE.exec(m)?.[0] === m) return;
-    // 直接问调用方的单一 authority;JWT、高熵与关键词都不能在被删 span 里静默消失。
-    // m 的长度由 SCHEMELESS_USERINFO_RE 自身封顶,这里不会重新打开无界扫描。
-    if (isSensitiveHere(m)) poisoned = true;
-  };
   // 1. 任意 `scheme://…`,不止 http(s):DB/AMQP/ssh DSN(postgres://user:pass@host 等)也常
   //    出现在 query/shell/错误文本里,userinfo 即明文密码。要求 `://` 故不误伤 Windows 盘符(C:/)。
   let out = s.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi, (m) => originDomain(m) ?? "");
-  // 后面的 pass 2 也会改写文本,并可能只消费一个 pass-3 候选的前半段。若敏感信号恰好在
-  // 被消费的那一段里,等 pass 3 callback 再问已经太晚:它看到的是信号消失后新拼出的候选。
-  // 因此先**算出** pass 2 的结果,但仍在修改前的字符串上用同一份 pass-3 matcher / poison
-  // 判据保存证据。replace/originDomain 都是纯计算,先算结果不会改变 preflight 看到的输入。
-  const beforePass2 = out;
-  const afterPass2 = beforePass2.replace(PROTOCOL_RELATIVE_RE, (_m, p1: string) => {
+  // 2. 协议相对 `//host/path`:补 https 后降级(secret 可能在 path)。
+  out = out.replace(PROTOCOL_RELATIVE_RE, (_m, p1: string) => {
     const url = _m.slice(p1.length); // 去掉前导分隔符
     return p1 + (originDomain(`https:${url}`) ?? "");
   });
-  // substring `//` 不是 pass 2 候选:`" // @ "` 会满足旧 gate 却一个字符都不改,白跑第二遍
-  // 二次扫描。只有 pass 2 **实际改写**且原串含 userinfo 必需分隔符时才保存证据。`@` 不会由
-  // pass 2 凭空产生,所以这两个条件不会跳过任何能形成 pass-order userinfo 的输入。
-  if (afterPass2 !== beforePass2 && beforePass2.indexOf("@") >= 0) {
-    for (const match of beforePass2.matchAll(SCHEMELESS_USERINFO_RE)) {
-      poisonIfNewShapeCarriesSignal(match[0]);
-    }
-  }
-  // 2. 协议相对 `//host/path`:补 https 后降级(secret 可能在 path)。
-  out = afterPass2;
   // 3. 无 scheme 的 userinfo DSN(`user:pass@host…`):只留注册域,丢 userinfo/path。
   out = out.replace(SCHEMELESS_USERINFO_RE, (m) => {
-    const afterAt = m.slice(m.lastIndexOf("@") + 1);
-    // IPv6 主机整段带方括号,而按 `:` 切会把 `[::1]` 切成 `[` —— `new URL("https://[")` 抛错,
-    // 整条落到 `?? ""`,于是一条 IPv6 DSN 把整行打空。方向安全,但没必要:方括号里的部分
-    // 本来就是完整主机,直接取到 `]` 为止。
-    const host = afterAt.startsWith("[")
-      ? afterAt.slice(0, afterAt.indexOf("]") + 1)
-      : afterAt.split(/[/:]/)[0];
-    const reduced = originDomain(`https://${host}`);
-    // **归约出的主机必须逐字出现在被替换的那一段里,否则什么都不发。**
-    //
-    // 这一条同时关掉两类缺陷,而且是按构造关掉,不是逐个枚举:
-    //
-    //   1. `new URL()` 的规范化会造串。`a:b@1.2.3` → `1.2.0.3`、`scope:name@1.0.0` →
-    //      `1.0.0.0`、`a:b@0x7f.1` → `127.0.0.1` —— 都是输入里没有的地址。此前只给**无点**
-    //      分支加了「必须含字母」,而带点分支是同一个 new URL() 的第二条路,漏在那里;
-    //      而语料的造串检测按「4 个以上字母数字连排」找,`1.0.0.0` 拆开全是单字符,看不见。
-    //   2. `new URL()` 会把主机**小写**(WHATWG)。而 `AKIA…`/`AIza…` 两条探测器是大小写敏感的,
-    //      于是 `a:b@AKIAIOSFODNN7EXAMPLE` 归约成 `https://akiaiosfodnn7example`,守卫再看
-    //      就认不出了 —— 归约把唯一压着它的信号自己毁掉。逐字比对时大小写不同即不匹配,
-    //      这条路直接断掉。
-    //
-    // 代价:主机大小写混写的 DSN(`user:pw@DB.Example.COM`)不再归约,整段被丢弃而不是
-    // 渲染成注册域。方向安全(少渲染),而且这种写法在 DSN 里罕见。
-    //
-    // **比对的是 `host`,不是整段 `m`。** `m` 含 userinfo,也就是口令 —— 拿归约结果去它里面找,
-    // 口令里塞一份小写主机名就能满足检查:`a:akiaiosfodnn7example@AKIAIOSFODNN7EXAMPLE` 会渲染出
-    // `https://akiaiosfodnn7example`,第 2 类那条小写化泄漏原样复活。必须只在 `host` 上比。
-    poisonIfNewShapeCarriesSignal(m);
-    if (reduced === null) return "";
-    return host.includes(reduced.slice("https://".length)) ? reduced : "";
+    const host = m.slice(m.lastIndexOf("@") + 1).split(/[/:]/)[0];
+    return originDomain(`https://${host}`) ?? "";
   });
   // 4. 任意无 scheme 的 `host.tld/path`:保留注册域,统一抹掉可能承载凭据的 path。
   out = out.replace(SCHEMELESS_HOST_PATH_RE, (_m, prefix: string, hostAndPath: string) => (
     prefix + (originDomain(`https://${hostAndPath}`) ?? "")
   ));
-  // 新归约的 host 形状里带着 main 据以整行扣下的关键词/前缀 → 与 main 一样整行扣下。
-  // 仍残留 `name:…@` 的 token 则说明所有归约 pass 都没认出它:在单一 choke point default-deny,
-  // 一次覆盖非 ASCII 用户名、标点用户名、IPv6 zone-id、空 host,不再扩第四份字符类。
-  return poisoned || hasResidualDsnShapedToken(out) ? "" : out;
+  return out;
 }
 
 /** url 策略:取 url 参数并降级为注册域。 */
@@ -950,23 +573,18 @@ export function summarizeToolParams(toolName: string | undefined, params: unknow
     case "shell": v = summarizeShell(p); break;
     case "url": v = summarizeUrl(p); break;
     case "query": v = firstString(p, ["query", "pattern"]); break;
-    case "enum": v = summarizeEnum(p, PROCESS_ACTIONS); break;
   }
   if (!v) return "";
   // query/url 是「裸 token」易出没处 → 额外套用通用高熵/长 hex 检测;path/shell 只走关键词
   // + 明确前缀,避免把 git SHA / docker digest / 缓存哈希等正常路径误伤成空。
   const generic = strategy === "query" || strategy === "url";
-  const sensitiveHere = sensitivePredicate(generic);
+  const sensitiveHere: SensitivePredicate = (t) => isSensitive(t, generic);
   // 单一 choke point:所有策略统一把内嵌 URL 降级为 scheme://注册域。避免逐 sink 加降级时
   // 漏掉某个策略(query 的 pattern、shell 的 URL-as-program 都会原样渲染 webhook/userinfo/内网主机)。
   // 输入上限住在 reduceUrlsInText 内部,这里不再重复设界(见 REDUCE_INPUT_MAX)。**同一个谓词
   // 传进去**,界丢掉的那一段就用下面这道守卫检查,两者不可能再分岔。
-  // **两趟折叠都要带上谓词** —— 折叠自己会在 RAW_INPUT_MAX 处截断,被截掉的那一段要过同一道
-  // 守卫,否则「压住凭据的那个关键词」被丢掉,fail-closed 的输入就变成看起来干净的输入。
-  const s = collapseForReduction(
-    reduceUrlsInText(collapseForReduction(v, sensitiveHere), sensitiveHere),
-    sensitiveHere,
-  );
+  const s = reduceUrlsInText(v.replace(/\s+/g, " ").trim(), sensitiveHere)
+    .replace(/\s+/g, " ").trim();
   if (!s || sensitiveHere(s)) return "";
   return s.length > SUMMARY_MAX ? s.slice(0, SUMMARY_MAX) + "…" : s;
 }
@@ -1005,11 +623,11 @@ const ERROR_MAX = 120;
  */
 export function sanitizeErrorText(err?: string): string {
   if (!err) return "";
-  // 传自己的守卫:界和折叠丢掉的那一段都用**同一个**判定检查(错误文本这道多一条构建哈希豁免)。
-  let s = collapseForReduction(err, ERROR_TEXT_SENSITIVE);
+  let s = err.replace(/\s+/g, " ").trim();
   if (!s) return "";
-  s = collapseForReduction(reduceUrlsInText(s, ERROR_TEXT_SENSITIVE), ERROR_TEXT_SENSITIVE); // URL 降级可能留下空隙
-  if (!s || ERROR_TEXT_SENSITIVE(s)) return "";
+  // 传自己的守卫:界丢掉的那一段用**同一个**判定检查(错误文本这道多一条构建哈希豁免)。
+  s = reduceUrlsInText(s, isSensitiveErrorText).replace(/\s+/g, " ").trim(); // URL 降级可能留下空隙
+  if (!s || isSensitiveErrorText(s)) return "";
   return s.length > ERROR_MAX ? s.slice(0, ERROR_MAX) + "…" : s;
 }
 
@@ -1017,15 +635,10 @@ export function sanitizeErrorText(err?: string): string {
 const BENIGN_ERROR_HASH_RE =
   /\b(?:commit|revision|rev|digest|sha(?:-?(?:1|256))?)\b\s*(?:at\s+)?(?::|=|#)?\s*(?:sha256:)?[0-9a-fA-F]{32,64}\b/gi;
 
-/**
- * 错误文本这一档:非 generic + 一条构建哈希豁免后的高熵检测。
- *
- * 与 sensitivePredicate 共用同一套 detector,只在 generic 高熵判定前去掉已标注的构建哈希。
- * JWT 也由 hasSecretShape 的单一线性 scanner 处理,不存在第二份判据。
- */
-const ERROR_TEXT_SENSITIVE: SensitivePredicate = (s) => (
-  hasSecretShape(s, false) || hasGenericSecretShape(s.replace(BENIGN_ERROR_HASH_RE, ""))
-);
+function isSensitiveErrorText(s: string): boolean {
+  if (isSensitive(s, false)) return true;
+  return hasGenericSecretShape(s.replace(BENIGN_ERROR_HASH_RE, ""));
+}
 
 /** 工具名 label 展示上限。MCP 工具名可能很长,防其撑爆卡片。 */
 const LABEL_MAX = 40;
@@ -1475,7 +1088,6 @@ export function renderProgressCard(
       caps: flatCaps,
       trusted: true,
       dropMarker: EN_DROP_MARKER,
-      budgetMarker: EN_BUDGET_MARKER,
     });
     return { card: flat.card, plain: flat.plain || PROGRESS_CARD_PLACEHOLDER };
   };
@@ -1491,7 +1103,7 @@ export function renderProgressCard(
   // trusted:进度卡的每行文案已在上游逐 sink 脱敏(summarizeToolParams/sanitizeErrorText/safeLabel:
   // URL 已降级、path/shell 按 generic=false 保留 git SHA/digest)。buildDisplayCard 默认 generic=true
   // 会二次套用长 hex/高熵检测,误删含哈希的正常行、甚至把错误终态帧整卡清空 —— 故此路径关掉严格 generic。
-  const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true, dropMarker: EN_DROP_MARKER, budgetMarker: EN_BUDGET_MARKER });
+  const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true, dropMarker: EN_DROP_MARKER });
   const headerItems = progressHeaderItems(state, header, state.steps, total, canRichText);
   const canToggle = supportsTerminalCollapse(caps);
   const isTerminal = state.phase === "done" || state.phase === "stopped" || state.phase === "error" || state.phase === "expired";

@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderCardActionStatus } from "./card-action-status.js";
+import { REDUCE_INPUT_MAX } from "./card-render.js";
 
 /** Collect every `text` string in a rendered card, in-memory (single backslashes, no JSON escaping). */
 function collectText(node: unknown, acc: string[] = []): string[] {
@@ -119,6 +120,53 @@ describe("renderCardActionStatus", () => {
     // remains is honest and visible, matching how authored content reduces URLs.
     expect(texts).toContain("\\[admin\\]");
     expect(texts).not.toContain("[admin](");
+  });
+
+  it("显示名里归约漏掉的凭据退回 [redacted],不明文渲染", () => {
+    // neutralizeEcho 是全树唯一「归约即脱敏、后面没有守卫」的 sink。归约本身漏掉的凭据形状
+    // (口令超 256 上限整条不匹配 —— 评审第七轮 P1)此前原样进群卡片。补守卫后退回占位符。
+    const pw = "correcthorsebatterystaple".repeat(11).slice(0, 275);
+    const rendered = renderCardActionStatus({
+      card: {
+        type: "AdaptiveCard",
+        version: "1.5",
+        body: [{ type: "TextBlock", text: "选择方案" }],
+        actions: [{ type: "Action.Submit", id: "s", title: "确认" }],
+      },
+      plain: "选择方案",
+      inputs: {},
+      operator: `alice:${pw}@db.example.com`,
+      actionLabel: "确认",
+      status: "completed",
+    } as never);
+    const texts = collectText(rendered.card).join("\n") + "\n" + rendered.plain;
+    expect(texts, "275 字符口令明文进了群卡片").not.toContain(pw);
+    expect(texts).toContain("[redacted]");
+  });
+
+  it("超长 operator 的空白判定不在 raw string 上 trim", () => {
+    const originalTrim = String.prototype.trim;
+    let maxTrimmedLength = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      maxTrimmedLength = Math.max(maxTrimmedLength, this.length);
+      return originalTrim.call(this);
+    });
+    try {
+      const operator = "x" + " ".repeat(1_000_000);
+      const rendered = renderCardActionStatus({
+        card: { type: "AdaptiveCard", version: "1.5", body: [] },
+        plain: "",
+        inputs: {},
+        operator,
+        actionLabel: "确认",
+        status: "completed",
+      });
+      expect(collectText(rendered.card).join("\n")).toContain("[redacted]");
+      expect(maxTrimmedLength, `trim 收到了 ${maxTrimmedLength} 字符的原始值`)
+        .toBeLessThanOrEqual(REDUCE_INPUT_MAX);
+    } finally {
+      trim.mockRestore();
+    }
   });
 
   it("普通提交值与显示名不被加转义(无回归)", () => {
