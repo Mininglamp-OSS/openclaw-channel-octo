@@ -18,6 +18,12 @@ paths = [
   # Unit tests seed bots/accounts with fabricated tokens
   # (e.g. "tok-…_bot", "bf_secret", "app_EXAMPLE_dummy_app_bot_token").
   '''.*\.test\.ts''',
+  # Redaction corpora: these files exist precisely to hold secret-shaped
+  # strings (high-entropy tokens next to "api_key" / "db_pass" keywords) so the
+  # masking pipeline can be tested against them. A generic-api-key hit here is
+  # the corpus doing its job, not a leak — the strings are fabricated.
+  '''.*\.corpus\.ts''',
+  '''src/__tests__/fixtures/.*''',
   # API skill docs demonstrate curl calls with placeholder Authorization headers.
   '''skills/.*\.md''',
 ]
