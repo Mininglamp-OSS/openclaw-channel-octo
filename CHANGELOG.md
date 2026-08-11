@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.2.0...v1.3.0) (2026-08-11)
+
+
+### Added
+
+* **cards:** use server-driven per-bot card policy ([#204](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/204)) ([def63bb](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/def63bb14e289cfdb0130c8cf2d371484eaddf11))
+* **events:** opt in to the server-side /v1/bot/events long poll ([#194](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/194)) ([b1e3def](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/b1e3def370da01e5f2a01406ae8368de806a5b04))
+
+
+### Fixed
+
+* **cards:** bound every step that scales with input, and clear the follow-up list ([#207](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/207)) ([68bc420](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/68bc4207808056f50f1921cb2ea63798eb521319))
+* **cards:** collapse the reasoning trace on every terminal state ([#202](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/202)) ([339417a](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/339417a33f9946370044b2e2df4e3122838017d2))
+* **cards:** count successful card tools as answer delivery ([#209](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/209)) ([5e08edf](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/5e08edfd03f027ffb62453a53ff715473a67fbda))
+* **cards:** keep tool-delivered turns out of the Failed state ([#198](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/198)) ([cbf79cb](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/cbf79cb2b6129d3f25adfa316c7af1824e2175b3))
+* **cards:** say why a reasoning card shows less than expected ([#206](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/206)) ([62481e4](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/62481e4fb66572f29468c186a778c18e98a42666))
+* **cards:** two default-level defects in the summary pipeline, plus a shape corpus ([#203](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/203)) ([58639fb](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/58639fb52e61c599b5b7796a6949d4720a1a9f94))
+* keep bots connected when the server rate-limits them ([#196](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/196)) ([#208](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/208)) ([c81df55](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/c81df557a09214ee41192ccfc0fb9889b52d3578))
+
 ## [1.2.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.1.2...v1.2.0) (2026-07-30)
 
 ### Added
