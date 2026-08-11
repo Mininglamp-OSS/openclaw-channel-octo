@@ -11,9 +11,9 @@ All notable changes to this project will be documented in this file.
   - fail-closed：profile config 缺失、格式错误或自相矛盾时，在执行时刻拒绝而不是猜一个默认值。工具发现只在缓存里有权威 deny 时才隐藏工具，未知状态保持可见并在执行前再校验一次。已存在的 reasoning 卡在新发送被禁用后仍可收到终态编辑。
   - 兼容性与部署顺序：`cardProgress` / `reasoningCardTemplateMode` / `cardDisplay` / `cardInteraction` 保留为 deprecated 类型，但运行时忽略、也不再出现在公开 schema。服务端对应改动是 octo-server #706 —— **先升级本插件，再在服务端设 `reasoning_enabled=false`**，否则旧版插件仍会发裸 Model B 卡，而服务端刻意不把它们归类为 reasoning 卡。
 - **可选接入服务端 `/v1/bot/events` long poll，卡片点击响应从秒级降到几十毫秒**（PR #194）：服务端侧是 octo-server #685，给事件接口加了可选的 `wait`（秒），队列空时把请求挂住、有事件立刻应答，而不是等下一个轮询周期。
-  - 现状：`startEventPoller` 每 `pollIntervalMs`（默认 2s）短轮询一次，一次卡片点击要 0~2s 才到 bot，且每个空闲 bot 长期维持 ~25–30 请求/分钟。开启后点击在几十毫秒内送达，空闲流量降到 ~5 请求/分钟。
+  - 现状：`startEventPoller` 每 `pollIntervalMs`（默认 2s）短轮询一次，一次卡片点击要 0~2s 才到 bot，且每个空闲 bot 长期维持 ~25–30 请求/分钟。开启后点击在几十毫秒内送达，空闲流量随 hold 时长下降：最小值 5s 约 12 请求/分钟，hold 到 12s 及以上约 5 请求/分钟。
   - **默认关闭、需显式开启**：新增 `eventWaitSeconds`（顶层默认 + `accounts.<id>` 覆盖）。不设它时升级后行为与旧版逐字一致。
-  - 三个承重细节：**客户端超时**从固定 10s 改为 `wait * 1000 + 10s` —— 客户端永远不能是先放弃的一方，否则会丢掉服务端正要返回的那批事件（这个固定超时也正是服务端把 hold 做成 opt-in 的原因）；**轮询节奏由每次请求的实际结果推导**，而不是由 `waitSeconds` 决定（拿到事件 → 立即续拉；空但确实被挂住了（耗时 ≥ 请求 wait 的 50%）→ 立即续拉；空但过早返回 → 判定服务端没在 hold，退回 `intervalMs`；出错 → 从 `intervalMs` 起指数退避、上限 30s、成功即重置）；**`stop()` 学会中止在途请求**，因为轮询是单条顺序链，把单次请求上限从 10s 抬到约 35s 后，关停时不能再靠等它自己回来。
+  - 三个承重细节：**客户端超时**从固定 10s 改为 `wait * 1000 + 10s` —— 客户端永远不能是先放弃的一方，否则会丢掉服务端正要返回的那批事件（这个固定超时也正是服务端把 hold 做成 opt-in 的原因）。`eventWaitSeconds` 的取值区间是 5~30s，因此单次请求超时最高 **40s**，按这些说明配代理 / 读超时时请按 40s 留余量；**轮询节奏由每次请求的实际结果推导**，而不是由 `waitSeconds` 决定（拿到事件 → 立即续拉；空但确实被挂住了（耗时 ≥ 请求 wait 的 50%）→ 立即续拉；空但过早返回 → 判定服务端没在 hold，退回 `intervalMs`；出错 → 从 `intervalMs` 起指数退避、上限 30s、成功即重置）；**`stop()` 学会中止在途请求**，因为轮询是单条顺序链，把单次请求上限从 10s 抬到最高 40s 后，关停时不能再靠等它自己回来。
   - 与服务端 PR 无合并顺序依赖：老服务端 + 开了开关时，服务端会立刻返回，poller 探测到 hold 未被兑现并退回 `intervalMs` 节奏 —— 这是探测出来的 no-op，不是嘴上保证的。收益只在两端都部署且 `eventWaitSeconds` 已配置时出现。
 
 ### Fixed
