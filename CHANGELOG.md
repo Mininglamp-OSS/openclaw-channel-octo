@@ -2,6 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.2.0...v1.3.0) (2026-08-11)
+
+### Added
+- **卡片能力改为由服务端按 Bot 下发策略决定**（PR #204）：`GET /v1/bot/card/profile` 的顶层 `config` 成为 reasoning / display / interactive 三类卡片的**唯一权威**，插件不再自行决定发不发卡。
+  - 移除本地自动的 Model B 进度卡回退，旧的本地卡片开关不再参与决策；reasoning 进度卡严格使用服务端选定的那个 Registry 模板 ref，最终答复仍走普通文本路径。
+  - 新增进程内共享的 per-Bot profile 缓存：带 TTL、并发请求去重、按 generation 安全失效，并消费 `bot_setting_updated` 事件即时刷新。调用方各自的 abort 预算不会取消这次共享的 profile 请求。
+  - fail-closed：profile config 缺失、格式错误或自相矛盾时，在执行时刻拒绝而不是猜一个默认值。工具发现只在缓存里有权威 deny 时才隐藏工具，未知状态保持可见并在执行前再校验一次。已存在的 reasoning 卡在新发送被禁用后仍可收到终态编辑。
+  - 兼容性与部署顺序：`cardProgress` / `reasoningCardTemplateMode` / `cardDisplay` / `cardInteraction` 保留为 deprecated 类型，但运行时忽略、也不再出现在公开 schema。服务端对应改动是 octo-server #706 —— **先升级本插件，再在服务端设 `reasoning_enabled=false`**，否则旧版插件仍会发裸 Model B 卡，而服务端刻意不把它们归类为 reasoning 卡。
+- **可选接入服务端 `/v1/bot/events` long poll，卡片点击响应从秒级降到几十毫秒**（PR #194）：服务端侧是 octo-server #685，给事件接口加了可选的 `wait`（秒），队列空时把请求挂住、有事件立刻应答，而不是等下一个轮询周期。
+  - 现状：`startEventPoller` 每 `pollIntervalMs`（默认 2s）短轮询一次，一次卡片点击要 0~2s 才到 bot，且每个空闲 bot 长期维持 ~25–30 请求/分钟。开启后点击在几十毫秒内送达，空闲流量随 hold 时长下降：最小值 5s 约 12 请求/分钟，hold 到 12s 及以上约 5 请求/分钟。
+  - **默认关闭、需显式开启**：新增 `eventWaitSeconds`（顶层默认 + `accounts.<id>` 覆盖）。不设它时升级后行为与旧版逐字一致。
+  - 三个承重细节：**客户端超时**从固定 10s 改为 `wait * 1000 + 10s` —— 客户端永远不能是先放弃的一方，否则会丢掉服务端正要返回的那批事件（这个固定超时也正是服务端把 hold 做成 opt-in 的原因）。`eventWaitSeconds` 的取值区间是 5~30s，因此单次请求超时最高 **40s**，按这些说明配代理 / 读超时时请按 40s 留余量；**轮询节奏由每次请求的实际结果推导**，而不是由 `waitSeconds` 决定（拿到事件 → 立即续拉；空但确实被挂住了（耗时 ≥ 请求 wait 的 50%）→ 立即续拉；空但过早返回 → 判定服务端没在 hold，退回 `intervalMs`；出错 → 从 `intervalMs` 起指数退避、上限 30s、成功即重置）；**`stop()` 学会中止在途请求**，因为轮询是单条顺序链，把单次请求上限从 10s 抬到最高 40s 后，关停时不能再靠等它自己回来。
+  - 与服务端 PR 无合并顺序依赖：老服务端 + 开了开关时，服务端会立刻返回，poller 探测到 hold 未被兑现并退回 `intervalMs` 节奏 —— 这是探测出来的 no-op，不是嘴上保证的。收益只在两端都部署且 `eventWaitSeconds` 已配置时出现。
+
+### Fixed
+- **被服务端限流后 bot 直接失联约 40 分钟，只能手工重启 OpenClaw**（#196, PR #208）：真正让 bot 下线的不是限流本身，是限流之后那条没有回头路的路径。
+  - 根因链：服务端按源 IP 的限流桶对 `/v1/bot/heartbeat` 返回 429 → 插件把它计作第三次失败并拆掉 WebSocket（一条 REST 存活心跳说明不了 socket 是否健康，服务端也没有任何地方读这条心跳写入的 key）→ 三次快速断连后 socket 不再自行重连、把责任交给 token refresh，而 refresh 的 `registerBot` 因为同一个限流原因失败、它的 `catch` 只打了日志。此时 `needReconnect` 已是 false、socket 定时器已清、心跳只能从 `onConnected` 重启 —— 进程活着，但已经没有任何东西会把它连回来。
+  - **429 退避收归一个负责人**：`postJson` 把 `Retry-After` 当作**最早**可重试时刻（jitter 只增不减；等待超过上限时直接放弃重试而不是缩短它 —— 缩短意味着回到服务端允许的时间点之前）。有自己节奏的调用方显式退出这套，因为把 sleep 藏在调用里即便退避本身是对的也是错的：心跳是周期性的、typing 与已读回执可丢弃、事件轮询按每次请求的结果自定节奏、ack 失败只记日志、进度卡帧共用一个 flush 槽。
+  - **心跳不再碰 socket**：生命周期跟随账号，一次没能完成的重连不会让它永久停摆。429 只记日志、不计入失败；真实失败最多升级成一行日志。
+  - **没有路径能让账号搁死**：连接建立阶段加了截止时间（此前完全没有，而卡在 CONNECTING、或 OPEN 但收不到 CONNACK 这两种情况都不产生 close 事件、也不触发 ping 超时）；延迟重连改走一个受追踪、可取消的句柄，不再凭空消失；新增守护定时器在慢节奏上检查"是否有账号该重连却没人在重连"。
+  - **进度卡帧尊重限流窗口**：某后端返回 429 后记录它下次接受帧的时间，在此之前 flush 只保留最新状态而不去敲门，窗口结束时每张卡唤醒一次。窗口按后端维度记（服务端桶是按源 IP 的），并封顶 5 分钟，避免一个超长的 `Retry-After` 让该后端所有卡片沉默一整天。
+  - **不解决的部分**：桶空着时发送仍会失败 —— 三次尝试跨 2~3 秒，扛不过空了一分钟的桶。变化的是频率：我们不再对一个已经拒绝我们的桶继续加压。配额隔离属于服务端改动，此处刻意不做。
+- **agent 用 `message` 工具发出答复、本轮没有 final text 时，进度卡被判成「Generation failed / Reasoning was interrupted」**（PR #198）：用户其实已经拿到答复，只有卡片在喊失败，而卡上每个工具步骤都是绿的。
+  - 根因：走工具投递时 reply dispatcher 的 deliver 回调从不被调用，`replySucceeded` 保持 false，`finalizeCard` 于是把卡推到 `phase=error`。
+  - 这是插件自己的问题，不是 host：OpenClaw core 的 `resolveAttemptTrajectoryTerminal` 把同一轮算作**成功**（它统计 messaging 工具的投递证据），dispatch 正常收尾、从不抛 `non_deliverable_terminal_turn` —— 我们只是没消费那份证据。
+  - 修复：把一次成功投递到本卡自己频道的 `message` 工具发送算作本轮的答复投递。归属 fail-closed：`action` 必须是 `send`、目标必须显式、`channelId` 与 `channelType` 都要匹配；显式的 `errorText` 仍然优先于这份证据。
+  - 为什么此前看起来时好时坏：只要本轮有任何 final text，`replySucceeded` 就会翻真并掩盖它。
+  - 顺带说明：卡上那句"Reasoning was interrupted"是 `reasoning-process.ts` 里的硬编码兜底（仅在 `errorText` 为空时使用），它断言了一个我们从未确立的原因，把第一轮排查带向了超时方向 —— 真正的超时走 `expired` 分支、文案不同。
+- **通过卡片工具投递答复后返回 `NO_REPLY`，推理卡仍收成 Failed**（PR #209）：与上一条同源、下一层。
+  - 根因：#198 加的投递统计只认核心 `message` 工具。Octo 自有的 `octo_send_display_card` / `octo_send_card` 刻意不参与进度步骤渲染，所以它们的成功结果从未设置投递证据；模型随后返回 `NO_REPLY`，卡片就在请求的卡片其实已经送达的情况下收成 `Failed / Interrupted`。
+  - 修复：这两个工具的成功结果也算作答复投递证据，且只接受各自**明确的**成功信封 —— `details: null` 与 hook 错误仍然算失败；同时保留 dispatch 失败的优先级，投递证据不能掩盖一次真正失败的轮次。
+  - 覆盖：成功 / 失败 / 优先级三类单测，外加真实 OpenClaw 容器 E2E 跑 display-card 投递后接 `NO_REPLY` 这条路径。
+- **同一套部署里，失败的推理卡是展开还是折叠取决于服务端广告了什么模板**（PR #202）：Registry 卡（Model A）在 `error` 时保持推理轨迹展开，而本地 `renderProgressCard` 对所有终态一律折叠，两者由模板协商结果决定谁来渲染。
+  - 只对齐这个布尔量并不叫 parity：error 块位于 `trace_panel` **内部**，折叠轨迹会把失败原因一起藏掉，常驻可见的 header 只剩 `✦ Reasoning`、一个恒定的 `Interrupted` 和 `Failed` 徽标。
+  - 修复：失败原因改由 `timerText` 承载（形如 `⚠️ Interrupted: provider timeout`）。选它而不是改布局，是因为 Model A 的布局归服务端模板所有 —— 把 error 块从本地容器里提出来只能修好本地渲染器，模板卡照旧坏着；`timerText` 是两个渲染器都消费的数据，是唯一能同时修好两者的层。长度沿用 `sanitizeErrorText` 已有的 `ERROR_MAX`。
+  - `expired` 单独给文案而不是复用通用那句：它来自 paused 卡的 TTL 定时器，此时没有 dispatch 在跑、也不会有伴随的文本消息，卡片是用户唯一的信号。
+  - 折叠摘要不再把失败标成成功：`collapsed_panel` 原先硬编码 `✓`，在终态默认折叠之后这从"手工折叠失败卡才会看到"变成了**默认呈现** —— 每个失败与中止都显示成 `✓ Interrupted …` 配一个 Attention 色的 `Failed` 徽标。字形现在按状态推导（`error` / `stopped` → `⚠`）。
+- **推理卡显示得比预期少时，说清为什么**（PR #206）：`FALLBACK_THOUGHT`（`Thinking through…`）有六个触发路径，还有第七条会把 OpenClaw 自己的诊断句原样渲染到群可见的卡上。读者分不清"模型什么都没产出"和"我们扣掉了它说的话"，而只有后者是可行动的。
+  - `resolveReasoningThought` 现在返回四种明确结果：`text`（脱敏后的原文）、`no-summary`（"Reasoned without a visible summary"）、`redacted`（"Reasoning hidden — matched a redaction rule"）、`none`（不渲染思考行）。实测一次真实群会话：七个 thinking 块全部带 `thinkingSignature`，三个有文本、四个为空 —— OpenAI Responses 在 `summary: "auto"` 无产出时、以及 Anthropic 的 `redacted_thinking` 都会走到这里。
+  - `redacted` 的文案刻意指向**规则**而非内容：这道守卫是 fail-safe 的，命中并不证明那里真有凭证 —— 长 hex、git SHA 等高熵字符串同样会触发。
+  - 思考文本上限原为 280（一条推文的长度）：线上一张群卡正好在第 280 字符处断在句子中间，丢掉的恰是"模型接下来要做什么"那半句。放开长度后补上三层约束才真正收住：模板数据契约、聚合思考预算（逐字段 clamp 之后聚合仍然无界）、UTF-8 字节预算（按 rune 计仍然没有约束真实 payload 字节数）；send 与 edit 用的信封字段不同，因此精确打包会让 edit 超限，需要预留余量。
+  - 已知脆弱点（在常量处注明）：识别 `no-summary` 依赖匹配 host 里一句硬编码英文，OpenClaw 升级可能静默改写它，而我们的测试用的是自己那份常量、不会因此变红。长期正解是上游给一个结构化标记。
+  - 顺带修掉 skill 文档里指向已不存在配置键的说明。
+- **默认配置下就能触发的两个卡片摘要缺陷，并把行为固化成可执行语料**（PR #203）：两个缺陷在当时的 `main` 上无需任何配置即可复现。
+  - **归约管线无界**：`reduceUrlsInText` 的 pass 是二次复杂度且有 11 个调用点，所以边界必须放在它**内部** —— 早期版本放在 `summarizeToolParams` 只护住一条路径，漏掉了 `card-action-status.ts`，而后者的输入是群成员提交的表单值、是这组入口里信任级别最低的一个。默认配置下拿 `"a"×100k + "?x"` 实测：`reduceUrlsInText` 在 `main` 上 9814ms、`sanitizeErrorText` 10269ms；现在两者在任何 pass 跑起来之前就拒绝，该输入渲染为空 —— 那是边界在起作用，不是管线变快了。
+  - **裁剪永远落在空白处，不切进 token 中间**：多个 pass 靠锚点定位要中和的内容，在 password 与它的 `@host` 之间盲 `slice` 会消掉锚点、把 password 明文渲染出去。保持 token 完整也意味着靠近裁剪点的 secret 要么整个留下（并被抓到）、要么整个丢掉，且代理对不会被劈开。
+  - **裁剪不能把守卫正在读的证据一起删掉**：守卫检查的是**截断后**的字符串，所以丢掉尾部的 `token` / `password` / `AKIA…` 会让一个正因为那个关键词才被扣掉的凭证看起来是干净的。`boundedForReduction` 现在会用调用方自己的 predicate 扫一遍它准备丢弃的那一段。
+  - 行为以可执行语料 `src/card-render.corpus.ts` 为准（LEAK / BENIGN / COST / REWRITE / UNFIXED / PERF 六组），不再由 PR 描述、README 和语料三处各写一份 —— 手工维护的多份说明会漂移，最终出现文档声明与代码矛盾。想知道某个输入渲染成什么，答案在语料里，且是可执行的。
+- **补完随输入规模增长的每一步的边界**（PR #207）：`REDUCE_INPUT_MAX` 只约束了二次复杂度的归约 pass 本身，pass **周围**同样随不可信输入增长的工作却跑在同步、没有 `try`/`catch` 的路径上。
+  - 现在三道限制各管一段：`RAW_INPUT_MAX`（64 KiB）管原始工具摘要提取、归约前的空白折叠、以及被丢弃尾部的扫描；`REDUCE_BUDGET_PER_CARD`（120 000）管单张 display 卡的累计脱敏工作量；`exec` 摘要的 4000 字符裁剪管归约管线之上的程序名提取。工具参数在 `trim()`、路径 `split()`、URL 解析之前就按 `RAW_INPUT_MAX` fail-closed。
+  - 原先二次复杂度的 JWT 正则换成一次线性扫描，keyword、已知前缀、JWT、超长 userinfo 与通用 secret 五类检测共用一个 `SensitivePredicate` 权威实现 —— 消除了那个反复让扣留信号变得不可见的距离窗口，同时让归约与丢弃尾部的工作量与原始输入长度无关。
+  - 无 scheme 的 `user:pass@host` 形式被归约成它的 host，且发出的 host 必须在匹配到的 host 段里**逐字出现**，以此防止 `new URL()` 的归一化、凭空构造与大小写折叠产生输入里根本不存在的输出。
+
 ## [1.2.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.1.2...v1.2.0) (2026-07-30)
 
 ### Added
