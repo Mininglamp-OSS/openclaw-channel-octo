@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   registerOwnerUid,
+  getOwnerUid,
   isOwner,
   _clearOwnerRegistry,
 } from "./owner-registry.js";
@@ -28,6 +29,7 @@ describe("owner-registry case-insensitive accountId (issue #33)", () => {
 
   it("registered mixed-case A, queried mixed-case B (different case form) → hit", () => {
     registerOwnerUid("AbCd_bot", "owner-uid");
+    expect(getOwnerUid("aBcD_bot")).toBe("owner-uid");
     expect(isOwner("aBcD_bot", "owner-uid")).toBe(true);
     expect(isOwner("ABCD_bot", "owner-uid")).toBe(true);
   });
@@ -38,6 +40,7 @@ describe("owner-registry case-insensitive accountId (issue #33)", () => {
   });
 
   it("unregistered account returns false regardless of case", () => {
+    expect(getOwnerUid("never_registered_bot")).toBeUndefined();
     expect(isOwner("never_registered_bot", "anyuid")).toBe(false);
     expect(isOwner("NEVER_REGISTERED_BOT", "anyuid")).toBe(false);
   });
@@ -47,5 +50,13 @@ describe("owner-registry case-insensitive accountId (issue #33)", () => {
     registerOwnerUid("BOT_bot", "owner-two"); // same canonical id
     expect(isOwner("bot_bot", "owner-one")).toBe(false);
     expect(isOwner("bot_bot", "owner-two")).toBe(true);
+  });
+
+  it("clears a stale owner when refresh no longer returns an owner uid", () => {
+    registerOwnerUid("Bot_bot", "owner-one");
+    registerOwnerUid("BOT_bot", undefined);
+
+    expect(getOwnerUid("bot_bot")).toBeUndefined();
+    expect(isOwner("bot_bot", "owner-one")).toBe(false);
   });
 });

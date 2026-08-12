@@ -3,7 +3,9 @@ import { ChannelType, MessageType } from "./types.js";
 import { handleInboundMessage } from "./inbound.js";
 import { setOctoRuntime } from "./runtime.js";
 import { _clearKnownBots } from "./bot-registry.js";
+import { _clearOwnerRegistry, registerOwnerUid } from "./owner-registry.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
+import { resolveCommandAuthorization } from "openclaw/plugin-sdk/command-auth";
 
 /**
  * Regression tests for #172 — DM no-reply.
@@ -149,6 +151,7 @@ const replyOptionsOf = (dispatch: ReturnType<typeof vi.fn>) => dispatch.mock.cal
 
 beforeEach(() => {
   _clearKnownBots();
+  _clearOwnerRegistry();
 });
 
 afterEach(() => {
@@ -157,6 +160,63 @@ afterEach(() => {
 });
 
 describe("#172 DM reply delivery mode", () => {
+  it("passes the server-verified OCTO owner through OpenClaw's standard owner allowlist", async () => {
+    installFetchStub();
+    registerOwnerUid("acct1", HUMAN_UID);
+    const { dispatch } = installRuntime({});
+
+    await runDm();
+
+    const ctx = dispatch.mock.calls[0][0].ctx;
+    expect(ctx.OwnerAllowFrom).toEqual([HUMAN_UID]);
+    expect(ctx.SenderId).toBe(HUMAN_UID);
+    expect(
+      resolveCommandAuthorization({ ctx, cfg: {}, commandAuthorized: true })
+        .senderIsOwner,
+    ).toBe(true);
+  });
+
+  it("does not grant OCTO owner status to a different sender", async () => {
+    installFetchStub();
+    registerOwnerUid("acct1", "different-owner");
+    const { dispatch } = installRuntime({});
+
+    await runDm();
+
+    const ctx = dispatch.mock.calls[0][0].ctx;
+    expect(ctx.OwnerAllowFrom).toEqual(["different-owner"]);
+    expect(ctx.SenderId).toBe(HUMAN_UID);
+    expect(
+      resolveCommandAuthorization({ ctx, cfg: {}, commandAuthorized: true })
+        .senderIsOwner,
+    ).toBe(false);
+  });
+
+  it("does not synthesize an owner allowlist before OCTO registration establishes ownership", async () => {
+    installFetchStub();
+    const { dispatch } = installRuntime({});
+
+    await runDm();
+
+    expect(dispatch.mock.calls[0][0].ctx.OwnerAllowFrom).toBeUndefined();
+  });
+
+  it("keeps an explicit OpenClaw owner allowlist authoritative", async () => {
+    installFetchStub();
+    registerOwnerUid("acct1", "different-server-owner");
+    const config = { commands: { ownerAllowFrom: [HUMAN_UID] } };
+    const { dispatch } = installRuntime(config);
+
+    await runDm();
+
+    const ctx = dispatch.mock.calls[0][0].ctx;
+    expect(ctx.OwnerAllowFrom).toEqual(["different-server-owner"]);
+    expect(
+      resolveCommandAuthorization({ ctx, cfg: config, commandAuthorized: true })
+        .senderIsOwner,
+    ).toBe(true);
+  });
+
   it("DM without configured visibleReplies → injects sourceReplyDeliveryMode=automatic", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({});

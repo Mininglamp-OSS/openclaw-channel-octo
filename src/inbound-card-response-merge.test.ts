@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleInboundMessage } from "./inbound.js";
+import { handleInboundMessage, pendingInboundContext } from "./inbound.js";
 import {
   registerCardProgress,
   setCardContext,
@@ -8,6 +8,10 @@ import {
 import { setOctoRuntime } from "./runtime.js";
 import { _clearKnownBots } from "./bot-registry.js";
 import { _clearOwnerRegistry, registerOwnerUid } from "./owner-registry.js";
+import {
+  clearOwnerDraftConfirmations,
+  createOwnerDraftDeliveryCapability,
+} from "./agent-mail-owner-draft.js";
 import { ChannelType, MessageType } from "./types.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 
@@ -204,10 +208,13 @@ function installRuntime(
 async function runInbound(opts: {
   log?: { warn?: (message: string) => void };
   messageContent?: string;
+  message?: ReturnType<typeof makeMessage>;
+  dispatchMode?: "standard" | "approval-bypass";
+  account?: ResolvedOctoAccount;
 } = {}) {
   await handleInboundMessage({
-    account: makeAccount(),
-    message: makeMessage(opts.messageContent) as any,
+    account: opts.account ?? makeAccount(),
+    message: (opts.message ?? makeMessage(opts.messageContent)) as any,
     botUid: BOT_UID,
     groupHistories: new Map(),
     lastBotReplySeqMap: new Map(),
@@ -215,6 +222,7 @@ async function runInbound(opts: {
     uidToNameMap: new Map(),
     groupCacheTimestamps: new Map(),
     log: opts.log,
+    dispatchMode: opts.dispatchMode,
   });
 }
 
@@ -224,15 +232,19 @@ describe("inbound final response progress-card merge", () => {
     sessionStoreMocks.getSessionEntry.mockReturnValue(undefined);
     _clearKnownBots();
     _clearOwnerRegistry();
+    clearOwnerDraftConfirmations();
     registerOwnerUid("acct1", HUMAN_UID);
     _resetCardProgressForTests();
+    pendingInboundContext.clear();
     process.env.OCTO_CARD_MERGE_FINAL = "1";
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
     _clearOwnerRegistry();
+    clearOwnerDraftConfirmations();
     _resetCardProgressForTests();
+    pendingInboundContext.clear();
     vi.restoreAllMocks();
     if (originalMergeFlag === undefined) delete process.env.OCTO_CARD_MERGE_FINAL;
     else process.env.OCTO_CARD_MERGE_FINAL = originalMergeFlag;
@@ -371,6 +383,129 @@ describe("inbound final response progress-card merge", () => {
       (body.payload as { type?: number } | undefined)?.type === 17);
     expect(cardSend).toBeTruthy();
     expect(JSON.stringify(cardSend?.payload)).not.toContain("STALE TURN MUST NOT LEAK");
+  });
+
+  it("approval bypass preserves the waiting run's progress card and pending context", async () => {
+    const { sends } = installFetchStub();
+    const hooks = collectCardHooks();
+    installRuntime(hooks, "", {
+      captureReasoningCallback: () => {},
+    });
+
+    setCardContext("sk-merge", {
+      apiUrl: API,
+      botToken: "tok",
+      channelId: GROUP_ID,
+      channelType: ChannelType.DM,
+    });
+    const waitingRun = { sessionKey: "sk-merge", runId: "run-waiting-for-approval" };
+    hooks.before_agent_run({}, waitingRun);
+    pendingInboundContext.set("sk-merge", {
+      historyPrefix: "waiting-run-history",
+      memberListPrefix: "",
+    });
+
+    await runInbound({ dispatchMode: "approval-bypass" });
+
+    expect(pendingInboundContext.get("sk-merge")?.historyPrefix)
+      .toBe("waiting-run-history");
+    hooks.before_tool_call(
+      { toolName: "read", toolCallId: "read-after-approval" },
+      waitingRun,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 850));
+
+    const cardSends = sends.filter((body) =>
+      (body.payload as { type?: number } | undefined)?.type === 17);
+    expect(cardSends).toHaveLength(1);
+  });
+
+  it("confirms the prepared Draft with the inbound route session and parsed Space", async () => {
+    installFetchStub();
+    installRuntime(collectCardHooks(), "");
+    const deliveryFetch = vi.fn(async () => new Response(JSON.stringify({
+      outcome: "accepted",
+      messageId: "mail-1",
+      submissionIds: ["submission-1"],
+    }), { status: 200 }));
+    const capability = createOwnerDraftDeliveryCapability({
+      accountId: "acct1",
+      apiUrl: API,
+      botToken: "tok",
+      getCurrentOwnerUid: () => HUMAN_UID,
+      fetchImpl: deliveryFetch as typeof fetch,
+    });
+    const request = {
+      sessionKey: "sk-merge",
+      mailboxId: "42",
+      draftId: "E17",
+      draftVersion: 3,
+    };
+    capability.prepareOwnerDraft(request);
+
+    await runInbound({
+      message: {
+        ...makeMessage("确认发送"),
+        message_id: "owner-confirmation-1",
+        channel_id: `sspace-42_${HUMAN_UID}@sspace-42_${BOT_UID}`,
+        channel_type: ChannelType.DM,
+        payload: { type: MessageType.Text, content: "确认发送" },
+      },
+    });
+
+    await expect(capability.sendOwnerDraft(request)).resolves.toMatchObject({
+      outcome: "accepted",
+      messageId: "mail-1",
+    });
+    expect(deliveryFetch).toHaveBeenCalledWith(
+      `${API}/v1/bot/agent-mail/drafts/E17/send`,
+      expect.objectContaining({
+        headers: expect.objectContaining({ "X-Space-ID": "space-42" }),
+      }),
+    );
+  });
+
+  it("does not confirm a prepared Draft from an OBO message rejected as irrelevant", async () => {
+    installFetchStub();
+    installRuntime(collectCardHooks(), "");
+    const deliveryFetch = vi.fn();
+    const capability = createOwnerDraftDeliveryCapability({
+      accountId: "acct1",
+      apiUrl: API,
+      botToken: "tok",
+      getCurrentOwnerUid: () => HUMAN_UID,
+      fetchImpl: deliveryFetch as typeof fetch,
+    });
+    const request = {
+      sessionKey: "sk-merge",
+      mailboxId: "42",
+      draftId: "E17",
+      draftVersion: 3,
+    };
+    capability.prepareOwnerDraft(request);
+    const account = makeAccount();
+    account.config.onBehalfOf = HUMAN_UID;
+
+    await runInbound({
+      account,
+      message: {
+        ...makeMessage("确认发送"),
+        message_id: "irrelevant-obo-confirmation",
+        channel_id: `sspace-42_${HUMAN_UID}@sspace-42_${BOT_UID}`,
+        channel_type: ChannelType.DM,
+        payload: {
+          type: MessageType.Text,
+          content: "确认发送",
+          obo_origin_channel_id: GROUP_ID,
+          obo_origin_channel_type: ChannelType.Group,
+          obo_respond_as: HUMAN_UID,
+          mention: { ais: 1 },
+        },
+      } as ReturnType<typeof makeMessage>,
+    });
+
+    await expect(capability.sendOwnerDraft(request)).rejects.toThrow("No matching exact");
+    expect(deliveryFetch).not.toHaveBeenCalled();
   });
 
   it("keeps mention-bearing final text on the normal message path", async () => {

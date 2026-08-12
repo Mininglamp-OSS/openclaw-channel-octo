@@ -54,7 +54,9 @@ import type { MentionPayload, MentionEntity, SendMessageResult } from "./types.j
 import { registerGroupAccount, ensureGroupMd, handleGroupMdEvent, broadcastGroupMdUpdate, extractParentGroupNo, extractThreadShortId, ensureThreadMd, handleThreadMdEvent } from "./group-md.js";
 import { handleForkCommandIfMatched } from "./commands/fork-inbound.js";
 import { isForkCommandHistoryMessage } from "./commands/fork-history-filter.js";
-import { isOwner } from "./owner-registry.js";
+import { getOwnerUid } from "./owner-registry.js";
+import { recordOwnerDraftConfirmation } from "./agent-mail-owner-draft.js";
+import { extractDmSpaceId } from "./inbound-queue.js";
 import { isKnownBot } from "./bot-registry.js";
 import { getPersonaPromptForSession } from "./persona-prompt.js";
 import { createWriteStream } from "node:fs";
@@ -1526,6 +1528,11 @@ export async function handleInboundMessage(params: {
   statusSink?: OctoStatusSink;
   /** Trusted adapter-side route captured when an interactive card was authored. */
   routeOverride?: { sessionKey: string; agentId?: string };
+  /**
+   * A trusted owner approval must use the same session while an older run is
+   * waiting, but must not replace or clean up that run's adapter-owned state.
+   */
+  dispatchMode?: "standard" | "approval-bypass";
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
   // Server-authoritative robot map. Default to a throwaway Map when the caller
@@ -1535,6 +1542,7 @@ export async function handleInboundMessage(params: {
   // Current-group roster cache (per-account, keyed by parent groupNo). Same
   // fallback pattern as memberRobotMap so omitting it is harmless.
   const currentGroupMembersMap = params.currentGroupMembersMap ?? new Map<string, GroupMember[]>();
+  const ownsRunScopedState = params.dispatchMode !== "approval-bypass";
 
   // Detect GROUP.md update/delete notification — refresh both memory + disk cache, do NOT pass to LLM
   const earlyEventType = (message.payload as any)?.event?.type;
@@ -1665,29 +1673,18 @@ export async function handleInboundMessage(params: {
     // and never reach here because early handler returns.
   }
 
-  // Parse space_id from channel_id (format: s{spaceId}_{peerId})
-  // For DM, channel_id is a fake channel: s{spaceId}_{uid1}@s{spaceId}_{uid2}
-  // Use LastIndex approach: spaceId is everything between 's' and the last '_' before peerId
+  // Parse space_id from channel_id. A DM channel contains full participant
+  // UIDs, which may themselves contain underscores, so match the authoritative
+  // sender suffix instead of splitting on the last underscore.
   let spaceId = "";
-  const effectiveChannelId = isGroup ? message.channel_id! : message.from_uid;
-  if (effectiveChannelId.startsWith("s")) {
+  const effectiveChannelId = isGroup ? message.channel_id! : "";
+  if (isGroup && effectiveChannelId.startsWith("s")) {
     const lastUnderscore = effectiveChannelId.lastIndexOf("_");
     if (lastUnderscore > 0) {
       spaceId = effectiveChannelId.substring(1, lastUnderscore);
     }
   }
-  // Also try to extract spaceId from the WS channel_id (compound DM format)
-  if (!spaceId && message.channel_id && message.channel_id.startsWith("s")) {
-    // DM compound: s{spaceId}_{uid1}@s{spaceId}_{uid2}
-    const atIdx = message.channel_id.indexOf("@");
-    const firstPart = atIdx > 0 ? message.channel_id.substring(0, atIdx) : message.channel_id;
-    if (firstPart.startsWith("s")) {
-      const lastUnderscore = firstPart.lastIndexOf("_");
-      if (lastUnderscore > 0) {
-        spaceId = firstPart.substring(1, lastUnderscore);
-      }
-    }
-  }
+  if (!isGroup) spaceId = extractDmSpaceId(message);
 
   // Session ID: include spaceId for Space isolation (same user in different Spaces = different sessions)
   const sessionId = isGroup
@@ -2315,7 +2312,7 @@ export async function handleInboundMessage(params: {
     ? (currentGroupMembersMap.get(memberCacheGroupNo) ?? [])
     : [];
   const memberListPrefix = isGroup ? buildMemberListPrefix(currentGroupMembers) : "";
-  if (historyPrefix || memberListPrefix) {
+  if (ownsRunScopedState && (historyPrefix || memberListPrefix)) {
     pendingInboundContext.set(route.sessionKey, { historyPrefix, memberListPrefix });
   }
 
@@ -2366,7 +2363,12 @@ export async function handleInboundMessage(params: {
   }
 
   const commandBody = resolveCommandBody(rawBody, isGroup, isExplicitBotMention);
-  const commandAuthorized = resolveCommandAuthorized(isGroup, isOwner(account.accountId, message.from_uid), isExplicitBotMention);
+  const ownerUid = getOwnerUid(account.accountId);
+  const commandAuthorized = resolveCommandAuthorized(
+    isGroup,
+    message.from_uid === ownerUid,
+    isExplicitBotMention,
+  );
 
   // `/fork` command split (spec §3). Runs BEFORE OBO detection /
   // finalizeInboundContext / recordInboundSession / the dispatch main path: a
@@ -2397,7 +2399,7 @@ export async function handleInboundMessage(params: {
     // before_prompt_build hook's get/delete (index.ts) — neither runs for a
     // fork. Drop the entry set above (pendingInboundContext.set) so a fork does
     // not leak a Map entry / inject a stale historyPrefix later.
-    pendingInboundContext.delete(route.sessionKey);
+    if (ownsRunScopedState) pendingInboundContext.delete(route.sessionKey);
     return;
   }
 
@@ -2467,6 +2469,20 @@ export async function handleInboundMessage(params: {
       return;
     }
   }
+
+  // Mail confirmation is recorded from the authoritative inbound Channel
+  // event, not from model-visible prompt text. It confirms only the exact
+  // mailbox/Draft/version tuple prepared earlier for this account/session;
+  // that bound tuple is later consumed once by the runtime capability. Keep
+  // this after the OBO relevance filter so a message intentionally discarded
+  // by the Channel cannot grant delivery authorization as a side effect.
+  recordOwnerDraftConfirmation({
+    accountId: account.accountId,
+    sessionKey: route.sessionKey,
+    spaceId,
+    ownerUid: getOwnerUid(account.accountId),
+    message,
+  });
 
   // Compute GroupSystemPrompt for two distinct persona-clone scenarios:
   //
@@ -2567,6 +2583,12 @@ export async function handleInboundMessage(params: {
     AccountId: route.accountId,
     ChatType: isGroup ? "group" : "direct",
     ConversationLabel: fromLabel,
+    // ownerUid comes from the authenticated OCTO registerBot response and is
+    // registered per account during startAccount. Supplying that trusted list
+    // lets OpenClaw derive senderIsOwner from SenderId using its standard
+    // command-authorization path. Never derive this list directly from the
+    // inbound sender, otherwise any sender could self-assert owner status.
+    OwnerAllowFrom: ownerUid ? [ownerUid] : undefined,
     SenderId: message.from_uid,
     SenderName: senderName,
     SenderUsername: message.from_uid,
@@ -2681,16 +2703,20 @@ export async function handleInboundMessage(params: {
 
   // 波 B:登记进度卡发送上下文(hook 侧懒发/更新时用)。route.sessionKey 桥接
   // dispatch↔hook(H1 实证一致)。OBO(persona-clone)场景由 setCardContext 内部标记跳过。
-  setCardContext(route.sessionKey, {
-    accountId: account.accountId,
-    apiUrl,
-    botToken,
-    channelId: replyChannelId,
-    channelType: replyChannelType,
-    reasoningVisibility,
-    ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-  });
-  const recordReasoningForGeneration = createCardReasoningRecorder(route.sessionKey);
+  if (ownsRunScopedState) {
+    setCardContext(route.sessionKey, {
+      accountId: account.accountId,
+      apiUrl,
+      botToken,
+      channelId: replyChannelId,
+      channelType: replyChannelType,
+      reasoningVisibility,
+      ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
+    });
+  }
+  const recordReasoningForGeneration = ownsRunScopedState
+    ? createCardReasoningRecorder(route.sessionKey)
+    : () => {};
 
   // 已读回执 + 正在输入 — fire-and-forget
   if (isOBOv2) {
@@ -2866,7 +2892,9 @@ export async function handleInboundMessage(params: {
       && sentMediaUrls.size === 0
       && !hasPotentialMention
     ) {
-      const merged = await finalizeCardWithResponse(route.sessionKey, content);
+      const merged = ownsRunScopedState
+        ? await finalizeCardWithResponse(route.sessionKey, content)
+        : false;
       if (merged) {
         statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
         return { merged: true };
@@ -2983,7 +3011,9 @@ export async function handleInboundMessage(params: {
 
           // OpenClaw has no exact "answer generation started" hook. The first
           // non-reasoning, non-tool text is the documented best-effort boundary.
-          if (kind !== "tool") markCardAnswering(route.sessionKey);
+          if (ownsRunScopedState && kind !== "tool") {
+            markCardAnswering(route.sessionKey);
+          }
 
           if (kind === "tool") {
             // Verbose tool call output: send immediately
@@ -3188,12 +3218,14 @@ export async function handleInboundMessage(params: {
     clearInterval(typingInterval);
     // 波 B:收尾进度卡(终态帧 + 清理);fire-and-forget，不阻塞 dispatch 结束/会话释放。
     // finalizeCard 内部同步删 Map(立即释放关联),终态 edit 后台异步发送。
-    void finalizeCard(route.sessionKey, {
-      success: replySucceeded,
-      ...(!replySucceeded && dispatchFailed ? { failed: true } : {}),
-    });
+    if (ownsRunScopedState) {
+      void finalizeCard(route.sessionKey, {
+        success: replySucceeded,
+        ...(!replySucceeded && dispatchFailed ? { failed: true } : {}),
+      });
+    }
     // Safety net: clean up pending inbound context in case the hook didn't fire
-    pendingInboundContext.delete(route.sessionKey);
+    if (ownsRunScopedState) pendingInboundContext.delete(route.sessionKey);
 
     // Record last answered inbound message_seq for history segmentation (don't clear history).
     // We use the inbound @mention message's message_seq (from WebSocket frame) rather than

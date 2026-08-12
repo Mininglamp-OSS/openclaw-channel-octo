@@ -14,12 +14,26 @@ import { normalizeAccountId } from "./account-id.js";
 
 const _ownerUidMap = new Map<string, string>(); // normalized accountId → owner_uid
 
-export function registerOwnerUid(accountId: string, ownerUid: string): void {
-  _ownerUidMap.set(normalizeAccountId(accountId), ownerUid);
+export function registerOwnerUid(
+  accountId: string,
+  ownerUid: string | null | undefined,
+): void {
+  const normalizedAccountId = normalizeAccountId(accountId);
+  const normalizedOwnerUid = ownerUid?.trim();
+  if (!normalizedOwnerUid) {
+    _ownerUidMap.delete(normalizedAccountId);
+    return;
+  }
+  _ownerUidMap.set(normalizedAccountId, normalizedOwnerUid);
+}
+
+/** Return the server-verified owner UID for an account, if registered. */
+export function getOwnerUid(accountId: string): string | undefined {
+  return _ownerUidMap.get(normalizeAccountId(accountId));
 }
 
 export function isOwner(accountId: string, uid: string): boolean {
-  return _ownerUidMap.get(normalizeAccountId(accountId)) === uid;
+  return getOwnerUid(accountId) === uid;
 }
 
 /** Visible for testing — clears all owner registrations. */

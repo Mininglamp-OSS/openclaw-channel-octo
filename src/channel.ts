@@ -40,7 +40,7 @@ import { WKSocket } from "./socket.js";
 import { handleInboundMessage, type OctoStatusSink, sanitizeFilename } from "./inbound.js";
 import { runWithSessionInitRetry, isSessionInitConflict } from "./session-retry.js";
 import { notifyInboundConflictDropped } from "./inbound-conflict-notice.js";
-import { enqueueInbound, getInboundQueueKey } from "./inbound-queue.js";
+import { dispatchInboundWithQueue } from "./inbound-queue.js";
 import {
   createFileEventCursorStore,
   setCardEventPollStarter,
@@ -68,7 +68,12 @@ import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMe
 import type { MentionEntity } from "./types.js";
 import { handleOctoMessageAction, parseTarget, resolveOutboundOctoTarget, normalizeOutboundChannelPrefix, extractInlineMentionUids, type MessageActionResult } from "./actions.js";
 import { getOrCreateGroupMdCache, registerBotGroupIds, getKnownGroupIds, writeGroupMdToDisk, extractParentGroupNo } from "./group-md.js";
-import { registerOwnerUid } from "./owner-registry.js";
+import { getOwnerUid, registerOwnerUid } from "./owner-registry.js";
+import {
+  clearOwnerDraftConfirmations,
+  createOwnerDraftDeliveryCapability,
+  OCTO_AGENT_MAIL_OWNER_DRAFT_CAPABILITY,
+} from "./agent-mail-owner-draft.js";
 import { registerKnownBot, isKnownBot } from "./bot-registry.js";
 import { preloadGroupMemberCache, getGroupMembersFromCache } from "./member-cache.js";
 import { preloadMentionPrefs } from "./mention-prefs.js";
@@ -1294,9 +1299,35 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // Track this bot's uid for bot-to-bot loop prevention
       _knownBotUids.add(credentials.robot_id);
 
-      // Register owner_uid for permission checks
-      if (credentials.owner_uid) {
-        registerOwnerUid(account.accountId, credentials.owner_uid);
+      // Synchronize owner_uid for permission checks. An empty value is
+      // authoritative too: it revokes any owner cached by an earlier account
+      // start in this process.
+      registerOwnerUid(account.accountId, credentials.owner_uid);
+
+      // Expose a narrow account-scoped capability to the independent OCTO
+      // Mail plugin. The capability retains the Bot credential internally and
+      // requires a prepared exact Draft tuple plus a one-time exact Owner DM
+      // recorded by inbound.ts. The consumer must finish the Draft-preparation
+      // turn before waiting for `确认发送`; this confirmation is recorded only
+      // when that new Owner message enters the normal inbound path.
+      let ownerDraftContext: { dispose: () => void } | undefined;
+      try {
+        ownerDraftContext = getOctoRuntime().channel.runtimeContexts.register({
+          channelId: CHANNEL_ID,
+          accountId: normalizeAccountId(account.accountId),
+          capability: OCTO_AGENT_MAIL_OWNER_DRAFT_CAPABILITY,
+          context: createOwnerDraftDeliveryCapability({
+            accountId: account.accountId,
+            apiUrl: account.config.apiUrl,
+            botToken: account.config.botToken,
+            getCurrentOwnerUid: () => getOwnerUid(account.accountId),
+          }),
+          abortSignal: ctx.abortSignal,
+        });
+      } catch (err) {
+        log?.warn?.(
+          `octo: [${account.accountId}] Agent Mail owner Draft capability unavailable: ${String(err)}`,
+        );
       }
 
       log?.info?.(
@@ -1456,8 +1487,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       const dispatchInboundMessage = (
         msg: BotMessage,
         routeOverride?: { sessionKey: string; agentId?: string },
-      ): Promise<"completed" | "dropped"> =>
-        enqueueInbound(getInboundQueueKey(account.accountId, msg), async () => {
+      ): Promise<"completed" | "dropped"> => {
+        const run = async (
+          dispatchMode: "standard" | "approval-bypass" = "standard",
+        ): Promise<"completed" | "dropped"> => {
           try {
             await runWithSessionInitRetry(
               () =>
@@ -1476,6 +1509,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   log,
                   statusSink,
                   routeOverride,
+                  dispatchMode,
                 }),
               { ...SESSION_INIT_RETRY, log },
             );
@@ -1494,7 +1528,23 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             throw err;
           }
           return "completed" as const;
+        };
+
+        const ownerUid = getOwnerUid(account.accountId);
+        return dispatchInboundWithQueue({
+          accountId: account.accountId,
+          message: msg,
+          ownerUid,
+          run: async (dispatchMode) => {
+            if (dispatchMode === "approval-bypass") {
+              log?.info?.(
+                `octo: [${account.accountId}] dispatching approval command outside the conversation queue`,
+              );
+            }
+            return run(dispatchMode);
+          },
         });
+      };
 
       let cardEventPoller: EventPoller | undefined;
       const startCardEventPoller = (): void => {
@@ -1632,6 +1682,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   });
                   if (stopped) return;
                   credentials = fresh;
+                  registerOwnerUid(account.accountId, fresh.owner_uid);
                   log?.info?.(`octo: [${account.accountId}] got fresh IM token, reconnecting WS...`);
                   socket.updateCredentials(fresh.robot_id, fresh.im_token);
                   // Stagger reconnect to avoid thundering herd when multiple bots
@@ -1732,6 +1783,8 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           watchdog.stop();
           deferredReconnect.cancel();
           stopPersonaPromptCache(account.accountId);
+          ownerDraftContext?.dispose();
+          clearOwnerDraftConfirmations(account.accountId);
           ctx.setStatus({
             accountId: account.accountId,
             running: false,

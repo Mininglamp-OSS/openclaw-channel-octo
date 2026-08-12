@@ -36,6 +36,19 @@ vi.mock("./api-fetch.js", async () => {
   };
 });
 
+vi.mock("./socket.js", () => ({
+  WKSocket: class {
+    connect() {}
+    disconnect() {}
+    async disconnectAndWait() {}
+    updateCredentials() {}
+    stopReconnectTimer() {}
+    isConnected() { return false; }
+    isConnectingOrConnected() { return false; }
+    hasPendingReconnect() { return false; }
+  },
+}));
+
 // ─── Token refresh cooldown tests ───────────────────────────────────────────
 // These test the time-based cooldown pattern used in channel.ts onError handler
 // to prevent token refresh storms.
@@ -161,6 +174,136 @@ describe("octoPlugin structure", () => {
 
     expect(octoPlugin.capabilities?.chatTypes).toContain("direct");
     expect(octoPlugin.capabilities?.chatTypes).toContain("group");
+  });
+});
+
+describe("gateway owner registration", () => {
+  it("clears a stale owner when account startup returns no owner_uid", async () => {
+    const { registerBot } = await import("./api-fetch.js");
+    const {
+      _clearOwnerRegistry,
+      getOwnerUid,
+      registerOwnerUid,
+    } = await import("./owner-registry.js");
+    const { octoPlugin } = await import("./channel.js");
+
+    _clearOwnerRegistry();
+    registerOwnerUid("acct1", "revoked-owner");
+    vi.mocked(registerBot).mockResolvedValueOnce({
+      robot_id: "acct1_bot",
+      im_token: "im-token",
+      ws_url: "ws://127.0.0.1:1",
+      api_url: "http://127.0.0.1:1",
+      owner_uid: "",
+      owner_channel_id: "",
+    });
+
+    const abortController = new AbortController();
+    abortController.abort();
+    await octoPlugin.gateway!.startAccount!({
+      account: {
+        accountId: "acct1",
+        name: "acct1",
+        enabled: true,
+        configured: true,
+        config: {
+          apiUrl: "http://127.0.0.1:1",
+          botToken: "bot-token",
+          wsUrl: "ws://127.0.0.1:1",
+          heartbeatIntervalMs: 60_000,
+          pollIntervalMs: 1_000,
+          eventWaitSeconds: 1,
+        },
+      },
+      cfg: {
+        channels: {
+          octo: {
+            accounts: {
+              acct1: {
+                botToken: "bot-token",
+                apiUrl: "http://127.0.0.1:1",
+              },
+            },
+          },
+        },
+      },
+      log: {},
+      setStatus: vi.fn(),
+      abortSignal: abortController.signal,
+    } as any);
+
+    expect(getOwnerUid("acct1")).toBeUndefined();
+    _clearOwnerRegistry();
+  });
+
+  it("registers the Agent Mail runtime capability with a normalized account ID", async () => {
+    const { registerBot } = await import("./api-fetch.js");
+    const { octoPlugin } = await import("./channel.js");
+    const {
+      _resetOctoRuntimeForTests,
+      setOctoRuntime,
+    } = await import("./runtime.js");
+    const registerContext = vi.fn(() => ({ dispose: vi.fn() }));
+    setOctoRuntime({
+      version: "test",
+      channel: { runtimeContexts: { register: registerContext } },
+    } as any);
+    vi.mocked(registerBot).mockResolvedValueOnce({
+      robot_id: "mixed_bot",
+      im_token: "im-token",
+      ws_url: "ws://127.0.0.1:1",
+      api_url: "http://127.0.0.1:1",
+      owner_uid: "owner-1",
+      owner_channel_id: "",
+    });
+
+    try {
+      const abortController = new AbortController();
+      abortController.abort();
+      await octoPlugin.gateway!.startAccount!({
+        account: {
+          accountId: "Mixed_Bot",
+          name: "Mixed_Bot",
+          enabled: true,
+          configured: true,
+          config: {
+            apiUrl: "http://127.0.0.1:1",
+            botToken: "bot-token",
+            wsUrl: "ws://127.0.0.1:1",
+            heartbeatIntervalMs: 60_000,
+            pollIntervalMs: 1_000,
+            eventWaitSeconds: 1,
+          },
+        },
+        cfg: {
+          channels: {
+            octo: {
+              accounts: {
+                Mixed_Bot: {
+                  botToken: "bot-token",
+                  apiUrl: "http://127.0.0.1:1",
+                },
+              },
+            },
+          },
+        },
+        log: {},
+        setStatus: vi.fn(),
+        abortSignal: abortController.signal,
+      } as any);
+
+      expect(registerContext).toHaveBeenCalledWith(expect.objectContaining({
+        channelId: "octo",
+        accountId: "mixed_bot",
+        capability: "octo.agent-mail.owner-draft.v1",
+        context: expect.objectContaining({
+          prepareOwnerDraft: expect.any(Function),
+          sendOwnerDraft: expect.any(Function),
+        }),
+      }));
+    } finally {
+      _resetOctoRuntimeForTests();
+    }
   });
 });
 
