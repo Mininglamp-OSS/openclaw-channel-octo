@@ -41,6 +41,10 @@
             "type": "string",
             "description": "Octo server REST API base URL (e.g. https://your-server:8090/api)"
           },
+          "docsApiUrl": {
+            "type": "string",
+            "description": "Base URL for the docs domain used by document comment @Bot task replies — both docs-backend (/v1/bot/docs/**) and octo-doc (/docs-html/v1/**). When omitted, apiUrl is used, which is correct whenever one gateway origin fronts the IM server and both doc services. Setting it assumes those two doc services share ONE origin; serving them from two different origins is not supported. A wrong value makes every doc task reply 404 permanently — no retry, and the fallback notice is lost too, so the document is edited with no visible reply."
+          },
           "wsUrl": {
             "type": "string",
             "description": "WebSocket endpoint. Auto-detected from apiUrl if omitted."
@@ -76,6 +80,10 @@
           "historyPromptTemplate": {
             "type": "string"
           },
+          "docTasks": {
+            "type": "boolean",
+            "description": "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM."
+          },
           "accounts": {
             "type": "object",
             "additionalProperties": {
@@ -96,6 +104,10 @@
                 "apiUrl": {
                   "type": "string",
                   "description": "Octo server REST API base URL (e.g. https://your-server:8090/api)"
+                },
+                "docsApiUrl": {
+                  "type": "string",
+                  "description": "Base URL for the docs domain used by document comment @Bot task replies — both docs-backend (/v1/bot/docs/**) and octo-doc (/docs-html/v1/**). When omitted, apiUrl is used, which is correct whenever one gateway origin fronts the IM server and both doc services. Setting it assumes those two doc services share ONE origin; serving them from two different origins is not supported. A wrong value makes every doc task reply 404 permanently — no retry, and the fallback notice is lost too, so the document is edited with no visible reply."
                 },
                 "wsUrl": {
                   "type": "string",
@@ -131,6 +143,10 @@
                 },
                 "historyPromptTemplate": {
                   "type": "string"
+                },
+                "docTasks": {
+                  "type": "boolean",
+                  "description": "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM."
                 },
                 "onBehalfOf": {
                   "type": "string",

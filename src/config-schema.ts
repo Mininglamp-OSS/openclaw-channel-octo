@@ -22,6 +22,7 @@ export interface OctoAccountConfig {
   enabled?: boolean;
   botToken?: string;
   apiUrl?: string;
+  docsApiUrl?: string;  // Base URL for the docs domain (/v1/bot/docs/**); unset = same origin as apiUrl
   wsUrl?: string;
   cdnUrl?: string;  // CDN base URL for media files (e.g. https://cdn.example.com/bucket)
   pollIntervalMs?: number;
@@ -39,6 +40,7 @@ export interface OctoAccountConfig {
   cardDisplay?: boolean;
   /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
   cardInteraction?: boolean;
+  docTasks?: boolean;  // true enables document comment @Bot tasks
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace); if neither resolves, write-secret fails closed (no process.cwd() fallback).
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms). Unset = derived from agents.defaults.timeoutSeconds + 60s buffer (issue #113).
@@ -49,6 +51,7 @@ export interface OctoConfig {
   enabled?: boolean;
   botToken?: string;
   apiUrl?: string;
+  docsApiUrl?: string;  // Top-level default for the docs-domain base URL; unset = same origin as apiUrl
   wsUrl?: string;
   cdnUrl?: string;  // CDN base URL for media files (e.g. https://cdn.example.com/bucket)
   pollIntervalMs?: number;
@@ -66,6 +69,7 @@ export interface OctoConfig {
   cardDisplay?: boolean;
   /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
   cardInteraction?: boolean;
+  docTasks?: boolean;  // Top-level default for document comment @Bot tasks
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret (see OctoAccountConfig)
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms); see OctoAccountConfig
@@ -94,6 +98,43 @@ export const DISPATCH_TIMEOUT_MS_DESCRIPTION =
 
 export const EVENT_WAIT_SECONDS_DESCRIPTION =
   "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";
+// main 删除了 CARD_PROGRESS / CARD_DISPLAY / CARD_INTERACTION / REASONING_CARD_TEMPLATE_MODE 这些
+// description 常量与 schema 片段(服务端 per-Bot 配置权威,本地字段仅保留为 @deprecated 兼容项),
+// 本 PR 不恢复它们。下面只保留本 PR 真正新增的两个 key 的描述。
+
+export const DOC_TASKS_DESCRIPTION =
+  "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM.";
+
+// Shared description for docsApiUrl, kept identical to the wording in
+// openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
+//
+// Why this knob exists: the docs domain (`/v1/bot/docs/**`, which is where doc
+// task replies are POSTed) is a **separate service** from the IM server that
+// `apiUrl` points at. Hosted deployments put both behind one gateway origin, so
+// the default (fall back to `apiUrl`) is right there. A split local stack does
+// not: the IM gateway answers `/v1/bot/**` but has no route for
+// `/v1/bot/docs/**`, so every doc task reply POST gets a 404 — which is a
+// *permanent* failure, so it is not retried, the reply never reaches the comment
+// thread, and even the fallback notice (same endpoint) is lost. The document
+// still gets edited, so the user sees a silent mutation with no reply at all.
+//
+// ★ ONE knob, TWO upstream services — and that is a declared limitation, not an
+// oversight. `docsApiUrl` is the base for BOTH:
+//   * docs-backend  `/v1/bot/docs/<docId>/comments`   (Yjs docs — postDocComment)
+//   * octo-doc      `/docs-html/v1/agent/replies`     (HTML docs — postHtmlDocReply)
+// Those are two different services. Deployments that front both from one gateway
+// origin (hosted, and the standard local compose) work. A deployment that puts
+// them on **two different origins is NOT SUPPORTED**: whichever of the two the
+// single value does not match will 404 on every reply, permanently (404 is
+// classified non-retryable), and the fallback notice goes to the same broken
+// origin, so the user gets a silently mutated document and no reply.
+// We do not add a second knob because that turns one mismatch into two, and no
+// deployment we have needs the split. If one ever does, the fix is a separate
+// `htmlDocsApiUrl`, not a heuristic.
+export const DOCS_API_URL_DESCRIPTION =
+  "Base URL for the docs domain used by document comment @Bot task replies — both docs-backend (/v1/bot/docs/**) and octo-doc (/docs-html/v1/**). When omitted, apiUrl is used, which is correct whenever one gateway origin fronts the IM server and both doc services. Setting it assumes those two doc services share ONE origin; serving them from two different origins is not supported. A wrong value makes every doc task reply 404 permanently — no retry, and the fallback notice is lost too, so the document is edited with no visible reply.";
+
+
 
 // Shared description for commands.fork.scope, kept identical to the wording in
 // openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
@@ -127,6 +168,7 @@ export const OctoConfigJsonSchema = {
       enabled: { type: "boolean" },
       botToken: { type: "string" },
       apiUrl: { type: "string" },
+      docsApiUrl: { type: "string", description: DOCS_API_URL_DESCRIPTION },
       wsUrl: { type: "string" },
       cdnUrl: { type: "string" },
       pollIntervalMs: { type: "number", minimum: 500 },
@@ -136,6 +178,7 @@ export const OctoConfigJsonSchema = {
       botUid: { type: "string" },
       historyLimit: { type: "number", minimum: 1, maximum: 100 },
       historyPromptTemplate: { type: "string" },
+      docTasks: { type: "boolean", description: DOC_TASKS_DESCRIPTION },
       onBehalfOf: { type: "string" },
       secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
       dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },
@@ -149,6 +192,7 @@ export const OctoConfigJsonSchema = {
             enabled: { type: "boolean" },
             botToken: { type: "string" },
             apiUrl: { type: "string" },
+            docsApiUrl: { type: "string", description: DOCS_API_URL_DESCRIPTION },
             wsUrl: { type: "string" },
             cdnUrl: { type: "string" },
             pollIntervalMs: { type: "number", minimum: 500 },
@@ -158,6 +202,7 @@ export const OctoConfigJsonSchema = {
             botUid: { type: "string" },
             historyLimit: { type: "number", minimum: 1, maximum: 100 },
             historyPromptTemplate: { type: "string" },
+            docTasks: { type: "boolean", description: DOC_TASKS_DESCRIPTION },
             onBehalfOf: { type: "string" },
             secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
             dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },

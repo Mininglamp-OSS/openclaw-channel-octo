@@ -20,7 +20,9 @@ const isReplyPayloadNonTerminalToolErrorWarning =
     ? replyPayloadCompat.isReplyPayloadNonTerminalToolErrorWarning
     : undefined;
 const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
-import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
+import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
+import { createImEgressGuard } from "./im-egress.js";
+import type { DocTaskTurnReport } from "./doc-mention-handler.js";
 import type { GroupMember } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
 import { normalizeAccountId } from "./account-id.js";
@@ -55,6 +57,7 @@ import { registerGroupAccount, ensureGroupMd, handleGroupMdEvent, broadcastGroup
 import { handleForkCommandIfMatched } from "./commands/fork-inbound.js";
 import { isForkCommandHistoryMessage } from "./commands/fork-history-filter.js";
 import { isOwner } from "./owner-registry.js";
+import { isSessionInitConflict } from "./session-retry.js";
 import { isKnownBot } from "./bot-registry.js";
 import { getPersonaPromptForSession } from "./persona-prompt.js";
 import { createWriteStream } from "node:fs";
@@ -1526,8 +1529,36 @@ export async function handleInboundMessage(params: {
   statusSink?: OctoStatusSink;
   /** Trusted adapter-side route captured when an interactive card was authored. */
   routeOverride?: { sessionKey: string; agentId?: string };
+  /**
+   * 文档评论任务上下文(octo-server `doc_comment_mention`)。
+   *
+   * 一旦存在,本次 inbound 的全部 IM 出站被关闭,最终答复改投 `postComment`:
+   * 合成消息是 DM 形状的,不改道会把答复、正在输入、已读回执、进度卡全部发进
+   * 发起人的私聊 —— 正是本特性要消除的污染。`postComment` 由调用方注入,
+   * 便于测试直接断言 IM 出站零调用。
+   */
+  docTask?: {
+    docId: string;
+    threadId: string;
+    /** 会话作用域片段,如 `doctask:{docId}:{threadId}`(见 doc-mention.ts)。 */
+    sessionScope: string;
+    /**
+     * intent 必须透传:出站层要靠它决定评论上的判定徽章。
+     * "output" = agent 给出了答复(applied);"notice" = 失败/超时/兜底通知(question)。
+     * 丢掉它 ⇒ 一条「超时了，抱歉」顶着「已完成」徽章,把本特性
+     * 「说了完成就是真完成」的立场在最后一跳反过来。
+     */
+    postComment: (
+      text: string,
+      signal?: AbortSignal,
+      intent?: "output" | "notice",
+    ) => Promise<void>;
+    /** 回合末尾上报一次事实;没上报按「什么都没发生」处理(见 doc-mention-handler.ts)。 */
+    reportTurn: (report: DocTaskTurnReport) => void;
+  };
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
+  const docTask = params.docTask;
   // Server-authoritative robot map. Default to a throwaway Map when the caller
   // omits it so the gate logic below can read it unconditionally; the real
   // channel call site passes a persistent per-account map.
@@ -2261,6 +2292,21 @@ export async function handleInboundMessage(params: {
       ...(params.routeOverride.agentId ? { agentId: params.routeOverride.agentId } : {}),
     };
   }
+  if (docTask) {
+    // 文档任务的会话粒度是「评论串」:同串追问共享上下文,跨串互不可见,且与
+    // DM/群会话彻底分开。刻意不落进 `octo:group:` 命名空间 —— group-md.ts 靠
+    // 该前缀正则决定是否注入 GROUP.md,文档任务不该继承群聊规则。
+    //
+    // accountId 必须在键里:宿主自己的 key 构造器是
+    // `agent:{agentId}:{channel}:{accountId}:direct:{peerId}`,漏掉它会让共用同一
+    // agent 的两个 bot 账号在同一条评论串下塌成一个会话、共享历史。两侧 id 一律
+    // 小写归一,和宿主保持一致。docId/threadId 里的 `:` 已在 docTaskSessionScope
+    // 里转义,否则键的结构会有歧义(`d:1` + `2` 与 `d` + `1:2` 会撞成同一个键)。
+    route = {
+      ...route,
+      sessionKey: `agent:${route.agentId}:${CHANNEL_ID}:${normalizeAccountId(account.accountId)}:${docTask.sessionScope}`,
+    };
+  }
 
   // Fire-and-forget: ensure GROUP.md is cached for this group
   if (isGroup && message.channel_id) {
@@ -2366,7 +2412,14 @@ export async function handleInboundMessage(params: {
   }
 
   const commandBody = resolveCommandBody(rawBody, isGroup, isExplicitBotMention);
-  const commandAuthorized = resolveCommandAuthorized(isGroup, isOwner(account.accountId, message.from_uid), isExplicitBotMention);
+  // 文档任务一律不授权斜杠命令。它是一条合成 DM,而 resolveCommandAuthorized 对 DM
+  // 形态恒返回 true —— 于是攻击者可控的评论正文会带着 CommandAuthorized: true 进入
+  // core 的命令解析。今天唯一挡住它的是 formatDocMentionText 给正文加了前缀,使得
+  // 锚定在位置 0 的命令匹配不上;这和 /fork 那处是同一种「意外保护」,提示词格式
+  // 一改就失效。评论区没有斜杠命令语义,直接关掉。
+  const commandAuthorized = docTask
+    ? false
+    : resolveCommandAuthorized(isGroup, isOwner(account.accountId, message.from_uid), isExplicitBotMention);
 
   // `/fork` command split (spec §3). Runs BEFORE OBO detection /
   // finalizeInboundContext / recordInboundSession / the dispatch main path: a
@@ -2374,7 +2427,13 @@ export async function handleInboundMessage(params: {
   // and early-returns — so it never writes the parent session nor reaches the
   // LLM on this (parent) conversation. Non-fork messages return false here and
   // fall through unchanged (a cheap regex, no behavior change for the hot path).
+  // 文档任务一律不走 /fork:评论串里没有「分叉出一个子群」的语义,而 fork-inbound
+  // 会用自己的 sendMessage 直发 IM(它在另一个文件,inbound 的出站闸门管不到它),
+  // 目标又是合成消息的 DM channel —— 也就是发起人的私聊。今天只是因为
+  // formatDocMentionText 给正文加了前缀、锚定的 /^\/fork…$/ 匹配不上才碰不到,
+  // 提示词格式一改就重新打开。而且这条早返回排在任何 reportTurn 之前。
   if (
+    !docTask &&
     await handleForkCommandIfMatched({
       commandBody,
       commandAuthorized,
@@ -2681,46 +2740,295 @@ export async function handleInboundMessage(params: {
 
   // 波 B:登记进度卡发送上下文(hook 侧懒发/更新时用)。route.sessionKey 桥接
   // dispatch↔hook(H1 实证一致)。OBO(persona-clone)场景由 setCardContext 内部标记跳过。
-  setCardContext(route.sessionKey, {
-    accountId: account.accountId,
-    apiUrl,
-    botToken,
-    channelId: replyChannelId,
-    channelType: replyChannelType,
-    reasoningVisibility,
-    ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-  });
+  // 文档任务不登记进度卡上下文:进度卡走 IM sendCardMessage/editCardMessage,
+  // 登记了就会把进度卡发进发起人的私聊。
+  //
+  // 保留 main 的字段形态:accountId 现在是承重的(card-progress.ts 用它懒启动该账号的
+  // 配置事件轮询),而 cardProgress / reasoningCardTemplateMode 已标 @deprecated 且被
+  // 忽略(服务端权威),所以不再从本地 config 透传。
+  if (!docTask) {
+    setCardContext(route.sessionKey, {
+      accountId: account.accountId,
+      apiUrl,
+      botToken,
+      channelId: replyChannelId,
+      channelType: replyChannelType,
+      reasoningVisibility,
+      ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
+    });
+  }
   const recordReasoningForGeneration = createCardReasoningRecorder(route.sessionKey);
 
+  // --- IM 出站闸门 ---
+  // 文档任务下所有 IM 出站一律不发。下面每个显式的 `if (docTask)` 守卫都保留 ——
+  // 闸门是兜底,不是替代:守卫负责「不做无谓的工作」(不建 typing 定时器、不上传
+  // 附件),闸门负责「守卫漏了也发不出去」。新增出站点只要没经过闸门包装,
+  // inbound-im-egress-guard.test.ts 就会在 CI 变红。
+  const imEgress = createImEgressGuard({
+    suppressed: docTask !== undefined,
+    reason: docTask ? `doc task ${docTask.docId}/${docTask.threadId}` : "",
+    log,
+  });
+  const imSendMessage = imEgress.guard("sendMessage", sendMessage);
+  const imSendTyping = imEgress.guard("sendTyping", sendTyping);
+  const imSendReadReceipt = imEgress.guard("sendReadReceipt", sendReadReceipt);
+  const imUploadAndSendMedia = imEgress.guard("uploadAndSendMedia", uploadAndSendMedia);
+
   // 已读回执 + 正在输入 — fire-and-forget
-  if (isOBOv2) {
+  // 文档任务全部跳过:评论区没有对应语义,发出去就是 IM 侧的噪音。
+  if (docTask) {
+    log?.info?.(`octo: doc task ${docTask.docId}/${docTask.threadId} — IM outbound suppressed`);
+  } else if (isOBOv2) {
     // v2: send typing to origin group with grantor identity (skip readReceipt)
     log?.info?.(`octo: OBO v2 — sending typing to origin group=${replyChannelId} as=${effectiveOnBehalfOf}`);
-    sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, onBehalfOf: effectiveOnBehalfOf })
+    imSendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, onBehalfOf: effectiveOnBehalfOf })
       .then(() => log?.info?.("octo: OBO v2 typing sent OK"))
       .catch((err) => log?.error?.(`octo: OBO v2 typing failed: ${String(err)}`));
   } else {
     log?.info?.(`octo: sending readReceipt+typing to channel=${replyChannelId} type=${replyChannelType} apiUrl=${apiUrl}`);
     const messageIds = message.message_id ? [message.message_id] : [];
-    sendReadReceipt({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, messageIds })
+    imSendReadReceipt({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, messageIds })
       .then(() => log?.info?.("octo: readReceipt sent OK"))
       .catch((err) => log?.error?.(`octo: readReceipt failed: ${String(err)}`));
-    sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) })
+    imSendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) })
       .then(() => log?.info?.(`octo: typing sent OK${effectiveOnBehalfOf ? ` (as ${effectiveOnBehalfOf})` : ""}`))
       .catch((err) => log?.error?.(`octo: typing failed: ${String(err)}`));
   }
 
   // Keep sending typing indicator while AI is processing
-  const typingInterval = setInterval(() => {
-    sendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) }).catch(() => {});
+  // 文档任务不建这个定时器:评论区没有「正在输入」语义,建了也只是每 5s 空转一次。
+  const typingInterval = docTask ? undefined : setInterval(() => {
+    imSendTyping({ apiUrl, botToken, channelId: replyChannelId, channelType: replyChannelType, ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}) }).catch(() => {});
   }, 5000);
+
+  // --- 文档任务的唯一出站出口 ---
+  // 文档任务的一切用户可见输出(最终答复、错误/超时兜底、media 说明)都必须从这里
+  // 走。分散在各处加 `if (docTask)` 守卫的做法已经漏过一次:onError / 超时 /
+  // dispatch 拒绝 / media 四个出口曾直接 sendMessage 到合成消息的 DM channel,
+  // 也就是发起人的私聊 —— 既污染 IM,评论区又毫无痕迹。收敛成单一出口后,
+  // 新增出站点只要不经过它就会被失败路径测试抓住。
+  //
+  // 失败只记日志,绝不回退 IM:回退等于把污染放回来;文档修改本身已经落盘。
+  // 本回合的事实记账。**只在 postDocTaskReply 里赋值**,回合末尾原样上报给 handler
+  // —— 这里只说发生了什么,不下「算不算完成」的判断(那是 handler 的策略)。
+  let docTaskFinalDelivered = false; // 本回合的最终答复**确实发成功了**
+  // 本回合有过「带着自己内容的 final」投递尝试。收口(不带自己内容的空 final)看到
+  // 它为真就必须让路 —— 真正的最终答复另有其人,收口不能替它翻案。
+  let docTaskFinalClaimed = false;
+  let docTaskDelivered = false; // 评论区收到过任何内容(含提示)
+  let docTaskLost = false; // 有非提示内容重试耗尽仍没发出去(仅供观测)
+  let docTaskNoticed = false; // 发出过提示(道歉/超时/拒绝)
+  // 最近一次投递失败的原因。**必须跟着回合末尾那条 info 级日志一起出去**:
+  // 失败原因本身是 error 级的,而部署环境完全可能把 stderr 丢掉(实测:launchd
+  // 的 StandardErrorPath=/dev/null),于是运维手上只剩 `lost=true` 这一个没有下文
+  // 的事实 —— 一个 404(endpoint 配错)和一次网络抖动长得一模一样,查不下去。
+  let docTaskLastPostError: string | undefined;
+  const docTaskDeliveredMediaUrls = new Set<string>(); // 确实随评论 POST 成功的附件 URL
+  type DocTaskReplyIntent =
+    | {
+        type: "output";
+        final?: boolean;
+        /**
+         * **这一次投递自己的**、尚未发出的附件。只有它进 body,也只有它能给这次的
+         * final 背书。回合级的附件队列已经拆掉:一次 POST 的 body 只装它自己的内容。
+         */
+        ownMedia?: readonly string[];
+        /**
+         * 这个 payload 引用到的全部附件(含本回合早先已经发出去的)。**不进 body**,
+         * 只用于「纯收口」的认养判定 —— dispatcher 会先把 media 作为中间产出发出去,
+         * 再用一条引用同一 URL 的空 final 收口,那种形态才是合法的最终产出。
+         */
+        referencedMedia?: readonly string[];
+      }
+    | { type: "notice" };
+  type DocTaskReplyResult = {
+    outputDelivered: boolean;
+    finalDelivered: boolean;
+  };
+  /**
+   * 文档任务的唯一出站。
+   *
+   * 关于 `finalDelivered` 这个事实,连续多轮评审的教训收敛成一条规则:
+   *
+   *   **只有「这一次调用自己带着最终产出去 POST 了」才有资格写它,写的值就是这次
+   *   POST 的结果。**
+   *
+   * 反复出错的根源是把这个事实从 `intent.final` 这个**意图标志**加上当时队列里
+   * 恰好有什么来推导 —— 而这两样都不知道「我这次实际发出去的 body 里装的是什么」。
+   * 于是同一个事实被八次写在不知情的地方:兜底道歉、进度文本、空转收口、别的
+   * payload 遗留的附件,都曾经冒充过最终答复,或者把一个真答复抹掉。
+   *
+   * **前七次都是在补这个谓词,第八次(case D)才看清补不完的原因:附件放在跨
+   * payload 共享的回合级队列里,所以一次 POST 的 body 里可以装着别人的内容,
+   * 「这次投递了什么」这个问题本身就没法从 body 回答。** 队列已经拆掉 ——
+   * 每次投递只带 `intent.ownMedia`(自己刚产出、还没发过的附件),失败就丢掉、
+   * 不顺延给后面的帖子。于是下面这条规则可以只看这一次调用:
+   *
+   *   - 认领(claimsFinal):intent 是 final **且**这次带着自己的内容 —— 自己的
+   *     文本,或自己的 `ownMedia`。认领者按这次 POST 的结果落定终态(成败都写)。
+   *   - 认养(adoptsDeliveredMedia):没有自己的内容可发,但明确引用了本回合已经
+   *     投递成功的附件,且**本回合还没有任何 final 认领过**。这才是「纯附件产出被
+   *     一条空 final 收尾」的合法形态。
+   *   - 其余一律不写:进度、提示、空转收口。它们如实返回回合已有的结论。
+   *
+   * 「body 里全是别的 payload 遗留附件」这一类调用现在**不可表达**,不再需要单独
+   * 挡:body 只由 `ownText` + `ownMedia` 组成,别人的东西进不来。
+   */
+  const postDocTaskReply = async (
+    content: string,
+    signal: AbortSignal | undefined,
+    // **必填,没有默认值。** 省略时退回 `{ type: "output" }` 曾经让「工具失败警告」
+    // 这条路以 status:"applied" 发出去 —— 上游 octo-doc 会据此翻转父评论状态并发
+    // marked_applied,于是一条「执行失败」的回复把用户的诉求标成已解决,dedupe 再
+    // 把任务永久关闭。同一类缺陷被人工枚举找到两次、漏掉两次,两次都是这个可选参数
+    // 在兜底。改成必填后,「哪些消息可以宣称完成」由编译器枚举成闭集。
+    intent: DocTaskReplyIntent,
+  ): Promise<DocTaskReplyResult> => {
+    const ownText = content.trim();
+    // 这次投递自己的内容。**提示(notice)永远不带附件** —— 一句道歉后面挂着任务
+    // 产出是另一类事故,这里从类型上就取不到。
+    const ownMedia = intent.type === "output" ? [...(intent.ownMedia ?? [])] : [];
+    // 「这次带着自己的内容」不再需要单独写成条件:body 只由 ownText + ownMedia 组成,
+    // 所以 body 非空 ⟺ 这两样至少有一个非空。而 claimsFinal 只在空 body 提前返回
+    // **之后**才被读到,那里已经证明了这一点 —— 资格由实际要发的内容本身担保,不是
+    // 另写一个可能和 body 走偏的谓词。(变异测试发现原来那个子句已经恒真。)
+    const claimsFinal = intent.type === "output" && intent.final === true;
+
+    /** 认领者落定终态。**回合级事实只在这里被写。** */
+    const settleFinal = (delivered: boolean): DocTaskReplyResult => {
+      docTaskFinalClaimed = true;
+      docTaskFinalDelivered = delivered;
+      return { outputDelivered: delivered, finalDelivered: delivered };
+    };
+    /** 没有认领:这次没决定 final,如实返回回合已有的结论,不写任何东西。 */
+    const unchanged = (outputDelivered: boolean): DocTaskReplyResult => ({
+      outputDelivered,
+      finalDelivered: docTaskFinalDelivered,
+    });
+
+    if (!docTask) return unchanged(false);
+    // 允许「只有附件、没有文本」:agent 产出纯 media 的回合在这里无文本可发,
+    // 不发的话评论区静默、任务却被当成功。
+    const body = [ownText, ...ownMedia.map((url) => `[附件] ${url}`)]
+      .filter(Boolean)
+      .join("\n\n");
+    if (!body) {
+      // 纯收口:自己没有内容可发。只有在本回合还没有任何 final 认领过、且它引用的
+      // 附件确实都已投递成功时,才允许把那些附件认养为最终产出。
+      const referencedMedia =
+        intent.type === "output" && intent.final ? [...(intent.referencedMedia ?? [])] : [];
+      const adoptsDeliveredMedia =
+        !docTaskFinalClaimed
+        && referencedMedia.length > 0
+        && referencedMedia.every((url) => docTaskDeliveredMediaUrls.has(url));
+      if (adoptsDeliveredMedia) return settleFinal(true);
+      return unchanged(false);
+    }
+    try {
+      await docTask.postComment(body, signal, intent.type);
+      docTaskDelivered = true;
+      if (intent.type === "notice") {
+        docTaskNoticed = true;
+      } else {
+        for (const url of ownMedia) docTaskDeliveredMediaUrls.add(url);
+      }
+      statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
+      if (claimsFinal) return settleFinal(true);
+      return unchanged(intent.type === "output");
+    } catch (err) {
+      // 提示发失败不记 lost:提示本来就不是产出,发不出去只是没留下痕迹,
+      // 由 handler 的兜底补。内容发失败才是「答复丢了」。
+      if (intent.type === "output") docTaskLost = true;
+      docTaskLastPostError = String(err);
+      statusSink?.({ lastError: String(err) });
+      log?.error?.(`octo: doc comment reply failed doc=${docTask.docId} thread=${docTask.threadId}: ${String(err)}`);
+      // 附件跟着这次投递一起作废,**不顺延**给本回合后续的帖子。顺延正是此前三个
+      // 阻塞缺陷的来源:遗留物会让后来的 payload 拿别人的产出给自己的 final 背书。
+      // 这一回合会如实 report lost,由 handler 补兜底通知并 release,允许重投。
+      if (ownMedia.length > 0) {
+        log?.error?.(`octo: doc task attachments dropped with the failed post (not carried over): ${ownMedia.join(", ")}`);
+      }
+      // 认领者失败就必须落定为失败 —— 后来的更正答复发丢了,不能留着此前那次成功。
+      if (claimsFinal) return settleFinal(false);
+      return unchanged(false);
+    }
+  };
+  /**
+   * 用户可见的兜底通知(错误/超时/拒绝)。文档任务改投评论区,其余保持原样直发。
+   *
+   * `type: "notice"` 是关键:一句道歉证明不了任务做成了。提示与任务产出分开记账,
+   * 这里只负责把「这是提示不是产出」这件事说清楚。
+   */
+  const sendUserFacingFallback = async (content: string, signal?: AbortSignal): Promise<void> => {
+    if (docTask) {
+      await postDocTaskReply(withSuppressedToolTail(content), signal, { type: "notice" });
+      return;
+    }
+    await imSendMessage({
+      apiUrl,
+      botToken,
+      channelId: replyChannelId,
+      channelType: replyChannelType,
+      content,
+      ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
+      ...(signal ? { signal } : {}),
+    });
+  };
+
+  /**
+   * 文档任务:最后一段被抑制的工具进度文本。
+   *
+   * 进度本身不该进评论区(见 deliver 的 kind === "tool" 分支),但整回合什么都没产出
+   * 时,只发一句「处理时遇到了问题」用户无从下手 —— 失败往往就写在最后那段进度里
+   * (`⚠️ Exec failed`、412 base_version_stale 之类)。所以抑制不等于丢弃:留在这里,
+   * 由兜底通知带出去。
+   */
+  let docTaskLastToolText: string | null = null;
+  /** 兜底文本的字符上限。整段工具输出可能上千字,评论区放不下也没人看。 */
+  const SUPPRESSED_TOOL_TAIL_MAX = 500;
+  /**
+   * 给兜底通知补上最后一段进度的尾部。
+   *
+   * 取尾而不是取头:失败信息在末尾。取一次即清空,免得同一段进度被超时兜底和
+   * dispatch 兜底各带一遍。
+   *
+   * 暴露面没有变大:这些文本本来就是逐条发进这同一个评论串的,现在只发截断的一段,
+   * 严格少于改动前。
+   */
+  const withSuppressedToolTail = (content: string): string => {
+    const tail = docTaskLastToolText;
+    docTaskLastToolText = null;
+    if (!tail) return content;
+    const trimmed = tail.trim();
+    if (!trimmed) return content;
+    const clipped =
+      trimmed.length > SUPPRESSED_TOOL_TAIL_MAX
+        ? `…${trimmed.slice(-SUPPRESSED_TOOL_TAIL_MAX)}`
+        : trimmed;
+    return `${content}\n\n最后一步的执行输出：\n${clipped}`;
+  };
 
   // Buffer text across streaming deliver calls; only send once after dispatcher finishes.
   // Media is sent immediately (no edit problem); text is buffered (each call overwrites).
   const deliverBuffer = {
     lastText: null as string | null,
     textSent: false,
+    // 文档任务:被缓冲的 block payload 自己带的附件。文本被缓冲(还没 POST)时附件
+    // 也必须跟着等,否则这一回合它们一条都发不出去。**这不是回合级共享队列** ——
+    // 只有「尚未投递过的 payload」的内容会进来,任何已经 POST 过(成功或失败)的
+    // 附件都不会回流,所以别的投递拿不到它们。
+    docTaskMedia: [] as string[],
   };
+  /**
+   * 取走并清空缓冲里的附件,交给**接管这段缓冲**的那次投递(final 覆盖了缓冲文本,
+   * 或收尾把缓冲刷出去)。取走即消费,不会被第二次投递再拿到。
+   *
+   * 这些附件从未 POST 过 —— 它们属于文本被 dispatcher 自己覆盖/延后的 payload,
+   * 和「某次 POST 已经发生过之后遗留下来的东西」是两回事,后者才是那三个阻塞缺陷
+   * 的来源,而拆掉共享队列之后已经不可表达。
+   */
+  const takeBufferedDocTaskMedia = (): string[] =>
+    deliverBuffer.docTaskMedia.splice(0, deliverBuffer.docTaskMedia.length);
   const sentMediaUrls = new Set<string>();
   let userFacingFinalDelivered = false;
   let pendingToolWarningFinal: { text: string } | undefined;
@@ -2737,7 +3045,34 @@ export async function handleInboundMessage(params: {
   let dispatchFailed = false;
 
   // --- Shared helper: resolve mentions and send text ---
-  const resolveAndSendText = async (content: string, signal?: AbortSignal): Promise<SendMessageResult | undefined> => {
+  const resolveAndSendText = async (
+    content: string,
+    signal: AbortSignal | undefined,
+    // `intent` 必填:文档任务分支要把它原样透传给 postDocTaskReply。此前这里把
+    // `type: "output"` 写死,于是上游三个 deliverFinalText 调用点**根本没有通道**
+    // 把「这是提示、不是产出」传下来 —— 这才是工具失败警告以 applied 发出去的
+    // 真正原因,不是「调用点忘了传」。IM 分支不读它(IM 没有 applied/question 之分)。
+    opts: {
+      intent: DocTaskReplyIntent["type"];
+      final?: boolean;
+      ownMedia?: readonly string[];
+      referencedMedia?: readonly string[];
+    },
+  ): Promise<DocTaskReplyResult> => {
+    if (docTask) {
+      return postDocTaskReply(
+        content,
+        signal,
+        opts.intent === "notice"
+          ? { type: "notice" }
+          : {
+              type: "output",
+              final: opts.final,
+              ownMedia: opts.ownMedia,
+              referencedMedia: opts.referencedMedia,
+            },
+      );
+    }
     let replyMentionUids: string[] = [];
     let replyMentionEntities: MentionEntity[] = [];
     let finalContent = content;
@@ -2835,7 +3170,7 @@ export async function handleInboundMessage(params: {
     // Detect @all/@所有人 in final content
     const hasAtAll = /(?:^|(?<=\s))@(?:all|所有人)(?=\s|[^\w]|$)/i.test(finalContent);
 
-    const result = await sendMessage({
+    const result = await imSendMessage({
       apiUrl: account.config.apiUrl,
       botToken: account.config.botToken ?? "",
       channelId: replyChannelId,
@@ -2848,7 +3183,7 @@ export async function handleInboundMessage(params: {
       ...(signal ? { signal } : {}),
     });
     statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
-    return result;
+    return { outputDelivered: true, finalDelivered: opts?.final === true };
   };
 
   // Experimental opt-in: when a progress card is already visible, try to put
@@ -2856,24 +3191,39 @@ export async function handleInboundMessage(params: {
   // that emitted media keep the normal path because a card edit cannot retain
   // their notification / attachment semantics. A failed merge is transparent:
   // the caller still sends text and finally closes the progress card normally.
+  /** 承载本回合最终产出的出站。文档任务据此判定「答复落地了没有」。 */
   const deliverFinalText = async (
     content: string,
-    signal?: AbortSignal,
-  ): Promise<{ merged: boolean }> => {
+    signal: AbortSignal | undefined,
+    // `intent` 必填,原因同 resolveAndSendText:这一层才是「工具失败警告」那次投递
+    // 的实际入口,以前它没有通道表达「这是提示」。
+    opts: {
+      intent: DocTaskReplyIntent["type"];
+      ownMedia?: readonly string[];
+      referencedMedia?: readonly string[];
+    },
+  ): Promise<{ merged: boolean; delivered: boolean }> => {
     const hasPotentialMention = content.includes("@");
     if (
-      process.env.OCTO_CARD_MERGE_FINAL === "1"
+      !docTask // 文档任务没有 IM 进度卡可合并(setCardContext 已跳过)
+      && process.env.OCTO_CARD_MERGE_FINAL === "1"
       && sentMediaUrls.size === 0
       && !hasPotentialMention
     ) {
       const merged = await finalizeCardWithResponse(route.sessionKey, content);
       if (merged) {
         statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
-        return { merged: true };
+        return { merged: true, delivered: true };
       }
     }
-    await resolveAndSendText(content, signal);
-    return { merged: false };
+    const delivery = await resolveAndSendText(content, signal, {
+      // 透传:deliverFinalText 自己不决定这次是产出还是提示,由调用方声明。
+      intent: opts.intent,
+      final: true,
+      ownMedia: opts.ownMedia,
+      referencedMedia: opts.referencedMedia,
+    });
+    return { merged: false, delivered: delivery.finalDelivered };
   };
 
   let replySucceeded = false;
@@ -2928,8 +3278,14 @@ export async function handleInboundMessage(params: {
       // messages.visibleReplies — the requested mode outranks config, so
       // injecting it for a group or over an explicit setting would change
       // group behaviour and override operator intent.
+      //
+      // 文档任务是例外,必须无条件 automatic。它是一条合成 DM,本来跟着上面那条 DM
+      // 规则走,于是运维一旦显式配了 messages.visibleReplies: "message_tool",最终
+      // 答复就不会经 deliver() 出来 —— 评论区只剩兜底提示,事件却照样 ack;而 agent
+      // 真去调 message tool 的话,输出又落回 IM,正是本特性要消除的污染。
+      // messages.visibleReplies 管的是 **IM 会话** 的显隐,对不落 IM 的文档任务没有语义。
       replyOptions:
-        !isGroup && config.messages?.visibleReplies === undefined
+        docTask || (!isGroup && config.messages?.visibleReplies === undefined)
           ? {
               sourceReplyDeliveryMode: "automatic" as const,
               onReasoningStream: captureReasoning,
@@ -2953,10 +3309,32 @@ export async function handleInboundMessage(params: {
 
           // --- Media: send immediately (no edit/forward issue) with dedup ---
           const outboundMediaUrls = resolveOutboundMediaUrls(payload);
+          // 文档任务:这一次 payload **自己**新产出的附件。只有它会进这次 POST 的
+          // body,也只有它能给这次的 final 背书 —— 回合级共享队列已经拆掉。
+          const docTaskOwnMedia: string[] = [];
           for (const mediaUrl of outboundMediaUrls) {
             if (sentMediaUrls.has(mediaUrl)) continue;
+            if (docTask) {
+              // 评论 API 不收附件:不上传、不发 IM,URL 附到评论正文里带出去。
+              //
+              // 只带 http(s)。IM 路径会把本地文件先经 presign 上传再引用,而这里是
+              // 直接把字符串写进公开评论 —— 原样带出去的话,读者拿到一个用不了的
+              // 路径,而且主机文件系统路径被发布进了文档评论区。跳过并记一条日志,
+              // 让这类产出在 report 里如实体现为「没有产出」,而不是假装投递成功。
+              if (!/^https?:\/\//i.test(mediaUrl)) {
+                sentMediaUrls.add(mediaUrl);
+                log?.error?.(
+                  `octo: doc task media skipped (not an http(s) URL, would leak a local path into a public comment): ${mediaUrl}`,
+                );
+                continue;
+              }
+              docTaskOwnMedia.push(mediaUrl);
+              sentMediaUrls.add(mediaUrl);
+              log?.info?.(`octo: doc task media not sent to IM, attached to comment: ${mediaUrl}`);
+              continue;
+            }
             try {
-              const mediaResult = await uploadAndSendMedia({
+              const mediaResult = await imUploadAndSendMedia({
                 mediaUrl,
                 apiUrl: account.config.apiUrl,
                 botToken: account.config.botToken ?? "",
@@ -2975,6 +3353,28 @@ export async function handleInboundMessage(params: {
           // --- Text handling based on kind ---
           const content = payload.text?.trim() ?? "";
           if (!content && sentMediaUrls.size > 0) {
+            // 文档任务:附件必须经出站收口发出去,否则本回合一条评论都不会产生。
+            if (docTask) {
+              // 纯附件就是本回合 kind:"final" 的全部产出,和一段最终文本等价 ——
+              // 不标 final 的话这个回合永远拿不到去重记录,重投会把文档改第二遍。
+              // `ownMedia` 为空(附件早先已发过)时这次就没有自己的内容,只能凭
+              // `referencedMedia` 走认养 —— 那才是 dispatcher 的空 final 收口协议。
+              const delivery = await postDocTaskReply(
+                "",
+                AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+                {
+                  type: "output",
+                  final: kind === "final",
+                  ownMedia: docTaskOwnMedia,
+                  referencedMedia: outboundMediaUrls,
+                },
+              );
+              // 和下面的非文档分支一样置位:不置位的话本回合会被判成「没答复过」,
+              // 走到 !replySucceeded 兜底,在已经发出附件评论之后再补一句道歉。
+              replySucceeded ||= delivery.outputDelivered;
+              if (kind === "final") userFacingFinalDelivered = delivery.finalDelivered;
+              return;
+            }
             statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
             replySucceeded = true;
             return;
@@ -2986,10 +3386,35 @@ export async function handleInboundMessage(params: {
           if (kind !== "tool") markCardAnswering(route.sessionKey);
 
           if (kind === "tool") {
+            // 文档任务:工具进度不进评论区。IM 会话里逐条发是**功能**(用户看着 Bot
+            // 干活),但评论区是文档的一部分 —— 实测一次改单元格产生 9 条评论
+            // (读 SKILL.md、读 sheet.md、get、edit 吃 400、重读、edit 吃 412、
+            // 再 get、再 edit、成功),真正的答复被埋在最下面,用户报「为什么回复
+            // 的都是工具调用」。评论区只该留结论。
+            //
+            // 带附件的那一条不抑制:附件已被计入 sentMediaUrls,这里跳过就等于永久
+            // 丢弃(后续 payload 的 referencedMedia 认养不到自己没产出的东西)。
+            // 多一条评论,好过丢一个产出。
+            if (docTask && docTaskOwnMedia.length === 0) {
+              // 留着给收尾兜底用:整回合什么都没产出时,一句「出问题了」说不清哪步
+              // 失败,把最后一段进度(截断)带上才有可操作性。
+              docTaskLastToolText = content;
+              log?.info?.(
+                `octo: doc task tool progress suppressed from comments (${content.length} chars)`,
+              );
+              return;
+            }
             // Verbose tool call output: send immediately
-            await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
-            replySucceeded = true;
-            log?.info?.(`octo: [deliver] tool text sent (${content.length} chars)`);
+            const delivery = await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), {
+              // agent 自己产出的工具输出文本,是真实产出(非 final,不认领终态)。
+              intent: "output",
+              ownMedia: docTaskOwnMedia,
+              referencedMedia: outboundMediaUrls,
+            });
+            replySucceeded ||= delivery.outputDelivered;
+            if (delivery.outputDelivered) {
+              log?.info?.(`octo: [deliver] tool text sent (${content.length} chars)`);
+            }
             return;
           }
 
@@ -3004,17 +3429,30 @@ export async function handleInboundMessage(params: {
               return;
             }
 
-            const delivered = await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
-            replySucceeded = true;
-            userFacingFinalDelivered = true;
+            // final 覆盖缓冲文本(下面就把它清掉),所以缓冲里那些还没投递过的附件
+            // 由这次 final 一并带出去 —— 否则它们会随缓冲一起被丢掉。
+            const delivered = await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), {
+              // 正常的 kind:"final" —— agent 给出的真实答复,配 applied。
+              intent: "output",
+              ownMedia: [...takeBufferedDocTaskMedia(), ...docTaskOwnMedia],
+              referencedMedia: outboundMediaUrls,
+            });
+            replySucceeded ||= delivered.delivered;
+            userFacingFinalDelivered = delivered.delivered;
             pendingToolWarningFinal = undefined;
             deliverBuffer.lastText = null;
             deliverBuffer.textSent = true;
-            log?.info?.(`octo: [deliver] final ${delivered.merged ? "merged into progress card" : "text sent immediately"} (${content.length} chars)`);
+            if (delivered.delivered) {
+              log?.info?.(`octo: [deliver] final ${delivered.merged ? "merged into progress card" : "text sent immediately"} (${content.length} chars)`);
+            }
             return;
           }
 
           // kind === "block" / anything else: buffer, send only once after dispatcher finishes
+          // 文本被缓冲就没有 POST 发生,这一条自己的附件必须跟着一起等 —— 否则本回合
+          // 它们一条都发不出去。文本是覆盖语义(只留最后一段),附件是累加:每段
+          // block 的附件都还没投递过,谁都不该被后一段挤掉。
+          if (docTask) deliverBuffer.docTaskMedia.push(...docTaskOwnMedia);
           deliverBuffer.lastText = content;
           log?.debug?.(`octo: [deliver-buffer] ${kind} text buffered (${content.length} chars)`);
         },
@@ -3026,20 +3464,16 @@ export async function handleInboundMessage(params: {
           deliverBuffer.textSent = true;
           deliveryErrorOccurred = true;
           dispatchFailed = true;
+          // 抑制的只是「那句道歉」,不是失败事实 —— dispatchFailed 照常置位(上一行),
+          // 否则进度卡会把一次真实失败画成成功终态。
+          if (userFacingFinalDelivered) {
+            log?.info?.("octo: dispatcher onError fired after a final answer already landed — suppressing the error notice");
+            return;
+          }
           try {
-            await sendMessage({
-              apiUrl,
-              botToken,
-              channelId: replyChannelId,
-              channelType: replyChannelType,
-              content: "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
-              ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-              // Same bounded signal as the timeout-path apology: if upstream
-              // signals an error AND the Octo API is also sick, this recovery
-              // sendMessage would otherwise hold the per-group queue until
-              // the outer dispatch timeout kicks in.
-              signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-            });
+            // 经唯一出口:文档任务改投评论区,其余仍直发 IM。同样用受限 signal ——
+            // 上游报错且 Octo API 也病了时,别把队列卡到外层 dispatch 超时。
+            await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
           } catch (sendErr) {
             log?.error?.(`octo: failed to send error message: ${String(sendErr)}`);
           }
@@ -3057,12 +3491,25 @@ export async function handleInboundMessage(params: {
           const pending = pendingToolWarningFinal;
           pendingToolWarningFinal = undefined;
           try {
-            await deliverFinalText(pending.text, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
-            replySucceeded = true;
+            const delivered = await deliverFinalText(
+              pending.text,
+              AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+              {
+                // ★ 本轮 P1 的现场。这是「非终止性工具错误警告」在没有任何真答复
+                // 时的兜底投递 —— 上面 isFallbackOnlyToolWarningFinal 的文档已经
+                // 声明它**不是真答复**。以 output 发会让上游 octo-doc 收到
+                // status:"applied",翻转父评论状态、发 marked_applied,把一条
+                // 「⚠️ 执行失败」标成已解决,dedupe 再把任务永久关闭。
+                intent: "notice",
+                ownMedia: takeBufferedDocTaskMedia(),
+              },
+            );
+            replySucceeded ||= delivered.delivered;
+            userFacingFinalDelivered = delivered.delivered;
             log?.info?.(
               `octo: [deliver] pending tool warning sent as fallback (${pending.text.length} chars)`,
             );
-            return { visibleReplySent: true };
+            return { visibleReplySent: delivered.delivered };
           } catch (err) {
             dispatchFailed = true;
             log?.error?.(
@@ -3095,23 +3542,29 @@ export async function handleInboundMessage(params: {
       );
       deliverBuffer.lastText = null;
       deliverBuffer.textSent = true;
-      try {
-        // The apology call itself MUST be bounded — otherwise a sick Octo API
-        // hangs this sendMessage too, defeating the whole timeout fix. See
-        // DISPATCH_TIMEOUT_APOLOGY_MS above.
-        await sendMessage({
-          apiUrl,
-          botToken,
-          channelId: replyChannelId,
-          channelType: replyChannelType,
-          content: "⚠️ 处理超时，请稍后重试。",
-          ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-          signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-        });
-      } catch (sendErr) {
-        log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
+      // 和下面 dispatch-rejected 分支同一条守卫(见其注释):答复已经发出去了就别再
+      // 追一句「处理超时，请稍后重试」—— 用户会同时看到正确答复和自相矛盾的失败提示。
+      // 对文档任务还多一层代价:那句道歉会把一个已经落地的回合拖成「未完成」。
+      // 必须是 userFacingFinalDelivered 而不是 replySucceeded:后者对进度/工具文本
+      // 也置位(见 kind === "tool" 分支),用它做守卫会让「只发过进度然后 hang」的
+      // 回合彻底收不到终态信号 —— 而那正好是超时提示最该出现的场景,且这条路径
+      // 在 docTasks 关着时也走,是普通 DM/群聊上的静默回归。
+      if (userFacingFinalDelivered) {
+        log?.info?.("octo: dispatch timed out after a final answer already landed — suppressing the timeout notice");
+      } else {
+        try {
+          // The apology call itself MUST be bounded — otherwise a sick Octo API
+          // hangs this sendMessage too, defeating the whole timeout fix. See
+          // DISPATCH_TIMEOUT_APOLOGY_MS above.
+          await sendUserFacingFallback("⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+        } catch (sendErr) {
+          log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
+        }
       }
-    } else if (!deliveryErrorOccurred && !replySucceeded) {
+    } else if (!deliveryErrorOccurred && !replySucceeded && !isSessionInitConflict(err)) {
+      // 会话初始化冲突整条分支都跳过,连 dispatchFailed 也不置位:它会被
+      // runWithSessionInitRetry 重试(channel.ts),置位会让一个随后成功的回合被
+      // finalizeCard 画成失败终态(card-progress.ts 的 failed 会否决成功证据)。
       dispatchFailed = true;
       // Dispatch itself rejected (e.g. non_deliverable_terminal_turn) and the
       // onError callback was never invoked, AND no visible reply has been
@@ -3120,6 +3573,11 @@ export async function handleInboundMessage(params: {
       // dispatcher already sent a visible reply before the top-level rejection
       // (e.g. a post-delivery terminal throw): without this guard the user
       // would receive both a real answer and a contradictory error message.
+      //
+      // 会话初始化冲突也排除在外:它会被 runWithSessionInitRetry 重试(默认 4 次),
+      // 每次都道歉一遍就是 5 句道歉,而且 session-retry.ts 的前提正是「冲突发生在
+      // 任何投递之前,所以重试不产生重复回复」—— 在这里道歉会亲手打破那个前提。
+      // 重试全败之后由 channel.ts 发一条冲突回执收尾。
       clearInterval(typingInterval);
       if (deliverBuffer.lastText && !deliverBuffer.textSent) {
         // A blocks-only reply was buffered (replySucceeded is not set for block
@@ -3133,8 +3591,15 @@ export async function handleInboundMessage(params: {
           `octo: dispatch rejected but buffered block text exists; delivering instead of error fallback (${bufferedText.length} chars)`,
         );
         try {
-          await resolveAndSendText(bufferedText, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
-          replySucceeded = true;
+          // 缓冲的 block 文本就是 agent 这一回合的真实答复,和 kind:"final" 等价 ——
+          // 不标 final 的话文档任务会在这条正确答复下面再贴一句「没有给出答复」。
+          const delivery = await resolveAndSendText(
+            bufferedText,
+            AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+            // 缓冲正文是 agent 的真实答复(见上方注释),按产出记账。
+            { intent: "output", final: true, ownMedia: takeBufferedDocTaskMedia() },
+          );
+          replySucceeded ||= delivery.outputDelivered;
         } catch (sendErr) {
           log?.error?.(`octo: failed to deliver buffered block text on dispatch error: ${String(sendErr)}`);
         }
@@ -3146,15 +3611,7 @@ export async function handleInboundMessage(params: {
         deliverBuffer.lastText = null;
         deliverBuffer.textSent = true;
         try {
-          await sendMessage({
-            apiUrl,
-            botToken,
-            channelId: replyChannelId,
-            channelType: replyChannelType,
-            content: "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
-            ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
-            signal: AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-          });
+          await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
         } catch (sendErr) {
           log?.error?.(`octo: failed to send dispatch-error fallback: ${String(sendErr)}`);
         }
@@ -3174,16 +3631,25 @@ export async function handleInboundMessage(params: {
         // on the happy path either — dispatch may have completed normally
         // but if the final POST hangs, handleInboundMessage would never
         // settle. See DISPATCH_TIMEOUT_APOLOGY_MS comment at top of file.
-        await deliverFinalText(
+        const delivered = await deliverFinalText(
           deliverBuffer.lastText,
           AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+          // 只收到 block 文本的回合:这段缓冲正文就是 agent 的答复本身。
+          { intent: "output", ownMedia: takeBufferedDocTaskMedia() },
         );
-        replySucceeded = true;
-        log?.info?.(`octo: [deliver-buffer] fallback text sent (${deliverBuffer.lastText.length} chars)`);
+        replySucceeded ||= delivered.delivered;
+        if (delivered.delivered) {
+          log?.info?.(`octo: [deliver-buffer] fallback text sent (${deliverBuffer.lastText.length} chars)`);
+        }
       } catch (finalSendErr) {
         dispatchFailed = true;
         log?.error?.(`octo: [deliver-buffer] final text send failed: ${String(finalSendErr)}`);
       }
+    }
+    // 缓冲里的附件没人接管(比如 onError 把缓冲文本清掉后只发了一句道歉)。
+    // 提示不夹带产出是刻意的,但静默丢弃不行 —— 至少让运维能看见。
+    if (deliverBuffer.docTaskMedia.length > 0) {
+      log?.error?.(`octo: doc task buffered attachments never delivered: ${takeBufferedDocTaskMedia().join(", ")}`);
     }
     clearInterval(typingInterval);
     // 波 B:收尾进度卡(终态帧 + 清理);fire-and-forget，不阻塞 dispatch 结束/会话释放。
@@ -3194,6 +3660,31 @@ export async function handleInboundMessage(params: {
     });
     // Safety net: clean up pending inbound context in case the hook didn't fire
     pendingInboundContext.delete(route.sessionKey);
+
+    // --- 文档任务:把本回合的事实上报一次 ---
+    // 放在最外层 finally,所以正常结束、dispatch 抛错、超时三条路径都会走到;
+    // dispatch 之前的早返回(能力门禁、路由解析失败)走不到,handler 按「什么都没
+    // 发生」处理 —— 那些回合确实什么都没产出,不写去重、允许重投,方向天然正确。
+    //
+    // 只报事实,不下结论:「最终答复送达了吗」「有没有东西发丢」「道歉过没有」是
+    // 三件独立的事,压成一个枚举就会出现无处安放的组合(见 doc-mention-handler.ts)。
+    // finalDelivered 来自上面的文档评论出站事实,而不是 replySucceeded —— 后者对
+    // 进度/工具文本也置位,拿它当「答复落地」会让「正在读取文档… + 道歉」被判成完成。
+    if (docTask) {
+      const report: DocTaskTurnReport = {
+        finalDelivered: docTaskFinalDelivered,
+        delivered: docTaskDelivered,
+        lost: docTaskLost,
+        noticed: docTaskNoticed,
+      };
+      log?.info?.(
+        `octo: doc task turn final=${report.finalDelivered} delivered=${report.delivered} lost=${report.lost} noticed=${report.noticed}`
+          // 失败原因跟着 info 级一起出去 —— 见 docTaskLastPostError 的声明:
+          // 只报 lost=true 而把原因留在 error 级,等于在丢 stderr 的部署里无法排查。
+          + (docTaskLastPostError ? ` lastPostError=${docTaskLastPostError}` : ""),
+      );
+      docTask.reportTurn(report);
+    }
 
     // Record last answered inbound message_seq for history segmentation (don't clear history).
     // We use the inbound @mention message's message_seq (from WebSocket frame) rather than
