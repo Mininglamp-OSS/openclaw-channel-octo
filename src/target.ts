@@ -7,7 +7,7 @@
  * card-progress` import cycle.
  */
 import { ChannelType } from "./types.js";
-import { stripAllChannelPrefixes } from "./constants.js";
+import { stripAllChannelPrefixes, isDocTaskNonRoutableTarget } from "./constants.js";
 
 const THREAD_SEP = "____";
 
@@ -140,6 +140,18 @@ export function resolveOutboundTarget(
   knownGroupIds?: Set<string>,
 ): { channelId: string; channelType: ChannelType } {
   const THREAD_SEP = "____";
+
+  // Fail-closed on the doc-task sentinel. 文档任务的会话上下文里 `ctx.to` 是一个
+  // 不可路由的哨兵(见 constants.ts),因为那类回合的产出只能回评论区、绝不能进 IM。
+  // 这道检查放在**出站解析的唯一入口**,而不是逐个出站点加判断:后者正是此前
+  // 漏掉 channel.ts 的 sendText/sendMedia 的原因 —— 守卫只扫 inbound.ts,框架自己
+  // 那条出站路没人管。这里抛错 ⇒ 任何走 resolveOutboundTarget 的出站(现在的和以后
+  // 新增的)都够不到真实会话,agent 调 message 工具只会拿到一个明确的失败。
+  if (isDocTaskNonRoutableTarget(ctxTo)) {
+    throw new Error(
+      "octo: document-comment task sessions have no IM destination — replies must go to the doc comment thread, not a chat target",
+    );
+  }
 
   // Normalise `channel:<id>` to `group:<id>` so downstream parseTarget sees a
   // shape it knows. See normalizeOutboundChannelPrefix for rationale.

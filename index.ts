@@ -140,6 +140,10 @@ export default defineBundledChannelEntry({
           cfg,
           agentAccountId: ctx.agentAccountId,
           agentId: ctx.agentId,
+          // 文档评论任务回合要把整只工具关掉(见 agent-tools.ts 的 docTaskTurn)。
+          // 两个判据都透传:tool-discovery 阶段宿主可能不给 deliveryContext。
+          sessionKey: ctx.sessionKey,
+          deliveryContext: ctx.deliveryContext,
         });
       },
       { names: ['octo_management'] },

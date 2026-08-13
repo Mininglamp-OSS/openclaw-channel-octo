@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "event_data": {
+        "bot_uid": "bot_docsmith00000000000000000000",
+        "comment_id": "10077",
+        "doc_id": "68f0a1b2c3d4e5f600112233",
+        "enqueued_at": 1753939200,
+        "from_uid": "u_alice0000000000000000000000000",
+        "idempotency_key": "docs:comment:9c31:rev2",
+        "parent_id": "10070",
+        "space_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "text": "把“确保所有客户提升 50%”改成有数据边界、保留人工复核的表述",
+        "thread_id": "10070",
+        "url": "https://docs.example.com/d/68f0a1b2c3d4e5f600112233#10077"
+      },
+      "event_id": 1000001,
+      "event_type": "doc_comment_mention"
+    }
+  ],
+  "status": 1
+}

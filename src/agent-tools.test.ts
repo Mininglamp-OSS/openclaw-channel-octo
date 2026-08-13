@@ -135,6 +135,66 @@ describe("createOctoManagementTools", () => {
   });
 
   // -----------------------------------------------------------------------
+  // 文档评论任务回合的整体门控
+  //
+  // 这只工具的动作全部跑在 Bot 权限下、不按发起人身份收敛,而文档回合的输入是
+  // 任何人都能写的评论正文。所以文档回合里整只工具必须闭。锁分两条判据各一份,
+  // 因为它们在不同阶段命中:tool-discovery 时宿主可能不给 deliveryContext。
+  // -----------------------------------------------------------------------
+  describe("document-comment task gating", () => {
+    const MGMT_ACTIONS = [
+      "group-md-update",
+      "group-md-read",
+      "create-group",
+      "add-members",
+      "remove-members",
+      "thread-md-update",
+      "list-groups",
+      "read-messages",
+    ];
+
+    function executeWith(params: Record<string, unknown>) {
+      const tools = createOctoManagementTools({ cfg: mockCfg, ...params });
+      expect(tools).toHaveLength(1);
+      return tools[0].execute as (
+        id: string,
+        args: Record<string, unknown>,
+      ) => Promise<{ content: { text: string }[]; details: unknown }>;
+    }
+
+    it.each(MGMT_ACTIONS)(
+      "哨兵 to 命中文档回合时,%s 必须被拒(Bot 权限动作不能由评论正文驱动)",
+      async (action) => {
+        const execute = executeWith({ deliveryContext: { to: "doctask-no-im:d1#c70" } });
+        const out = parseText(await execute("t", { action, groupId: "g1" }));
+        expect(String(out.error)).toContain("document-comment task sessions");
+      },
+    );
+
+    it.each(MGMT_ACTIONS)(
+      "只有 doctask 会话键(宿主未给 deliveryContext)时,%s 同样必须被拒",
+      async (action) => {
+        const execute = executeWith({ sessionKey: "agent:main:octo:default:doctask:d1:70" });
+        const out = parseText(await execute("t", { action, groupId: "g1" }));
+        expect(String(out.error)).toContain("document-comment task sessions");
+      },
+    );
+
+    it("拒绝发生在动作分派之前 —— 一个网络调用都不能发出去", async () => {
+      const execute = executeWith({ sessionKey: "agent:main:octo:default:doctask:d1:70" });
+      await execute("t", { action: "group-md-update", groupId: "g1", content: "被注入的内容" });
+      expect(vi.mocked(updateGroupMd)).not.toHaveBeenCalled();
+      expect(vi.mocked(getGroupMd)).not.toHaveBeenCalled();
+    });
+
+    it("普通 IM 回合不受影响 —— 门控不能误伤正常会话", async () => {
+      const execute = executeWith({ sessionKey: "agent:main:octo:default:g1", deliveryContext: { to: "group:g1" } });
+      const out = parseText(await execute("t", { action: "list-groups" }));
+      expect(String(out.error ?? "")).not.toContain("document-comment task sessions");
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // tool creation
   // -----------------------------------------------------------------------
   describe("tool creation", () => {

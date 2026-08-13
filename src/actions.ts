@@ -7,7 +7,7 @@
 
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
 import type { MentionEntity, LogSink, RichTextBlock } from "./types.js";
-import { stripAllChannelPrefixes } from "./constants.js";
+import { stripAllChannelPrefixes, isDocTaskNonRoutableTarget, DOC_TASK_ALLOWED_MESSAGE_ACTIONS } from "./constants.js";
 import { collapseParentScope, normalizeOutboundChannelPrefix, parseTarget, resolveOutboundTarget } from "./target.js";
 import {
   sendMessage,
@@ -121,6 +121,35 @@ export async function handleOctoMessageAction(params: {
 
   if (!botToken) {
     return { ok: false, error: "Octo botToken is not configured" };
+  }
+
+  // ====== 文档任务会话的能力上限:在**入口**判,不在各分支里判 ======
+  //
+  // 上一轮只在 handleSend 里拒,于是同一个 switch 的兄弟分支照旧敞着:
+  // `group-md-update` 拿 Bot token 往**攻击者指定的**群写 GROUP.md,
+  // `group-md-read` 把任意群的 GROUP.md 读进会话 —— 后者连 IM 出站都不需要,
+  // 文档任务自己的合法出口(评论区)就把内容带出去了,egress 哨兵一次都不会命中。
+  //
+  // action 名是模型直接给的、没有被校验过:宿主 message 工具只特判 send/poll,
+  // 其余一律落到 dispatchChannelMessageAction;本插件没有实现 supportsAction 钩子,
+  // 所以 getAvailableActions() 返回的 ["send","read","search"] 只是给模型看的 schema
+  // 提示,不是强制。评论正文正是攻击者供给 action 名的地方。
+  //
+  // 因此改成**正向允许集**:文档回合只留 read / search 两个分支 —— 它们按
+  // **发起人身份**(requesterSenderId = 评论作者)判权限(见本文件 :794 的跨频道检查),
+  // 读不到发起人本来读不到的东西。其余一律拒,**包括以后新增的分支**:新分支默认
+  // 关着,要开必须显式进这个集合并说明理由。这就是把「哪些 action 文档回合够得着」
+  // 从一条需要逐分支重新推导的性质,变成一行可复核的声明。
+  //
+  // 判据用 `currentChannelId`(会话上下文,文档回合里是哨兵),不是 args.target ——
+  // target 是攻击者控制的输入,拿它做判据等于让攻击者自己声明合不合法。
+  if (isDocTaskNonRoutableTarget(currentChannelId) && !DOC_TASK_ALLOWED_MESSAGE_ACTIONS.has(action)) {
+    return {
+      ok: false,
+      error:
+        `document-comment task sessions may only use ${[...DOC_TASK_ALLOWED_MESSAGE_ACTIONS].join(" / ")} ` +
+        `(requester-scoped reads) — action "${action}" is not available; reply in the document comment thread instead`,
+    };
   }
 
   switch (action) {
@@ -347,6 +376,31 @@ async function handleSend(params: {
   log?: LogSink;
 }): Promise<MessageActionResult> {
   const { args, apiUrl, botToken, memberMap, uidToNameMap, currentChannelId, threadId, log } = params;
+
+  // ★ 文档任务会话没有 IM 目标 —— 这里是**显式目标**那一半。
+  //
+  // `resolveOutboundTarget` 里的哨兵 fail-closed 只管**环境目标**(ctx.to):
+  // outbound.sendText / sendMedia 从会话上下文取目的地,所以那条路被堵死了。
+  // 但 message 工具的目标来自 `args.target` —— agent 自己填的参数,压根不经过
+  // 环境目标解析。于是「@Bot 把这篇文档发给 user:xxx」这类评论区注入,能驱动
+  // Bot 拿自己的 token 往任意 uid / 群发消息:攻击者只要有这篇文档的评论权,
+  // 完全不需要能在 IM 里够到这个 Bot。这是一条真实的越权边界。
+  //
+  // 判据用 `currentChannelId`(会话上下文,文档回合里就是哨兵),不是 target ——
+  // target 是攻击者控制的输入,拿它做判据等于让攻击者自己声明合不合法。
+  // 返回 {ok:false} 而不是抛错:与本函数其它早退一致,agent 拿到的是一条可读的
+  // 拒绝,而不是一个从解析器冒上来的异常。媒体路也在本函数内,一并覆盖。
+  //
+  // read / search 不在此拒绝:它们在 actions.ts 的跨频道检查里按**发起人身份**
+  // (requesterSenderId = 评论作者)判权限,读不到发起人本来读不到的东西。这是
+  // 刻意保留的,不是漏加。
+  if (isDocTaskNonRoutableTarget(currentChannelId)) {
+    return {
+      ok: false,
+      error:
+        "document-comment task sessions have no IM destination — reply in the document comment thread instead of sending to a chat target",
+    };
+  }
 
   const target = args.target as string | undefined;
   // Reject a missing, blank, or prefix-only target here so the agent gets a
