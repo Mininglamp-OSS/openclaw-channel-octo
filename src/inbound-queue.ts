@@ -3,8 +3,19 @@ import { ChannelType, type BotMessage } from "./types.js";
 
 const inboundQueues = new Map<string, Promise<void>>();
 
-export function getInboundQueueKey(accountId: string, message: BotMessage): string {
+/**
+ * `scopeOverride` 让合成消息脱离「按消息字段派生」的默认分区。
+ *
+ * 文档任务必须用它:合成消息是 DM 形状的,不覆写会落进发起人的 DM 队列,
+ * 一个跑几分钟的文档任务会队头阻塞该用户与这个 Bot 的所有私聊(队列严格串行)。
+ */
+export function getInboundQueueKey(
+  accountId: string,
+  message: BotMessage,
+  scopeOverride?: string,
+): string {
   const id = normalizeAccountId(accountId);
+  if (scopeOverride) return `${id}:${scopeOverride}`;
   const isGroup =
     typeof message.channel_id === "string" &&
     message.channel_id.length > 0 &&

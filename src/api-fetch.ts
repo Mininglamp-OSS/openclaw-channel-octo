@@ -1024,7 +1024,7 @@ export async function fetchBotEvents(params: {
   return Array.isArray(response?.results) ? response.results : [];
 }
 
-/** Best-effort queue pruning after a card_action has been durably accepted locally. */
+/** Best-effort queue pruning after a recognized bot event has been accepted locally. */
 export async function ackBotEvent(params: {
   apiUrl: string;
   botToken: string;
@@ -1091,7 +1091,131 @@ export async function sendHeartbeat(params: {
   });
 }
 
+/**
+ * docs 后端明确拒绝了这条评论(2xx 但信封是失败)。与传输故障区分开:重试它没有
+ * 意义 —— 「文档不存在」重试三次仍然不存在,只会在轮询器的串行循环里白烧 3 次
+ * POST 和 600ms,而后续的兜底通知还会再烧一遍同样的三次。
+ */
+export class DocCommentRejectedError extends Error {
+  readonly name = "DocCommentRejectedError";
+}
 
+/**
+ * 这个错误重试也不会变好吗?
+ *
+ * 信封拒绝 = 确定性失败。4xx 同理,但排除 408 / 423 / 425 / 429 —— 那几个是
+ * 「稍后再来」的语义。其余(网络、5xx、超时)都值得重试。
+ */
+export function isPermanentDocCommentFailure(err: unknown): boolean {
+  if (err instanceof DocCommentRejectedError) return true;
+  const status = httpStatusFromApiFetchError(err);
+  if (status === undefined) return false;
+  // 408 请求超时 / 423 资源被锁(文档正被并发编辑)/ 425 太早 / 429 限流 —— 这四个
+  // 都是「稍后再来」的语义,重试有意义。其余 4xx 重试不会变好。
+  if (status === 408 || status === 423 || status === 425 || status === 429) return false;
+  return status >= 400 && status < 500;
+}
+
+/**
+ * 在文档评论串下发布一条 Bot 评论(docs domain,与 IM 消息无关)。
+ *
+ * 文档任务的最终答复走这条出口而不是 sendMessage:合成消息是 DM 形状的,
+ * 走 IM 出口会把答复发进发起人的私聊 —— 正是本特性要消除的污染。
+ * parentId 省略时发布为根评论。
+ */
+export async function postDocComment(params: {
+  apiUrl: string;
+  botToken: string;
+  docId: string;
+  body: string;
+  parentId?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const path = `/v1/bot/docs/${encodeURIComponent(params.docId)}/comments`;
+  const result = await postJson<{ status?: unknown; msg?: unknown; message?: unknown }>(
+    params.apiUrl,
+    params.botToken,
+    path,
+    {
+      body: params.body,
+      ...(params.parentId !== undefined ? { parentId: params.parentId } : {}),
+    },
+    // 必须有界。多处调用点不传 signal(handler 的兜底通知、会话冲突回执、
+    // deliver() 的正常答复),而这条 POST 是在轮询器的单条循环里 await 的:
+    // docs 后端接了连接却不回包,handleDocMention 就永不返回,该账号的文档任务
+    // 和卡片事件一起停到重启为止。hang 不是 try/catch 能接住的。
+    params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  );
+
+  // 平台返回的是 {status, ...} 信封,业务失败(文档不存在、无评论权限、正文超长)
+  // 一样可能是 HTTP 200。而这条 POST 的成败是整个特性**唯一**的投递凭证 —— 只看
+  // response.ok 会把业务失败记成「已投递」,进而写入去重、永不重投。
+  //
+  // 断言的是**成功形状**而不是「不等于某个已知失败值」:接口尚未对着真实 docs 后端
+  // 验证过,`{"status":"0"}` 这种字符串型状态完全可能出现,只否定数字 0 会放它过去。
+  //
+  // ★ 为什么**不**把它写成「缺 status ⇒ 拒」:docs 后端未必用同一套信封。一律拒会让
+  // 每条评论都被判丢失、任务永远无法完成 —— 那比放过一个 200+`{"error":...}` 严重得多
+  // （前者是全量坏死，后者是特定后端形状下的漏判）。这也是 reviewer 上一轮主动撤回
+  // 该强版本的理由，且 doc-comment-post.test.ts 里有两条测试正是钉住这个契约的
+  // （「响应是数组」「响应没有 status 字段」都必须 resolve）。缺字段按 HTTP 语义处理。
+  if (result && typeof result === "object" && !Array.isArray(result) && "status" in result) {
+    const { status } = result;
+    const ok = status === 1 || status === "1";
+    if (!ok) {
+      const detail = result.msg ?? result.message;
+      throw new DocCommentRejectedError(
+        `Octo API ${path} rejected the comment (status=${String(status)})${detail ? `: ${String(detail)}` : ""}`,
+      );
+    }
+  }
+}
+
+/**
+ * 在 HTML 文档(octo-doc)的评论串下发布一条 Bot 答复。
+ *
+ * 为什么不能复用 postDocComment:那条打的是 `/v1/bot/docs/<docId>/comments`,由
+ * docs-backend 按 **docId** 提供;HTML 文档的标识是 octo-doc 的 slug,docs-backend
+ * 查不到它 —— 每条答复都会是一个看不出根因的 404。HTML 的评论存在 octo-doc,
+ * 得走它自己的 agent 回帖口。
+ *
+ * 路径前缀 `/docs-html` 与 octo-cli 一致(它把这个前缀写死在 API spec 里),生产由
+ * 网关反代到 octo-doc。
+ *
+ * status 决定评论上渲染的判定标记(applied/partial/question)。**不能固定发 applied**:
+ * channel.ts 把这个回调用在四种消息上 —— 最终答复、超时道歉、会话冲突回执、
+ * 「本次没有给出答复」兜底通知。后三种都是**没碰文档**就失败了,打 applied 徽章等于
+ * 在最后一跳把本 PR「说了完成就是真完成」的立场反过来。
+ * 调用点已经有 intent("output" | "notice"),透传即可,不需要猜。
+ */
+export async function postHtmlDocReply(params: {
+  apiUrl: string;
+  botToken: string;
+  slug: string;
+  parentId: string;
+  body: string;
+  /** "output" = agent 给出了答复(applied);"notice" = 失败/超时/兜底通知(question)。 */
+  intent?: "output" | "notice";
+  signal?: AbortSignal;
+}): Promise<void> {
+  const path = `/docs-html/v1/agent/replies`;
+  await postJson(
+    params.apiUrl,
+    params.botToken,
+    path,
+    {
+      slug: params.slug,
+      parent_id: params.parentId,
+      text: params.body,
+      status: params.intent === "notice" ? "question" : "applied",
+    },
+    // 与 postDocComment 同样必须有界:这条 POST 在轮询器的单条循环里被 await,
+    // 后端接了连接不回包会让该账号的文档任务停到重启为止。
+    params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  );
+  // 不做 {status:1} 信封校验:octo-doc 回的是 {data}/{error} 形状,业务失败走
+  // 非 2xx,已由 postJson 抛出。照搬 postDocComment 那段会把正常成功判成失败。
+}
 
 export async function registerBot(params: {
   apiUrl: string;

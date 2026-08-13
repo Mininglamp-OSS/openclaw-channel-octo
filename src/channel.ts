@@ -22,7 +22,7 @@ import {
   resolveOctoAccount,
   type ResolvedOctoAccount,
 } from "./accounts.js";
-import { registerBot, sendMessage, sendHeartbeat, sendMediaMessage, inferContentType, ensureTextCharset, fetchBotGroups, getGroupMd, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl } from "./api-fetch.js";
+import { registerBot, sendMessage, sendHeartbeat, postDocComment, postHtmlDocReply, sendMediaMessage, inferContentType, ensureTextCharset, fetchBotGroups, getGroupMd, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl } from "./api-fetch.js";
 import type { GroupMember } from "./api-fetch.js";
 import { PLUGIN_VERSION } from "./version.js";
 import { getOctoRuntime } from "./runtime.js";
@@ -48,6 +48,13 @@ import {
   type EventPoller,
 } from "./events-poll.js";
 import { synthesizeCardActionMessage } from "./card-action.js";
+import {
+  docCommentParentId,
+  type DocCommentMention,
+} from "./doc-mention.js";
+import { createFileDocMentionDedupeStore } from "./doc-mention-dedupe.js";
+import { createFileDocTaskDeadLetterStore } from "./doc-task-deadletter.js";
+import { createDocMentionHandler, DOC_TASK_NOTICE_TIMEOUT_MS } from "./doc-mention-handler.js";
 import { handleCardAction } from "./card-action-handler.js";
 
 /**
@@ -1456,8 +1463,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       const dispatchInboundMessage = (
         msg: BotMessage,
         routeOverride?: { sessionKey: string; agentId?: string },
+        // 合成消息(文档任务)用 queueScope 脱离「按消息字段派生」的默认分区,
+        // docTask 则关闭 IM 出站并把答复改投评论区。
+        extra?: {
+          queueScope?: string;
+          docTask?: Parameters<typeof handleInboundMessage>[0]["docTask"];
+        },
       ): Promise<"completed" | "dropped"> =>
-        enqueueInbound(getInboundQueueKey(account.accountId, msg), async () => {
+        enqueueInbound(getInboundQueueKey(account.accountId, msg, extra?.queueScope), async () => {
           try {
             await runWithSessionInitRetry(
               () =>
@@ -1476,25 +1489,105 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   log,
                   statusSink,
                   routeOverride,
+                  ...(extra?.docTask ? { docTask: extra.docTask } : {}),
                 }),
               { ...SESSION_INIT_RETRY, log },
             );
           } catch (err) {
             if (isSessionInitConflict(err)) {
-              await notifyInboundConflictDropped({
-                err,
-                msg,
-                accountId: account.accountId,
-                apiUrl: account.config.apiUrl,
-                botToken: account.config.botToken,
-                log,
-              });
+              if (extra?.docTask) {
+                // 第五处 IM 出口:该回执按合成消息解析目标,会发进发起人的私聊。
+                // 文档任务改投评论区 —— 与 inbound 的出站收口同一条原则。
+                // 每次重试都会由 handleInboundMessage.finally 上报一次;handler 会
+                // 累计各 attempt 的事实。这里再补 notice-only:留了痕,但本次冲突
+                // 没产出,不再补一条通用兜底(否则用户连着看两句废话)。
+                try {
+                  await extra.docTask.postComment(
+                    "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
+                    AbortSignal.timeout(DOC_TASK_NOTICE_TIMEOUT_MS),
+                    // ★ 必须显式 "notice":本次冲突根本没碰文档,缺省会回落 applied。
+                    "notice",
+                  );
+                  extra.docTask.reportTurn({
+                    finalDelivered: false,
+                    delivered: true,
+                    lost: false,
+                    noticed: true,
+                  });
+                } catch (postErr) {
+                  extra.docTask.reportTurn({
+                    finalDelivered: false,
+                    delivered: false,
+                    lost: false,
+                    noticed: false,
+                  });
+                  log?.error?.(`octo: doc task conflict notice failed: ${String(postErr)}`);
+                }
+              } else {
+                await notifyInboundConflictDropped({
+                  err,
+                  msg,
+                  accountId: account.accountId,
+                  apiUrl: account.config.apiUrl,
+                  botToken: account.config.botToken,
+                  log,
+                });
+              }
               return "dropped" as const;
             }
             throw err;
           }
           return "completed" as const;
         });
+
+      // 文档评论 @Bot 任务。持久去重:轮询器先执行后存游标,server 侧也可能在
+      // enqueue 后 confirm 前崩溃重投,两条路径都靠 idempotency_key 收敛。
+      const docTasksEnabled = account.config.docTasks === true;
+      // log 必须传:去重表读不出来时(EACCES / JSON 截断)会退化成空表,
+      // 已完成的事件全部变回可重放 —— 这是必须能在日志里看见的降级,不是静默的。
+      const docMentionDedupe = createFileDocMentionDedupeStore({ accountId: account.accountId, log });
+      // 死信:只在「答复与兜底通知都没送达」时落一条,给运维一个可查的记录。
+      // 不重投 —— 改文档的任务重放不幂等。见 doc-task-deadletter.ts 顶部。
+      const docTaskDeadLetter = createFileDocTaskDeadLetterStore({ accountId: account.accountId, log });
+      const handleDocMention = createDocMentionHandler({
+        botUid: credentials.robot_id,
+        dedupe: docMentionDedupe,
+        deadLetter: docTaskDeadLetter,
+        dispatch: dispatchInboundMessage,
+        postComment: async (mention, text, signal, intent) => {
+          // HTML 文档的评论存在 octo-doc,且 mention.docId 是它的 slug ——
+          // docs-backend 的 `/v1/bot/docs/<docId>/comments` 按 docId 查,拿 slug 去打
+          // 每条都是 404。所以这里按类型分流,而不是靠「先试一次再回退」:那个 404
+          // 跟「文档真的不存在」没法区分,回退只会把后者也误当 HTML 再失败一次。
+          if (mention.docKind === "html") {
+            await postHtmlDocReply({
+              apiUrl: account.config.docsApiUrl,
+              botToken: account.config.botToken ?? "",
+              slug: mention.docId,
+              // HTML 的 parent_id 是字符串 id,不能走 docCommentParentId(它按数字解析)。
+              // 回帖必须挂在**串根**上,threadId 已由 server 按 parent_id→comment_id 派生。
+              parentId: mention.threadId,
+              body: text,
+              // 失败/超时/兜底通知不能打 applied 徽章:那三种都是没碰文档就失败了。
+              intent,
+              signal,
+            });
+            return;
+          }
+          await postDocComment({
+            // 文档域,不是 IM 域:apiUrl 指向 IM server,而 `/v1/bot/docs/**` 由
+            // docs-backend 提供。同一个网关前置两者时 docsApiUrl 就等于 apiUrl;
+            // 拆开部署时用它指向 docs-backend,否则每条回帖都是 404(见 accounts.ts)。
+            apiUrl: account.config.docsApiUrl,
+            botToken: account.config.botToken ?? "",
+            docId: mention.docId,
+            body: text,
+            parentId: docCommentParentId(mention),
+            signal,
+          });
+        },
+        log,
+      });
 
       let cardEventPoller: EventPoller | undefined;
       const startCardEventPoller = (): void => {
@@ -1506,6 +1599,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           waitSeconds: account.config.eventWaitSeconds,
           cursorStore: createFileEventCursorStore({ accountId: account.accountId }),
           log,
+          ...(docTasksEnabled ? { onDocMention: handleDocMention } : {}),
+          // 本地 cardInteraction 已废弃(服务端 per-Bot interaction_enabled 权威),
+          // 这里无条件注册,与 main 保持一致。
           onCardAction: async (action) => {
             await handleCardAction({
               action,
@@ -1528,13 +1624,17 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             });
           },
         });
-        log?.info?.(`octo: [${account.accountId}] card_action poller started`);
+        log?.info?.(
+          `octo: [${account.accountId}] bot event poller started (doc_tasks=${docTasksEnabled})`,
+        );
       };
-      // The poller remains lazy, but every card-profile consumer may now start it so
-      // bot_setting_updated can invalidate that Bot's cached policy even when interactions are
-      // currently disabled. Local cardInteraction is deprecated and no longer gates events.
+      // 保留 main 的形态:轮询器仍是懒启动,但注册不再被本地 cardInteraction 门控 —— 任何
+      // card-profile 消费者都可以启动它,好让 bot_setting_updated 能作废该 Bot 的缓存策略。
       setCardEventPollStarter(account.accountId, startCardEventPoller);
       if (process.env.OCTO_CARD_POLL_FORCE === "1") startCardEventPoller();
+      // 文档任务必须常驻轮询:上面是「发过卡片才懒启动」的,而 doc bot 可能从不发卡片,
+      // 不常驻就永远收不到 doc_comment_mention。
+      if (docTasksEnabled) startCardEventPoller();
 
       // 6. Connect WebSocket — pure real-time
       const socket = new WKSocket({

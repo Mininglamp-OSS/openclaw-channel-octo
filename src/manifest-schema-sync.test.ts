@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { OctoConfigJsonSchema } from "./config-schema.js";
+import { DOC_TASKS_DESCRIPTION, DOCS_API_URL_DESCRIPTION, OctoConfigJsonSchema } from "./config-schema.js";
 
 // Regression guard for OpenClaw v2026.5.x channel manifest requirement:
 // openclaw.plugin.json#channelConfigs.octo.schema must stay in sync
@@ -45,6 +45,24 @@ describe("openclaw.plugin.json channelConfigs", () => {
       expect(manifestProps[key]).toBeUndefined();
       expect(manifestAccountProps[key]).toBeUndefined();
     }
+  });
+
+  // §1.4 收口:本 PR 新增的两个 key 自己没有描述钉子,而它们的描述在 config-schema.ts 和
+  // openclaw.plugin.json 里各存了一份 —— 通用的那条只断言 key 存在、不比描述文本,所以两份
+  // 会悄悄漂移。这里按 key 把两侧描述钉到 config-schema 的单一来源上。
+  it.each([
+    ["docTasks", DOC_TASKS_DESCRIPTION],
+    ["docsApiUrl", DOCS_API_URL_DESCRIPTION],
+  ])("%s description matches at top-level and per-account", (key, expected) => {
+    const manifestProps = manifest.channelConfigs.octo.schema.properties;
+    const manifestAccountProps = manifestProps.accounts.additionalProperties.properties;
+    const tsProps = OctoConfigJsonSchema.schema.properties as Record<string, any>;
+    const tsAccountProps = (tsProps.accounts as any).additionalProperties.properties;
+
+    expect(tsProps[key]?.description).toBe(expected);
+    expect(tsAccountProps[key]?.description).toBe(expected);
+    expect(manifestProps[key]?.description).toBe(expected);
+    expect(manifestAccountProps[key]?.description).toBe(expected);
   });
 
   // Description drift guard: secretsFileRoot carries operator-facing semantics

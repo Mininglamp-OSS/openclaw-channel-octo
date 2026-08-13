@@ -11,6 +11,18 @@ export type ResolvedOctoAccount = {
   config: {
     botToken?: string;
     apiUrl: string;
+    /**
+     * 文档域(`/v1/bot/docs/**`)的 base URL。**总是有值** —— 没配就等于 `apiUrl`。
+     *
+     * 为什么不能直接用 `apiUrl`:文档域由**另一个服务**(docs-backend)提供。托管
+     * 环境把它和 IM server 摆在同一个网关 origin 后面,所以「等于 apiUrl」是对的
+     * 默认值;拆开部署的本地栈不是 —— IM 网关照常应答 `/v1/bot/**`,却没有
+     * `/v1/bot/docs/**` 的路由,于是文档任务的每一条回帖都拿到 404。404 属于
+     * **确定性失败**,不重试,回复直接丢掉,连兜底提示(同一个 endpoint)也发不
+     * 出去;而文档本身已经改完了 —— 用户看到的就是「正文被悄悄改了、评论区一个
+     * 字都没有」。
+     */
+    docsApiUrl: string;
     wsUrl?: string;
     cdnUrl?: string;  // CDN base URL for media files (public-read, no auth)
     pollIntervalMs: number;
@@ -22,6 +34,7 @@ export type ResolvedOctoAccount = {
     historyPromptTemplate?: string;  // Template for group history context injection
     onBehalfOf?: string;  // Persona clone: grantor uid
     secretsFileRoot?: string;  // Jail root for write-secret file writes
+    docTasks?: boolean;  // true 开启文档评论 @Bot 任务(常驻事件轮询 + 出站改投评论区)
     dispatchTimeoutMs?: number;  // Explicit dispatch-timeout override; unset = derive from agents.defaults.timeoutSeconds (issue #113)
   };
 };
@@ -74,6 +87,9 @@ export function resolveOctoAccount(params: {
 
   const botToken = accountConfig.botToken ?? channel.botToken;
   const apiUrl = accountConfig.apiUrl ?? channel.apiUrl ?? DEFAULT_API_URL;
+  // 没配就退回 apiUrl:托管环境一个网关同时前置 IM 与 docs-backend,那里两者本来
+  // 就是同一个 origin。只有拆开部署的栈需要显式配置。
+  const docsApiUrl = accountConfig.docsApiUrl ?? channel.docsApiUrl ?? apiUrl;
   const wsUrl = accountConfig.wsUrl ?? channel.wsUrl;
   const cdnUrl = accountConfig.cdnUrl ?? channel.cdnUrl;
   const pollIntervalMs =
@@ -100,6 +116,7 @@ export function resolveOctoAccount(params: {
     config: {
       botToken,
       apiUrl,
+      docsApiUrl,
       wsUrl,
       cdnUrl,
       pollIntervalMs,
@@ -108,6 +125,10 @@ export function resolveOctoAccount(params: {
       requireMention: accountConfig.requireMention ?? channel.requireMention,
       historyLimit: accountConfig.historyLimit ?? channel.historyLimit ?? 20,
       historyPromptTemplate: accountConfig.historyPromptTemplate ?? channel.historyPromptTemplate,
+      // main 已废弃 cardProgress/cardDisplay/cardInteraction/reasoningCardTemplateMode 的本地
+      // 透传(服务端 per-Bot 配置权威),这里不再恢复。docTasks 是本 PR 新增的本地开关,
+      // 服务端没有对应字段,必须透传。
+      docTasks: accountConfig.docTasks ?? channel.docTasks,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,
       secretsFileRoot: accountConfig.secretsFileRoot ?? channel.secretsFileRoot,
       dispatchTimeoutMs: accountConfig.dispatchTimeoutMs ?? channel.dispatchTimeoutMs,

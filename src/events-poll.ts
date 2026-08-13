@@ -13,6 +13,7 @@ import {
 import { CHANNEL_ID } from "./constants.js";
 import { parseCardAction, type CardAction } from "./card-action.js";
 import { invalidateBotCardProfile } from "./card-profile-cache.js";
+import { parseDocCommentMention, type DocCommentMention } from "./doc-mention.js";
 
 const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_LIMIT = 50;
@@ -64,7 +65,9 @@ export interface EventPollerOptions {
   apiUrl: string;
   botToken: string;
   cursorStore: EventCursorStore;
-  onCardAction: (action: CardAction) => void | Promise<void>;
+  onCardAction?: (action: CardAction) => void | Promise<void>;
+  /** 文档评论 @Bot 任务(octo-server `doc_comment_mention`)。未提供则该类事件不被识别。 */
+  onDocMention?: (mention: DocCommentMention) => void | Promise<void>;
   intervalMs?: number;
   limit?: number;
   /**
@@ -113,8 +116,22 @@ export function requestCardEventPolling(accountId: string): void {
 
 /**
  * Start one non-overlapping poll loop, short-polling by default and long-polling when
- * `waitSeconds` is set. Cursor persistence happens before ack so a process crash can at worst
- * replay an action; it cannot acknowledge an event that it forgot locally.
+ * `waitSeconds` is set.
+ *
+ * Ordering (two invariants, both load-bearing — do not collapse them):
+ * 1. Cursor persistence is attempted **before** ack, so a process crash can at worst replay an
+ *    action; it can never acknowledge an event it has already forgotten locally.
+ * 2. That persistence is **not allowed to throw**. The cursor file (`events.cursor.json`) and the
+ *    doc-task dedupe table (`doc-mentions.processed.json`) live in the **same** state directory, so
+ *    EROFS / ENOSPC / EACCES / EDQUOT hit both writes at once. A bare `save()` here would escape
+ *    the whole `for` loop: no ack, no cursor advance, remaining batch events dropped — re-fetching
+ *    the same document-mutating task every tick (measured: polls=6 taskRuns=6 in 3.2s, never
+ *    converging). So the failure is logged, the in-memory cursor still advances, and the ack
+ *    attempt plus the rest of the batch still run.
+ *
+ * Fetching is cursor-driven; ack additionally asks the server to prune an accepted event but is
+ * not assumed to be the sole durability guarantee. After a restart, a stale on-disk cursor may
+ * re-fetch a doc event; the persistent dedupe table converges it.
  */
 export function startEventPoller(options: EventPollerOptions): EventPoller {
   const intervalMs = Math.max(500, Math.floor(options.intervalMs ?? DEFAULT_INTERVAL_MS));
@@ -213,24 +230,69 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
         options.log?.error?.(`octo: event poll dropped ${malformed} event(s) with a non-integer event_id`);
       }
       let cardActions = 0;
+      let docMentions = 0;
       const ordered = events
         .filter((event) => Number.isSafeInteger(event.event_id) && event.event_id > cursor)
         .sort((a, b) => a.event_id - b.event_id);
       for (const event of ordered) {
-        const action = parseCardAction(event);
+        // 已识别的事件才 ack。未识别的只推进游标(本消费者不再重复拉取),
+        // 留在服务端直至过期 —— 不 ack 自己没处理的事件。
+        let recognized = false;
+        const action = options.onCardAction ? parseCardAction(event) : null;
         if (action) {
+          recognized = true;
           cardActions += 1;
-          await options.onCardAction(action);
+          // 卡片动作**故意**让异常逃出去:不存游标、不 ack,下一轮重取同一事件。
+          // 卡片动作是幂等的即时响应,重放的代价只是再回一次;这条语义由
+          // events-poll.test.ts 钉住,不要顺手改。
+          await options.onCardAction!(action);
+        } else if (options.onDocMention) {
+          const mention = parseDocCommentMention(event);
+          if (mention) {
+            recognized = true;
+            docMentions += 1;
+            // 文档任务相反,异常绝不能逃出去。下面的 cursorStore.save 和 ack 都排在
+            // handler 之后,异常逃出去就等于「不存游标、不 ack」,下一 tick 原样重取
+            // —— 而这是个会改文档、会往评论区发言的任务,重放不幂等:实测每个轮询
+            // 周期重跑一次,3.2s 内跑了 6 遍,永不收敛。handler 自己承诺不抛(见
+            // doc-mention-handler.ts 不变量 3),这里是轮询器侧的兜底,不依赖它。
+            try {
+              await options.onDocMention(mention);
+            } catch (error) {
+              options.log?.error?.(
+                `octo: doc mention handler threw for event ${event.event_id}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+          }
         }
         if (event.event_type === "bot_setting_updated" &&
             event.event_data?.scope === "bot_setting") {
           invalidateBotCardProfile({ apiUrl: options.apiUrl, botToken: options.botToken });
         }
 
-        await options.cursorStore.save(event.event_id);
+        // 落盘游标**排在 ack 之前**(保留 main 的不变量):进程崩溃最坏是重放一次动作,
+        // 绝不会 ack 掉一个本地已经忘掉的事件。
+        //
+        // 但落盘**不许抛**(本 PR 补的第二个不变量):游标文件(events.cursor.json)和文档
+        // 任务的去重表(doc-mentions.processed.json)在**同一个状态目录**,EROFS / ENOSPC /
+        // EACCES / EDQUOT 会同时命中两处写。原先 save() 裸在这里,一抛就逃出整个 for 循环:
+        // 不 ack、游标不前进、批次剩下的事件也一起不处理 —— 下一 tick 原样重取,把会改文档
+        // 的任务每周期重跑一遍(实测 polls=6 taskRuns=6,3.2s 内 6 遍,永不收敛),同时把
+        // 卡片动作一并楔死。所以:记日志、内存游标照常前进、ack 与批次余项照常执行。
+        try {
+          await options.cursorStore.save(event.event_id);
+        } catch (error) {
+          options.log?.error?.(
+            `octo: cursor save failed at event ${event.event_id} (in-memory cursor still advances): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        // 内存游标无条件前进:落盘失败只影响重启后的起点,不该让本进程反复重取。
+        // 重启后若因旧 cursor 再取到文档事件,持久去重表负责收敛。
         cursor = event.event_id;
 
-        if (action && options.ack !== false) {
+        // 只 ack 自己识别并处理过的事件。未识别的只推进游标(本消费者不再重复拉取),
+        // 留在服务端直至过期。
+        if (recognized && options.ack !== false) {
           try {
             await ackBotEvent({
               apiUrl: options.apiUrl,
@@ -255,7 +317,7 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       outcome = ordered.length > 0 ? "batch" : "empty";
       if (events.length > 0) {
         options.log?.info?.(
-          `octo: event poll batch events=${events.length} card_actions=${cardActions} cursor=${cursor}`,
+          `octo: event poll batch events=${events.length} card_actions=${cardActions} doc_mentions=${docMentions} cursor=${cursor}`,
         );
       }
     } catch (error) {
@@ -276,9 +338,10 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
   const ready = options.cursorStore.load()
     .then((loaded) => {
       cursor = Number.isSafeInteger(loaded) && loaded >= 0 ? loaded : 0;
-      options.log?.info?.(`octo: card event poller ready at cursor=${cursor}`);
-      // First tick keeps the pre-existing timing: short polling waits one interval before its
-      // first read, long polling starts immediately.
+      // "bot" not "card": this loop now drains card actions *and* doc_comment_mention events.
+      options.log?.info?.(`octo: bot event poller ready at cursor=${cursor}`);
+      // First tick keeps main's timing: short polling waits one interval before its first read,
+      // long polling starts immediately.
       schedule(waitSeconds > 0 ? 0 : intervalMs);
     })
     .catch((error) => {
