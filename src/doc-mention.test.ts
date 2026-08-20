@@ -208,6 +208,62 @@ describe("synthesizeDocMentionMessage", () => {
       expect(formatDocMentionText(htmlMention)).not.toContain("base-version 令牌");
     });
 
+    // ── 整篇取回分支 ──────────────────────────────────────────────────────
+    // #217 那句无条件的「别整篇重写」正是这样悄悄关掉了 whole-doc 路径:没有任何
+    // 断言钉住它,于是无锚点评论只能猜 aid,实测空转 8 分钟。这几条就是那把锁。
+    // 注意:锚点不在这条载荷里(server 的 event_data 没有 anchor 字段),所以这段
+    // 整篇取回说明是**无条件**发给 HTML 文档的,由 agent 按评论内容自行判断走哪条。
+    // 因此下面用的就是同一个 htmlMention,不存在「无锚点的 mention」这种构造。
+    describe("整篇(whole-doc)取回说明", () => {
+      const noAnchor = htmlMention;
+      const BASE = "https://docs.example.com";
+
+      it("★ 给出拼好的绝对取回地址,而不是让 agent 自己从 url= 推域名", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain(
+          `${BASE}/docs-html/d/${encodeURIComponent(noAnchor.docId)}/v/latest/export?download=0`,
+        );
+        // /docs-html 前缀丢了就会打到网页 SPA 空壳上。
+        expect(text).toContain("/docs-html/");
+        // 不再教它「取 url= 的协议+域名」。
+        expect(text).not.toContain("取自载荷里的 url=");
+        expect(text).not.toContain("<站点根>");
+      });
+
+      it("★ 尾部斜杠不会拼出双斜杠", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: `${BASE}/` });
+        expect(text).toContain(`${BASE}/docs-html/`);
+        expect(text).not.toContain(`${BASE}//docs-html/`);
+      });
+
+      it("★ 没有下发 docsBaseUrl 时,明确禁止猜域名,而不是退回自己推", () => {
+        const text = formatDocMentionText(noAnchor);
+        expect(text).not.toContain("<站点根>");
+        expect(text).toContain("不要从别处猜一个域名去试");
+      });
+
+      it("★ 失败答复里不许回贴请求 URL —— 那条答复会被自动发进公开评论区", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        // 旧文案让 agent「原样附上你请求的完整 URL」,URL 上的 ?code= 就是有效读票。
+        expect(text).not.toContain("原样附上");
+        expect(text).not.toContain("完整 URL");
+        expect(text).toContain("收到的状态码");
+      });
+
+      it("★ Bearer 只许发往给定地址,不许带到评论正文里的链接上", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain("只许发往上面给出的那个地址");
+        // 不再教它把载荷 url= 上的 ?code= 保留到 query 上。
+        expect(text).not.toContain("一并保留在 query 上");
+      });
+
+      it("窄改纪律仍在:整篇取回只用于读结构取 aid,落笔仍是单元素替换", () => {
+        const text = formatDocMentionText(htmlMention, { docsBaseUrl: BASE });
+        expect(text).toContain("别整篇重写");
+        expect(text).toContain("不能原样拿去发布");
+      });
+    });
+
     it("仍然保留「先读 skill 再动手」和「只改锚点位置」这两条纪律", () => {
       const text = formatDocMentionText(htmlMention);
       expect(text).toContain("动手前先读 skill 文档");
