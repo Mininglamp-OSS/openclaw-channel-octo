@@ -1551,6 +1551,8 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       const docTaskDeadLetter = createFileDocTaskDeadLetterStore({ accountId: account.accountId, log });
       const handleDocMention = createDocMentionHandler({
         botUid: credentials.robot_id,
+        // 整篇取回地址由这里的**已解析配置**拼,不让 agent 从载荷 url= 推域名。
+        docsBaseUrl: account.config.docsApiUrl,
         dedupe: docMentionDedupe,
         deadLetter: docTaskDeadLetter,
         dispatch: dispatchInboundMessage,

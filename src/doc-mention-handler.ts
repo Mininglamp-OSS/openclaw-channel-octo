@@ -70,6 +70,12 @@ export type DocMentionDispatch = (
 
 export interface DocMentionHandlerDeps {
   botUid: string;
+  /**
+   * 已解析的文档服务根(accounts.ts 的 docsApiUrl,缺省回退 apiUrl)。透传给
+   * formatDocMentionText 拼出整篇取回地址 —— 让 agent 自己从载荷 url= 推域名
+   * 会在拆分部署上打错主机,并把 bot token 发到入站文本决定的地址上。
+   */
+  docsBaseUrl?: string;
   dedupe: DocMentionDedupeStore;
   dispatch: DocMentionDispatch;
   postComment: (
@@ -182,25 +188,29 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
     let reported: DocTaskTurnReport | undefined;
     let outcome: "completed" | "dropped" = "dropped";
     try {
-      outcome = await deps.dispatch(synthesizeDocMentionMessage(mention, deps.botUid), undefined, {
-        queueScope: docTaskQueueScope(mention),
-        docTask: {
-          docId: mention.docId,
-          threadId: mention.threadId,
-          sessionScope: docTaskSessionScope(mention),
-          postComment: postWithRetry,
-          reportTurn: (value) => {
-            reported = reported
-              ? {
-                  finalDelivered: reported.finalDelivered || value.finalDelivered,
-                  delivered: reported.delivered || value.delivered,
-                  lost: reported.lost || value.lost,
-                  noticed: reported.noticed || value.noticed,
-                }
-              : value;
+      outcome = await deps.dispatch(
+        synthesizeDocMentionMessage(mention, deps.botUid, { docsBaseUrl: deps.docsBaseUrl }),
+        undefined,
+        {
+          queueScope: docTaskQueueScope(mention),
+          docTask: {
+            docId: mention.docId,
+            threadId: mention.threadId,
+            sessionScope: docTaskSessionScope(mention),
+            postComment: postWithRetry,
+            reportTurn: (value) => {
+              reported = reported
+                ? {
+                    finalDelivered: reported.finalDelivered || value.finalDelivered,
+                    delivered: reported.delivered || value.delivered,
+                    lost: reported.lost || value.lost,
+                    noticed: reported.noticed || value.noticed,
+                  }
+                : value;
+            },
           },
         },
-      });
+      );
     } catch (err) {
       deps.log?.error?.(
         `octo: doc task dispatch failed doc=${mention.docId} thread=${mention.threadId}: ${String(err)}`,

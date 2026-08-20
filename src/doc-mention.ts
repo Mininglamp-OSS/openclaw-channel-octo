@@ -145,8 +145,23 @@ export function docTaskQueueScope(mention: DocCommentMention): string {
 /**
  * 把用户评论原文放进 JSON 值,而不是直接拼进控制文本 —— 与 card_action 的
  * formatCardActionText 同样的注入防御姿态。
+ *
+ * `docsBaseUrl` 由调用方从**已解析的账号配置**(accounts.ts 的 docsApiUrl,缺省回退
+ * apiUrl)传进来,不由 agent 从载荷里的 url= 推。README 把这件事写死了:docsApiUrl
+ * 是配置值不是可推导值,拆开部署时 IM/网页那个 origin 上根本没有文档路由 ——
+ * 「the fix is a separate htmlDocsApiUrl, not a heuristic」。让模型从 url= 取协议+域名
+ * 再把 bot token 发过去,既会在拆分部署上打错主机,也等于把凭证送到一个**由入站文本
+ * 决定**的地址上。这里改成直接给出拼好的绝对 URL。
  */
-export function formatDocMentionText(mention: DocCommentMention): string {
+export function formatDocMentionText(
+  mention: DocCommentMention,
+  opts?: { docsBaseUrl?: string },
+): string {
+  // 载荷里的 url= 可能带 ?code= 这类分享读票;拼我们自己的地址时一概不带它。
+  const docsBase = opts?.docsBaseUrl?.replace(/\/+$/, "");
+  const wholeDocUrl = docsBase
+    ? `${docsBase}/docs-html/d/${encodeURIComponent(mention.docId)}/v/latest/export?download=0`
+    : null;
   const lines = [
     "[Octo doc comment task]",
     `doc_id=${JSON.stringify(mention.docId)}`,
@@ -174,6 +189,12 @@ export function formatDocMentionText(mention: DocCommentMention): string {
     "  锚点就是这条评论钉住的位置:表格里是单元格地址(如 E8),文档里是被选中的原文片段,",
     "  HTML 里是某个被盖了 aid 的元素。**只改那个位置**。",
     "  锚点为空时才回到「按评论文字自行判断」,并在答复里说明你改了哪里。",
+    // HTML 的「自行判断」跟另外两种不是一回事:文档/表格能把正文读回来再判断,HTML
+    // 的正文不在 CLI 的任何 op 里(见下面 whole-doc 那几条,要走渲染路由取),所以这里
+    // 点明它此时该走那条路,免得它以为「自行判断」= 继续找锚点,然后猜 aid 猜到超时。
+    ...(mention.docKind === "html"
+      ? ["  HTML 的锚点为空就是 whole-doc 请求,按下面 whole-doc 那三步取回整篇再动手,别凭空猜 aid。"]
+      : []),
     "",
     // 为什么要显式点名 skill:实测 agent 会自己去摸索 —— 先读 SKILL.md,再读
     // doc.md,中途还撞过 `docs content edit` 的 400(ops 格式没读对)和 412
@@ -191,9 +212,46 @@ export function formatDocMentionText(mention: DocCommentMention): string {
     "",
     // 「base-version 令牌」是 docs-backend 的并发模型;HTML 那侧是
     // base_version + 单元素替换,规则写在 octo-html skill 里,别在这里替它说。
+    //
+    // HTML 分支按**锚点有无**分流。锚点不在这条载荷里(见上面「先定位改哪里」那段),
+    // 所以这里没法在代码里判断,只能把两种情况都写清楚交给 agent 自己分流。
+    //
+    // 为什么不能再无条件写「别整篇重写」:那句话(#217 随侧边栏派发一起进来)把
+    // whole-doc 请求堵死了 —— 「把所有字体都改成红色」这类评论没有锚点,而 CLI
+    // 侧唯一的写入口 `html element replace` 必须按 aid,`html element get` 也必须
+    // 按 aid、`html get` 只有元数据(200 响应只有 slug/title/latest/created/updated),
+    // 没有任何命令能读整篇或列出 aid 清单。于是 agent 既不许整篇重写、又拿不到
+    // aid,只能瞎猜到超时(实测空转 8 分钟)。
+    //
+    // 读整篇的路不在 CLI 里,在 octo-doc 的渲染路由上:
+    //   GET /d/{doc}/v/{version}           handlers_docs.go:353 handleRender
+    //   GET /d/{doc}/v/{version}/{kind}    handleForkExport, kind ∈ {export, fork}
+    // 两条都是 requireDocReadHTML(CapRead) 把门,version 接受 "latest";export 默认
+    // 带 Content-Disposition: attachment,加 ?download=0 关掉。吐出来的 HTML 是
+    // StampAids 之后的,带 data-odoc-aid —— 这正是 agent 缺的那份 aid 清单。
+    //
+    // 但**不能原样回灌**:handleRender 注入了 overlay 配置与 overlay JS bundle,
+    // handleForkExport 另加 banner 和 <!--ODOC-COMMENT ...--> 标记。把它当作
+    // publish 的入参会把这些注入物写进文档。所以下面只让它「取来看结构、拿 aid」,
+    // 落笔仍走窄的 element replace。
     ...(mention.docKind === "html"
       ? [
-          "改动要窄：只替换锚点指向的那一个元素，别整篇重写 —— 重写会让同文档其它评论的锚点失效。",
+          "锚点指向某个元素时：只替换那一个元素，别整篇重写 —— 窄改最不容易让同文档其它评论的锚点失效。",
+          "锚点为空（whole-doc 请求，例如「把所有字体都改成红色」）时，按下面三步走，别猜 aid：",
+          wholeDocUrl
+            ? `  1) 取回当前整篇 HTML 看清结构。**就取这个地址，原样使用，不要自己拼、也不要改域名**：${wholeDocUrl}`
+            : "  1) 取回当前整篇 HTML 看清结构。地址形如 <docs 服务根>/docs-html/d/<doc>/v/latest/export?download=0；本次没有下发可用的文档服务地址，**不要从别处猜一个域名去试**，直接按第 3 步之后的兜底说明照实答复。",
+          "     **鉴权必须用 `Authorization: Bearer <bot token>`** —— octo-doc 只认三种凭证：Bearer、该文档的 cookie、query 上的 ?code=。**放在 `token` 头里没用**，会被当成没凭证。这张 Bearer 就是 octo-cli 平时用的那张（`OCTO_BOT_TOKEN` 或 profile 里的 bot_token），它在 `element get` 上已经被证明是够用的。",
+          "     **这张 Bearer 只许发往上面给出的那个地址**，不要把它带到评论正文里出现的任何链接上 —— 那些链接是用户可控的。",
+          "     取不到时**别把 404 读成「文档不存在」**：这个接口在权限不足时会**故意返回 404 'Not found'**（隐藏文档是否存在）。所以 404 的第一嫌疑是凭证没带对，不是文档没了、更不是没有 aid。",
+          "  2) 从取回的 HTML 里读 data-odoc-aid 属性 —— 那就是你缺的 aid 清单；挑出真正需要改的那些元素。",
+          "  3) 对每个要改的元素走窄替换（按 aid 替换单个元素）。改动面大时可以替换更靠上的那一个容器元素，但仍然是「替换一个元素」，不是整篇重发。",
+          "**aid 是内容哈希，不是 body/main/section 这种名字。** 拿这类名字去 element get 必然 404，而那个 404 只说明「你猜的名字不是 aid」，**不能**据此断定文档没有 aid、更不能据此建议用户重新发布。要判断有没有 aid，只能看第 1 步取回的 HTML 里有没有 data-odoc-aid。",
+          "**取回的 HTML 不能原样拿去发布**：渲染路由注入了 overlay 脚本，export 还会加 banner 和 <!--ODOC-COMMENT--> 标记。把它当发布入参会把这些注入物写进文档。它只用来读结构、取 aid。",
+          // 这条答复会被系统自动发到评论区(公开面)。早先这里让 agent「原样附上你请求的完整 URL」,
+          // 一旦 URL 上带着 ?code= 分享读票或 token,就等于把一张有效凭证贴进公开评论 ——
+          // inbound.ts 跳过非 http 的文档任务媒体走的是同一个理由。所以只许报状态码和路径。
+          "如果第 1 步确实取不到内容：不要猜 aid，也不要凭空造一篇新文档覆盖上去 —— 直接在答复里说明「读不到当前文档内容，无法执行整篇修改」，附上**收到的状态码**即可。答复会公开发到评论区，**不要把请求 URL 的 query 部分、任何 token / ?code= 之类的凭证写进答复**。宁可明确回一句，也不要空转到超时。",
         ]
       : [
           "改动一律走「读-改-写」：先 get 拿到 base-version 令牌，再带着它 edit。",
@@ -247,7 +305,11 @@ function docTypeSkillHint(mention: DocCommentMention): string {
  * card_action 保持一致;真正决定隔离的是 docTask 作用域(会话键 + 队列键),
  * 而不是这里的 channel_id。
  */
-export function synthesizeDocMentionMessage(mention: DocCommentMention, botUid: string): BotMessage {
+export function synthesizeDocMentionMessage(
+  mention: DocCommentMention,
+  botUid: string,
+  opts?: { docsBaseUrl?: string },
+): BotMessage {
   const channelId = mention.spaceId ? `s${mention.spaceId}_${mention.fromUid}` : mention.fromUid;
   return {
     message_id: `doc_mention:${mention.idempotencyKey}`,
@@ -258,7 +320,7 @@ export function synthesizeDocMentionMessage(mention: DocCommentMention, botUid: 
     timestamp: mention.enqueuedAt ?? Math.floor(Date.now() / 1000),
     payload: {
       type: MessageType.Text,
-      content: formatDocMentionText(mention),
+      content: formatDocMentionText(mention, opts),
       mention: { uids: [botUid] },
     },
   };

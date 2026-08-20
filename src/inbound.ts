@@ -3,22 +3,21 @@ import type { ChannelLogSink } from "openclaw/plugin-sdk/channel-contract";
 import type { ReplyPayload, ReplyDispatchKind } from "openclaw/plugin-sdk/reply-runtime";
 import type { ReplyDispatcherWithTypingOptions } from "openclaw/plugin-sdk/reply-runtime";
 import { DEFAULT_GROUP_HISTORY_LIMIT } from "openclaw/plugin-sdk/reply-history";
-// Namespace import + runtime feature detection so the deliver-buffer fix
-// degrades gracefully across SDK versions:
-//   - isReplyPayloadNonTerminalToolErrorWarning lands in newer SDK (>=5.27);
-//     on older SDK (e.g. 5.22) it is undefined, so we cannot classify a final
-//     as a tool-warning fallback and treat it as a normal final (sent
-//     immediately), which still preserves the real user-facing reply.
-//   - resolveSendableOutboundReplyParts is present across these versions.
+// Namespace import + runtime feature detection.
+//   - resolveSendableOutboundReplyParts is present across supported versions.
+//   - isReplyPayloadNonTerminalToolErrorWarning is no longer consulted by the
+//     deliver-buffer gate: its underlying marker only covers middleware errors,
+//     so exec-class failures never matched it (see isToolErrorBroadcastFinal).
+//     The gate is now `isError` alone, which means the classifier no longer acts
+//     as the "new enough SDK" proxy it used to be. That proxy is not needed:
+//     openclaw@2026.6.9 -- the floor declared in peerDependencies -- already
+//     ships onFreshSettledDelivery, the primary flush site for a deferred
+//     warning. And the dispatch finally block now flushes any still-pending
+//     warning, so a host that never invokes that callback (or an SDK that skips
+//     it because a newer inbound superseded the turn) degrades to a late notice
+//     rather than swallowing the warning outright.
 import * as replyPayloadSdk from "openclaw/plugin-sdk/reply-payload";
 
-const replyPayloadCompat = replyPayloadSdk as typeof replyPayloadSdk & {
-  isReplyPayloadNonTerminalToolErrorWarning?: (payload: ReplyPayload) => boolean;
-};
-const isReplyPayloadNonTerminalToolErrorWarning =
-  typeof replyPayloadCompat.isReplyPayloadNonTerminalToolErrorWarning === "function"
-    ? replyPayloadCompat.isReplyPayloadNonTerminalToolErrorWarning
-    : undefined;
 const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
 import { createImEgressGuard } from "./im-egress.js";
@@ -259,36 +258,74 @@ function resolveOutboundMediaUrls(payload: { mediaUrl?: string; mediaUrls?: stri
   ].filter(Boolean);
 }
 
-// Tool warning final: a kind=final payload that carries a non-terminal tool
-// error warning and no media.  These should be deferred (not sent immediately)
-// so they don't overwrite the real user-facing answer in the single-slot
-// deliver buffer.  Mirrors Discord's isFallbackOnlyToolWarningFinal.
 /**
- * **分类器判决**:SDK 认为这个 payload 是一次非终止性的工具错误警告 —— 也就是
- * 「这不是 agent 的真答复」。
+ * 这条 final **不是**一条普通的助手答复吗?
  *
- * 与下面的 `isFallbackOnlyToolWarningFinal` 拆开,是因为两者回答的是不同问题:
- * 这里回答「它算不算真答复」(内容性质),下面回答「要不要延后缓冲」(投递策略,
- * 额外受附件约束)。此前只有合并版,于是**带附件**的工具警告在策略问题上答了
- * false,顺带把性质问题也答成了「是真答复」,一路以 `applied` 落库。
+ * 判据是 `isError`。准确的语义是「这不是一条普通答复」,它覆盖两类:
+ *   1. 工具错误播报(`⚠️ 🛠️ … failed: …`);
+ *   2. 助手级错误面 —— SDK 在 reply payload 构造处对 API 错误/计费错误/被中断的
+ *      回合 push `{ text: errorText, isError: true }`,同样不带那条元数据标记。
+ * 两类都不该抢占单槽 deliver buffer 里那条真答复,也都可以延后兜底,所以这里合并
+ * 处理。**不要**把这条注释读成「isError 只标工具播报」—— 早先就是这么写的,而
+ * 助手错误面从来不满足它。真正恒成立的是反向:助手的**普通答复**项永远不带
+ * `isError`(同一段 SDK 代码用 `!item.isError` 把答复挑出来做 transcript 归属)。
+ *
+ * 为什么不再要求那条元数据标记:`nonTerminalToolErrorWarning` 的置位条件是
+ *   shouldMarkNonTerminalToolErrorWarning = lastToolError.middlewareError === true
+ * ——**只覆盖中间件错误**。exec 类工具失败(我们撞到的这种)天然拿不到这个标记,于是
+ * 旧判据判 false,整条播报就以普通 final 身份进了评论区
+ * (实测 2026-08-19 17:38 与 17:57 各一次:真答复先投递,26ms 后又来一条
+ * `⚠️ 🛠️ Exec failed: …`,把 agent 敲的原始命令暴露给了文档读者)。
+ *
+ * 延后不等于丢弃 —— 若整回合真的没有别的产出,`pendingToolWarningFinal` 会把它作为
+ * 兜底带出去,且**先经 sanitizeToolErrorNoticeText 砍掉冒号后的命令行/错误详情**,
+ * 所以评论区看到的始终不是原始命令。
+ *
+ * 也不改成「一个回合只许一条 final」:agent 确实会合法地分两段发答复,那样会吞掉第二段。
  */
-function isNonTerminalToolErrorWarning(payload: ReplyPayload): boolean {
-  // Older SDK lacks the tool-warning classifier: never classify, so no payload
-  // is treated as a warning and behaviour matches the pre-classifier contract.
-  if (!isReplyPayloadNonTerminalToolErrorWarning) {
-    return false;
+function isToolErrorBroadcastFinal(payload: ReplyPayload): boolean {
+  return payload.isError === true;
+}
+
+/**
+ * 兜底投递前的净化:只保留「哪个工具失败了」,砍掉冒号之后的命令行与错误详情。
+ *
+ * 走到兜底这条路时,整回合没有别的产出,所以这段文本会**原样进评论区**(公开面)。
+ * 而它的原文形如 `⚠️ 🛠️ Exec failed: curl -H 'Authorization: Bearer …' https://…`
+ * —— 既有 agent 敲的原始命令,也可能带着 Bearer/?code= 这类凭证。本 PR 要堵的正是
+ * 这类暴露,只把 intent 改成 notice 只改了状态账,不改内容,所以在这里补一刀。
+ *
+ * 前缀 `⚠️ 🛠️ ` 是 SDK 侧的稳定契约(其 helpers 就靠 startsWith 这个前缀判定工具
+ * 播报),所以只对命中前缀的文本动手;助手级错误面(API/计费/中断)不带这个前缀,
+ * 原样保留 —— 那是真正面向用户的内容。
+ */
+export function sanitizeToolErrorNoticeText(text: string): string {
+  const TOOL_ERROR_PREFIX = "⚠️ 🛠️ ";
+  if (!text.startsWith(TOOL_ERROR_PREFIX)) {
+    return text;
   }
-  return payload.isError === true && isReplyPayloadNonTerminalToolErrorWarning(payload);
+  // 只看第一行:详情常常是多行 stderr。
+  const [firstLine] = text.split("\n");
+  const colon = firstLine.indexOf(":");
+  const head = colon === -1 ? firstLine : firstLine.slice(0, colon);
+  return `${head.trimEnd()}（详情见日志）`;
 }
 
 function isFallbackOnlyToolWarningFinal(payload: ReplyPayload): boolean {
-  if (!isNonTerminalToolErrorWarning(payload)) {
+  if (!isToolErrorBroadcastFinal(payload)) {
     return false;
   }
   // 带附件的不延后:延后只保留文本,附件会随缓冲一起丢掉。它改走正常 final 分支,
   // 但**不许宣称完成** —— 见 deliver 里 claimsCompletion 的注释。
   return !resolveSendableOutboundReplyParts(payload).hasMedia;
 }
+
+/** 仅供单测:这几个判据决定「工具错误播报会不会以答复身份、带着命令行进评论区」,值得被钉住。 */
+export const __testing = {
+  isFallbackOnlyToolWarningFinal,
+  isToolErrorBroadcastFinal,
+  sanitizeToolErrorNoticeText,
+};
 
 /**
  * Sanitize a filename for safe use inside a temp directory.
@@ -3331,10 +3368,13 @@ export async function handleInboundMessage(params: {
               onReasoningStream: captureReasoning,
             }
           : { onReasoningStream: captureReasoning },
-      // onFreshSettledDelivery is only present on newer SDK dispatcher options.
-      // On older SDK the property is ignored (and never invoked, since
-      // pendingToolWarningFinal is only set when the tool-warning classifier
-      // exists), so the cast keeps both versions type-correct.
+      // onFreshSettledDelivery is not in the published dispatcher-options type,
+      // hence the cast. It is the *only* flush site for pendingToolWarningFinal,
+      // and the defer gate no longer piggybacks on the tool-warning classifier
+      // as a version proxy -- so a host that ignores this callback would swallow
+      // the warning. openclaw@2026.6.9 (the peerDependencies floor) already
+      // ships it; the dispatch finally block additionally flushes any warning
+      // this callback did not consume, so the property is not load-bearing.
       dispatcherOptions: ({
         deliver: async (payload: ReplyPayload, info: { kind: ReplyDispatchKind }) => {
           // Reasoning is not a normal chat reply. Capture its user-visible lane for the
@@ -3462,17 +3502,24 @@ export async function handleInboundMessage(params: {
             if (isFallbackOnlyToolWarningFinal(payload)) {
               if (!userFacingFinalDelivered) {
                 pendingToolWarningFinal = { text: content };
+                log?.debug?.(
+                  `octo: [deliver-buffer] tool warning final deferred (${content.length} chars)`,
+                );
+              } else {
+                // 真答复已经出去了,这条播报就是纯噪音 —— 丢掉,别记成「延后」。
+                log?.debug?.(
+                  `octo: [deliver-buffer] tool warning final dropped after real reply (${content.length} chars)`,
+                );
               }
-              log?.debug?.(
-                `octo: [deliver-buffer] tool warning final deferred (${content.length} chars)`,
-              );
               return;
             }
 
             // 走到这里的两类 payload:真答复,以及**带附件**的非终止性工具警告
             // (它不能延后 —— 延后只留文本、附件会随缓冲一起丢)。后者要发附件,
             // 但不许拿 applied 徽章:见 deliverFinalText 的 claimsCompletion。
-            const isToolWarningWithMedia = isNonTerminalToolErrorWarning(payload);
+            // 判据同上:只看 isError。元数据标记只覆盖中间件错误,拿它当门槛会让
+            // exec 类失败顶着「已完成」徽章进评论区。
+            const isToolWarningWithMedia = isToolErrorBroadcastFinal(payload);
             // final 覆盖缓冲文本(下面就把它清掉),所以缓冲里那些还没投递过的附件
             // 由这次 final 一并带出去 —— 否则它们会随缓冲一起被丢掉。
             const delivered = await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), {
@@ -3537,9 +3584,11 @@ export async function handleInboundMessage(params: {
           }
           const pending = pendingToolWarningFinal;
           pendingToolWarningFinal = undefined;
+          // 兜底文本会原样进评论区(公开面),先砍掉命令行/错误详情再发。
+          const noticeText = sanitizeToolErrorNoticeText(pending.text);
           try {
             const delivered = await deliverFinalText(
-              pending.text,
+              noticeText,
               AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
               {
                 // ★ 本轮 P1 的现场。这是「非终止性工具错误警告」在没有任何真答复
@@ -3554,7 +3603,7 @@ export async function handleInboundMessage(params: {
             replySucceeded ||= delivered.delivered;
             userFacingFinalDelivered = delivered.delivered;
             log?.info?.(
-              `octo: [deliver] pending tool warning sent as fallback (${pending.text.length} chars)`,
+              `octo: [deliver] pending tool warning sent as fallback (${noticeText.length} chars)`,
             );
             return { visibleReplySent: delivered.delivered };
           } catch (err) {
@@ -3647,6 +3696,12 @@ export async function handleInboundMessage(params: {
             { intent: "output", final: true, ownMedia: takeBufferedDocTaskMedia() },
           );
           replySucceeded ||= delivery.outputDelivered;
+          // ★ 这条缓冲正文就是本回合的真实答复(见上方注释),所以它落地 ⟹ 用户已经
+          // 看到答复了。不写 userFacingFinalDelivered 的话,下面 finally 的
+          // pending 工具警告 flush 会在这条正确答复后面再贴一句「⚠️ 🛠️ … failed」——
+          // 正是本 PR 要消灭的失败形态。镜像 onFreshSettledDelivery 里那条
+          // 「真答复已经在缓冲里 ⇒ 丢掉警告兜底」的纪律。
+          userFacingFinalDelivered ||= delivery.finalDelivered;
         } catch (sendErr) {
           log?.error?.(`octo: failed to deliver buffered block text on dispatch error: ${String(sendErr)}`);
         }
@@ -3685,12 +3740,44 @@ export async function handleInboundMessage(params: {
           { intent: "output", ownMedia: takeBufferedDocTaskMedia() },
         );
         replySucceeded ||= delivered.delivered;
+        // ★ 同 dispatch-rejected 分支:只收到 block 文本的回合,这段缓冲正文就是
+        // 答复本身。它落地之后必须置位 userFacingFinalDelivered,否则紧接着下面
+        // 那次 pending 工具警告 flush 会在真答复后面追一条矛盾的失败提示。
+        // (镜像 onFreshSettledDelivery: src/inbound.ts 里「缓冲有真答复 ⇒ 丢警告」。)
+        userFacingFinalDelivered ||= delivered.delivered;
         if (delivered.delivered) {
           log?.info?.(`octo: [deliver-buffer] fallback text sent (${deliverBuffer.lastText.length} chars)`);
         }
       } catch (finalSendErr) {
         dispatchFailed = true;
         log?.error?.(`octo: [deliver-buffer] final text send failed: ${String(finalSendErr)}`);
+      }
+    }
+    // --- 兜底之兜底:延后的工具警告没被 onFreshSettledDelivery 消费掉 ---
+    // pendingToolWarningFinal 的唯一 flush 是 onFreshSettledDelivery。宿主没实现
+    // 那个回调、或 SDK 因新消息抢占跳过它时,延后就变成了静默吞掉:整回合既无答复
+    // 也无警告。判据不再依赖「分类器在不在」这种版本代理,所以这里补一次真正的
+    // flush —— 到这一步 dispatch 已经结束,还挂着 pending 就说明没人接管。
+    // 同样先净化,理由见 sanitizeToolErrorNoticeText。
+    if (pendingToolWarningFinal && !userFacingFinalDelivered && !deliveryErrorOccurred) {
+      const pendingFinal = pendingToolWarningFinal;
+      pendingToolWarningFinal = undefined;
+      const noticeText = sanitizeToolErrorNoticeText(pendingFinal.text);
+      try {
+        const delivered = await deliverFinalText(
+          noticeText,
+          AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+          // notice 而非 output:它不是答复,不该让上游翻转父评论为 applied。
+          { intent: "notice", ownMedia: takeBufferedDocTaskMedia() },
+        );
+        replySucceeded ||= delivered.delivered;
+        userFacingFinalDelivered ||= delivered.delivered;
+        log?.info?.(
+          `octo: [deliver] pending tool warning flushed in finally (${noticeText.length} chars)`,
+        );
+      } catch (warnFlushErr) {
+        dispatchFailed = true;
+        log?.error?.(`octo: [deliver] tool warning finally-flush failed: ${String(warnFlushErr)}`);
       }
     }
     // 缓冲里的附件没人接管(比如 onError 把缓冲文本清掉后只发了一句道歉)。
