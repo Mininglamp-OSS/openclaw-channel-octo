@@ -8,9 +8,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  *   1. `const docTasksEnabled = account.config.docTasks === true` 改成 `= true`。
  *      `inbound.ts` 里 `grep docTasks` 是 0 命中 —— 它只看注入的 `docTask` 对象在不在,
  *      所以各测试 makeAccount 里那句 `docTasks: true` 是**装饰**,看着像门禁测试其实
- *      不是。真正的门禁只在 channel.ts,而没有任何测试碰过它。而「默认关闭」正是
- *      这个特性能先合进来的前提(评论正文是攻击者可控文本,IM 工具当前仍可从文档
- *      会话里调用)。
+ *      不是。真正的门禁只在 channel.ts,而没有任何测试碰过它。
+ *
+ *      门禁本身的承重理由(这条不随默认值变):评论正文是攻击者可控文本,IM 工具当前
+ *      仍可从文档会话里调用,所以「谁能评论谁就能驱使 Bot」。特性最初是靠**默认关闭**
+ *      来限制这个暴露面的;现在默认已翻成开启(PR #222,产品决定:开关是插件本地的、
+ *      服务端没有对应字段,默认关意味着用户得先知道有这个开关,否则只会看到「@ 了没
+ *      反应」)。残余风险改由三样东西承担,而不是靠默认值:显式 `docTasks: false` 是
+ *      受支持的退出方式(README 里点名了不该开的场景),文档任务路径上 slash 命令被
+ *      禁用、评论正文只作为引用值进入会话,以及下面这条门禁 —— 它保证只有布尔 `true`
+ *      能开,写错类型不会静默半开。所以门禁越发不能被改成常量,这条测试是它的钉子。
  *
  *   2. 会话冲突回执的 `if (extra?.docTask)` 改成 `if (false)`,回执就退回
  *      `notifyInboundConflictDropped` → sendMessage 到发起人私聊(第五处 IM 出口,
@@ -121,7 +128,11 @@ describe("channel.ts:docTasks 开关是真的门禁", () => {
   // 关键点:轮询器是**懒启动**的(发过卡片才起),文档任务则要求常驻 ——
   // `if (docTasksEnabled) startCardEventPoller()`。所以「开关关着」等价于
   // 「轮询器根本没起」,这条断言把那句 `=== true` 真正钉住了。
-  it("未开启:常驻轮询器不启动,文档事件根本收不到", async () => {
+  // 注意:这里直接构造 account.config、**绕过了 accounts.ts 的解析**,所以「空配置」
+  // 在这条测试里等于「门禁拿到 undefined」,不等于产品默认值。真实链路上未配置的账号
+  // 会被 accounts.ts 兜底成 true(默认开启,见 accounts.test.ts)。这条钉的是门禁本身:
+  // 拿不到 true 就不许起常驻轮询器。
+  it("门禁拿不到 true(此处为 undefined):常驻轮询器不启动,文档事件根本收不到", async () => {
     const stop = await startAccount({});
     try {
       expect(pollerOptions().filter((o) => o.onDocMention !== undefined)).toEqual([]);
@@ -142,6 +153,90 @@ describe("channel.ts:docTasks 开关是真的门禁", () => {
 
   it('docTasks: "true" 这类真值不算开启 —— 门禁是严格 === true', async () => {
     const stop = await startAccount({ docTasks: "true" });
+    try {
+      expect(pollerOptions().filter((o) => o.onDocMention !== undefined)).toEqual([]);
+    } finally {
+      await stop();
+    }
+  });
+
+  it('docTasks: "true" 被拒时必须出声 —— 静默的话运维查不出「本想开却比不写还少」', async () => {
+    // 上一条钉的是「拒掉」,这条钉的是「拒掉时说了」。默认已改成开启,所以写错类型的
+    // 后果是**默认值的反面**:期待开,实得关。没有这行日志的话,现象和「配置没生效」
+    // 完全一样,而配置文件里明明白白写着 docTasks。
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stop = await startAccount({ docTasks: "true" });
+    try {
+      const msg = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(msg).toContain("docTasks");
+      expect(msg).toContain("string"); // 说出实收类型
+      expect(msg).toContain("acct1"); // 说出是哪个账号
+    } finally {
+      await stop();
+      warn.mockRestore();
+    }
+  });
+
+  it("布尔值不告警 —— 正常配置不该往日志里添噪音", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stop = await startAccount({ docTasks: false });
+    try {
+      expect(warn.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain("[octo:doc-tasks]");
+    } finally {
+      await stop();
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("accounts.ts 默认值 → channel.ts 门禁:未配置的账号真的把轮询器开起来", () => {
+  // 这条补的是评审点名的接缝。此前两侧各测各的:accounts.test.ts 断言解析器吐出
+  // `docTasks === true`,本文件断言门禁认不认 `true` —— 但没有任何测试走完
+  // 「配置里根本没写 docTasks」→ 常驻轮询器真的起来了 这条完整链路。
+  // 也就是说把 accounts.ts 那句 `?? true` 删掉,两侧测试依然全绿(各自的前提都还成立),
+  // 而产品行为已经退回默认关。这条测试就是那个缺口的钉子。
+  //
+  // 手法:不像上面的 startAccount 那样直接构造 config,而是喂一份**真实形态的 openclaw
+  // 配置**给 resolveOctoAccount,把它解析出来的 config 原样交给 channel.ts。
+  it("openclaw.json 里没有 docTasks 这个键 ⇒ onDocMention 已注册、轮询器常驻", async () => {
+    const { resolveOctoAccount } = await import("./accounts.js");
+    const resolved = resolveOctoAccount({
+      cfg: {
+        channels: {
+          octo: {
+            accounts: { acct1: { botToken: "tok", apiUrl: API } },
+          },
+        },
+      } as never,
+      accountId: "acct1",
+    });
+    // 前提自检:解析结果里确实没有人显式写过 true,是兜底给的。
+    expect(resolved.config.docTasks).toBe(true);
+
+    const stop = await startAccount(resolved.config as unknown as Record<string, unknown>);
+    try {
+      const withDoc = pollerOptions().filter((o) => typeof o.onDocMention === "function");
+      expect(withDoc.length).toBeGreaterThan(0);
+    } finally {
+      await stop();
+    }
+  });
+
+  it("openclaw.json 里写了 docTasks: false ⇒ 常驻轮询器不启动(退出方式仍然有效)", async () => {
+    const { resolveOctoAccount } = await import("./accounts.js");
+    const resolved = resolveOctoAccount({
+      cfg: {
+        channels: {
+          octo: {
+            accounts: { acct1: { botToken: "tok", apiUrl: API, docTasks: false } },
+          },
+        },
+      } as never,
+      accountId: "acct1",
+    });
+    expect(resolved.config.docTasks).toBe(false);
+
+    const stop = await startAccount(resolved.config as unknown as Record<string, unknown>);
     try {
       expect(pollerOptions().filter((o) => o.onDocMention !== undefined)).toEqual([]);
     } finally {

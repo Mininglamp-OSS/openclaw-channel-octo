@@ -40,7 +40,7 @@ export interface OctoAccountConfig {
   cardDisplay?: boolean;
   /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
   cardInteraction?: boolean;
-  docTasks?: boolean;  // true enables document comment @Bot tasks
+  docTasks?: boolean;  // Document comment @Bot tasks. Default on; boolean false opts out.
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace); if neither resolves, write-secret fails closed (no process.cwd() fallback).
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms). Unset = derived from agents.defaults.timeoutSeconds + 60s buffer (issue #113).
@@ -103,7 +103,7 @@ export const EVENT_WAIT_SECONDS_DESCRIPTION =
 // 本 PR 不恢复它们。下面只保留本 PR 真正新增的两个 key 的描述。
 
 export const DOC_TASKS_DESCRIPTION =
-  "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM.";
+  "Document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM. Enabled by default; set false to run the account as a plain IM bot.";
 
 // Shared description for docsApiUrl, kept identical to the wording in
 // openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
@@ -178,7 +178,7 @@ export const OctoConfigJsonSchema = {
       botUid: { type: "string" },
       historyLimit: { type: "number", minimum: 1, maximum: 100 },
       historyPromptTemplate: { type: "string" },
-      docTasks: { type: "boolean", description: DOC_TASKS_DESCRIPTION },
+      docTasks: { type: "boolean", default: true, description: DOC_TASKS_DESCRIPTION },
       onBehalfOf: { type: "string" },
       secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
       dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },
@@ -202,7 +202,7 @@ export const OctoConfigJsonSchema = {
             botUid: { type: "string" },
             historyLimit: { type: "number", minimum: 1, maximum: 100 },
             historyPromptTemplate: { type: "string" },
-            docTasks: { type: "boolean", description: DOC_TASKS_DESCRIPTION },
+            docTasks: { type: "boolean", default: true, description: DOC_TASKS_DESCRIPTION },
             onBehalfOf: { type: "string" },
             secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
             dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },

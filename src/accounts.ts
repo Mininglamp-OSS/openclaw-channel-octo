@@ -34,7 +34,7 @@ export type ResolvedOctoAccount = {
     historyPromptTemplate?: string;  // Template for group history context injection
     onBehalfOf?: string;  // Persona clone: grantor uid
     secretsFileRoot?: string;  // Jail root for write-secret file writes
-    docTasks?: boolean;  // true 开启文档评论 @Bot 任务(常驻事件轮询 + 出站改投评论区)
+    docTasks?: boolean;  // 文档评论 @Bot 任务(常驻事件轮询 + 出站改投评论区)。**默认开启**,布尔 false 关闭
     dispatchTimeoutMs?: number;  // Explicit dispatch-timeout override; unset = derive from agents.defaults.timeoutSeconds (issue #113)
   };
 };
@@ -128,7 +128,14 @@ export function resolveOctoAccount(params: {
       // main 已废弃 cardProgress/cardDisplay/cardInteraction/reasoningCardTemplateMode 的本地
       // 透传(服务端 per-Bot 配置权威),这里不再恢复。docTasks 是本 PR 新增的本地开关,
       // 服务端没有对应字段,必须透传。
-      docTasks: accountConfig.docTasks ?? channel.docTasks,
+      //
+      // **默认开启**(产品决定):文档评论 @Bot 是这个 channel 的主要能力之一,而开关是插件
+      // 本地的、服务端没有对应字段 —— 默认关意味着每个用户都得先知道有这么个开关、再手动
+      // 写进配置,否则只会看到「@ 了 Bot 但它没反应」然后来问。所以缺省即开。
+      // 仍然保留显式 `docTasks: false` 的关法:需要一个只当普通 IM Bot 的账号时用它。
+      // 注意这里只兜底 nullish —— 非布尔的真值(如字符串 "true")照旧透传下去,由
+      // channel.ts 的严格 `=== true` 门禁拒掉,免得配置写错时静默地半开。
+      docTasks: accountConfig.docTasks ?? channel.docTasks ?? true,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,
       secretsFileRoot: accountConfig.secretsFileRoot ?? channel.secretsFileRoot,
       dispatchTimeoutMs: accountConfig.dispatchTimeoutMs ?? channel.dispatchTimeoutMs,

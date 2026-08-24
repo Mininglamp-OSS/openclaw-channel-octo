@@ -1543,6 +1543,17 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 文档评论 @Bot 任务。持久去重:轮询器先执行后存游标,server 侧也可能在
       // enqueue 后 confirm 前崩溃重投,两条路径都靠 idempotency_key 收敛。
       const docTasksEnabled = account.config.docTasks === true;
+      // 配置写错类型时说清楚。解析器只兜底 nullish,所以非布尔值(典型是 JSON 里写成
+      // 字符串 "true")原样透传到这里,被下面的严格 `=== true` 拒掉 —— 得到的是**默认值
+      // 的反面**:本想开,结果比不写还少。这条门禁本身是对的(不能让写错的配置静默半开),
+      // 但不出声就成了运维查不出来的坑,所以在这儿说明白。
+      if (account.config.docTasks !== undefined && typeof account.config.docTasks !== "boolean") {
+        console.warn(
+          `[octo:doc-tasks] [${account.accountId}] docTasks 必须是布尔值,收到 ` +
+            `${typeof account.config.docTasks} —— 文档评论 @Bot 任务**已关闭**(门禁只认布尔 true)。` +
+            `想开就写 docTasks: true(不带引号);想关就写 docTasks: false。`,
+        );
+      }
       // log 必须传:去重表读不出来时(EACCES / JSON 截断)会退化成空表,
       // 已完成的事件全部变回可重放 —— 这是必须能在日志里看见的降级,不是静默的。
       const docMentionDedupe = createFileDocMentionDedupeStore({ accountId: account.accountId, log });
