@@ -242,6 +242,62 @@ describe("synthesizeDocMentionMessage", () => {
         expect(text).toContain("不要从别处猜一个域名去试");
       });
 
+      // 「锚点为空」和「文档一个 aid 都没有」是两件事。上一版只修了前者:指令让 agent
+      // 取回整篇 → 读 aid → 按 aid 窄替换,于是在 aid 为 0 的老文档上走到第 2 步就断路,
+      // 而且还有一句「不能据此建议重新发布」把唯一的出路也堵掉了(实测 test-page-0806:
+      // 4 个版本、正文真实 aid = 0，agent 只能回「无法修改」)。这几条钉住无 aid 的出路。
+      it("★ 一个 aid 都没有时给出整篇重发的出路,而不是让它无路可走", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain("一个 aid 都没有");
+        expect(text).toContain("整篇重新发布");
+        // publish 会 StampAids 重新盖,所以这条路顺带修好 aid —— 要让 agent 知道。
+        expect(text).toContain("StampAids");
+      });
+
+      // 剥离规则是**破坏性写入**的前置条件,错一次就是把用户整篇文档毁掉,所以逐条钉。
+      // reviewer 指出的三个真问题,都在这条 diff 的实测样本上复现过:
+      //   1) doctype 实际是 <!DOCTYPE html>(大写) —— 只认小写就匹配不到;
+      //   2) 评论数据块排在文档主体**前面**(样本:script 闭合于 21232、doctype 在 21242),
+      //      而块内嵌着历史评论原文,「全文第一个 <!doctype」会被评论里提到的字样带偏;
+      //   3) ODOC-COMMENT 是成对的(<!--/ODOC-COMMENT-->),只删开标记会留下闭标记。
+      it("★ 剥离按结构锚定:先过 odoc-fork-comments 的 </script>,不许用全文首个匹配", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain("odoc-fork-comments");
+        expect(text).toContain("</script>");
+        expect(text).toContain("不许用「全文第一个匹配」");
+      });
+
+      it("★ doctype 大小写不敏感,且覆盖没有 doctype 的文档", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain("大小写不敏感");
+        // 没有 doctype 时以 <html 为起点(skill 的发布样例就不带 doctype)。
+        expect(text).toContain("<html");
+      });
+
+      it("★ 定位不到评论块时必须放弃发布,并在发布前自检", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain("定位不到那个评论块就不要发布");
+        expect(text).toContain("自检");
+      });
+
+      it("★ ODOC-COMMENT 锚点标记要成对删除", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain("<!--/ODOC-COMMENT-->");
+        expect(text).toContain("成对删掉");
+      });
+
+      it("★ 有 aid 时仍必须窄替换 —— 不许拿整篇重发当万能解", () => {
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain("只在「确认没有任何 aid」时才走这条");
+      });
+
+      it("★ 提醒 aid 判定要看真实属性,而不是纯文本搜索(评论正文会造成假阳性)", () => {
+        // export 把历史评论正文也嵌进来;之前 agent 在评论里写过 data-odoc-aid 这几个字,
+        // 于是 grep 会数出假阳性 —— 我自己第一次排查就被这个骗过。
+        const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
+        expect(text).toContain("假阳性");
+      });
+
       it("★ 失败答复里不许回贴请求 URL —— 那条答复会被自动发进公开评论区", () => {
         const text = formatDocMentionText(noAnchor, { docsBaseUrl: BASE });
         // 旧文案让 agent「原样附上你请求的完整 URL」,URL 上的 ?code= 就是有效读票。
@@ -257,10 +313,15 @@ describe("synthesizeDocMentionMessage", () => {
         expect(text).not.toContain("一并保留在 query 上");
       });
 
-      it("窄改纪律仍在:整篇取回只用于读结构取 aid,落笔仍是单元素替换", () => {
+      // 窄改仍然是默认纪律,但不再是**唯一**出路:aid 为 0 时整篇重发是唯一可走的路
+      // (见上面无 aid 那几条)。所以这里钉「优先窄改 + 不许原样回灌」,而不是钉旧措辞
+      // 「别整篇重写」—— 那句话曾经把 whole-doc 连同 no-aid 一起堵死。
+      it("窄改仍是默认纪律:有 aid 就单元素替换,且任何情况都不许把取回内容原样回灌", () => {
         const text = formatDocMentionText(htmlMention, { docsBaseUrl: BASE });
-        expect(text).toContain("别整篇重写");
-        expect(text).toContain("不能原样拿去发布");
+        expect(text).toContain("不是整篇重发");
+        expect(text).toContain("别把取回的 HTML 原样拿去发布");
+        // 整篇重发有严格前提,不是随手可选的等价方案。
+        expect(text).toContain("只在「确认没有任何 aid」时才走这条");
       });
     });
 
