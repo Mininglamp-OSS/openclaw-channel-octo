@@ -555,6 +555,68 @@ describe("event poller long-poll", () => {
     poller.stop();
   });
 
+  it("短轮询出错时也退避 —— 默认配置下不再按 intervalMs 无限敲一个坏端点", async () => {
+    // 回归:`waitSeconds === 0` 的早返回原先排在 error 分支**之前**,所以短轮询
+    // (eventWaitSeconds 未配置,即默认形态)命中错误时照旧按 intervalMs 重排,
+    // 对一个不健康/未授权的 events 端点是每 tick 一次请求 + 一行错误日志,永不放缓。
+    // docTasks 默认开启之后每个账号都常驻一个轮询器,这个形态会按账号数放大。
+    let calls = 0;
+    global.fetch = vi.fn().mockImplementation(async () => {
+      calls += 1;
+      return new Response("nope", { status: 401 });
+    }) as typeof fetch;
+
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1_000,
+      waitSeconds: 0, // 短轮询 = 默认形态
+      cursorStore: memoryCursor(0),
+      log: { error: () => {} },
+      onCardAction: async () => {},
+    });
+    await poller.ready;
+    // 短轮询的首次读要等满一个 intervalMs(长轮询才是立即起跑),所以先推一个 interval。
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(calls).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1_050); // 第 1 次退避 = intervalMs
+    expect(calls).toBe(2);
+    // 无退避时这里会再来一次;有退避时第 2 次要等 2x intervalMs。
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(calls).toBe(2);
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(calls).toBe(3);
+    poller.stop();
+  });
+
+  it("短轮询成功时节奏不变 —— 退避只影响出错路径", async () => {
+    // 上一条的配对断言:退避不能顺手改掉健康服务器上的 ~2s 节奏。
+    let calls = 0;
+    global.fetch = vi.fn().mockImplementation(async () => {
+      calls += 1;
+      return Response.json({ results: [] });
+    }) as typeof fetch;
+
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1_000,
+      waitSeconds: 0,
+      cursorStore: memoryCursor(0),
+      onCardAction: async () => {},
+    });
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(1_050); // 同上:短轮询首读等一个 interval
+    expect(calls).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(calls).toBe(2);
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(calls).toBe(3);
+    poller.stop();
+  });
+
   it("非空但完全无法推进游标的响应不算 batch —— 否则 0ms 重排会打成风暴", async () => {
     // Regression for a hot loop that survived the first pacing fix: `outcome` was classified
     // from events.length, but a response can be non-empty and still advance nothing — event ids

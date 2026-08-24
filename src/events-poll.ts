@@ -187,13 +187,24 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
     outcome: "batch" | "empty" | "error",
     requestMs: number,
   ): number => {
-    if (waitSeconds === 0) return intervalMs; // short poll: unchanged, always paced
     if (outcome === "error") {
       // Never hammer an unhealthy server. Exponential, capped, reset on any success.
+      //
+      // This applies to short polling too, and that matters more than it used to. Short poll
+      // (`eventWaitSeconds` unset, the default) used to return `intervalMs` here unconditionally,
+      // so a poller pointed at an unhealthy or unauthorized events endpoint kept its ~2s cadence
+      // forever — one request and one `event poll failed at cursor=` line every tick, on the
+      // order of 43k of each per account per day. That was tolerable while the resident poller
+      // only ran for accounts that had opted into `docTasks`; now that doc tasks default to on,
+      // every account has one, so the failure mode would scale with the account count.
+      // Backing off is strictly a reduction: on a healthy server no error occurs and pacing is
+      // untouched, and the counter resets on the first success, so a transient blip costs at
+      // most a few slower ticks before the ~2s cadence returns.
       consecutiveErrors += 1;
       return Math.min(MAX_ERROR_BACKOFF_MS, intervalMs * 2 ** (consecutiveErrors - 1));
     }
     consecutiveErrors = 0;
+    if (waitSeconds === 0) return intervalMs; // short poll: success pacing unchanged
     // Events in hand: drain immediately, there may be more behind them.
     if (outcome === "batch") return 0;
     // Empty, and the server clearly did not hold for anything like the time we asked for — it is

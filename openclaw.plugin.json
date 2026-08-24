@@ -82,7 +82,8 @@
           },
           "docTasks": {
             "type": "boolean",
-            "description": "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM."
+            "default": true,
+            "description": "Document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM. Enabled by default; set false to run the account as a plain IM bot."
           },
           "accounts": {
             "type": "object",
@@ -146,7 +147,8 @@
                 },
                 "docTasks": {
                   "type": "boolean",
-                  "description": "Enable document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM."
+                  "default": true,
+                  "description": "Document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM. Enabled by default; set false to run the account as a plain IM bot."
                 },
                 "onBehalfOf": {
                   "type": "string",
