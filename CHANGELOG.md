@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.3.0...v1.4.0) (2026-08-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **doc-task:** 未写 docTasks 的账号在下次重启后开始接受文档评论 @Bot 任务, 并常驻 /v1/bot/events 轮询。升级前请确认信任边界(能评论文档的人即可驱使 Bot)、 轮询开销(建议配 eventWaitSeconds)、以及分体部署下的 docsApiUrl。README 新增 「Upgrading to the release that makes docTasks default on」一节。
+
+### Added
+
+* **doc-task:** dispatch document comment @Bot mentions to isolated sessions ([#217](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/217)) ([abda2b7](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/abda2b7658bd91a146a4c45d9ca46cdb9824520e))
+* **doc-task:** 文档评论 @Bot 任务改为默认开启 ([#222](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/222)) ([baf6dbf](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/baf6dbfdaa08da5a6d4244bc2d12514fac28922b))
+
+
+### Internal
+
+* **release:** set v1.4.0 release ([#224](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/224)) ([0c0d02d](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/0c0d02d087924478d565dfd2b17c0a53d132ed4c))
+
 ## [1.3.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.2.0...v1.3.0) (2026-08-11)
 
 ### Added
