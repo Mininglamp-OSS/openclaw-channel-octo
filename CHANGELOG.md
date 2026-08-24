@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.3.0...v1.4.0) (2026-08-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **未配置 `docTasks` 的账号升级并重启后，会开始处理文档评论里的 `@Bot`（PR #222）。** 这也会为每个账号启动常驻的 `/v1/bot/events` 轮询。
+  - 升级前请确认信任边界：能够在 Bot 可读文档中评论的人，也就能驱使该 Bot；分体部署还须正确配置 `docsApiUrl`。轮询开销可通过 `eventWaitSeconds` 降低。
+  - 不需要此能力的账号可继续显式设置 `docTasks: false`；错误写成字符串等非布尔值仍会被严格拒绝，不会被静默当作开启。
+
+### Added
+
+* **文档评论中的 `@Bot` 会在独立会话执行，并把结果回复到原评论线程（PR #217）。** 文档任务与 IM 会话隔离，避免同一用户的两类对话互相串扰；投递失败会留下 dead letter，便于追查已确认但未回复的任务。
+* **文档评论任务改为默认开启，并改善异常轮询的退避（PR #222）。** 新安装或未写配置的账号不再出现“`@Bot` 没反应”；短轮询遇到异常时也会退避，避免不健康端点按 tick 持续请求和刷日志。
+
+### Fixed
+
+* **HTML 文档评论没有锚点时，不再因拿不到元素列表而空转到超时（PR #221）。** Bot 会先取回整篇 export 内容读取真实的 `data-odoc-aid`，再按 aid 做窄替换；已有锚点的评论仍只修改对应元素。工具执行错误也不会再被当作正常答复投递到公开评论区。
+* **文档完全没有 aid 时，可安全地按同一 slug 整篇重新发布（PR #223）。** 仅在确认文档没有任何真实 aid 时启用；发布前会剥离 export 注入的评论数据和标记，并做结构校验，避免将注入物写回正文。存在 aid 时仍保持窄替换，避免影响其他评论锚点。
+
 ## [1.3.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.2.0...v1.3.0) (2026-08-11)
 
 ### Added
