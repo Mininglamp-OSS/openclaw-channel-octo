@@ -185,6 +185,18 @@ describe("ai.reasoning-process successor-compatible contract", () => {
     }]);
   });
 
+  it("explains an action phase whose model call returned no visible reasoning summary", () => {
+    const data = buildReasoningProcessWireData(state({
+      steps: [
+        { tool: "__thinking__", status: "done", modelCallId: "call-1" },
+        { tool: "session_status", status: "done", toolCallId: "tool-1" },
+      ],
+    }));
+
+    expect(data?.phases[0]?.thought).toBe("No visible reasoning summary");
+    expect(data?.phases[0]?.thought).not.toBe("—");
+  });
+
   it("returns no wire data before a real displayable action exists", () => {
     expect(buildReasoningProcessWireData(state({
       phase: "reasoning" as never,
