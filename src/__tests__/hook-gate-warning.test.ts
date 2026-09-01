@@ -79,6 +79,30 @@ describe("2026.8 hook gate — operator warning", () => {
     expect(w).toContain("allowConversationAccess");
   });
 
+  it("stays silent on hosts older than 2026.8, which accept the keys but do not gate", () => {
+    // 2026.6/2026.7 normalize these two keys into config but ship no
+    // resolveConversationAccessAllowed gate, so an unset opt-in is harmless
+    // there. peerDependencies still allows >=2026.6.9, and warning those hosts
+    // would be pure noise about a problem they do not have.
+    for (const v of ["2026.6.9", "2026.6.34", "2026.7.1", "2026.7.2"]) {
+      expect(_buildHookGateWarning(withHooks({}), v), `host ${v}`).toBeUndefined();
+    }
+  });
+
+  it("warns on 2026.8 and later, where the gate is enforced", () => {
+    for (const v of ["2026.8.1", "2026.9.1-beta.1", "2027.1.0"]) {
+      expect(_buildHookGateWarning(withHooks({}), v), `host ${v}`).toBeDefined();
+    }
+  });
+
+  it("warns when the host version is missing or unparseable", () => {
+    // Cannot prove the host is old, so assume it gates: one extra log line is
+    // cheaper than missing a silent degradation.
+    for (const v of [undefined, "", "unknown", "dev"]) {
+      expect(_buildHookGateWarning(withHooks({}), v as never), `host ${String(v)}`).toBeDefined();
+    }
+  });
+
   it("never throws on absent or malformed config", () => {
     for (const bad of [
       undefined,

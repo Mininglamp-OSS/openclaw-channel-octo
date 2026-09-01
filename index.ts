@@ -103,12 +103,41 @@ export function _buildToolAvailabilityHint(messageProvider: string | undefined):
  *     a warning that fires on a correctly configured deployment just teaches
  *     operators to ignore warnings.
  *
+ * Only relevant on hosts that actually enforce this (2026.8+, see
+ * _hostGatesPluginHooks) — older hosts accept the same keys without gating.
+ *
  * Returns one operator-facing warning describing only what is actually wrong, or
  * undefined when the gating is fine. Never throws — a malformed config must not
  * take registration down — and an unreadable config warns rather than staying
  * quiet, since the required opt-in cannot be proven from it.
  */
-export function _buildHookGateWarning(cfg: unknown): string | undefined {
+/**
+ * Whether the host enforces the non-bundled hook opt-in.
+ *
+ * 2026.8 is the first release that gates it: 2026.6/2026.7 normalize the same
+ * two keys into config but ship no resolveConversationAccessAllowed, so an unset
+ * opt-in is harmless there. peerDependencies still allows >=2026.6.9, and
+ * warning those hosts about a problem they do not have is noise that teaches
+ * operators to tune warnings out.
+ *
+ * An unreadable version is treated as gating: one spurious log line is far
+ * cheaper than missing a silent degradation.
+ */
+function _hostGatesPluginHooks(hostVersion: string | undefined): boolean {
+  const m = /^(\d{4})\.(\d+)/.exec((hostVersion ?? "").trim());
+  if (!m) return true;
+  const year = Number(m[1]);
+  const minor = Number(m[2]);
+  if (!Number.isFinite(year) || !Number.isFinite(minor)) return true;
+  return year > 2026 || (year === 2026 && minor >= 8);
+}
+
+export function _buildHookGateWarning(
+  cfg: unknown,
+  hostVersion?: string,
+): string | undefined {
+  if (!_hostGatesPluginHooks(hostVersion)) return undefined;
+
   let hooks: Record<string, unknown> = {};
   try {
     const entry = (cfg as { plugins?: { entries?: Record<string, { hooks?: unknown }> } })
@@ -270,7 +299,10 @@ export default defineBundledChannelEntry({
     // own per-hook message names the key but not what breaks, and the failure
     // is silent (the bot keeps replying, just without group context/persona).
     try {
-      const gateWarning = _buildHookGateWarning(api.runtime.config.current());
+      const gateWarning = _buildHookGateWarning(
+        api.runtime.config.current(),
+        api.runtime.version,
+      );
       if (gateWarning) console.warn(gateWarning);
     } catch {
       // A diagnostic must never be able to break registration.
