@@ -17,7 +17,7 @@
  * are checked here against the openclaw actually installed.
  */
 import { describe, it, expect } from "vitest";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, lstatSync } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -41,7 +41,11 @@ function collectSourceFiles(): string[] {
     for (const entry of readdirSync(dir)) {
       if (entry === "node_modules" || entry === "dist" || entry.startsWith(".")) continue;
       const full = join(dir, entry);
-      if (statSync(full).isDirectory()) walk(full);
+      // lstat, not stat: a symlink pointing at a parent dir (or node_modules)
+      // would otherwise make this walk recurse forever.
+      const st = lstatSync(full);
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) walk(full);
       else if (CODE.test(entry)) out.push(full);
     }
   };
@@ -54,6 +58,21 @@ function collectSourceFiles(): string[] {
 const sourceFiles = collectSourceFiles();
 const rel = (f: string) => f.slice(repoRoot.length + 1);
 
+/**
+ * File contents with whole-line comments removed.
+ *
+ * Both checks below need this: prose legitimately names an unexported subpath or
+ * a removed API when explaining why the code avoids it, and flagging that is a
+ * false positive that pushes people toward vaguer comments. Line-granular is
+ * enough here — a real call sits on a code line.
+ */
+function readCode(file: string): string {
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+}
+
 describe("OpenClaw SDK surface", () => {
   it("imports openclaw only through subpaths the installed version actually exports", () => {
     const pkg = JSON.parse(
@@ -64,11 +83,7 @@ describe("OpenClaw SDK surface", () => {
 
     const offenders: string[] = [];
     for (const file of sourceFiles) {
-      // Skip comment lines: they legitimately name subpaths in prose.
-      const text = readFileSync(file, "utf8")
-        .split("\n")
-        .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
-        .join("\n");
+      const text = readCode(file);
       for (const m of text.matchAll(/^\s*(?:import|export)[\s\S]*?from\s+"(openclaw(?:\/[^"]*)?)"/gm)) {
         const spec = m[1];
         const subpath = spec === "openclaw" ? "." : "." + spec.slice("openclaw".length);
@@ -93,7 +108,7 @@ describe("OpenClaw SDK surface", () => {
     const removed = ["config.loadConfig(", "config.writeConfigFile("];
     const offenders: string[] = [];
     for (const file of sourceFiles) {
-      const text = readFileSync(file, "utf8");
+      const text = readCode(file);
       for (const api of removed) {
         if (text.includes(api)) offenders.push(`${rel(file)} -> ${api})`);
       }
