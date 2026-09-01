@@ -19,7 +19,7 @@
 //
 // See docs/specs/2026-06-18-fork-command-design.md.
 
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import type { ChannelLogSink } from "openclaw/plugin-sdk/channel-contract";
 import type { ReplyPayload, ReplyDispatchKind } from "openclaw/plugin-sdk/reply-runtime";
 

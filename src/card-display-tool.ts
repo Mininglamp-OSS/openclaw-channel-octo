@@ -19,7 +19,7 @@
  *     不可信模型输入指定(与进度卡路径一致,OBO 一律跳过),避免群可见卡片成为 persona 冒充 sink。
  */
 
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { listOctoAccountIds, resolveOctoAccount } from "./accounts.js";
 import { appendFile, mkdir } from "node:fs/promises";

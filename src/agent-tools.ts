@@ -60,7 +60,7 @@ import {
   sep,
 } from "node:path";
 
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 // 🔴 Canonical, platform-owned agent-workspace resolver. This is the SAME logic
 // the OpenClaw host uses to decide where an agent's workspace lives, so the
 // write-secret jail default stays in lock-step with the platform instead of a

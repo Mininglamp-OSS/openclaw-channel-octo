@@ -1,4 +1,4 @@
-import type { PluginRuntime } from "openclaw/plugin-sdk";
+import type { PluginRuntime } from "openclaw/plugin-sdk/core";
 
 // State lives on globalThis under a registered Symbol — NOT on a module-scope
 // `let`. Reason: when OpenClaw SDK's loadBundledEntryExportSync loads this

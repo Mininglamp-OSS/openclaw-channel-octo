@@ -116,7 +116,7 @@ function installRuntime(finalText: string) {
     await args.dispatcherOptions.deliver({ text: finalText }, { kind: "final" });
   });
   setOctoRuntime({
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,

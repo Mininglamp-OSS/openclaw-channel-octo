@@ -145,7 +145,7 @@ function installDispatcher(payloads: Array<{ payload: Record<string, unknown>; k
 
 function runtimeWith(dispatch: unknown) {
   return {
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,

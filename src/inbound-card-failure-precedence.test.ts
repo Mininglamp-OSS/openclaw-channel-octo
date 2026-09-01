@@ -146,7 +146,7 @@ function installRuntime(
   mode: "onError" | "swallowed-final-send" = "onError",
 ) {
   setOctoRuntime({
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: async (args: any) => {

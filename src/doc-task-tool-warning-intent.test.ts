@@ -177,7 +177,7 @@ function installDispatcher(
 
 function runtimeWith(dispatch: unknown) {
   return {
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,

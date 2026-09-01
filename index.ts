@@ -14,8 +14,7 @@
  * openclaw CLI — ClawScan blocks `child_process` imports on install.
  */
 
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
