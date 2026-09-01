@@ -90,6 +90,36 @@ This is a **breaking change for existing deployments**. Before it, an omitted `d
 
 One deployment shape is **not** supported with doc tasks enabled: running the *same account* in more than one process. Write serialization for the doc-mention dedupe table is single-process only, and doc-task replay is not idempotent — two pollers can claim the same mention and both edit the document. This was always the case, but until now only operators who deliberately opted in could reach it. Run one process per account, or set `docTasks: false` on accounts that are replicated.
 
+### Upgrading to OpenClaw 2026.8
+
+2026.8 gates typed hooks for non-bundled plugins — anything installed from ClawHub, including this one — behind two explicit config opt-ins. **A plugin cannot grant these to itself**: consent deliberately lives in the operator's config, so an upgrade leaves them off until you add them.
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "octo": {
+        "enabled": true,
+        "hooks": {
+          "allowPromptInjection": true,
+          "allowConversationAccess": true
+        }
+      }
+    }
+  }
+}
+```
+
+`allowPromptInjection` governs `before_prompt_build` — the hook this plugin uses to inject the group MD, the member list, and (for persona clones) the persona identity. `allowConversationAccess` governs `before_agent_run`, `llm_output` and `agent_end`, which carry card progress binding and reply finalization.
+
+**The failure mode is silent.** Without the opt-ins the bot still connects and still replies. It simply never receives the group roster, the group MD, or its own persona, so a persona clone answers out of character and nothing in the reply hints at why. The gateway logs one line per blocked hook during startup (`typed hook "before_prompt_build" blocked because ...`) and this plugin logs a warning that names the consequence, but neither interrupts startup — look for them after upgrading.
+
+Two further migrations belong to OpenClaw itself rather than to this plugin, and the gateway refuses to start until both are done: the config schema retired a number of legacy keys, and the session store moved to SQLite. Run `openclaw doctor --fix` **interactively** for these — under `--non-interactive` it reports the legacy keys without applying anything, since several of the decisions (for example `agents.ownership` on a multi-agent roster) change routing semantics and need a human. Two details worth checking by hand afterwards, because getting them wrong is quiet rather than loud:
+
+- `mcp.servers.*.connectTimeout` / `timeout` were replaced by `connectionTimeoutMs` / `requestTimeoutMs`. The old keys were **seconds**, the new ones are **milliseconds** — a straight rename turns a 45s connect timeout into 45ms and the server never connects.
+- `gateway.nodes.denyCommands` / `allowCommands` became `gateway.nodes.commands.deny` / `.allow`. If those denies were carrying a security policy, confirm the list survived the move.
+
+
 ## Agent tools
 
 This plugin registers three agent tools:

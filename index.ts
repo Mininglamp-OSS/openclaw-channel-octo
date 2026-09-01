@@ -27,7 +27,7 @@ import { octoPlugin } from "./src/channel.js";
 import { createOctoManagementTools } from "./src/agent-tools.js";
 import { createDisplayCardTool } from "./src/card-display-tool.js";
 import { createInteractiveCardTool } from "./src/card-tool.js";
-import { CHANNEL_ID, DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./src/constants.js";
+import { CHANNEL_ID, PLUGIN_ID, DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./src/constants.js";
 import { bindCardRun, registerCardProgress } from "./src/card-progress.js";
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,63 @@ export const OCTO_TOOL_AVAILABILITY_HINT =
  */
 export function _buildToolAvailabilityHint(messageProvider: string | undefined): string | null {
   return messageProvider === CHANNEL_ID ? OCTO_TOOL_AVAILABILITY_HINT : null;
+}
+
+/**
+ * OpenClaw 2026.8 gates typed hooks for non-bundled plugins behind two config
+ * opt-ins that a plugin cannot grant itself (by design — consent lives in the
+ * operator's own config):
+ *
+ *   plugins.entries.octo.hooks.allowPromptInjection    -> before_prompt_build
+ *   plugins.entries.octo.hooks.allowConversationAccess -> before_agent_run,
+ *                                                         llm_output, agent_end
+ *
+ * Missing them degrades the bot SILENTLY: it keeps answering, but without the
+ * group roster, the group MD, or — for persona clones — its own identity, so it
+ * drops out of character with nothing in the reply hinting at why. The host
+ * logs one line per blocked hook, naming the key but not the consequence, which
+ * is easy to scroll past among startup noise.
+ *
+ * Returns one operator-facing warning naming only what is actually missing, or
+ * undefined when both are granted. Never throws — a malformed config must not
+ * take registration down — and when config is unreadable it warns rather than
+ * staying quiet: a spurious log line is far cheaper than silent degradation.
+ */
+export function _buildHookGateWarning(cfg: unknown): string | undefined {
+  let hooks: Record<string, unknown> = {};
+  try {
+    const entry = (cfg as { plugins?: { entries?: Record<string, { hooks?: unknown }> } })
+      ?.plugins?.entries?.[PLUGIN_ID];
+    if (entry?.hooks && typeof entry.hooks === "object") {
+      hooks = entry.hooks as Record<string, unknown>;
+    }
+  } catch {
+    // Unreadable config — fall through and report both as missing.
+  }
+
+  const missing: string[] = [];
+  if (hooks.allowPromptInjection !== true) missing.push("allowPromptInjection");
+  if (hooks.allowConversationAccess !== true) missing.push("allowConversationAccess");
+  if (missing.length === 0) return undefined;
+
+  const lines = [
+    `[octo] OpenClaw 2026.8 blocks plugin hooks without an explicit opt-in: ` +
+      `${missing.join(", ")} not set to true under plugins.entries.${PLUGIN_ID}.hooks.`,
+  ];
+  if (missing.includes("allowPromptInjection")) {
+    lines.push(
+      "  - missing allowPromptInjection: group MD, the member list and persona identity " +
+        "never reach the prompt. The bot still replies, so nothing looks broken — " +
+        "persona clones simply answer out of character.",
+    );
+  }
+  if (missing.includes("allowConversationAccess")) {
+    lines.push(
+      "  - missing allowConversationAccess: conversation hooks stay inert " +
+        "(card progress binding, reply finalization).",
+    );
+  }
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +261,17 @@ export default defineBundledChannelEntry({
 
     setOctoRuntime(api.runtime);
     api.registerChannel({ plugin: octoPlugin });
+
+    // 2026.8 gates the hooks below behind config opt-ins we cannot grant
+    // ourselves. Surface it here with the consequence spelled out: the host's
+    // own per-hook message names the key but not what breaks, and the failure
+    // is silent (the bot keeps replying, just without group context/persona).
+    try {
+      const gateWarning = _buildHookGateWarning(api.runtime.config.current());
+      if (gateWarning) console.warn(gateWarning);
+    } catch {
+      // A diagnostic must never be able to break registration.
+    }
 
     console.log('[octo] registering before_prompt_build hook');
     api.on('before_prompt_build', (_event, ctx) => {
