@@ -30,9 +30,15 @@
 import {
   registerSessionBindingAdapter,
   unregisterSessionBindingAdapter,
-  type SessionBindingAdapter,
-  type SessionBindingRecord,
 } from "openclaw/plugin-sdk/thread-bindings-runtime";
+// The types come from conversation-runtime, which ships declarations for them;
+// thread-bindings-runtime exports only `default` (no `types`) as of 2026.8.1, so
+// its two functions are typed by a local shim instead — see
+// openclaw-thread-bindings-runtime.d.ts.
+import type {
+  SessionBindingAdapter,
+  SessionBindingRecord,
+} from "openclaw/plugin-sdk/conversation-runtime";
 import { CHANNEL_ID, THREAD_ID_SEPARATOR } from "./constants.js";
 import { createThread } from "./api-fetch.js";
 import { normalizeAccountId } from "./account-id.js";

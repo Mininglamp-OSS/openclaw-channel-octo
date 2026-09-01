@@ -94,6 +94,45 @@ describe("OpenClaw SDK surface", () => {
     expect(offenders, `unexported openclaw subpath(s):\n${offenders.join("\n")}`).toEqual([]);
   });
 
+  it("only imports openclaw subpaths that ship types, unless a local shim covers them", () => {
+    // A subpath can be present in `exports` yet carry only `default` and no
+    // `types` — tsc then fails with TS7016 on a clean checkout. It does NOT fail
+    // locally when a stray node_modules/openclaw sits above the repo, because
+    // resolution walks up and finds that copy's .d.ts. That asymmetry is exactly
+    // how thread-bindings-runtime shipped a build-breaking import: green locally,
+    // red in CI. Checking export shape here catches it without needing a clean
+    // machine.
+    const pkg = JSON.parse(
+      readFileSync(join(repoRoot, "node_modules", "openclaw", "package.json"), "utf8"),
+    ) as { exports?: Record<string, unknown> };
+
+    // Subpaths we knowingly import without host types, each covered by a local
+    // ambient declaration. Keep this list short and justified.
+    const shimmed = new Set(["./plugin-sdk/thread-bindings-runtime"]);
+
+    const imported = new Set<string>();
+    for (const file of sourceFiles) {
+      for (const m of readCode(file).matchAll(
+        /^\s*(?:import|export)[\s\S]*?from\s+"(openclaw(?:\/[^"]*)?)"/gm,
+      )) {
+        const spec = m[1];
+        imported.add(spec === "openclaw" ? "." : "." + spec.slice("openclaw".length));
+      }
+    }
+
+    const untyped: string[] = [];
+    for (const sub of imported) {
+      const entry = pkg.exports?.[sub];
+      const hasTypes = !!entry && typeof entry === "object" && !!(entry as { types?: string }).types;
+      if (!hasTypes && !shimmed.has(sub)) untyped.push(sub);
+    }
+
+    expect(
+      untyped,
+      `openclaw subpath(s) imported without types and without a local shim:\n${untyped.join("\n")}`,
+    ).toEqual([]);
+  });
+
   it("actually covers the e2e host bridge and scripts, not just src/", () => {
     // Pins the blind spot that let a removed-API call ship green.
     const files = sourceFiles.map(rel);
