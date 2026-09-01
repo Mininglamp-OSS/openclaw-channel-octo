@@ -92,7 +92,7 @@ One deployment shape is **not** supported with doc tasks enabled: running the *s
 
 ### Upgrading to OpenClaw 2026.8
 
-2026.8 gates typed hooks for non-bundled plugins — anything installed from ClawHub, including this one — behind two explicit config opt-ins. **A plugin cannot grant these to itself**: consent deliberately lives in the operator's config, so an upgrade leaves them off until you add them.
+2026.8 gates typed hooks for non-bundled plugins — anything installed from ClawHub, including this one — behind a config opt-in. **A plugin cannot grant it to itself**: consent deliberately lives in the operator's config, so an upgrade leaves the hooks blocked until you add this.
 
 ```json
 {
@@ -101,7 +101,6 @@ One deployment shape is **not** supported with doc tasks enabled: running the *s
       "octo": {
         "enabled": true,
         "hooks": {
-          "allowPromptInjection": true,
           "allowConversationAccess": true
         }
       }
@@ -110,14 +109,24 @@ One deployment shape is **not** supported with doc tasks enabled: running the *s
 }
 ```
 
-`allowPromptInjection` governs `before_prompt_build` — the hook this plugin uses to inject the group MD, the member list, and (for persona clones) the persona identity. `allowConversationAccess` governs `before_agent_run`, `llm_output` and `agent_end`, which carry card progress binding and reply finalization.
+`allowConversationAccess` is the one that must be set. For a non-bundled plugin the host requires it to be **explicitly `true`** (`allowConversationAccess === true`); left unset it blocks every typed hook this plugin registers — `before_prompt_build`, `before_agent_run`, `llm_output` and `agent_end` — and its log names this key for each of them.
 
-**The failure mode is silent.** Without the opt-ins the bot still connects and still replies. It simply never receives the group roster, the group MD, or its own persona, so a persona clone answers out of character and nothing in the reply hints at why. The gateway logs one line per blocked hook during startup (`typed hook "before_prompt_build" blocked because ...`) and this plugin logs a warning that names the consequence, but neither interrupts startup — look for them after upgrading.
+There is a second key, `allowPromptInjection`, which gates prompt mutation via `before_prompt_build`. **You do not need to set it**: the host reads it as `allowPromptInjection !== false`, so an unset key already means allowed. Only set it if you want to deliberately turn prompt injection *off*.
+
+**The failure mode is silent.** Without the opt-in the bot still connects and still replies. It simply never receives the group roster, the group MD, or its own persona, so a persona clone answers out of character and nothing in the reply hints at why. The gateway logs one line per blocked hook during startup (`typed hook "before_prompt_build" blocked because ... allowConversationAccess=true`) and this plugin logs a warning that names the consequence, but neither interrupts startup — look for them after upgrading.
 
 Two further migrations belong to OpenClaw itself rather than to this plugin, and the gateway refuses to start until both are done: the config schema retired a number of legacy keys, and the session store moved to SQLite. Run `openclaw doctor --fix` **interactively** for these — under `--non-interactive` it reports the legacy keys without applying anything, since several of the decisions (for example `agents.ownership` on a multi-agent roster) change routing semantics and need a human. Two details worth checking by hand afterwards, because getting them wrong is quiet rather than loud:
 
 - `mcp.servers.*.connectTimeout` / `timeout` were replaced by `connectionTimeoutMs` / `requestTimeoutMs`. The old keys were **seconds**, the new ones are **milliseconds** — a straight rename turns a 45s connect timeout into 45ms and the server never connects.
 - `gateway.nodes.denyCommands` / `allowCommands` became `gateway.nodes.commands.deny` / `.allow`. If those denies were carrying a security policy, confirm the list survived the move.
+
+A third migration is worth calling out here because its symptom points straight at this plugin: a leftover `~/.openclaw/exec-approvals.json` makes every agent run reject with `ExecApprovalsMigrationRequiredError`, and since the rejection happens *after* the message has already been routed, the bot answers `⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。` — the plugin's own dispatch-error fallback. Nothing about it suggests exec approvals, so it reads as an Octo bug. The gateway also logs the cause during startup (`Legacy exec approvals exist at ... Run "openclaw doctor --fix" before using exec approvals`), which is easy to dismiss as a warning about a feature you do not use. `openclaw doctor --fix` migrates it; if the file only carries `version` / `socket` with empty `defaults` and `agents`, moving it aside loses nothing and the gateway rebuilds it.
+
+Also check whether each Octo account has an agent binding. `openclaw doctor --fix` may set `agents.ownership: "explicit"` on a multi-agent roster (it is the only value that describes a roster with no `default: true` marker), and under `explicit` every channel account needs its own binding. Without one, inbound reaches this plugin and then dies in routing with `AgentSelectionRequiredError: ... routing has no explicit owner`, so the bot receives the message and silently answers nothing:
+
+```json
+{ "agentId": "main", "match": { "channel": "octo", "accountId": "<bot_id>" }, "type": "route" }
+```
 
 
 ## Agent tools

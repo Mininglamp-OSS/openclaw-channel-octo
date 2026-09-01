@@ -83,24 +83,30 @@ export function _buildToolAvailabilityHint(messageProvider: string | undefined):
 }
 
 /**
- * OpenClaw 2026.8 gates typed hooks for non-bundled plugins behind two config
- * opt-ins that a plugin cannot grant itself (by design — consent lives in the
- * operator's own config):
+ * OpenClaw 2026.8 gates typed hooks. The host's own resolvers (verified against
+ * 2026.8.1, dist/hook-policy-decisions) are asymmetric:
  *
- *   plugins.entries.octo.hooks.allowPromptInjection    -> before_prompt_build
- *   plugins.entries.octo.hooks.allowConversationAccess -> before_agent_run,
- *                                                         llm_output, agent_end
+ *   resolvePromptInjectionAllowed(policy)
+ *     = policy?.allowPromptInjection !== false
+ *   resolveConversationAccessAllowed(origin, policy)
+ *     = origin === "bundled" ? policy?.allowConversationAccess !== false
+ *                            : policy?.allowConversationAccess === true
  *
- * Missing them degrades the bot SILENTLY: it keeps answering, but without the
- * group roster, the group MD, or — for persona clones — its own identity, so it
- * drops out of character with nothing in the reply hinting at why. The host
- * logs one line per blocked hook, naming the key but not the consequence, which
- * is easy to scroll past among startup noise.
+ * This plugin is non-bundled (installed from ClawHub), so:
  *
- * Returns one operator-facing warning naming only what is actually missing, or
- * undefined when both are granted. Never throws — a malformed config must not
- * take registration down — and when config is unreadable it warns rather than
- * staying quiet: a spurious log line is far cheaper than silent degradation.
+ *   allowConversationAccess must be EXPLICITLY true. Left unset, the host blocks
+ *     the typed hooks and names this key in the log line for every one of them,
+ *     `before_prompt_build` included — which is why a missing opt-in here, not a
+ *     missing allowPromptInjection, is what drops group context and persona.
+ *   allowPromptInjection is allowed by default. Only an explicit `false` turns
+ *     prompt mutation off, so an unset key must never be reported as a problem:
+ *     a warning that fires on a correctly configured deployment just teaches
+ *     operators to ignore warnings.
+ *
+ * Returns one operator-facing warning describing only what is actually wrong, or
+ * undefined when the gating is fine. Never throws — a malformed config must not
+ * take registration down — and an unreadable config warns rather than staying
+ * quiet, since the required opt-in cannot be proven from it.
  */
 export function _buildHookGateWarning(cfg: unknown): string | undefined {
   let hooks: Record<string, unknown> = {};
@@ -111,32 +117,29 @@ export function _buildHookGateWarning(cfg: unknown): string | undefined {
       hooks = entry.hooks as Record<string, unknown>;
     }
   } catch {
-    // Unreadable config — fall through and report both as missing.
+    // Unreadable config — the required opt-in cannot be proven; warn below.
   }
 
-  const missing: string[] = [];
-  if (hooks.allowPromptInjection !== true) missing.push("allowPromptInjection");
-  if (hooks.allowConversationAccess !== true) missing.push("allowConversationAccess");
-  if (missing.length === 0) return undefined;
+  const lines: string[] = [];
 
-  const lines = [
-    `[octo] OpenClaw 2026.8 blocks plugin hooks without an explicit opt-in: ` +
-      `${missing.join(", ")} not set to true under plugins.entries.${PLUGIN_ID}.hooks.`,
-  ];
-  if (missing.includes("allowPromptInjection")) {
+  if (hooks.allowConversationAccess !== true) {
     lines.push(
-      "  - missing allowPromptInjection: group MD, the member list and persona identity " +
-        "never reach the prompt. The bot still replies, so nothing looks broken — " +
-        "persona clones simply answer out of character.",
+      `[octo] plugins.entries.${PLUGIN_ID}.hooks.allowConversationAccess is not true. ` +
+        "OpenClaw 2026.8 blocks every typed hook of a non-bundled plugin without it, " +
+        "before_prompt_build included, so group MD, the member list and persona identity " +
+        "never reach the prompt. The bot still connects and still replies, so nothing looks " +
+        "broken — persona clones simply answer out of character.",
     );
   }
-  if (missing.includes("allowConversationAccess")) {
+
+  if (hooks.allowPromptInjection === false) {
     lines.push(
-      "  - missing allowConversationAccess: conversation hooks stay inert " +
-        "(card progress binding, reply finalization).",
+      `[octo] plugins.entries.${PLUGIN_ID}.hooks.allowPromptInjection is explicitly false, ` +
+        "which disables prompt mutation. Unset it to restore the default (allowed).",
     );
   }
-  return lines.join("\n");
+
+  return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
 // ---------------------------------------------------------------------------

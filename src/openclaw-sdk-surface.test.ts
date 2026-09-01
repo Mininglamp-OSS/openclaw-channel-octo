@@ -18,25 +18,34 @@
  */
 import { describe, it, expect } from "vitest";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..");
 
-/** Every .ts file we ship or test, excluding build output and deps. */
+/**
+ * Every source file we ship, test, or run in CI.
+ *
+ * Scope is the whole point: the first version of this guard walked only
+ * `src/**` plus the two root entries, so `e2e/openclaw-host-plugin/index.mjs`
+ * went on calling the removed `config.loadConfig()` while this test reported
+ * green — a guard with a blind spot is worse than no guard, because it is
+ * trusted. Walk the repo and match every executable extension rather than
+ * enumerating locations, so a new directory or a .mjs is covered by default.
+ */
 function collectSourceFiles(): string[] {
   const out: string[] = [];
+  const CODE = /\.(ts|mts|cts|js|mjs|cjs)$/;
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir)) {
       if (entry === "node_modules" || entry === "dist" || entry.startsWith(".")) continue;
       const full = join(dir, entry);
       if (statSync(full).isDirectory()) walk(full);
-      else if (entry.endsWith(".ts")) out.push(full);
+      else if (CODE.test(entry)) out.push(full);
     }
   };
-  walk(join(repoRoot, "src"));
-  for (const entry of ["index.ts", "setup-entry.ts"]) out.push(join(repoRoot, entry));
+  walk(repoRoot);
   // This file names the forbidden APIs in order to look for them.
   const self = fileURLToPath(import.meta.url);
   return out.filter((f) => f !== self);
@@ -68,6 +77,15 @@ describe("OpenClaw SDK surface", () => {
     }
 
     expect(offenders, `unexported openclaw subpath(s):\n${offenders.join("\n")}`).toEqual([]);
+  });
+
+  it("actually covers the e2e host bridge and scripts, not just src/", () => {
+    // Pins the blind spot that let a removed-API call ship green.
+    const files = sourceFiles.map(rel);
+    expect(files).toContain(join("e2e", "openclaw-host-plugin", "index.mjs"));
+    expect(files.some((f) => f.startsWith("scripts" + sep))).toBe(true);
+    expect(files).toContain("index.ts");
+    expect(files).toContain("setup-entry.ts");
   });
 
   it("never calls the config APIs OpenClaw removed in 2026.8", () => {

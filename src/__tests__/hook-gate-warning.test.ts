@@ -2,71 +2,84 @@ import { describe, it, expect } from "vitest";
 import { _buildHookGateWarning } from "../../index.js";
 
 /**
- * OpenClaw 2026.8 gates typed hooks for non-bundled plugins behind two
- * explicit config opt-ins:
+ * OpenClaw 2026.8 hook gating, per the host's own resolvers
+ * (dist/hook-policy-decisions, verified against 2026.8.1):
  *
- *   plugins.entries.octo.hooks.allowPromptInjection    -> before_prompt_build
- *   plugins.entries.octo.hooks.allowConversationAccess -> before_agent_run,
- *                                                         llm_output, agent_end
+ *   resolvePromptInjectionAllowed(policy)
+ *     = policy?.allowPromptInjection !== false
+ *   resolveConversationAccessAllowed(origin, policy)
+ *     = origin === "bundled" ? policy?.allowConversationAccess !== false
+ *                            : policy?.allowConversationAccess === true
  *
- * A plugin cannot grant itself these (by design — the user must consent in
- * their own config), so the only thing we can do is tell the operator loudly.
+ * So for a non-bundled plugin (anything installed from ClawHub, this one
+ * included):
  *
- * This matters because the failure is SILENT: the bot still answers, it just
- * loses the group roster, the group MD and — for persona clones — its own
- * identity, so it drops out of character. Without a warning that names the
- * consequence, an operator reads the stock host message as harmless noise.
+ *   allowConversationAccess — must be EXPLICITLY true. Left unset, the host
+ *     blocks the typed hooks, and its log names this key for every one of them,
+ *     `before_prompt_build` included.
+ *   allowPromptInjection — allowed by default. ONLY an explicit `false` turns
+ *     prompt mutation off; an unset key is not a problem and must not be
+ *     reported as one.
+ *
+ * Getting this backwards produces a warning that fires forever on a correctly
+ * configured deployment, which trains operators to ignore the warning.
  */
 describe("2026.8 hook gate — operator warning", () => {
   const withHooks = (hooks: unknown) => ({
     plugins: { entries: { octo: { hooks } } },
   });
 
-  it("stays silent when both opt-ins are granted", () => {
-    const w = _buildHookGateWarning(
-      withHooks({ allowPromptInjection: true, allowConversationAccess: true }),
-    );
-    expect(w).toBeUndefined();
+  it("stays silent when allowConversationAccess is granted and promptInjection is left unset", () => {
+    // The correctly-configured minimum: unset allowPromptInjection defaults to
+    // allowed, so there is nothing to report.
+    expect(_buildHookGateWarning(withHooks({ allowConversationAccess: true }))).toBeUndefined();
   });
 
-  it("names allowPromptInjection and the context/persona it silently drops", () => {
-    const w = _buildHookGateWarning(withHooks({ allowConversationAccess: true }));
-    expect(w).toBeDefined();
-    expect(w).toContain("allowPromptInjection");
-    // must state the consequence, not just the missing key
-    expect(w).toMatch(/persona/i);
-    expect(w!.toLowerCase()).toMatch(/group (context|md|roster)|member list/);
-    // the granted one must NOT be reported as missing
-    expect(w).not.toContain("allowConversationAccess");
+  it("stays silent when both are explicitly granted", () => {
+    expect(
+      _buildHookGateWarning(
+        withHooks({ allowConversationAccess: true, allowPromptInjection: true }),
+      ),
+    ).toBeUndefined();
   });
 
-  it("names allowConversationAccess when only that one is missing", () => {
-    const w = _buildHookGateWarning(withHooks({ allowPromptInjection: true }));
+  it("blames the missing allowConversationAccess for the dropped context and persona", () => {
+    const w = _buildHookGateWarning(withHooks({}));
     expect(w).toBeDefined();
     expect(w).toContain("allowConversationAccess");
+    // the consequence, not just the key
+    expect(w).toMatch(/persona/i);
+    expect(w!.toLowerCase()).toMatch(/group (context|md|roster)|member list/);
+    // an operator must be able to act on it
+    expect(w).toContain("plugins.entries.octo.hooks");
+    // an unset allowPromptInjection is fine — never name it as missing
     expect(w).not.toContain("allowPromptInjection");
   });
 
-  it("reports both when neither is granted, and shows where to set them", () => {
-    const w = _buildHookGateWarning(withHooks({}));
-    expect(w).toBeDefined();
-    expect(w).toContain("allowPromptInjection");
-    expect(w).toContain("allowConversationAccess");
-    // an operator must be able to act on it: name the config path
-    expect(w).toContain("plugins.entries.octo.hooks");
-  });
-
-  it("treats an explicit false the same as missing", () => {
+  it("reports an explicitly disabled allowPromptInjection on its own", () => {
     const w = _buildHookGateWarning(
-      withHooks({ allowPromptInjection: false, allowConversationAccess: false }),
+      withHooks({ allowConversationAccess: true, allowPromptInjection: false }),
     );
     expect(w).toBeDefined();
     expect(w).toContain("allowPromptInjection");
+    // conversation access is granted here, so it must not be reported
+    expect(w).not.toContain("allowConversationAccess");
+  });
+
+  it("reports both when conversation access is missing and prompt injection is off", () => {
+    const w = _buildHookGateWarning(withHooks({ allowPromptInjection: false }));
+    expect(w).toBeDefined();
+    expect(w).toContain("allowConversationAccess");
+    expect(w).toContain("allowPromptInjection");
+  });
+
+  it("treats an explicit allowConversationAccess:false as not granted", () => {
+    const w = _buildHookGateWarning(withHooks({ allowConversationAccess: false }));
+    expect(w).toBeDefined();
     expect(w).toContain("allowConversationAccess");
   });
 
   it("never throws on absent or malformed config", () => {
-    // Reading config must never be able to take the plugin's registration down.
     for (const bad of [
       undefined,
       null,
@@ -85,9 +98,7 @@ describe("2026.8 hook gate — operator warning", () => {
     }
   });
 
-  it("warns (rather than staying silent) when config is unreadable", () => {
-    // If we cannot prove the opt-ins are granted, the safer default is to warn:
-    // a spurious warning costs a log line, a missed one costs silent degradation.
+  it("warns when config is unreadable, since the required opt-in cannot be proven", () => {
     expect(_buildHookGateWarning(undefined as never)).toBeDefined();
     expect(_buildHookGateWarning({} as never)).toBeDefined();
   });

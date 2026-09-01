@@ -464,7 +464,7 @@ export default {
           throw new Error("childDelaySeconds must be an integer between 10 and 90");
         }
 
-        const config = api.runtime.config.loadConfig();
+        const config = api.runtime.config.current();
         const accountId = resolveAccountId(
           config,
           typeof params.accountId === "string" ? params.accountId.trim() : "",
