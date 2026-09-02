@@ -17,8 +17,9 @@
  * are checked here against the openclaw actually installed.
  */
 import { describe, it, expect } from "vitest";
-import { readdirSync, readFileSync, lstatSync } from "node:fs";
+import { readdirSync, readFileSync, lstatSync, existsSync } from "node:fs";
 import { join, dirname, sep } from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -107,8 +108,35 @@ describe("OpenClaw SDK surface", () => {
     ) as { exports?: Record<string, unknown> };
 
     // Subpaths we knowingly import without host types, each covered by a local
-    // ambient declaration. Keep this list short and justified.
-    const shimmed = new Set(["./plugin-sdk/thread-bindings-runtime"]);
+    // ambient declaration. Empty by design: prefer a subpath that ships types.
+    //
+    // Every entry MUST be justified by a real, GIT-TRACKED declaration file —
+    // asserted below, not taken on faith. An earlier version of this guard listed
+    // a subpath here on the strength of a shim that `.gitignore` (`*.d.ts`) had
+    // silently kept out of the commit, so the guard passed green while a clean
+    // checkout could not type-check at all. A whitelist that trusts its own
+    // premise reproduces the blind spot this file exists to prevent.
+    const shimmed = new Map<string, string>([
+      // "./plugin-sdk/example": "src/openclaw-example.d.ts",
+    ]);
+
+    for (const [sub, shimPath] of shimmed) {
+      const abs = join(repoRoot, shimPath);
+      expect(
+        existsSync(abs),
+        `shim promised for ${sub} is missing from the working tree: ${shimPath}`,
+      ).toBe(true);
+      // Present on disk is not enough — CI only ever sees tracked files.
+      const tracked = spawnSync("git", ["ls-files", "--error-unmatch", shimPath], {
+        cwd: repoRoot,
+        encoding: "utf8",
+      });
+      expect(
+        tracked.status,
+        `shim for ${sub} exists but is NOT tracked by git (${shimPath}) — ` +
+          "a clean checkout would not have it; check .gitignore",
+      ).toBe(0);
+    }
 
     const imported = new Set<string>();
     for (const file of sourceFiles) {

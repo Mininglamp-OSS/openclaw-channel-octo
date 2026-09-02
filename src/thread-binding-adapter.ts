@@ -27,17 +27,18 @@
  * session would be useless. Future iterations can adopt the SDK's
  * `createAccountScopedConversationBindingManager` for disk-backed records.
  */
+// All four names come from conversation-runtime, which ships a `types` condition
+// declaring both functions (`export declare function`) and both types, on 2026.6.9
+// as well as 2026.8.1. The thread-bindings-runtime subpath still re-exports the
+// two functions at runtime, but its 2026.8.1 export entry carries only `default`
+// with no `.d.ts`, so importing from there fails a clean type-check with TS7016 —
+// invisible locally whenever a stray node_modules/openclaw sits above the repo and
+// supplies declarations. Using the typed subpath needs no local shim at all.
 import {
   registerSessionBindingAdapter,
   unregisterSessionBindingAdapter,
-} from "openclaw/plugin-sdk/thread-bindings-runtime";
-// The types come from conversation-runtime, which ships declarations for them;
-// thread-bindings-runtime exports only `default` (no `types`) as of 2026.8.1, so
-// its two functions are typed by a local shim instead — see
-// openclaw-thread-bindings-runtime.d.ts.
-import type {
-  SessionBindingAdapter,
-  SessionBindingRecord,
+  type SessionBindingAdapter,
+  type SessionBindingRecord,
 } from "openclaw/plugin-sdk/conversation-runtime";
 import { CHANNEL_ID, THREAD_ID_SEPARATOR } from "./constants.js";
 import { createThread } from "./api-fetch.js";
