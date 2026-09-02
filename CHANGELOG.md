@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.1] - 2026-09-02
+
+### Fixed
+
+- **升级 OpenClaw 到 2026.8 后 bot 完全收不到消息**（#226, #228, PR #227）：症状很有辨识度 —— **出站正常、入站全断**：bot 能主动发消息、IM 里显示在线，却不响应任何群聊或私聊；重跑 `create-openclaw-octo bind` 无效；同一插件版本在低版本 OpenClaw 的机器上正常。「能发不能收」是根因的直接映射：出站路径不读 config，而入站在 `handleInboundMessage` 里读 config 时抛 `TypeError`，消息在管线中途被丢掉，既没有回复也没有报错。两处独立的 SDK surface 变更叠加：
+  - `PluginRuntime.config.loadConfig()` 在 2026.6 标记 deprecated、2026.8 彻底移除，只余 `current()`。inbound 路径有 4 处调用它。改用 `current()` —— 该方法自 2026.6 即存在，因此 peer dep 下限 `>=2026.6.9` **无需上调**
+  - bare 聚合 subpath `openclaw/plugin-sdk` 在 2026.8 被移除，10 个文件从它导入类型。这一条更隐蔽：模块解析会沿目录树向上，命中仓库之外任何一份 `node_modules/openclaw` 并**静默按那份老副本做类型检查**，于是本地 `type-check` 反而"通过"，只有干净检出（CI、新机器）才会 module-not-found。改为按语义拆到 versioned subpath：类型走 `plugin-sdk/core` 与 `plugin-sdk/plugin-entry`，`ChannelMessageActionAdapter` 归 `plugin-sdk/channel-contract`
+- **`plugin-sdk/thread-bindings-runtime` 在 2026.8.1 不再提供类型声明**（PR #227）：该 subpath 仍在 `exports` 里，但 entry 只有 `default`、没有 `types`，从它导入会让干净检出以 `TS7016` 失败，并连带把每一处流过 `SessionBindingRecord` 的地方报成 `'ref' is of type 'unknown'` —— 同样被上层 `node_modules` 的穿透掩盖，本地看不见。四个 SessionBinding 名称改从 `plugin-sdk/conversation-runtime` 导入：它在 2026.6.9 与 2026.8.1 上都带 `types` 条件、并以 `export declare function` 声明了那两个函数，因此不需要任何本地声明文件，也就不会与宿主定义漂移。运行时行为不变 —— 两个 subpath 在两个版本上都从同一个 `session-binding-service-*` chunk 取这两个函数，是同一个注册表实例
+- **缺少 `allowConversationAccess` 时功能静默残缺，此前无任何提示**（PR #227）：OpenClaw 把 non-bundled 插件（经 ClawHub 安装的都算，本插件在内）的 conversation hook 放在一个配置开关之后，而**插件无权给自己授权** —— 同意权按设计留在运维的 config 里。这道门槛**并非 2026.8 新增**：本插件声明的 peer 下限 `2026.6.9` 就已内联同样的 gate（`dist/registry-*.js`，连诊断文案都字节一致）；2026.8 只是把它提取成具名 `resolveConversationAccessAllowed`，并**扩大了 `conversationHookNameSet` 的成员**（7 → 9，新增 `agent_turn_prepare` 与 `before_prompt_build`）。对照本插件九处 hook 注册：
+  - 所有受支持版本 —— `before_agent_run` / `llm_output` / `agent_end` 被拦，交互卡片进度静默降级（进度绑定、流式、收尾三者一起失效）
+  - 2026.8 起额外 —— `before_prompt_build` 被拦，群 MD、成员列表、persona 身份不再进入 prompt，persona clone 直接跳出角色
+  - 其余五个（`before_reset` / `before_tool_call` / `after_tool_call` / `model_call_started` / `model_call_ended`）不属 conversation hook，从不受影响
+  - 现在 `registerFull` 注册 hook 前读一次 config，把确实缺失的开关连同各自后果播报出来；告警在**每个受支持版本**都发，只有措辞随版本区分后果。诊断包在 try/catch 里，config 畸形或 `current()` 抛错都不会带倒插件注册
+- README 增加升级须知：给出可直接粘贴的配置片段，并记下几处**症状指向本插件、根因却在 OpenClaw 自身迁移**的坑 —— 残留的 `~/.openclaw/exec-approvals.json` 会让 agent 运行以 `ExecApprovalsMigrationRequiredError` 拒绝，而拒绝发生在消息**已经路由之后**，于是 bot 回一句本插件的兜底道歉、看不出与 exec approvals 有关；`agents.ownership: "explicit"` 下每个 channel 账号都需要自己的 binding，否则 inbound 进了插件却死在路由、静默不答；`mcp.servers.*.connectTimeout` / `timeout` 换成 `connectionTimeoutMs` / `requestTimeoutMs` 时旧键是**秒**、新键是**毫秒**，直接改名会把 45s 变成 45ms；`gateway.nodes.denyCommands` / `allowCommands` 移到 `gateway.nodes.commands.deny` / `.allow`
+
+### Internal
+
+- 新增 `openclaw-sdk-surface.test.ts`：把上述两类 SDK 漏洞变成常驻断言 —— 所有 openclaw import 的 subpath 必须在**实际安装版本**的 `exports` 里、且必须 ships types（无 types 者需登记在自校验的 shim 白名单中，每个条目都要通过 `existsSync` 与 `git ls-files` 双重检查），且不得调用已移除的 config API。扫描覆盖全仓可执行源码（含 e2e bridge 的 `.mjs` 与 `scripts/`）而非只有 `src/**.ts`，匹配器覆盖单/双引号、动态 `import()` 与 `require()` 四种形式：带盲区的守卫比没有守卫更糟，因为它会被信任
+- 新增 `inbound-config-freshness.test.ts`：钉住 #68 的不变量 —— 每条入站消息都重新向 runtime 取 config，并把热重载后的新对象原样交给 `resolveAgentRoute`。`loadConfig()`（每次读盘必得新对象）与 `current()`（进程内快照）语义并不等价，而 routing 层按 config 对象做 WeakMap 记忆，此前没有任何测试锚定这一点
+- e2e host bridge 改用 `config.current()`
+- devDependency `openclaw` 升到 `^2026.8.1`（peer 范围不变）
+
 ## [1.4.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.3.0...v1.4.0) (2026-08-24)
 
 

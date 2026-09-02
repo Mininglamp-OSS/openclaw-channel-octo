@@ -15,6 +15,37 @@ PR 的 commit message 用 [Conventional Commits](https://www.conventionalcommits
 
 **关键**：commit message 前缀直接决定下次发什么版本号，认真写。
 
+### ⚠️ commit message 里的括号必须在同一行闭合
+
+conventional-commits parser 解析整条 commit message（标题 **加 body**）。遇到 `(` 就等 `)`，
+中间碰到换行会直接抛 `unexpected token '\n' ... valid tokens [)]`，**整条 message 解析失败**。
+
+后果是静默的：release-please 把这条 commit 算作「无法解析」，于是
+
+```
+❯ commits: 0
+✔ Considering: 0 commits
+✔ No commits for path: ., skipping
+```
+
+workflow 仍然 **conclusion=success**，但 release PR 根本不会出现，看起来就像自动发版坏了。
+1.4.1 就是这么撞上的：某条 commit body 里为了排版把 `(.ts/.mts/.cts/` 的括号折了行，
+squash 之后毁掉整次扫描，只能改走本文末尾的手动 override 路径。
+
+所以写 commit body 时，**宁可让那行超长，也不要把括号拆到两行**：
+
+```
+✅ 匹配全部可执行扩展名(.ts/.mts/.cts/.js/.mjs/.cjs)，这样新目录默认也在范围内
+❌ 匹配全部可执行扩展名(.ts/.mts/.cts/
+   .js/.mjs/.cjs)，这样新目录默认也在范围内
+```
+
+merge 之后可以顺手确认一眼，比事后补救便宜：
+
+```bash
+gh run view <release-please run id> --log | grep -E "could not be parsed|Considering:"
+```
+
 ---
 
 ## 想发版时（4 步）
