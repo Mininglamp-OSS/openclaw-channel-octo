@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.4.1] - 2026-09-02
+## [1.4.1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.4.0...v1.4.1) (2026-09-02)
 
 ### Fixed
 
