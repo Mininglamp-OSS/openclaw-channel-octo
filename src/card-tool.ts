@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { listOctoAccountIds, resolveOctoAccount } from "./accounts.js";
 import { sendCardMessage, sendMessage, type CardProfileManifest } from "./api-fetch.js";

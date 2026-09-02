@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import type { ChannelLogSink } from "openclaw/plugin-sdk/channel-contract";
 import type { ReplyPayload, ReplyDispatchKind } from "openclaw/plugin-sdk/reply-runtime";
 import type { ReplyDispatcherWithTypingOptions } from "openclaw/plugin-sdk/reply-runtime";
@@ -1688,7 +1688,7 @@ export async function handleInboundMessage(params: {
     let threadAgentId = "";
     try {
       const _core = getOctoRuntime();
-      const _cfg = _core.config.loadConfig() as OpenClawConfig;
+      const _cfg = _core.config.current() as OpenClawConfig;
       const _route = _core.channel.routing.resolveAgentRoute({
         cfg: _cfg, channel: CHANNEL_ID, accountId: account.accountId,
         peer: { kind: "group", id: message.channel_id },
@@ -1736,7 +1736,7 @@ export async function handleInboundMessage(params: {
     // Resolve agentId for the group→account mapping
     try {
       const _core = getOctoRuntime();
-      const _cfg = _core.config.loadConfig() as OpenClawConfig;
+      const _cfg = _core.config.current() as OpenClawConfig;
       const _route = _core.channel.routing.resolveAgentRoute({
         cfg: _cfg, channel: CHANNEL_ID, accountId: account.accountId,
         peer: { kind: "group", id: message.channel_id },
@@ -2214,7 +2214,7 @@ export async function handleInboundMessage(params: {
       let wmStartedAt: number | undefined;
       try {
         const wmCore = getOctoRuntime();
-        const wmConfig = wmCore.config.loadConfig() as OpenClawConfig;
+        const wmConfig = wmCore.config.current() as OpenClawConfig;
         const wmRoute = wmCore.channel.routing.resolveAgentRoute({
           cfg: wmConfig,
           channel: CHANNEL_ID,
@@ -2321,7 +2321,7 @@ export async function handleInboundMessage(params: {
     return;
   }
 
-  const config = core.config.loadConfig() as OpenClawConfig;
+  const config = core.config.current() as OpenClawConfig;
 
   let route;
   try {

@@ -14,8 +14,7 @@
  * openclaw CLI — ClawScan blocks `child_process` imports on install.
  */
 
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -28,7 +27,7 @@ import { octoPlugin } from "./src/channel.js";
 import { createOctoManagementTools } from "./src/agent-tools.js";
 import { createDisplayCardTool } from "./src/card-display-tool.js";
 import { createInteractiveCardTool } from "./src/card-tool.js";
-import { CHANNEL_ID, DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./src/constants.js";
+import { CHANNEL_ID, PLUGIN_ID, DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./src/constants.js";
 import { bindCardRun, registerCardProgress } from "./src/card-progress.js";
 
 // ---------------------------------------------------------------------------
@@ -81,6 +80,101 @@ export const OCTO_TOOL_AVAILABILITY_HINT =
  */
 export function _buildToolAvailabilityHint(messageProvider: string | undefined): string | null {
   return messageProvider === CHANNEL_ID ? OCTO_TOOL_AVAILABILITY_HINT : null;
+}
+
+/**
+ * Whether this host also gates `before_prompt_build`.
+ *
+ * The opt-in gate itself is NOT new in 2026.8 — openclaw@2026.6.9, the declared
+ * peer floor, already inlines it in dist/registry-*.js and refuses to register a
+ * non-bundled plugin's conversation hooks without `allowConversationAccess ===
+ * true`. What 2026.8 changed is the MEMBERSHIP of `conversationHookNameSet`:
+ *
+ *   2026.6.9 (7): before_model_resolve, before_agent_reply, llm_input,
+ *                 llm_output, before_agent_finalize, agent_end, before_agent_run
+ *   2026.8.1 (9): the same, plus agent_turn_prepare and before_prompt_build
+ *
+ * So the version only decides WHICH consequences to describe, never whether to
+ * warn. An unreadable version assumes the wider 2026.8 set: describing the worse
+ * case is safer than under-reporting it.
+ */
+function _hostGatesPromptBuildHook(hostVersion: string | undefined): boolean {
+  const m = /^(\d{4})\.(\d+)/.exec((hostVersion ?? "").trim());
+  if (!m) return true;
+  const year = Number(m[1]);
+  const minor = Number(m[2]);
+  if (!Number.isFinite(year) || !Number.isFinite(minor)) return true;
+  return year > 2026 || (year === 2026 && minor >= 8);
+}
+
+/**
+ * Operator-facing warning about the non-bundled hook opt-in.
+ *
+ * `allowConversationAccess` must be explicitly `true` (the host requires exactly
+ * that for a non-bundled plugin; see _hostGatesPromptBuildHook for why every
+ * supported host enforces it). Of this plugin's nine hook registrations, three
+ * are gated on every supported host — `before_agent_run`, `llm_output`,
+ * `agent_end`, which together carry interactive card progress — and 2026.8+ gates
+ * `before_prompt_build` as well, which is what feeds group MD, the member list
+ * and persona identity into the prompt. The remaining five (`before_reset`,
+ * `before_tool_call`, `after_tool_call`, `model_call_started`,
+ * `model_call_ended`) are not conversation hooks and are never affected, so the
+ * message must not claim that "every" hook is blocked.
+ *
+ * `allowPromptInjection` is asymmetric: the host reads it as `!== false`, so an
+ * unset key already means allowed and must never be reported as missing.
+ *
+ * Returns one warning describing only what is actually wrong, or undefined when
+ * the gating is fine. Never throws — a malformed config must not take
+ * registration down — and an unreadable config warns rather than staying quiet,
+ * since the required opt-in cannot be proven from it.
+ */
+export function _buildHookGateWarning(
+  cfg: unknown,
+  hostVersion?: string,
+): string | undefined {
+  let hooks: Record<string, unknown> = {};
+  try {
+    const entry = (cfg as { plugins?: { entries?: Record<string, { hooks?: unknown }> } })
+      ?.plugins?.entries?.[PLUGIN_ID];
+    if (entry?.hooks && typeof entry.hooks === "object") {
+      hooks = entry.hooks as Record<string, unknown>;
+    }
+  } catch {
+    // Unreadable config — the required opt-in cannot be proven; warn below.
+  }
+
+  const lines: string[] = [];
+
+  if (hooks.allowConversationAccess !== true) {
+    lines.push(
+      `[octo] plugins.entries.${PLUGIN_ID}.hooks.allowConversationAccess is not true. ` +
+        "OpenClaw blocks a non-bundled plugin's conversation hooks without it, so this " +
+        "plugin's before_agent_run, llm_output and agent_end never register — interactive " +
+        "card progress degrades silently (no run binding, no streaming, no finalization).",
+    );
+    if (_hostGatesPromptBuildHook(hostVersion)) {
+      lines.push(
+        "  - this host also gates before_prompt_build: group MD, the member list and " +
+          "persona identity never reach the prompt. The bot still connects and still " +
+          "replies, so nothing looks broken — persona clones simply answer out of character.",
+      );
+    } else {
+      lines.push(
+        "  - before_prompt_build is not gated on this host, so group context and persona " +
+          "injection still work; upgrading to 2026.8 or later gates them too.",
+      );
+    }
+  }
+
+  if (hooks.allowPromptInjection === false) {
+    lines.push(
+      `[octo] plugins.entries.${PLUGIN_ID}.hooks.allowPromptInjection is explicitly false, ` +
+        "which disables prompt mutation. Unset it to restore the default (allowed).",
+    );
+  }
+
+  return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +299,20 @@ export default defineBundledChannelEntry({
 
     setOctoRuntime(api.runtime);
     api.registerChannel({ plugin: octoPlugin });
+
+    // 2026.8 gates the hooks below behind config opt-ins we cannot grant
+    // ourselves. Surface it here with the consequence spelled out: the host's
+    // own per-hook message names the key but not what breaks, and the failure
+    // is silent (the bot keeps replying, just without group context/persona).
+    try {
+      const gateWarning = _buildHookGateWarning(
+        api.runtime.config.current(),
+        api.runtime.version,
+      );
+      if (gateWarning) console.warn(gateWarning);
+    } catch {
+      // A diagnostic must never be able to break registration.
+    }
 
     console.log('[octo] registering before_prompt_build hook');
     api.on('before_prompt_build', (_event, ctx) => {

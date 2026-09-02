@@ -96,7 +96,7 @@ function installRuntime(config: Record<string, unknown> = {}, deliver = false) {
     if (deliver) await args.dispatcherOptions.deliver({ text: "hi" }, { kind: "final" });
   });
   setOctoRuntime({
-    config: { loadConfig: () => config },
+    config: { current: () => config },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,

@@ -281,7 +281,7 @@ describe("channel.ts:回帖打到文档域,不是 IM 域", () => {
     });
     const { setOctoRuntime } = await import("./runtime.js");
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => {
@@ -335,7 +335,7 @@ describe("channel.ts:会话冲突回执走评论区,不走发起人私聊", () =
     const { setOctoRuntime } = await import("./runtime.js");
     // dispatch 抛 core 的会话初始化冲突 —— channel.ts 的冲突分支由它触发。
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => {
@@ -418,7 +418,7 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
   it("会话冲突回执 ⇒ status=question", async () => {
     const { setOctoRuntime } = await import("./runtime.js");
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => {
@@ -460,7 +460,7 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
     const { setOctoRuntime } = await import("./runtime.js");
     // dispatch 正常返回但什么都没发 ⇒ handler 走 userLeftHanging 兜底。
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => {}),

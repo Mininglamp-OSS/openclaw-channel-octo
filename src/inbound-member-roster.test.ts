@@ -62,7 +62,7 @@ function installRuntimeStub() {
     await args.dispatcherOptions.deliver({ text: "hi" }, { kind: "final" });
   });
   setOctoRuntime({
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,

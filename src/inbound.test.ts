@@ -31,7 +31,6 @@ import {
 import { extractMentionUids, parseStructuredMentions } from "./mention-utils.js";
 import { isForkCommandHistoryMessage } from "./commands/fork-history-filter.js";
 import type { GroupMember } from "./api-fetch.js";
-import { normalizeMediaAttachments } from "openclaw/plugin-sdk/media-runtime";
 import { existsSync, unlinkSync, readFileSync } from "node:fs";
 
 /**
@@ -1387,15 +1386,18 @@ describe("isRemoteMediaUrl", () => {
 });
 
 /**
- * Integration-style test: assert the inbound media payload built
- * by inbound.ts (MediaPaths / MediaUrls / MediaTypes) flows correctly through
- * Core's REAL normalizeMediaAttachments (= normalizeAttachments). This guards the
- * all-or-nothing contract directly against Core: all-local goes through the fs
- * (path) branch; any mixed-fail emits NO MediaPaths and every attachment is a
- * remote-URL attachment via the URL branch — so neither Core consumer ever sees
- * a sparse array or a bare local path in the http path.
+ * Guards the all-or-nothing shape of the inbound media payload built by
+ * inbound.ts (MediaPaths / MediaUrls / MediaTypes): all-local emits a full
+ * MediaPaths array; ANY failed download emits NO MediaPaths at all, so a
+ * consumer never sees a sparse array or a bare local path on the http path,
+ * and MediaUrls keeps every reference in original order.
+ *
+ * This used to additionally run the payload through Core's exported
+ * normalizeMediaAttachments to assert Core agreed. OpenClaw 2026.8 no longer
+ * exports that helper from any public subpath (attachment normalization moved
+ * Core-internal), so the payload-shape contract is asserted on our side only.
  */
-describe("inbound media payload × Core normalizeMediaAttachments (#59 all-or-nothing)", () => {
+describe("inbound media payload shape (#59 all-or-nothing)", () => {
   // Mirror the exact MediaPaths/MediaUrls/MediaTypes the inbound payload builds
   // from the per-image download outcome (localPath set ⇒ success, undefined ⇒ fail).
   const buildPayload = (items: { localPath?: string; remoteUrl: string }[]) => {
@@ -1420,12 +1422,6 @@ describe("inbound media payload × Core normalizeMediaAttachments (#59 all-or-no
       "/tmp/openclaw/octo-media/b.png",
     ]);
 
-    const attachments = normalizeMediaAttachments(payload as never);
-    expect(attachments).toHaveLength(2);
-    expect(attachments.map((x) => x.path)).toEqual([
-      "/tmp/openclaw/octo-media/a.jpg",
-      "/tmp/openclaw/octo-media/b.png",
-    ]);
   });
 
   it("[local, remote-fail]: MediaPaths undefined, both flow as remote-URL attachments", () => {
@@ -1441,14 +1437,6 @@ describe("inbound media payload × Core normalizeMediaAttachments (#59 all-or-no
       "https://cdn.example.com/b.png",
     ]);
 
-    const attachments = normalizeMediaAttachments(payload as never);
-    expect(attachments).toHaveLength(2);
-    expect(attachments.every((x) => x.path === undefined)).toBe(true);
-    expect(attachments.map((x) => x.url)).toEqual([
-      "https://cdn.example.com/a.jpg",
-      "https://cdn.example.com/b.png",
-    ]);
-    expect(attachments.map((x) => x.index)).toEqual([0, 1]);
   });
 
   it("[remote-fail, local]: order preserved, MediaPaths still undefined", () => {
@@ -1463,13 +1451,6 @@ describe("inbound media payload × Core normalizeMediaAttachments (#59 all-or-no
       "https://cdn.example.com/b.jpg",
     ]);
 
-    const attachments = normalizeMediaAttachments(payload as never);
-    expect(attachments).toHaveLength(2);
-    expect(attachments.every((x) => x.path === undefined)).toBe(true);
-    expect(attachments.map((x) => x.url)).toEqual([
-      "https://cdn.example.com/a.png",
-      "https://cdn.example.com/b.jpg",
-    ]);
   });
 
   it("all-failed (every remote): Core takes the URL branch, references survive", () => {
@@ -1479,13 +1460,6 @@ describe("inbound media payload × Core normalizeMediaAttachments (#59 all-or-no
     ];
     const payload = buildPayload(items);
     expect(payload.MediaPaths).toBeUndefined();
-    const attachments = normalizeMediaAttachments(payload as never);
-    expect(attachments).toHaveLength(2);
-    expect(attachments.every((x) => x.path === undefined)).toBe(true);
-    expect(attachments.map((x) => x.url)).toEqual([
-      "https://cdn.example.com/a.png",
-      "http://cdn.example.com/b.png",
-    ]);
   });
 
   it("MediaPaths never contains a non-string element in any download outcome", () => {

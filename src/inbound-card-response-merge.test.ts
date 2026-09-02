@@ -142,7 +142,7 @@ function installRuntime(
 ) {
   setOctoRuntime({
     config: {
-      loadConfig: () => opts.reasoningVisibility && opts.reasoningVisibility !== "off"
+      current: () => opts.reasoningVisibility && opts.reasoningVisibility !== "off"
         ? { agents: { defaults: { reasoningDefault: opts.reasoningVisibility } } }
         : {},
     },

@@ -174,7 +174,7 @@ function installHangingRuntime(): { dispatch: ReturnType<typeof vi.fn> } {
     await new Promise<void>(() => {}); // never resolves, never rejects
   });
   setOctoRuntime({
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,
@@ -205,7 +205,7 @@ function installImmediateRuntime(
     }
   });
   setOctoRuntime({
-    config: { loadConfig: () => opts?.config ?? {} },
+    config: { current: () => opts?.config ?? {} },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,
@@ -303,7 +303,7 @@ describe("dispatch timeout guard (issue #75)", () => {
       await new Promise<void>(() => {}); // 随后挂死
     });
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: dispatch,
@@ -333,7 +333,7 @@ describe("dispatch timeout guard (issue #75)", () => {
       await new Promise<void>(() => {});
     });
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: dispatch,
@@ -411,7 +411,7 @@ describe("dispatch timeout guard (issue #75)", () => {
       await args.dispatcherOptions.deliver({ text: "buffered-final" }, { kind: "block" });
     });
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: dispatch,
@@ -455,7 +455,7 @@ describe("dispatch-reject fallback guard (PR #152 regression)", () => {
       throw new Error("non_deliverable_terminal_turn");
     });
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: dispatch,
@@ -494,7 +494,7 @@ describe("dispatch-reject fallback guard (PR #152 regression)", () => {
       throw new Error("non_deliverable_terminal_turn");
     });
     setOctoRuntime({
-      config: { loadConfig: () => ({}) },
+      config: { current: () => ({}) },
       channel: {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: dispatch,

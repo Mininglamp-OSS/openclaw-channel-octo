@@ -77,7 +77,7 @@ function installRuntimeStub(): { dispatch: ReturnType<typeof vi.fn> } {
     await args.dispatcherOptions.deliver({ text: "hi there" }, { kind: "final" });
   });
   setOctoRuntime({
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,

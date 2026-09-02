@@ -81,7 +81,7 @@ function installRuntime(finalText = "已按要求改写完成") {
   const resolveAgentRoute = vi.fn(() => ({ agentId: "agent1", sessionKey: "sk-default", accountId: "acct1" }));
   const finalizeInboundContext = vi.fn((ctx: any) => ctx);
   setOctoRuntime({
-    config: { loadConfig: () => ({}) },
+    config: { current: () => ({}) },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,

@@ -50,17 +50,21 @@ function makeAdapterContext() {
 // shape from the SDK and construct a fresh bind input ourselves using
 // the same registry the SDK uses.
 
+// conversation-runtime is the subpath that ships types for these (see
+// thread-binding-adapter.ts) — thread-bindings-runtime has no `.d.ts` on 2026.8.1.
 import {
   registerSessionBindingAdapter,
   unregisterSessionBindingAdapter,
   type SessionBindingAdapter,
-} from "openclaw/plugin-sdk/thread-bindings-runtime";
+} from "openclaw/plugin-sdk/conversation-runtime";
 
 // Helper: capture the registered adapter so tests can call its methods.
 // We replace the SDK's register fn via vi.mock for the duration of the test.
 let _capturedAdapter: SessionBindingAdapter | null = null;
 
-vi.mock("openclaw/plugin-sdk/thread-bindings-runtime", async (importActual) => {
+// Must name the SAME specifier the code under test imports, or the mock never
+// applies: thread-binding-adapter.ts now uses conversation-runtime.
+vi.mock("openclaw/plugin-sdk/conversation-runtime", async (importActual) => {
   const actual = (await importActual()) as Record<string, unknown>;
   return {
     ...actual,

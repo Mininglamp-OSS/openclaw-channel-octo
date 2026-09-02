@@ -1,9 +1,11 @@
 import type {
   ChannelPlugin,
   OpenClawConfig,
+} from "openclaw/plugin-sdk/core";
+import type {
+  ChannelOutboundContext,
   ChannelMessageActionAdapter,
-} from "openclaw/plugin-sdk";
-import type { ChannelOutboundContext } from "openclaw/plugin-sdk/channel-contract";
+} from "openclaw/plugin-sdk/channel-contract";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
 import { createHeartbeatLoop } from "./heartbeat.js";
 import { createConnectionWatchdog } from "./connection-watchdog.js";

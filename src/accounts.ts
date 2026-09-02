@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
 import type { OctoConfig } from "./config-schema.js";
 import { getChannelConfig } from "./constants.js";

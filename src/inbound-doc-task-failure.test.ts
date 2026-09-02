@@ -93,7 +93,7 @@ type DispatchDriver = (args: any) => Promise<void>;
 function installRuntime(drive: DispatchDriver, openClawConfig: Record<string, unknown> = {}) {
   const dispatch = vi.fn(drive);
   setOctoRuntime({
-    config: { loadConfig: () => openClawConfig },
+    config: { current: () => openClawConfig },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,

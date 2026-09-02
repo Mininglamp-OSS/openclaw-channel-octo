@@ -13,7 +13,7 @@
  * 决策:关联键 sessionKey;Registry 编辑用单调 card_seq 串行提交;卡仅承载进度/状态
  * (C2,答案走文本);OBO(persona-clone)场景跳过(服务端拒 type-17 OBO,Decision 2b)。
  */
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { ChannelType } from "./types.js";
 import {
   editTemplateCardMessage,
