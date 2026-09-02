@@ -2,104 +2,143 @@ import { describe, it, expect } from "vitest";
 import { _buildHookGateWarning } from "../../index.js";
 
 /**
- * OpenClaw 2026.8 hook gating, per the host's own resolvers
- * (dist/hook-policy-decisions, verified against 2026.8.1):
+ * OpenClaw's non-bundled hook opt-in, as actually shipped.
  *
- *   resolvePromptInjectionAllowed(policy)
- *     = policy?.allowPromptInjection !== false
- *   resolveConversationAccessAllowed(origin, policy)
- *     = origin === "bundled" ? policy?.allowConversationAccess !== false
- *                            : policy?.allowConversationAccess === true
+ * The gate is NOT new in 2026.8. It exists at the declared peer floor already —
+ * openclaw@2026.6.9 inlines it in `dist/registry-*.js`:
  *
- * So for a non-bundled plugin (anything installed from ClawHub, this one
- * included):
+ *   if (isConversationHookName(effectiveHookName)) {
+ *     const explicitConversationAccess = policy?.allowConversationAccess;
+ *     if (record.origin !== "bundled" && explicitConversationAccess !== true) {
+ *       pushDiagnostic({ ... "blocked because non-bundled plugins must set
+ *                        plugins.entries.<id>.hooks.allowConversationAccess=true" });
+ *       return;   // the hook is not registered
+ *     }
  *
- *   allowConversationAccess — must be EXPLICITLY true. Left unset, the host
- *     blocks the typed hooks, and its log names this key for every one of them,
- *     `before_prompt_build` included.
- *   allowPromptInjection — allowed by default. ONLY an explicit `false` turns
- *     prompt mutation off; an unset key is not a problem and must not be
- *     reported as one.
+ * 2026.8 only extracted that into a named `resolveConversationAccessAllowed`
+ * helper and WIDENED the gated set. `conversationHookNameSet`:
  *
- * Getting this backwards produces a warning that fires forever on a correctly
- * configured deployment, which trains operators to ignore the warning.
+ *   2026.6.9 (7): before_model_resolve, before_agent_reply, llm_input,
+ *                 llm_output, before_agent_finalize, agent_end, before_agent_run
+ *   2026.8.1 (9): the same, plus agent_turn_prepare and before_prompt_build
+ *
+ * Of this plugin's nine hook registrations, that means:
+ *
+ *   every supported host — agent_end, before_agent_run, llm_output are gated,
+ *     so interactive card progress degrades (run binding, streaming, finalization)
+ *   2026.8+ additionally — before_prompt_build is gated, so group MD, the member
+ *     list and persona identity stop reaching the prompt
+ *
+ * Hence the warning must fire on EVERY supported host; only its description of
+ * the consequences varies by version. Suppressing it below 2026.8 would silence a
+ * true positive across the lower half of the supported peer range.
+ *
+ * The second key, allowPromptInjection, is asymmetric and default-allowed
+ * (`!== false`): only an explicit false disables prompt mutation, so an unset key
+ * must never be reported as a problem.
  */
-describe("2026.8 hook gate — operator warning", () => {
+describe("non-bundled hook opt-in — operator warning", () => {
   const withHooks = (hooks: unknown) => ({
     plugins: { entries: { octo: { hooks } } },
   });
+  const V_OLD = "2026.6.9";
+  const V_MID = "2026.7.2";
+  const V_NEW = "2026.8.1";
 
-  it("stays silent when allowConversationAccess is granted and promptInjection is left unset", () => {
-    // The correctly-configured minimum: unset allowPromptInjection defaults to
-    // allowed, so there is nothing to report.
-    expect(_buildHookGateWarning(withHooks({ allowConversationAccess: true }))).toBeUndefined();
+  it("stays silent when allowConversationAccess is granted, on every host", () => {
+    for (const v of [V_OLD, V_MID, V_NEW, undefined]) {
+      expect(
+        _buildHookGateWarning(withHooks({ allowConversationAccess: true }), v as never),
+        `host ${String(v)}`,
+      ).toBeUndefined();
+    }
   });
 
-  it("stays silent when both are explicitly granted", () => {
+  it("stays silent when both keys are explicitly granted", () => {
     expect(
       _buildHookGateWarning(
         withHooks({ allowConversationAccess: true, allowPromptInjection: true }),
+        V_NEW,
       ),
     ).toBeUndefined();
   });
 
-  it("blames the missing allowConversationAccess for the dropped context and persona", () => {
-    const w = _buildHookGateWarning(withHooks({}));
+  it("warns on hosts at the peer floor, where card-progress hooks are already gated", () => {
+    // Regression guard: an earlier version suppressed this below 2026.8 on the
+    // false premise that older hosts do not gate. They do.
+    for (const v of [V_OLD, V_MID]) {
+      const w = _buildHookGateWarning(withHooks({}), v);
+      expect(w, `host ${v}`).toBeDefined();
+      expect(w).toContain("allowConversationAccess");
+      // names the hooks this host actually blocks
+      expect(w).toContain("before_agent_run");
+      expect(w!.toLowerCase()).toMatch(/card progress|card-progress/);
+      // must NOT claim group context / persona are lost — not gated on these
+      // hosts. Saying they still work is correct and useful; claiming they broke
+      // would be the false positive.
+      expect(w!.toLowerCase()).toContain("still work");
+      expect(w).not.toMatch(/never reach the prompt|out of character/i);
+    }
+  });
+
+  it("warns on 2026.8+ and adds the group-context and persona consequence", () => {
+    const w = _buildHookGateWarning(withHooks({}), V_NEW);
     expect(w).toBeDefined();
     expect(w).toContain("allowConversationAccess");
-    // the consequence, not just the key
+    expect(w).toContain("before_prompt_build");
     expect(w).toMatch(/persona/i);
     expect(w!.toLowerCase()).toMatch(/group (context|md|roster)|member list/);
-    // an operator must be able to act on it
-    expect(w).toContain("plugins.entries.octo.hooks");
-    // an unset allowPromptInjection is fine — never name it as missing
-    expect(w).not.toContain("allowPromptInjection");
+    // still names the hooks gated on every host
+    expect(w).toContain("before_agent_run");
+  });
+
+  it("does not overstate the blast radius as every typed hook", () => {
+    // The host gates conversation hooks only; five of this plugin's nine
+    // registrations (before_reset, before_tool_call, after_tool_call,
+    // model_call_started, model_call_ended) are never affected.
+    for (const v of [V_OLD, V_NEW]) {
+      const w = _buildHookGateWarning(withHooks({}), v)!;
+      expect(w.toLowerCase()).not.toContain("every typed hook");
+      expect(w.toLowerCase()).toContain("conversation hook");
+    }
+  });
+
+  it("points at the config path an operator has to edit", () => {
+    expect(_buildHookGateWarning(withHooks({}), V_NEW)).toContain(
+      "plugins.entries.octo.hooks",
+    );
   });
 
   it("reports an explicitly disabled allowPromptInjection on its own", () => {
     const w = _buildHookGateWarning(
       withHooks({ allowConversationAccess: true, allowPromptInjection: false }),
+      V_NEW,
     );
     expect(w).toBeDefined();
     expect(w).toContain("allowPromptInjection");
-    // conversation access is granted here, so it must not be reported
     expect(w).not.toContain("allowConversationAccess");
   });
 
   it("reports both when conversation access is missing and prompt injection is off", () => {
-    const w = _buildHookGateWarning(withHooks({ allowPromptInjection: false }));
+    const w = _buildHookGateWarning(withHooks({ allowPromptInjection: false }), V_NEW);
     expect(w).toBeDefined();
     expect(w).toContain("allowConversationAccess");
     expect(w).toContain("allowPromptInjection");
   });
 
   it("treats an explicit allowConversationAccess:false as not granted", () => {
-    const w = _buildHookGateWarning(withHooks({ allowConversationAccess: false }));
+    const w = _buildHookGateWarning(withHooks({ allowConversationAccess: false }), V_NEW);
     expect(w).toBeDefined();
     expect(w).toContain("allowConversationAccess");
   });
 
-  it("stays silent on hosts older than 2026.8, which accept the keys but do not gate", () => {
-    // 2026.6/2026.7 normalize these two keys into config but ship no
-    // resolveConversationAccessAllowed gate, so an unset opt-in is harmless
-    // there. peerDependencies still allows >=2026.6.9, and warning those hosts
-    // would be pure noise about a problem they do not have.
-    for (const v of ["2026.6.9", "2026.6.34", "2026.7.1", "2026.7.2"]) {
-      expect(_buildHookGateWarning(withHooks({}), v), `host ${v}`).toBeUndefined();
-    }
-  });
-
-  it("warns on 2026.8 and later, where the gate is enforced", () => {
-    for (const v of ["2026.8.1", "2026.9.1-beta.1", "2027.1.0"]) {
-      expect(_buildHookGateWarning(withHooks({}), v), `host ${v}`).toBeDefined();
-    }
-  });
-
-  it("warns when the host version is missing or unparseable", () => {
-    // Cannot prove the host is old, so assume it gates: one extra log line is
-    // cheaper than missing a silent degradation.
+  it("assumes the wider 2026.8 gate when the host version is unknown", () => {
+    // Cannot prove the host is older, so describe the worse case rather than
+    // under-report it.
     for (const v of [undefined, "", "unknown", "dev"]) {
-      expect(_buildHookGateWarning(withHooks({}), v as never), `host ${String(v)}`).toBeDefined();
+      const w = _buildHookGateWarning(withHooks({}), v as never);
+      expect(w, `host ${String(v)}`).toBeDefined();
+      expect(w).toContain("before_prompt_build");
     }
   });
 
@@ -118,12 +157,12 @@ describe("2026.8 hook gate — operator warning", () => {
       { plugins: { entries: { octo: { hooks: "nope" } } } },
       { plugins: "nope" },
     ]) {
-      expect(() => _buildHookGateWarning(bad as never)).not.toThrow();
+      expect(() => _buildHookGateWarning(bad as never, V_NEW)).not.toThrow();
     }
   });
 
   it("warns when config is unreadable, since the required opt-in cannot be proven", () => {
-    expect(_buildHookGateWarning(undefined as never)).toBeDefined();
-    expect(_buildHookGateWarning({} as never)).toBeDefined();
+    expect(_buildHookGateWarning(undefined as never, V_NEW)).toBeDefined();
+    expect(_buildHookGateWarning({} as never, V_NEW)).toBeDefined();
   });
 });

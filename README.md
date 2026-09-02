@@ -90,9 +90,11 @@ This is a **breaking change for existing deployments**. Before it, an omitted `d
 
 One deployment shape is **not** supported with doc tasks enabled: running the *same account* in more than one process. Write serialization for the doc-mention dedupe table is single-process only, and doc-task replay is not idempotent — two pollers can claim the same mention and both edit the document. This was always the case, but until now only operators who deliberately opted in could reach it. Run one process per account, or set `docTasks: false` on accounts that are replicated.
 
-### Upgrading to OpenClaw 2026.8
+### The non-bundled hook opt-in (all supported hosts), and upgrading to OpenClaw 2026.8
 
-2026.8 gates typed hooks for non-bundled plugins — anything installed from ClawHub, including this one — behind a config opt-in. **A plugin cannot grant it to itself**: consent deliberately lives in the operator's config, so an upgrade leaves the hooks blocked until you add this.
+OpenClaw gates a non-bundled plugin's *conversation hooks* — anything installed from ClawHub, including this one — behind a config opt-in. **A plugin cannot grant it to itself**: consent deliberately lives in the operator's config.
+
+This is **not** new in 2026.8; the gate is already present at this plugin's minimum supported host, `2026.6.9`. What 2026.8 changed is which hooks it covers. So if you have never set the key below, some of this plugin's behaviour has been quietly disabled all along:
 
 ```json
 {
@@ -109,11 +111,19 @@ One deployment shape is **not** supported with doc tasks enabled: running the *s
 }
 ```
 
-`allowConversationAccess` is the one that must be set. For a non-bundled plugin the host requires it to be **explicitly `true`** (`allowConversationAccess === true`); left unset it blocks every typed hook this plugin registers — `before_prompt_build`, `before_agent_run`, `llm_output` and `agent_end` — and its log names this key for each of them.
+`allowConversationAccess` is the one that must be set. The host requires it to be **explicitly `true`** for a non-bundled plugin (`allowConversationAccess === true`) — an unset key is not "default allowed".
 
-There is a second key, `allowPromptInjection`, which gates prompt mutation via `before_prompt_build`. **You do not need to set it**: the host reads it as `allowPromptInjection !== false`, so an unset key already means allowed. Only set it if you want to deliberately turn prompt injection *off*.
+It gates *conversation hooks only*, so the blast radius differs by host version. Of this plugin's nine hook registrations:
 
-**The failure mode is silent.** Without the opt-in the bot still connects and still replies. It simply never receives the group roster, the group MD, or its own persona, so a persona clone answers out of character and nothing in the reply hints at why. The gateway logs one line per blocked hook during startup (`typed hook "before_prompt_build" blocked because ... allowConversationAccess=true`) and this plugin logs a warning that names the consequence, but neither interrupts startup — look for them after upgrading.
+| Hook | Purpose | Gated on 2026.6.9–2026.7.x | Gated on 2026.8+ |
+|---|---|---|---|
+| `before_agent_run`, `llm_output`, `agent_end` | interactive card progress: run binding, streaming, finalization | yes | yes |
+| `before_prompt_build` | injects group MD, member list, persona identity | no | **yes** |
+| `before_reset`, `before_tool_call`, `after_tool_call`, `model_call_started`, `model_call_ended` | — | no | no |
+
+There is a second key, `allowPromptInjection`, which can disable prompt mutation. **You do not need to set it**: the host reads it as `allowPromptInjection !== false`, so an unset key already means allowed. Only set it to deliberately turn prompt injection *off*.
+
+**The failure mode is silent, on every host.** The bot still connects and still replies. Below 2026.8 you lose interactive card progress; from 2026.8 on you additionally lose the group roster, the group MD and the bot's own persona, so a persona clone answers out of character with nothing in the reply hinting at why. The gateway logs one line per blocked hook at startup (`typed hook "..." blocked because ... allowConversationAccess=true`) and this plugin logs a warning naming the consequences for your host version, but neither interrupts startup — look for them.
 
 Two further migrations belong to OpenClaw itself rather than to this plugin, and the gateway refuses to start until both are done: the config schema retired a number of legacy keys, and the session store moved to SQLite. Run `openclaw doctor --fix` **interactively** for these — under `--non-interactive` it reports the legacy keys without applying anything, since several of the decisions (for example `agents.ownership` on a multi-agent roster) change routing semantics and need a human. Two details worth checking by hand afterwards, because getting them wrong is quiet rather than loud:
 

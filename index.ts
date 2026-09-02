@@ -112,18 +112,22 @@ export function _buildToolAvailabilityHint(messageProvider: string | undefined):
  * quiet, since the required opt-in cannot be proven from it.
  */
 /**
- * Whether the host enforces the non-bundled hook opt-in.
+ * Whether this host also gates `before_prompt_build`.
  *
- * 2026.8 is the first release that gates it: 2026.6/2026.7 normalize the same
- * two keys into config but ship no resolveConversationAccessAllowed, so an unset
- * opt-in is harmless there. peerDependencies still allows >=2026.6.9, and
- * warning those hosts about a problem they do not have is noise that teaches
- * operators to tune warnings out.
+ * The opt-in gate itself is NOT new in 2026.8 — openclaw@2026.6.9, the declared
+ * peer floor, already inlines it in dist/registry-*.js and refuses to register a
+ * non-bundled plugin's conversation hooks without `allowConversationAccess ===
+ * true`. What 2026.8 changed is the MEMBERSHIP of `conversationHookNameSet`:
  *
- * An unreadable version is treated as gating: one spurious log line is far
- * cheaper than missing a silent degradation.
+ *   2026.6.9 (7): before_model_resolve, before_agent_reply, llm_input,
+ *                 llm_output, before_agent_finalize, agent_end, before_agent_run
+ *   2026.8.1 (9): the same, plus agent_turn_prepare and before_prompt_build
+ *
+ * So the version only decides WHICH consequences to describe, never whether to
+ * warn. An unreadable version assumes the wider 2026.8 set: describing the worse
+ * case is safer than under-reporting it.
  */
-function _hostGatesPluginHooks(hostVersion: string | undefined): boolean {
+function _hostGatesPromptBuildHook(hostVersion: string | undefined): boolean {
   const m = /^(\d{4})\.(\d+)/.exec((hostVersion ?? "").trim());
   if (!m) return true;
   const year = Number(m[1]);
@@ -132,12 +136,32 @@ function _hostGatesPluginHooks(hostVersion: string | undefined): boolean {
   return year > 2026 || (year === 2026 && minor >= 8);
 }
 
+/**
+ * Operator-facing warning about the non-bundled hook opt-in.
+ *
+ * `allowConversationAccess` must be explicitly `true` (the host requires exactly
+ * that for a non-bundled plugin; see _hostGatesPromptBuildHook for why every
+ * supported host enforces it). Of this plugin's nine hook registrations, three
+ * are gated on every supported host — `before_agent_run`, `llm_output`,
+ * `agent_end`, which together carry interactive card progress — and 2026.8+ gates
+ * `before_prompt_build` as well, which is what feeds group MD, the member list
+ * and persona identity into the prompt. The remaining five (`before_reset`,
+ * `before_tool_call`, `after_tool_call`, `model_call_started`,
+ * `model_call_ended`) are not conversation hooks and are never affected, so the
+ * message must not claim that "every" hook is blocked.
+ *
+ * `allowPromptInjection` is asymmetric: the host reads it as `!== false`, so an
+ * unset key already means allowed and must never be reported as missing.
+ *
+ * Returns one warning describing only what is actually wrong, or undefined when
+ * the gating is fine. Never throws — a malformed config must not take
+ * registration down — and an unreadable config warns rather than staying quiet,
+ * since the required opt-in cannot be proven from it.
+ */
 export function _buildHookGateWarning(
   cfg: unknown,
   hostVersion?: string,
 ): string | undefined {
-  if (!_hostGatesPluginHooks(hostVersion)) return undefined;
-
   let hooks: Record<string, unknown> = {};
   try {
     const entry = (cfg as { plugins?: { entries?: Record<string, { hooks?: unknown }> } })
@@ -154,11 +178,22 @@ export function _buildHookGateWarning(
   if (hooks.allowConversationAccess !== true) {
     lines.push(
       `[octo] plugins.entries.${PLUGIN_ID}.hooks.allowConversationAccess is not true. ` +
-        "OpenClaw 2026.8 blocks every typed hook of a non-bundled plugin without it, " +
-        "before_prompt_build included, so group MD, the member list and persona identity " +
-        "never reach the prompt. The bot still connects and still replies, so nothing looks " +
-        "broken — persona clones simply answer out of character.",
+        "OpenClaw blocks a non-bundled plugin's conversation hooks without it, so this " +
+        "plugin's before_agent_run, llm_output and agent_end never register — interactive " +
+        "card progress degrades silently (no run binding, no streaming, no finalization).",
     );
+    if (_hostGatesPromptBuildHook(hostVersion)) {
+      lines.push(
+        "  - this host also gates before_prompt_build: group MD, the member list and " +
+          "persona identity never reach the prompt. The bot still connects and still " +
+          "replies, so nothing looks broken — persona clones simply answer out of character.",
+      );
+    } else {
+      lines.push(
+        "  - before_prompt_build is not gated on this host, so group context and persona " +
+          "injection still work; upgrading to 2026.8 or later gates them too.",
+      );
+    }
   }
 
   if (hooks.allowPromptInjection === false) {
