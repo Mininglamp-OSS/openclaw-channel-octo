@@ -15,6 +15,37 @@ PR 的 commit message 用 [Conventional Commits](https://www.conventionalcommits
 
 **关键**：commit message 前缀直接决定下次发什么版本号，认真写。
 
+### ⚠️ commit message 里的括号必须在同一行闭合
+
+conventional-commits parser 解析整条 commit message（标题 **加 body**）。遇到 `(` 就等 `)`，
+中间碰到换行会直接抛 `unexpected token '\n' ... valid tokens [)]`，**整条 message 解析失败**。
+
+后果是静默的：release-please 把这条 commit 算作「无法解析」，于是
+
+```
+❯ commits: 0
+✔ Considering: 0 commits
+✔ No commits for path: ., skipping
+```
+
+workflow 仍然 **conclusion=success**，但 release PR 根本不会出现，看起来就像自动发版坏了。
+1.4.1 就是这么撞上的：某条 commit body 里为了排版把 `(.ts/.mts/.cts/` 的括号折了行，
+squash 之后毁掉整次扫描，只能改走 `CONTRIBUTING.md` 的 **Manual override** 路径（注意那份清单要求同时改动**五个**文件）。
+
+所以写 commit body 时，**宁可让那行超长，也不要把括号拆到两行**：
+
+```
+✅ 匹配全部可执行扩展名(.ts/.mts/.cts/.js/.mjs/.cjs)，这样新目录默认也在范围内
+❌ 匹配全部可执行扩展名(.ts/.mts/.cts/
+   .js/.mjs/.cjs)，这样新目录默认也在范围内
+```
+
+merge 之后可以顺手确认一眼，比事后补救便宜：
+
+```bash
+gh run view <release-please run id> --log | grep -E "could not be parsed|Considering:"
+```
+
 ---
 
 ## 想发版时（4 步）
@@ -133,7 +164,16 @@ entry **不能 PUT / DELETE / PATCH**。重发同 version 会创建副本（不�
 
 ### release-please PR 一直不出现
 
-检查 `main` 上最新几个 commit 的 message 有没有 conventional commits 前缀。纯 `chore:` / `docs:` / `ci:` 不会触发新版本——必须至少有一个 `fix:` 或 `feat:`。
+先检查 `main` 上最新几个 commit 的 message 有没有 conventional commits 前缀。纯 `chore:` / `docs:` / `ci:` 不会触发新版本——必须至少有一个 `fix:` 或 `feat:`。
+
+**前缀没问题也可能不出现**，1.4.1 就是这么撞上的：commit 带着 `fix:` 前缀，但 body 里有一处跨行括号，整条 message 解析失败，于是 release-please 认为「零个可发布 commit」。这时上面那条建议会把人带偏，直接看日志：
+
+```bash
+gh run list --workflow release-please.yml --limit 1
+gh run view <run id> --log | grep -E "could not be parsed|Considering:"
+```
+
+看到 `commits: 0` 或 `could not be parsed` 就是这个原因，详见前文「commit message 里的括号必须在同一行闭合」。真需要绕过时走 `CONTRIBUTING.md` 的 Manual override（五个文件）。
 
 ---
 
@@ -147,7 +187,7 @@ entry **不能 PUT / DELETE / PATCH**。重发同 version 会创建副本（不�
   4. /octo-changelog 发用户语言公告到 im.deepminer.com.cn/changelog/
      （先测试环境后线上；entry 不可撤回，确认文案）
 
-绝对不要：
+绝对不要（例外：`CONTRIBUTING.md` 的 Manual override 路径，那条路要求这三件事一起做）：
   ❌ 手工改 package.json 版本号
   ❌ 手工改 src/version.ts（prebuild 自动生成）
   ❌ 手工 git tag

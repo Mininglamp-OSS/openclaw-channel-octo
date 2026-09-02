@@ -102,10 +102,26 @@ so, and any manual edit will be overwritten by the next build.
 ### Manual override (rare)
 
 If for some reason the release-please flow can't be used, open a regular PR that
-bumps `package.json` + `package-lock.json` + `src/version.ts` + `CHANGELOG.md`,
-get it reviewed and merged, then `git tag vX.Y.Z && git push origin vX.Y.Z` from
-the merged commit. `publish-clawhub.yml` enforces `package.json == tag`, so the
-bump MUST land on main first.
+bumps **all five** of these, then get it reviewed and merged:
+
+1. `package.json`
+2. `package-lock.json` (both the top-level `version` and `packages[""].version` —
+   `npm install --package-lock-only` does it)
+3. `src/version.ts` (via `npm run build`; the `prebuild` script writes it — do not hand-edit)
+4. `CHANGELOG.md` (hand-written prose section, see RELEASE.md)
+5. `.release-please-manifest.json`
+
+Then `git tag vX.Y.Z && git push origin vX.Y.Z` from the merged commit.
+`publish-clawhub.yml` enforces `package.json == tag`, so the bump MUST land on main first.
+
+**Do not skip #5.** release-please reads `.release-please-manifest.json` at the tip of
+the target branch as its source of truth for "last released version". Leave it behind and
+the next automated run still believes the previous version is current: it rescans commits
+that already shipped, proposes a release PR for a version that is already tagged and
+already on ClawHub, and the tag creation then collides — so the genuinely new fix never
+ships. Like the parse failure above, this surfaces only as a line in the run log, not as
+a red workflow. Cross-check against the previous release commit (`git show --stat <sha>`);
+it should touch exactly these five files.
 
 ## Code style
 
