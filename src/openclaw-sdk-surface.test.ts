@@ -85,7 +85,7 @@ describe("OpenClaw SDK surface", () => {
     const offenders: string[] = [];
     for (const file of sourceFiles) {
       const text = readCode(file);
-      for (const m of text.matchAll(/^\s*(?:import|export)[\s\S]*?from\s+"(openclaw(?:\/[^"]*)?)"/gm)) {
+      for (const m of text.matchAll(/(?:from|import|require)\s*\(?\s*["'](openclaw(?:\/[^"']*)?)["']/g)) {
         const spec = m[1];
         const subpath = spec === "openclaw" ? "." : "." + spec.slice("openclaw".length);
         if (!exported.has(subpath)) offenders.push(`${rel(file)} -> ${spec}`);
@@ -140,8 +140,10 @@ describe("OpenClaw SDK surface", () => {
 
     const imported = new Set<string>();
     for (const file of sourceFiles) {
+      // Covers single quotes, dynamic import() and require() too — a matcher that
+      // only saw double-quoted static imports would silently skip those forms.
       for (const m of readCode(file).matchAll(
-        /^\s*(?:import|export)[\s\S]*?from\s+"(openclaw(?:\/[^"]*)?)"/gm,
+        /(?:from|import|require)\s*\(?\s*["'](openclaw(?:\/[^"']*)?)["']/g,
       )) {
         const spec = m[1];
         imported.add(spec === "openclaw" ? "." : "." + spec.slice("openclaw".length));

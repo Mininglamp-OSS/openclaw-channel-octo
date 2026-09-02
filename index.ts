@@ -83,35 +83,6 @@ export function _buildToolAvailabilityHint(messageProvider: string | undefined):
 }
 
 /**
- * OpenClaw 2026.8 gates typed hooks. The host's own resolvers (verified against
- * 2026.8.1, dist/hook-policy-decisions) are asymmetric:
- *
- *   resolvePromptInjectionAllowed(policy)
- *     = policy?.allowPromptInjection !== false
- *   resolveConversationAccessAllowed(origin, policy)
- *     = origin === "bundled" ? policy?.allowConversationAccess !== false
- *                            : policy?.allowConversationAccess === true
- *
- * This plugin is non-bundled (installed from ClawHub), so:
- *
- *   allowConversationAccess must be EXPLICITLY true. Left unset, the host blocks
- *     the typed hooks and names this key in the log line for every one of them,
- *     `before_prompt_build` included — which is why a missing opt-in here, not a
- *     missing allowPromptInjection, is what drops group context and persona.
- *   allowPromptInjection is allowed by default. Only an explicit `false` turns
- *     prompt mutation off, so an unset key must never be reported as a problem:
- *     a warning that fires on a correctly configured deployment just teaches
- *     operators to ignore warnings.
- *
- * Only relevant on hosts that actually enforce this (2026.8+, see
- * _hostGatesPluginHooks) — older hosts accept the same keys without gating.
- *
- * Returns one operator-facing warning describing only what is actually wrong, or
- * undefined when the gating is fine. Never throws — a malformed config must not
- * take registration down — and an unreadable config warns rather than staying
- * quiet, since the required opt-in cannot be proven from it.
- */
-/**
  * Whether this host also gates `before_prompt_build`.
  *
  * The opt-in gate itself is NOT new in 2026.8 — openclaw@2026.6.9, the declared
