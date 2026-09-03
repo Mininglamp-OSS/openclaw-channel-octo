@@ -1,6 +1,50 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ChannelType, MessageType } from "./types.js";
 
+describe("registerBot", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it.each([false, true])("sends the stable instance ID (forceRefresh=%s)", async (forceRefresh) => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        robot_id: "bot_1",
+        im_token: "im_1",
+        ws_url: "ws://octo.test/ws",
+        api_url: "https://octo.test",
+        owner_uid: "owner_1",
+        owner_channel_id: "owner_1",
+      }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const { registerBot } = await import("./api-fetch.js");
+
+    await registerBot({
+      apiUrl: "https://octo.test",
+      botToken: "bf_token",
+      instanceId: "550e8400-e29b-41d4-a716-446655440000",
+      forceRefresh,
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(
+      forceRefresh
+        ? "https://octo.test/v1/bot/register?force_refresh=true"
+        : "https://octo.test/v1/bot/register",
+    );
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      instance_id: "550e8400-e29b-41d4-a716-446655440000",
+    });
+  });
+});
+
 /**
  * Tests for api-fetch.ts functions.
  *

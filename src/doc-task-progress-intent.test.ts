@@ -28,6 +28,11 @@ const startEventPoller = vi.fn((_options?: unknown) => ({ ready: Promise.resolve
 const sendMessage = vi.fn(async () => ({ message_id: "m1", client_msg_no: "c1", message_seq: 1 }));
 const postDocComment = vi.fn(async () => {});
 
+vi.mock("./instance-id.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getOrCreateInstanceId: vi.fn(async () => "550e8400-e29b-41d4-a716-446655440000"),
+}));
+
 vi.mock("./socket.js", () => ({
   WKSocket: class {
     connect() {}

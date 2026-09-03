@@ -11,6 +11,14 @@ const resp = (status: number, headers: Record<string, string> = {}) => ({
 });
 
 describe("OctoApiError.from", () => {
+  it("extracts the stable server error code", () => {
+    const err = OctoApiError.from(
+      resp(409),
+      "/v1/bot/register",
+      '{"error":{"code":"err.server.bot_api.instance_conflict"}}',
+    );
+    expect(err.code).toBe("err.server.bot_api.instance_conflict");
+  });
   it("prefers the Retry-After header over the body hint", () => {
     const err = OctoApiError.from(
       resp(429, { "retry-after": "3" }),
