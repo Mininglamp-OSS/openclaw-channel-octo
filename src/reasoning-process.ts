@@ -105,7 +105,7 @@ const PHASES_THOUGHT_TOTAL_MAX = 6_000;
 
 /**
  * 按总量裁剪 thought,从**最旧**的 phase 开始收缩。不删 phase(那会丢掉工具行 —— 读者没有
- * 别处可查),只把它的思考文本压短;压到 NO_THOUGHT_WIRE_LABEL 为止,因为契约要求 minLength 1。
+ * 别处可查),只把它的思考文本压短;压到 MIN_THOUGHT_WIRE_LABEL 为止,因为契约要求 minLength 1。
  */
 function budgetPhaseThoughts(
   phases: ReasoningProcessPhase[],
@@ -122,7 +122,7 @@ function budgetPhaseThoughts(
     // clampRunes 会追加一个 "…",产出是 keep + 1 —— 预算里要为它留位,否则每裁一个 phase
     // 就超 1 个 rune。
     const keep = before - (used - total) - 1;
-    phase.thought = keep > 0 ? clampRunes(phase.thought, keep) : NO_THOUGHT_WIRE_LABEL;
+    phase.thought = keep > 0 ? clampRunes(phase.thought, keep) : MIN_THOUGHT_WIRE_LABEL;
     used -= before - cost(phase.thought);
   }
   return out;
@@ -172,7 +172,7 @@ function budgetTemplatePayload(
   };
   for (const phase of out.phases) {
     const original = [...phase.thought];
-    phase.thought = NO_THOUGHT_WIRE_LABEL;
+    phase.thought = MIN_THOUGHT_WIRE_LABEL;
     if (templatePayloadBytes(out, limits.templateRef) > dataBudgetBytes) continue;
 
     // 当前 phase 已经足以把 payload 压进预算;二分找还能保留的最大前缀。
@@ -191,7 +191,7 @@ function budgetTemplatePayload(
     }
     phase.thought = best > 0
       ? original.slice(0, best).join("") + "…"
-      : NO_THOUGHT_WIRE_LABEL;
+      : MIN_THOUGHT_WIRE_LABEL;
     return out;
   }
 
@@ -664,10 +664,13 @@ function trimForRender(data: ReasoningProcessData): ReasoningProcessData {
  * `entry.skip = true` —— 整个 session 从此没有卡片。#204 之后模板路径是唯一出口,
  * renderReasoningProcessCard 已无生产调用方,所以契约违规不是降级渲染,而是功能整体消失。
  *
- * 因此 wire 侧对「没有可说的推理」用一句**简短的非空标签**,而不是空串。本地渲染器可以省掉
- * 整行(那是更好的呈现),但那个自由度只属于本地渲染。
+ * 因此 wire 侧对「模型没有提供可见思考摘要」使用明确的非空文案,而不是容易被误解为渲染
+ * 故障的横杠。本地渲染器可以省掉整行(那是更好的呈现),但那个自由度只属于本地渲染。
  */
-const NO_THOUGHT_WIRE_LABEL = "—";
+const NO_VISIBLE_REASONING_SUMMARY = "No visible reasoning summary";
+// 只有 payload 预算不足、必须把旧 thought 压到契约最小值时才使用单字符占位；该分支不代表
+// 模型没有产出摘要，不能复用上面的用户可见语义文案。
+const MIN_THOUGHT_WIRE_LABEL = "—";
 
 /** Build bounded Registry data without inventing synthetic tool actions for empty model calls. */
 export function buildReasoningProcessWireData(
@@ -682,8 +685,8 @@ export function buildReasoningProcessWireData(
   const phases = phasesFromSteps(state.steps, { synthesizeEmptyActions: false })
     .filter((phase) => phase.actions.length > 0)
     .map((phase) => ({
-      // 空 thought 违反契约的 minLength:1 —— 见 NO_THOUGHT_WIRE_LABEL。
-      thought: clampRunes(phase.thought || NO_THOUGHT_WIRE_LABEL, thoughtMax),
+      // 空 thought 违反契约的 minLength:1；用明确文案说明模型未提供可见摘要。
+      thought: clampRunes(phase.thought || NO_VISIBLE_REASONING_SUMMARY, thoughtMax),
       // detail 此前完全没有长度上限,一个长工具摘要就能超过契约的 192。
       actions: phase.actions.map((action) => ({
         ...action,
