@@ -1281,6 +1281,7 @@ export async function postHtmlDocReply(params: {
 export async function registerBot(params: {
   apiUrl: string;
   botToken: string;
+  instanceId: string;
   forceRefresh?: boolean;
   agentPlatform?: string;
   agentVersion?: string;
@@ -1297,7 +1298,7 @@ export async function registerBot(params: {
   const path = params.forceRefresh
     ? "/v1/bot/register?force_refresh=true"
     : "/v1/bot/register";
-  const body: Record<string, string> = {};
+  const body: Record<string, string> = { instance_id: params.instanceId };
   if (params.agentPlatform) body.agent_platform = params.agentPlatform;
   if (params.agentVersion) body.agent_version = params.agentVersion;
   if (params.pluginVersion) body.plugin_version = params.pluginVersion;

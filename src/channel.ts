@@ -29,6 +29,11 @@ import type { GroupMember } from "./api-fetch.js";
 import { PLUGIN_VERSION } from "./version.js";
 import { getOctoRuntime } from "./runtime.js";
 import { forkScopeStartupWarning } from "./commands/fork.js";
+import {
+  BOT_INSTANCE_CONFLICT_MESSAGE,
+  getOrCreateInstanceId,
+  isBotInstanceConflictError,
+} from "./instance-id.js";
 
 /** Get OpenClaw host version from PluginRuntime.version (provided by SDK). */
 function getAgentVersion(): string {
@@ -1279,6 +1284,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       log?.info?.(`[${account.accountId}] registering Octo bot...`);
 
       // 1. Register bot (first attempt uses cached token)
+      let instanceId: string;
       let credentials: {
         robot_id: string;
         im_token: string;
@@ -1286,18 +1292,22 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         owner_uid: string;
       };
       try {
+        instanceId = await getOrCreateInstanceId();
         credentials = await registerBot({
           apiUrl: account.config.apiUrl,
           botToken: account.config.botToken,
+          instanceId,
           agentPlatform: "OpenClaw",
           agentVersion: getAgentVersion(),
           pluginVersion: PLUGIN_VERSION,
         });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = isBotInstanceConflictError(err)
+          ? BOT_INSTANCE_CONFLICT_MESSAGE
+          : err instanceof Error ? err.message : String(err);
         log?.error?.(`octo: bot registration failed: ${message}`);
         statusSink({ lastError: message });
-        throw err;
+        throw isBotInstanceConflictError(err) ? new Error(message, { cause: err }) : err;
       }
 
       // Track this bot's uid for bot-to-bot loop prevention
@@ -1427,6 +1437,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // good, and its failures used to tear down the socket even though a REST beat says
       // nothing about whether the socket is healthy.
       let stopped = false;
+      let reconnectBlocked = false;
 
       // 4. Group history map — persists across auto-restarts (module-level)
       const groupHistories = getOrCreateHistoryMap(account.accountId);
@@ -1461,6 +1472,12 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 5c. Serialises the reconnect sequences so the watchdog can tell that one is already
       // running — including during the awaits, when nothing else shows it.
       const reconnectSequencer = createReconnectSequencer({ log });
+      // Assigned after all runtime components exist and before socket.connect().
+      // The placeholder covers the constructor-only interval without touching
+      // variables that are still in their temporal dead zone.
+      let enterBindingConflict = (): void => {
+        reconnectBlocked = true;
+      };
 
       const dispatchInboundMessage = (
         msg: BotMessage,
@@ -1606,7 +1623,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
 
       let cardEventPoller: EventPoller | undefined;
       const startCardEventPoller = (): void => {
-        if (cardEventPoller || stopped) return;
+        if (cardEventPoller || stopped || reconnectBlocked) return;
         cardEventPoller = startEventPoller({
           apiUrl: account.config.apiUrl,
           botToken: account.config.botToken ?? "",
@@ -1711,11 +1728,13 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         },
 
         onConnected: () => {
+          if (reconnectBlocked) return;
           log?.info?.(`octo: [${account.accountId}] WebSocket connected to ${wsUrl}`);
           statusSink({ lastError: null });
         },
 
         onDisconnected: () => {
+          if (reconnectBlocked) return;
           log?.warn?.(`octo: [${account.accountId}] WebSocket disconnected, will reconnect...`);
           statusSink({ lastError: "disconnected" });
         },
@@ -1729,6 +1748,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           // refreshGuard prevents concurrent refresh attempts (#43)
           const cooldownElapsed = Date.now() - lastTokenRefreshAt > TOKEN_REFRESH_COOLDOWN_MS;
           if (cooldownElapsed && !refreshGuard.isRaised() && !stopped &&
+              !reconnectBlocked &&
               (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
             lastTokenRefreshAt = Date.now();
             await refreshGuard.run(async () => {
@@ -1736,16 +1756,17 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
               await reconnectSequencer.run("token-refresh", async () => {
                 try {
                   await socket.disconnectAndWait();
-                  if (stopped) return; // the account can stop during any of these awaits
+                  if (stopped || reconnectBlocked) return; // the account can stop during any of these awaits
                   const fresh = await registerBot({
                     apiUrl: account.config.apiUrl,
                     botToken: account.config.botToken!,
+                    instanceId,
                     forceRefresh: true,
                     agentPlatform: "OpenClaw",
                     agentVersion: getAgentVersion(),
                     pluginVersion: PLUGIN_VERSION,
                   });
-                  if (stopped) return;
+                  if (stopped || reconnectBlocked) return;
                   credentials = fresh;
                   log?.info?.(`octo: [${account.accountId}] got fresh IM token, reconnecting WS...`);
                   socket.updateCredentials(fresh.robot_id, fresh.im_token);
@@ -1754,10 +1775,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   const staggerMs = Math.floor(Math.random() * 5000);
                   log?.info?.(`octo: [${account.accountId}] staggering reconnect by ${staggerMs}ms`);
                   await new Promise(r => setTimeout(r, staggerMs));
-                  if (stopped) return; // account was stopped during stagger delay
+                  if (stopped || reconnectBlocked) return; // account was stopped during stagger delay
                   socket.stopReconnectTimer();
                   socket.connect();
                 } catch (refreshErr) {
+                  if (isBotInstanceConflictError(refreshErr)) {
+                    enterBindingConflict();
+                    return;
+                  }
                   log?.error?.(`octo: [${account.accountId}] token refresh failed: ${String(refreshErr)}`);
                   // Returning here used to end the story: needReconnect was already false and
                   // disconnectAndWait had cleared the socket's own timer, so nothing was left
@@ -1768,7 +1793,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                 }
               });
             });
-          } else if (!refreshGuard.isRaised() && !stopped &&
+          } else if (!refreshGuard.isRaised() && !stopped && !reconnectBlocked &&
               (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
             // Cooldown active — skip token refresh but still reconnect with current credentials.
             log?.warn?.(`octo: [${account.accountId}] cooldown active, scheduling reconnect with current credentials...`);
@@ -1782,7 +1807,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // (connect / heartbeat.start / watchdog.start) above this const turns that capture into
       // a temporal-dead-zone throw, and the else-branch call site is not inside a try.
       const deferredReconnect = createDeferredReconnect({
-        isStopped: () => stopped,
+        isStopped: () => stopped || reconnectBlocked,
         sequencer: reconnectSequencer,
         run: async () => {
           // The wait is 5-10s, which is long enough for the connection to have come back on
@@ -1790,7 +1815,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           // thing this change set out to stop doing.
           if (socket.isConnected()) return;
           await socket.disconnectAndWait();
-          if (stopped) return; // the account can stop while the teardown above runs
+          if (stopped || reconnectBlocked) return; // the account can stop while the teardown above runs
           socket.stopReconnectTimer();
           socket.connect();
         },
@@ -1815,7 +1840,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         accountId: account.accountId,
         log,
         shouldReconnect: buildWatchdogPredicate({
-          isStopped: () => stopped,
+          isStopped: () => stopped || reconnectBlocked,
           isReconnectInFlight: () => reconnectSequencer.isInFlight(),
           isConnectingOrConnected: () => socket.isConnectingOrConnected(),
           hasPendingReconnect: () => socket.hasPendingReconnect(),
@@ -1825,11 +1850,29 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         reconnect: () =>
           reconnectSequencer.run("watchdog", async () => {
             await socket.disconnectAndWait();
-            if (stopped) return;
+            if (stopped || reconnectBlocked) return;
             socket.stopReconnectTimer();
             socket.connect();
           }),
       });
+
+      enterBindingConflict = (): void => {
+        if (stopped || reconnectBlocked) return;
+        reconnectBlocked = true;
+        socket.disconnect();
+        cardEventPoller?.stop();
+        setCardEventPollStarter(account.accountId, undefined);
+        heartbeat.stop();
+        watchdog.stop();
+        deferredReconnect.cancel();
+        stopPersonaPromptCache(account.accountId);
+        log?.error?.(`octo: [${account.accountId}] ${BOT_INSTANCE_CONFLICT_MESSAGE}`);
+        ctx.setStatus({
+          accountId: account.accountId,
+          running: false,
+          lastError: BOT_INSTANCE_CONFLICT_MESSAGE,
+        });
+      };
 
       socket.connect();
       heartbeat.start();

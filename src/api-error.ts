@@ -65,6 +65,7 @@ export class OctoApiError extends Error {
   readonly status: number;
   readonly path: string;
   readonly body: string;
+  readonly code?: string;
   /**
    * The server's requested wait, verbatim. Deliberately not clamped here: shortening it
    * would mean going back before the server said we could, which is the behaviour this
@@ -81,12 +82,14 @@ export class OctoApiError extends Error {
     retryAfterMs: number;
     rateLimitScope?: string;
     rateLimitRemaining?: string;
+    code?: string;
   }) {
     super(`Octo API ${params.path} failed (${params.status}): ${params.body}`);
     this.name = "OctoApiError";
     this.status = params.status;
     this.path = params.path;
     this.body = params.body;
+    this.code = params.code;
     this.retryAfterMs = params.retryAfterMs;
     this.rateLimitScope = params.rateLimitScope;
     this.rateLimitRemaining = params.rateLimitRemaining;
@@ -100,6 +103,13 @@ export class OctoApiError extends Error {
     const text = body || resp.statusText || "";
     const scope = header(resp, "X-RateLimit-Scope");
     const remaining = header(resp, "X-RateLimit-Remaining");
+    let code: string | undefined;
+    try {
+      const parsed = JSON.parse(body) as { error?: { code?: unknown } };
+      if (typeof parsed.error?.code === "string") code = parsed.error.code;
+    } catch {
+      // Non-JSON proxy and transport errors have no stable application code.
+    }
     return new OctoApiError({
       status: resp.status,
       path,
@@ -112,6 +122,7 @@ export class OctoApiError extends Error {
         DEFAULT_RETRY_AFTER_MS,
       ...(scope !== undefined ? { rateLimitScope: scope } : {}),
       ...(remaining !== undefined ? { rateLimitRemaining: remaining } : {}),
+      ...(code !== undefined ? { code } : {}),
     });
   }
 }
