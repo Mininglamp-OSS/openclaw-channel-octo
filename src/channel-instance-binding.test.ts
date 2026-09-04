@@ -140,6 +140,7 @@ describe("channel instance binding", () => {
     expect(mocks.connect).toHaveBeenCalledTimes(1);
     expect(mocks.disconnect).toHaveBeenCalled();
     expect(status).toHaveBeenCalledWith(expect.objectContaining({
+      running: false,
       lastError: BOT_INSTANCE_CONFLICT_MESSAGE,
     }));
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -32,6 +32,7 @@ describe("getOrCreateInstanceId", () => {
     expect(first).toMatch(/^[0-9a-f-]{36}$/);
     expect((await readFile(instanceIdPath({ stateDir }), "utf8")).trim()).toBe(first);
     expect((await stat(instanceIdPath({ stateDir }))).mode & 0o777).toBe(0o600);
+    expect(await readdir(join(stateDir, "octo"))).toEqual(["instance-id"]);
   });
 
   it("converges concurrent first starts on the same ID", async () => {
@@ -53,13 +54,31 @@ describe("getOrCreateInstanceId", () => {
     );
   });
 
-  it("prefers OPENCLAW_STATE_DIR and supports OPENCLAW_HOME", () => {
+  it("rejects a stable-looking value that is not the generated UUID contract", async () => {
+    const stateDir = await tempStateDir();
+    const file = instanceIdPath({ stateDir });
+    await mkdir(join(stateDir, "octo"), { recursive: true });
+    await writeFile(file, "instance_node-01\n", "utf8");
+
+    await expect(getOrCreateInstanceId({ stateDir })).rejects.toThrow(
+      "Octo instance ID file is invalid",
+    );
+  });
+
+  it("uses OpenClaw's canonical state directory resolver", async () => {
     expect(instanceIdPath({ env: { OPENCLAW_STATE_DIR: "/state", OPENCLAW_HOME: "/home" }, home: "/fallback" }))
       .toBe("/state/octo/instance-id");
     expect(instanceIdPath({ env: { OPENCLAW_HOME: "/home" }, home: "/fallback" }))
-      .toBe("/home/octo/instance-id");
+      .toBe("/home/.openclaw/octo/instance-id");
+    expect(instanceIdPath({ env: { OPENCLAW_STATE_DIR: "~/state" }, home: "/fallback" }))
+      .toBe("/fallback/state/octo/instance-id");
     expect(instanceIdPath({ env: {}, home: "/fallback" }))
       .toBe("/fallback/.openclaw/octo/instance-id");
+
+    const legacyHome = await tempStateDir();
+    await mkdir(join(legacyHome, ".clawdbot"));
+    expect(instanceIdPath({ env: {}, home: legacyHome }))
+      .toBe(join(legacyHome, ".clawdbot", "octo", "instance-id"));
   });
 });
 

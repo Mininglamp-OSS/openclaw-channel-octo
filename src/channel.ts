@@ -1867,7 +1867,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         deferredReconnect.cancel();
         stopPersonaPromptCache(account.accountId);
         log?.error?.(`octo: [${account.accountId}] ${BOT_INSTANCE_CONFLICT_MESSAGE}`);
-        statusSink({ lastError: BOT_INSTANCE_CONFLICT_MESSAGE });
+        ctx.setStatus({
+          accountId: account.accountId,
+          running: false,
+          lastError: BOT_INSTANCE_CONFLICT_MESSAGE,
+        });
       };
 
       socket.connect();
