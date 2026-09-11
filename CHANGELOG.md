@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.4.1...v1.5.0) (2026-09-11)
+
+
+### Added
+
+* **bot-task:** execute generic task events ([#235](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/235)) ([0795c82](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/0795c824e1e999d73b88f24c5708c0afd1f80a34))
+* **ppt:** execute anchored comment edit requests ([#239](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/239)) ([6b5b3f1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/6b5b3f14457df72ab95d2159ad50214faed793e4))
+
 ## [1.4.1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.4.0...v1.4.1) (2026-09-02)
 
 ### Fixed

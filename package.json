@@ -1,6 +1,6 @@
 {
   "name": "octo",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Octo channel plugin for OpenClaw",
   "license": "Apache-2.0",
   "main": "dist/index.js",
@@ -31,7 +31,7 @@
     "test:watch": "vitest",
     "test:e2e:openclaw": "node scripts/run-openclaw-card-e2e.mjs",
     "prepack": "npm run build",
-    "pack:check": "npm pack --dry-run 2>&1 | tee /tmp/octo-pack.txt && grep -q 'dist/index.js' /tmp/octo-pack.txt && grep -q 'dist/setup-entry.js' /tmp/octo-pack.txt && grep -q 'docs/ppt-contract.md' /tmp/octo-pack.txt && echo '\u2713 dist/ and PPT contract included in tarball'",
+    "pack:check": "npm pack --dry-run 2>&1 | tee /tmp/octo-pack.txt && grep -q 'dist/index.js' /tmp/octo-pack.txt && grep -q 'dist/setup-entry.js' /tmp/octo-pack.txt && grep -q 'docs/ppt-contract.md' /tmp/octo-pack.txt && echo '✓ dist/ and PPT contract included in tarball'",
     "verify:429": "npm run build && node scripts/verify-429.mjs",
     "verify:429-backoff": "npm run build && node scripts/verify-429-backoff.mjs"
   },
