@@ -4,11 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [1.5.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.4.1...v1.5.0) (2026-09-11)
 
-
 ### Added
 
-* **bot-task:** execute generic task events ([#235](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/235)) ([0795c82](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/0795c824e1e999d73b88f24c5708c0afd1f80a34))
-* **ppt:** execute anchored comment edit requests ([#239](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/239)) ([6b5b3f1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/6b5b3f14457df72ab95d2159ad50214faed793e4))
+- **业务系统可以直接给 Bot 派任务：新增通用 `bot_task` 事件通道**（#236, PR #235）：任务内容整个由业务方给全 —— 完整 prompt 加可选的 JSON `context` / `metadata`，插件不硬编码 `source`、`task_type`、能力画像或执行步骤，也不假设任务一定得调工具（一次工具都没调的任务同样算完成）。执行走正常的 OpenClaw Agent turn，按业务 thread 建稳定会话。
+  - **新增账号级开关 `botTasks`，默认开启**，与 `docTasks` 彼此独立：关掉一个不会关掉另一个，也不影响交互卡片那条懒启动的轮询；两个都设成 `false` 才不再常驻 `/v1/bot/events`。默认开启是有意的铺开策略，和 `docTasks` 保持一致 —— 装完、升完就能用，不必先发现开关的存在
+  - **信任边界落在事件生产方**：能投 `bot_task` 事件的人就是可信的 prompt 发布者。这条路径上 Octo IM 出站、message action 与 `octo_management` 全部关闭，Agent 若试图往 Octo channel 发 final，会被抑制并记日志、且不因此重放任务；但 Agent 自己配置的非 Octo 工具（shell、文件系统、浏览器等）照常可用。要读写业务数据、或给业务侧回话，一律由 prompt 指向对应的 `octo-cli` 命令。事件生产方不可信的账号请显式设 `botTasks: false`
+  - **分阶段的 at-most-once 执行语义**：交给 Agent runtime 之前失败可以安全重试，并按指数退避；交接前一刻插件尽力把 `started` 持久化下来，万一状态存盘失败，就退化成进程内记录、任务照旧交给 Agent —— 宁可留一个模糊窗口，也不让一次可恢复的本地磁盘错误变成「已 ACK 却从未执行」。越过这个边界之后的失败、超时、结果不确定，一律记 dead letter 并 ACK、不重放，因为业务写入可能已经落库。插件不去读 transcript，也不按工具调用次数推断业务是否成功
+  - **一条坏任务不会卡死整个账号**：同一批取回的事件里，若某条在交接前失败且仍然可重试，它后面的事件继续处理，不被那个 cursor 空洞挡住。代价是同一业务 thread 的两条任务可能乱序完成 —— 业务侧 prompt 不能假设严格的队列顺序，碰业务数据时应当在写之前重读当前状态
+  - 超时的 Agent run 会收到取消信号并获得一段有界的宽限期；无论它在宽限期内停下、还是干脆无视取消，任务都按「已交接」处理：记 dead letter 并 ACK，因为重试可能把一个不明副作用做第二遍。仅靠内存记住 `started` 的那段降级窗口里若发生崩溃或重启，结果仍可能模糊，业务侧按 `idempotency_key` 做幂等是后续工作（#237）
+  - 同一账号跑在多个进程里这种部署形态**依然不支持**：两份任务状态文件的写序列化都只在单进程内成立，任务重放也不幂等，两个轮询器可能领到同一条事件、各做一次业务动作。被复制部署的账号请关掉对应开关
+- **PPT 评论里 `@Bot` 提的修改要求会真正改到演示文稿上，并把结果回到原评论线程**（#240, PR #239）：此前这条路径只给一段「我打算怎么改」的计划回复就收尾，评论区看着有人应答、稿子其实没动。现在 Bot 拿到的是权威的评论 root / anchor、当前文档标识和可信 CLI 路径，并被要求读当前 deck、用 revision CAS 提交窄改动、再读回确认；最终回复带原 parent ID 发在同一条线程里，不会降级成一条新的根评论。
+  - **至多续跑一次，且续跑不继承首轮成绩**：只有两次 revision 读都成功、显示确实没变、回答又还停在「计划」形状时，才允许再跑一轮；拒绝执行、已完成、判定无需改动这几种结果不会被反复重试，revision 读失败则一律不启用续跑。每一轮有各自独立的投递报告，失败的第二轮不能顶着第一轮的成功交付。revision 涨了只当信号、不当证据 —— 协作者也可能同时在改，涨幅并不能证明改的正是目标那处
+  - **两轮共享同一个绝对 deadline**（默认 660 秒，账号级 timeout 覆写优先）：续跑只拿剩下的时间，已过期的任务不再起新的 Agent turn。实时读配置抛错时回落到既有的有界默认预算并打诊断，而不是静默把任务丢掉
+  - **不合规的 thread ID 在读 deck、起 Agent 之前就被挡掉**：PPT 线程 ID 必须是 canonical 的正安全整数，否则记 `invalid_ppt_reply_target` dead letter 并终态去重。revision 探测把解码后的响应限制在 9 MiB（默认 8 MiB deck 加信封），超限直接取消流；探测失败只影响那个可选的续跑
+  - **未知 `doc_kind` 只记账、不执行**：非空 kind 只接受 `html` 与 `ppt`（legacy 文档 / 表格 / 画板不带 kind），其余值记 `unsupported_doc_kind` 进既有的 per-account `doc-tasks.deadletter.json`（上限 200 条），推进 cursor 但不 ACK —— 为的是不让一个未知协议造成的空洞在去重记录过期之后把后面的编辑重放一遍。恢复是运维的显式动作，不是自动重放。**因此升级顺序是先升全部消费端（本插件与 CLI），再升 Server / Docs 生产端**
+  - 账号停机时 PPT 事件留作未 ACK，与它交接前那份持久化预留配对；legacy 与 HTML 文档任务则仍旧完成既有的 cursor / ACK 收尾，因为它们不持有这种预留。停机之后，同批里后续的事件不再启动
+  - 新增可选账号配置 `docsCliPath`（默认 `octo-cli`），指向可信的本地 CLI 可执行文件；凭证只来自账号配置，绝不从评论正文或 deck 内容里取。随包新增 `docs/ppt-contract.md`，记录已验证的 HTTP 形状与 ID 边界 —— 共用路由背后 PPT 与 legacy 评论各有自己的存储适配器和响应信封，不能因为 origin 相同就推断 envelope 也相同
+
+### Changed
+
+- **`docTasks: false` 不再等于「关掉后台任务轮询」**（PR #235）：文档任务与通用 Bot Task 现在是两个独立开关，只要还有一个开着，`/v1/bot/events` 轮询就保持常驻。README 与 manifest 里 `docTasks` 的描述已相应收窄，不再宣称设成 `false` 就能把账号变回纯 IM Bot —— 要那个效果得 `docTasks: false` 与 `botTasks: false` 一起设。轮询开销本身与用 `eventWaitSeconds` 摊薄的办法都不变
+
+### Internal
+
+- `pack:check` 增加一条断言：`docs/ppt-contract.md` 必须出现在 tarball 里 —— README 指向的 wire 契约文档若没随包发出去，拿到包的人就读不到那份边界说明
 
 ## [1.4.1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.4.0...v1.4.1) (2026-09-02)
 
