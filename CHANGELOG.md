@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.0...v1.5.1) (2026-09-28)
+
+
+### Fixed
+
+* **docs:** harden permission notices and PPT media guidance ([#249](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/249)) ([f3c62fd](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/f3c62fde45e36f09bfb7fecf4cf4f3cceecaa67a))
+
 ## [1.5.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.4.1...v1.5.0) (2026-09-11)
 
 ### Added
