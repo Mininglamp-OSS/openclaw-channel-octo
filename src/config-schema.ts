@@ -107,7 +107,7 @@ export const EVENT_WAIT_SECONDS_DESCRIPTION =
 // 本 PR 不恢复它们。下面只保留当前功能实际使用的配置描述。
 
 export const DOC_TASKS_DESCRIPTION =
-  "Document comment @Bot tasks: routes task replies to the doc comment thread instead of IM. Enabled by default; false disables document tasks only. Event polling may remain active for generic Bot Tasks or interactive cards.";
+  "Document comment @Bot tasks: routes task replies to the doc comment thread instead of IM. If a real HTTP 403 prevents comment delivery and the fallback comment also fails, one fixed, content-free requester DM may report that failure. Enabled by default; false disables document tasks only. Event polling may remain active for generic Bot Tasks or interactive cards.";
 
 export const BOT_TASKS_DESCRIPTION =
   "Generic server-issued Bot Tasks: runs the supplied business prompt in an isolated agent turn and requires business output through octo-cli. Enabled by default; set false to disable generic task execution. Set both botTasks and docTasks to false when the account should not run background tasks.";

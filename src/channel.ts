@@ -92,6 +92,7 @@ import os from "node:os";
 import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
 import { createReadStream, createWriteStream, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { sendDocPermissionNotice } from './doc-permission-notice.js';
 // HistoryEntry type - compatible with any version
 type HistoryEntry = { sender: string; body: string; timestamp: number };
 const DEFAULT_GROUP_HISTORY_LIMIT = 20;
@@ -1576,6 +1577,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       const docTaskDeadLetter = createFileDocTaskDeadLetterStore({ accountId: account.accountId, log });
       const handleDocMention = createDocMentionHandler({
         botUid: credentials.robot_id,
+        notifyPermissionFailure: (mention, signal) => sendDocPermissionNotice(account.config.apiUrl, account.config.botToken ?? '', mention, signal),
         // 整篇取回地址由这里的**已解析配置**拼,不让 agent 从载荷 url= 推域名。
         docsBaseUrl: account.config.docsApiUrl,
         docsCliPath: account.config.docsCliPath,

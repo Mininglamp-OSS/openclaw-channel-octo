@@ -2842,7 +2842,8 @@ export async function handleInboundMessage(params: {
   // 文档任务下所有 IM 出站一律不发。下面每个显式的 `if (docTask)` 守卫都保留 ——
   // 闸门是兜底,不是替代:守卫负责「不做无谓的工作」(不建 typing 定时器、不上传
   // 附件),闸门负责「守卫漏了也发不出去」。新增出站点只要没经过闸门包装,
-  // inbound-im-egress-guard.test.ts 就会在 CI 变红。
+  // inbound-im-egress-guard.test.ts 会检查本文件;文档任务模块另有唯一固定
+  // 权限提示例外的扫描,见 doc-permission-notice.ts。这里不发送该提示。
   const imEgress = createImEgressGuard({
     suppressed: docTask !== undefined,
     reason: docTask ? `doc task ${docTask.docId}/${docTask.threadId}` : "",

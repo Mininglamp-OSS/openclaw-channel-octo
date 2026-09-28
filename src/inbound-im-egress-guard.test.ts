@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -91,6 +91,43 @@ export function findUnguardedImEgress(source: string): Array<{ line: number; nam
   });
   return found;
 }
+
+// Audit the document-task modules as well as inbound.ts. This is a bounded
+// source census, not a whole-program or namespace/dynamic-import flow analysis.
+const DOC_SOURCES = Object.fromEntries(readdirSync(SRC)
+  .filter(name => /^(doc-.*|ppt-comment|html-doc-comment)\.ts$/.test(name) && !name.endsWith('.test.ts'))
+  .map(name => [name, readFileSync(join(SRC, name), 'utf8')]));
+const PERMISSION_NOTICE_CALL = "const result = await sendMessage({ apiUrl, botToken, channelId: mention.fromUid, channelType: ChannelType.DM,";
+function docTaskEgressViolations(sources: Record<string, string>): string[] {
+  let exceptions = 0;
+  const violations: string[] = [];
+  for (const [file, source] of Object.entries(sources)) {
+    for (const call of findUnguardedImEgress(source)) {
+      // These are the explicit Docs HTTP helpers, not IM send primitives.
+      if (call.name === 'postJson' || call.name === 'postDocComment') continue;
+      if (file === 'doc-permission-notice.ts' && call.text === PERMISSION_NOTICE_CALL) exceptions++;
+      else violations.push(`${file}:${call.line}:${call.name}`);
+    }
+  }
+  if (exceptions !== 1) violations.push(`permission notice exception count=${exceptions}`);
+  return violations;
+}
+
+describe('document-task IM outlet census', () => {
+  it('allows only the uniquely located fixed permission notice', () => {
+    expect(docTaskEgressViolations(DOC_SOURCES)).toEqual([]);
+  });
+  it('detects a new direct sender in another document-task module', () => {
+    expect(docTaskEgressViolations({...DOC_SOURCES, 'doc-extra.ts': 'import { sendMessage } from "./api-fetch.js";\nsendMessage({});'}))
+      .toEqual(['doc-extra.ts:2:sendMessage']);
+  });
+  it('refuses duplicate or missing permission-notice exceptions', () => {
+    expect(docTaskEgressViolations({...DOC_SOURCES, 'doc-permission-notice.ts': DOC_SOURCES['doc-permission-notice.ts'] + '\n' + PERMISSION_NOTICE_CALL}))
+      .toContain('permission notice exception count=2');
+    expect(docTaskEgressViolations({...DOC_SOURCES, 'doc-permission-notice.ts': ''}))
+      .toContain('permission notice exception count=0');
+  });
+});
 
 describe("inbound.ts 的 IM 出站闸门", () => {
   it("名单是从 api-fetch 的 import 推导出来的,不是写死的", () => {

@@ -5,6 +5,7 @@ import type { DocTaskDeadLetterStore } from "./doc-task-deadletter.js";
 import type { BotMessage } from "./types.js";
 import { httpStatusFromApiFetchError, isPermanentDocCommentFailure } from "./api-fetch.js";
 import type { DocReplyIntent } from "./api-fetch.js";
+import { OctoApiError } from "./api-error.js";
 
 /**
  * 一个回合到底发生了什么。**由跑这个回合的人如实上报四个事实,不预先归纳成结论。**
@@ -100,6 +101,8 @@ export interface DocMentionHandlerDeps {
     signal?: AbortSignal,
     intent?: DocReplyIntent,
   ) => Promise<void>;
+  /** Fixed requester-only notice; never forwards the task or model answer. */
+  notifyPermissionFailure?: (mention: DocCommentMention, signal: AbortSignal) => Promise<void>;
   /**
    * 死信记录。可选 —— 未提供时行为与之前一致(只写日志)。
    * 只在「答复未送达 **且** 兜底通知也未送达」时写:那是唯一一个事件已 ack、
@@ -216,6 +219,7 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
     };
     const initialRevision = mention.docKind === "ppt" ? await readRevision() : undefined;
     let lastFinal: string | undefined;
+    let permissionDenied = false;
     const postWithRetry = async (
       text: string,
       signal?: AbortSignal,
@@ -236,6 +240,9 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           return;
         } catch (err) {
           lastErr = err;
+          // Only the transport's structured status can authorize a permission
+          // notice. Legacy error text can contain an upstream-supplied "(403)".
+          if (err instanceof OctoApiError && err.status === 403) permissionDenied = true;
           deps.log?.error?.(
             `octo: doc comment post failed (attempt ${attempt}/${POST_ATTEMPTS}) doc=${mention.docId}: ${String(err)}`,
           );
@@ -376,9 +383,27 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           `octo: doc task fallback notice failed doc=${mention.docId} thread=${mention.threadId}: ${String(err)}`,
         );
       }
-      // ★ 死信:answer 没送达、兜底通知也没送达,而事件随后会被 ack —— server 不再投递。
-      // 到这里为止,这条 @Bot 在系统里将不留任何痕迹,用户在评论区干等。
-      // 落一条持久记录让运维能回答「那条 @Bot 到底怎么了」。
+      // A reader cannot post even a failure comment. Keep document permissions
+      // intact and notify only the authenticated event's requester over IM.
+      // A later fallback 5xx must not erase an explicit permission denial from
+      // the answer. A successful fallback still suppresses this separate DM.
+      if (noticeErr !== undefined && permissionDenied && deps.notifyPermissionFailure && !deps.signal?.aborted) {
+        try {
+          const timeout = AbortSignal.timeout(DOC_TASK_NOTICE_TIMEOUT_MS);
+          await deps.notifyPermissionFailure(mention, deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout);
+          deps.log?.info?.(`octo: requester permission notice delivered doc=${mention.docId} thread=${mention.threadId}`);
+          noticeErr = undefined;
+        } catch (err) {
+          // Never echo an upstream body, URL or credential into this diagnostic.
+          const cause = err instanceof OctoApiError ? `http_${err.status}`
+            : err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")
+              ? err.name : "transport_or_receipt_failure";
+          deps.log?.error?.(`octo: requester permission notice failed doc=${JSON.stringify(mention.docId)} thread=${JSON.stringify(mention.threadId)} cause=${cause}; retaining dead letter`);
+        }
+      }
+      // ★ 死信:answer、评论兜底及允许的固定权限私聊均未送达时持久记录。
+      // 固定私聊有确认回执时上方已记录日志;它不代表文档答复已送达。
+      // 事件随后会被 ack,server 不再投递;保留失败记录供运维查询。
       //
       // 刻意**不是**重投队列:重投一个会改文档的任务不幂等(实测重放会每个轮询周期
       // 重跑一遍),那正是 ack 提前的原因。这里只要「可查」。

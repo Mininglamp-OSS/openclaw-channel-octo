@@ -1213,6 +1213,8 @@ export function isPermanentDocCommentFailure(err: unknown): boolean {
  *
  * 文档任务的最终答复走这条出口而不是 sendMessage:合成消息是 DM 形状的,
  * 走 IM 出口会把答复发进发起人的私聊 —— 正是本特性要消除的污染。
+ * 唯一例外是 doc-permission-notice.ts 的固定权限失败提示,不是模型答复;
+ * 仅在结构化 HTTP 403 且评论兜底失败后由 doc-mention-handler 发送。
  * parentId 省略时发布为根评论。
  */
 export async function postDocComment(params: {
