@@ -1,3 +1,4 @@
+import type { DocTaskTracker } from "./doc-task-progress.js";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 import type { ChannelLogSink } from "openclaw/plugin-sdk/channel-contract";
 import type { ReplyPayload, ReplyDispatchKind } from "openclaw/plugin-sdk/reply-runtime";
@@ -1600,6 +1601,7 @@ export async function handleInboundMessage(params: {
    * 便于测试直接断言 IM 出站零调用。
    */
   docTask?: {
+    progress?: DocTaskTracker;
     docId: string;
     threadId: string;
     /** 会话作用域片段,如 `doctask:{docId}:{threadId}`(见 doc-mention.ts)。 */
@@ -3360,6 +3362,7 @@ export async function handleInboundMessage(params: {
   let dispatchTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const dispatchTimeoutMs = resolveDispatchTimeoutMs(config, account);
   let remainingDispatchMs = dispatchTimeoutMs;
+  let taskInterrupted = false;
   const timeoutError = new Error("octo: dispatch timed out (shared budget expired)");
   const stoppedError = new Error("octo: account stopped during dispatch");
   let removeStopListener: (() => void) | undefined;
@@ -3368,6 +3371,7 @@ export async function handleInboundMessage(params: {
   let runtimeHandedOff = false;
   let dispatchTimeoutPromise: Promise<never> | undefined;
   let dispatchPromise: Promise<unknown> | undefined;
+  const detachTaskProgress = docTask?.progress?.attach(route.sessionKey);
   try {
     // Persist the at-most-once boundary before invoking the runtime. The
     // dispatch timeout starts afterwards so a slow state store cannot produce
@@ -3384,12 +3388,14 @@ export async function handleInboundMessage(params: {
     if (remainingDispatchMs <= 0) throw timeoutError;
     dispatchTimeoutPromise = new Promise<never>((_, reject) => {
       const onStop = () => {
+        taskInterrupted = true;
         reject(stoppedError);
         dispatchAbortController?.abort(stoppedError);
       };
       docTask?.signal?.addEventListener("abort", onStop, { once: true });
       removeStopListener = () => docTask?.signal?.removeEventListener("abort", onStop);
       dispatchTimeoutHandle = setTimeout(() => {
+        taskInterrupted = true;
         reject(timeoutError);
         dispatchAbortController?.abort(timeoutError);
       }, remainingDispatchMs);
@@ -3690,6 +3696,7 @@ export async function handleInboundMessage(params: {
     // — otherwise this group stays stuck forever, see issue #75.
     //
     if (err === timeoutError || err === stoppedError || docTask?.signal?.aborted) {
+      taskInterrupted = true;
       // Emit the primary diagnostic before waiting for cooperative shutdown;
       // otherwise an abort-ignoring host makes the timeout itself invisible.
       log?.warn?.(
@@ -3897,6 +3904,8 @@ export async function handleInboundMessage(params: {
     // 三件独立的事,压成一个枚举就会出现无处安放的组合(见 doc-mention-handler.ts)。
     // finalDelivered 来自上面的文档评论出站事实,而不是 replySucceeded —— 后者对
     // 进度/工具文本也置位,拿它当「答复落地」会让「正在读取文档… + 道歉」被判成完成。
+    detachTaskProgress?.();
+    docTask?.progress?.runEnded(dispatchFailed, taskInterrupted);
     if (docTask) {
       const report: DocTaskTurnReport = {
         finalDelivered: docTaskFinalDelivered,

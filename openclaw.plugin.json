@@ -85,6 +85,11 @@
             "default": true,
             "description": "Document comment @Bot tasks: routes task replies to the doc comment thread instead of IM. If a real HTTP 403 prevents comment delivery and the fallback comment also fails, one fixed, content-free requester DM may report that failure. Enabled by default; false disables document tasks only. Event polling may remain active for generic Bot Tasks or interactive cards."
           },
+          "docTaskProgress": {
+            "type": "boolean",
+            "default": false,
+            "description": "Opt in to upload document task receipts and sanitized tool inputs/outputs to docsApiUrl, visible to all document readers. Off by default; true enables uploads, false disables them without disabling tasks or replies. Credential filtering does not classify confidential business data. Deploy the receipt endpoint first. Per-account values override the channel default."
+          },
           "botTasks": {
             "type": "boolean",
             "default": true,
@@ -154,6 +159,11 @@
                   "type": "boolean",
                   "default": true,
                   "description": "Document comment @Bot tasks: routes task replies to the doc comment thread instead of IM. If a real HTTP 403 prevents comment delivery and the fallback comment also fails, one fixed, content-free requester DM may report that failure. Enabled by default; false disables document tasks only. Event polling may remain active for generic Bot Tasks or interactive cards."
+                },
+                "docTaskProgress": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Opt in to upload document task receipts and sanitized tool inputs/outputs to docsApiUrl, visible to all document readers. Off by default; true enables uploads, false disables them without disabling tasks or replies. Credential filtering does not classify confidential business data. Deploy the receipt endpoint first. Per-account values override the channel default."
                 },
                 "botTasks": {
                   "type": "boolean",

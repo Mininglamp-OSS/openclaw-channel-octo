@@ -35,6 +35,7 @@ export type ResolvedOctoAccount = {
     historyPromptTemplate?: string;  // Template for group history context injection
     onBehalfOf?: string;  // Persona clone: grantor uid
     secretsFileRoot?: string;  // Jail root for write-secret file writes
+    docTaskProgress?: boolean; // Explicit opt-in to upload receipts and tool previews to document readers.
     docTasks?: boolean;  // 文档评论 @Bot 任务(常驻事件轮询 + 出站改投评论区)。**默认开启**,布尔 false 关闭
     botTasks?: boolean;  // 通用服务端 Bot Task。**默认开启**,布尔 false 关闭
     dispatchTimeoutMs?: number;  // Explicit dispatch-timeout override; unset = derive from agents.defaults.timeoutSeconds (issue #113)
@@ -139,6 +140,7 @@ export function resolveOctoAccount(params: {
       // 注意这里只兜底 nullish —— 非布尔的真值(如字符串 "true")照旧透传下去,由
       // channel.ts 的严格 `=== true` 门禁拒掉,免得配置写错时静默地半开。
       docTasks: accountConfig.docTasks ?? channel.docTasks ?? true,
+      docTaskProgress: accountConfig.docTaskProgress ?? channel.docTaskProgress ?? false,
       botTasks: accountConfig.botTasks ?? channel.botTasks ?? true,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,
       secretsFileRoot: accountConfig.secretsFileRoot ?? channel.secretsFileRoot,
