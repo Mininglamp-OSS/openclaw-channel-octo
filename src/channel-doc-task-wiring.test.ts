@@ -481,17 +481,18 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
   });
 
   /** 装一个 fetch,记下每次 POST 的 body,供断言最终 status。 */
-  function captureHtmlPosts(): Array<Record<string, unknown>> {
+  function captureHtmlPosts(receipts: Array<{ url: string; body: Record<string, unknown> }> = []): Array<Record<string, unknown>> {
     const sent: Array<Record<string, unknown>> = [];
     globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
       const body = JSON.parse(init?.body ?? "{}") as Record<string, unknown>;
-      sent.push(body);
+      if (String(_url).endsWith("/comment-task")) receipts.push({ url: String(_url), body });
+      else if (String(_url).endsWith("/docs-html/v1/agent/replies")) sent.push(body);
       return {
         ok: true,
         status: 200,
         headers: { get: () => "application/json" },
-        text: async () => JSON.stringify({ status: 1 }),
-        json: async () => ({ status: 1 }),
+        text: async () => JSON.stringify({ status: 1, accepted: true }),
+        json: async () => ({ status: 1, accepted: true }),
       };
     }) as unknown as typeof fetch;
     return sent;
@@ -502,7 +503,7 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
     event_data: { ...docEvent.event_data, doc_kind: "html", idempotency_key: "docs:comment:html-notice" },
   };
 
-  it("会话冲突回执 ⇒ status=question", async () => {
+  it.each([false, true])("HTML 会话冲突与 slug 回执接线 (docTaskProgress=%s)", async docTaskProgress => {
     const { setOctoRuntime } = await import("./runtime.js");
     setOctoRuntime({
       config: { current: () => ({}) },
@@ -524,14 +525,24 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
       },
     } as never);
 
-    const sent = captureHtmlPosts();
-    const stop = await startAccount({ docTasks: true, dispatchTimeoutMs: 1000, docsApiUrl: API });
+    const receipts: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const sent = captureHtmlPosts(receipts);
+    const stop = await startAccount({ docTasks: true, docTaskProgress, dispatchTimeoutMs: 1000, docsApiUrl: API });
     try {
       const options = pollerOptions().find((o) => typeof o.onDocMention === "function")!;
       const onDocMention = options.onDocMention as (mention: unknown) => Promise<void>;
       const { parseDocCommentMention } = await import("./doc-mention.js");
 
-      await onDocMention(parseDocCommentMention(htmlDocEvent));
+      const key = `docs:comment:html-receipt-${docTaskProgress}`;
+      await onDocMention(parseDocCommentMention({ ...htmlDocEvent, event_data: {
+        ...htmlDocEvent.event_data, doc_id: 'html-slug', idempotency_key: key,
+      } }));
+      if (docTaskProgress) {
+        expect(receipts.length).toBeGreaterThanOrEqual(2);
+        expect(receipts.every(receipt => receipt.url === `${API}/v1/bot/docs/html-slug/comment-task` && receipt.body.idempotencyKey === key)).toBe(true);
+        expect(receipts[0].body.progress).toMatchObject({ state: 'waiting' });
+        expect(receipts.at(-1)?.body.progress).toMatchObject({ phase: 'ended', state: 'failed', errorCode: 'dispatch_failed', replyDelivered: false });
+      } else expect(receipts).toEqual([]);
 
       // HTML 分流生效:走的是 postHtmlDocReply(fetch),不是 postDocComment。
       expect(postDocComment).not.toHaveBeenCalled();
@@ -587,7 +598,7 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
 });
 
 describe("channel.ts:PPT 文档任务生产接线", () => {
-  it("使用 docsApiUrl 读取 revision，并把 threadId 作为回复 parentId", async () => {
+  it.each([undefined, false, 'true', true])("使用 docsApiUrl 读取 revision，并把 threadId 作为回复 parentId (docTaskProgress=%s)", async docTaskProgress => {
     const DOCS = "http://docs-backend.test:3000";
     const finalized = vi.fn((context: unknown) => context);
     const originalFetch = globalThis.fetch;
@@ -595,6 +606,7 @@ describe("channel.ts:PPT 文档任务生产接线", () => {
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       requests.push({ url, init });
+      if (url.endsWith("/comment-task")) return new Response(JSON.stringify({ accepted: true }), { status: 200 });
       if (init?.method === "POST") {
         return new Response(JSON.stringify({ id: 88 }), { status: 201 });
       }
@@ -623,7 +635,7 @@ describe("channel.ts:PPT 文档任务生产接线", () => {
       },
     } as never);
 
-    const stop = await startAccount({ docTasks: true, docsApiUrl: DOCS, docsCliPath: '/trusted/ppt-cli' });
+    const stop = await startAccount({ docTasks: true, docTaskProgress, docsApiUrl: DOCS, docsCliPath: '/trusted/ppt-cli' });
     try {
       const options = pollerOptions().find((o) => typeof o.onDocMention === "function")!;
       const onDocMention = options.onDocMention as (mention: unknown) => Promise<void>;
@@ -637,11 +649,20 @@ describe("channel.ts:PPT 文档任务生产接线", () => {
         },
       }));
 
-      expect(requests.map(({ url }) => url)).toEqual([
+      const processRequests = requests.filter(({ url }) => url.endsWith("/comment-task"));
+      if (docTaskProgress === true) {
+        expect(processRequests.length).toBeGreaterThanOrEqual(2);
+        expect(processRequests.every(({url}) => url === `${DOCS}/v1/bot/docs/d1/comment-task`)).toBe(true);
+        expect(processRequests.every(({ init }) => init?.signal?.aborted)).toBe(true);
+        expect(JSON.parse(String(processRequests[0].init?.body)).progress.state).toBe('waiting');
+        expect(JSON.parse(String(processRequests.at(-1)?.init?.body)).progress).toMatchObject({ phase: 'ended', state: 'failed', errorCode: 'dispatch_failed', replyDelivered: false });
+      } else expect(processRequests).toEqual([]);
+      const contentRequests = requests.filter(({ url }) => !url.endsWith("/comment-task"));
+      expect(contentRequests.map(({ url }) => url)).toEqual([
         `${DOCS}/v1/bot/docs/d1/ppt`,
         `${DOCS}/v1/bot/docs/d1/comments`,
       ]);
-      const post = requests[1]?.init;
+      const post = contentRequests[1]?.init;
       expect(JSON.parse(String(post?.body))).toEqual({
         body: "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
         parentId: 70,
@@ -703,6 +724,9 @@ it.each([403, 404])("routes a document HTTP %s failure through the production re
   const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = String(input);
     requests.push(url);
+    if (url === `${DOCS}/v1/bot/docs/d1/comment-task`) {
+      return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+    }
     if (url === `${DOCS}/v1/bot/docs/d1/ppt`) {
       return new Response(JSON.stringify({ data: { baseRevision: 12 } }), { status: 200 });
     }

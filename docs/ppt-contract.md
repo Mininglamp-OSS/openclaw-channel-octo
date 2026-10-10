@@ -22,6 +22,108 @@ Each PPT task resolves its deadline from the current runtime configuration, with
 
 The revision probe limits the decoded HTTP response to 9 MiB, including error bodies, and cancels oversized streams. This accommodates the default 8 MiB deck limit plus its envelope. Deployments allowing larger decks can still execute the initial editing turn, but an oversized or failed revision probe disables the optional continuation. There is no new configuration switch.
 
+## Document task progress receipts
+
+`POST /v1/bot/docs/{docId}/comment-task` is separate from comment creation. It
+accepts `{idempotencyKey, progress, events?}` and returns HTTP 200
+`{accepted:true}` for accepted updates and immutable retries.
+
+The JSON `idempotencyKey` is the original mention's task identity. Keep it stable
+across waiting, running and ended snapshots; do not hash it with each snapshot or
+move it into an `Idempotency-Key` header. The backend uses it to find the prepared
+task and check the authenticated Bot/document. Progress dedupe then uses
+`progress.attemptId` and monotonic `progress.sequence`; event dedupe uses immutable,
+contiguous `events[].seq` within that attempt. A duplicate terminal snapshot may
+carry later event batches up to its persisted `eventCount`. Reusing the task key
+does not replay the first response or discard later snapshots.
+
+The snapshot retains the latest 100 steps; `omittedSteps` counts evicted steps.
+Events are immutable and retained independently, up to the 1000-event limit, so
+an event's `stepId` may refer to a step no longer present in `progress.steps`.
+Readers must tolerate this and use the event's own `tool`, `type`, `at` and
+`failed` fields when rendering it. Step eviction also removes the in-memory
+call mapping: a late completion for an evicted step may have no result event.
+Do not infer that such a tool is still running, or delete/resequence earlier
+events to force every event into the current snapshot.
+
+Source contract checked against companion Docs backend
+`df830c3ec36768c141dd919f69fbb4a623dd757d` on 2026-10-10:
+`src/api/routes/commentTasks.ts`, `src/db/repos/docCommentTaskRepo.ts` and
+`src/comments/taskProgress.ts`. Route/validator tests use mocked authorization
+and storage; this check does not establish production deployment. Deploy the
+backend endpoint and event tables before opting in with `docTaskProgress: true`
+(default off; account values override the channel default). Receipt reads
+require document reader access; the audience is document readers, not just the
+comment author. Preview credential filtering does not classify business data.
+
+HTML receipts use this same Docs-backend endpoint with the HTML source slug in
+`{docId}`. This differs from ordinary comment creation: the receipt handler first
+looks up the prepared task by its original key, checks the authenticated Bot and
+canonical document access, then compares the path to that document's
+`octo_doc_slug` (or canonical `doc_id` for Docs/Sheets/PPT). A wrong slug or Bot is
+rejected. Receipt reads still use the canonical document ID. The companion
+`test/commentTasks.test.ts` pins correct-slug acceptance and mismatched-path
+rejection; the plugin's channel wiring pins its enabled HTML request and task key.
+These are source/contract tests, not evidence that an environment is deployed.
+
+The plugin coalesces snapshots, sends at most ten events per request, and selects
+newer snapshots between batches. Each HTTP request has a 2.5-second deadline.
+`finish()` adds a five-second aggregate budget, aborting active HTTP/backoff and
+stopping further sends at expiry. Transient failures get at most three attempts
+per batch, with 1/2/4-second exponential backoff between attempts/snapshots;
+a 429's longer `Retry-After` is never shortened. Other 4xx responses except 408
+stop this task's uploads. A successful HTTP response with invalid JSON or without
+`accepted: true` is a protocol failure and also stops uploads for this task.
+Failure logs are limited to one per minute per account handler and include only
+a fixed document-kind label and HTTP/protocol/transport category, never upstream
+response text, tokens or task identifiers. Evidence delivery
+does not alter execution/reply success. When no answer was delivered, the handler
+starts the terminal drain and sends the failure notice concurrently, then waits
+for the bounded drain before completing; the receipt deadline does not postpone
+the notice.
+
+### Terminal-state rules
+
+`replyDelivered` records the current turn's final comment, never a notice-only
+reply. `finished` confirms that delivery, not persisted edits. An optional
+revision probe after a delivered answer only decides whether to start another
+turn; its cancellation, failure or timeout (including a timeout that consumes the
+remaining task budget) cannot interrupt the completed turn. Once a continuation
+is admitted, it has a new final-delivery fact and ordinary execution rules apply.
+
+| Dispatch / observation point | Final delivered | Evidence | State / errorCode | replyDelivered |
+| --- | --- | --- | --- | --- |
+| Initial revision probe or pre-dispatch admission guard | no | Account cancellation or shared-budget expiry prevents execution | `unknown / interrupted` | false |
+| Inbound execution, including runtime handoff/reservation | no | Actual cancellation or execution timeout | `unknown / interrupted` | false |
+| Inbound execution before dispatch returns | yes | Actual cancellation or execution timeout | `unknown / interrupted` | true |
+| Dispatch returned, including an ordinary late provider/dispatch error | yes | No execution interruption | `finished / none` | true |
+| Optional post-dispatch revision probe | yes | Probe succeeds, fails, is cancelled, or exhausts its own/shared remaining budget | `finished / none` | true |
+| Admitted continuation after an unchanged revision | no new final | Admission or execution is interrupted | `unknown / interrupted` | false |
+| Final comment delivery | no | Structured HTTP 403 already observed before terminal draining | `failed / permission_denied` | false |
+| Dispatch rejected or runtime failed | no | No interruption and no known final-comment 403 | `failed / dispatch_failed` | false |
+| Session-conflict admission exhausted its retries; notice sent or failed | no | Dispatch returns `dropped` | `failed / dispatch_failed` | false |
+| Dispatch completed without a final comment | no | No known execution failure, interruption or final-comment 403 | `unknown / delivery_failed` | false |
+
+Actual execution interruption has precedence over final-delivery and permission
+facts; a delivered final has precedence over ordinary errors or later 403s.
+`failed` means the task could not complete, including failed session admission;
+it does not assert that model/tool execution began. Only runtime activity changes
+waiting to running. An answered conflict notice is not a final answer. The wire
+contract has no `skipped` state; adding one requires a coordinated backend/viewer
+protocol change. Failure-notice/IM delivery and receipt-upload failures do not
+retroactively change the task's terminal outcome.
+
+An independent initial revision-probe timeout or read failure disables the
+optional continuation and still permits the first turn while its task budget is
+valid. Initial admission stopped by account cancellation or shared-budget expiry
+remains `unknown/interrupted` even though inbound was never entered.
+
+Reporting is best effort: a deadline, lost response, or unreachable backend can
+leave the terminal receipt or detail tail missing. The declared `eventCount` is
+not reduced after cutoff, so readers must distinguish execution termination from
+complete detail delivery (`cursor >= expectedCount`). There is no persistent
+background resend queue and no claim that every retained event is always uploaded.
+
 ## Media guidance in PPT comment tasks
 
 The task prompt points to the installed CLI's `octo-docs/ppt.md` for media wire

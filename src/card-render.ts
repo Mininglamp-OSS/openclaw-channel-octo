@@ -628,6 +628,27 @@ const SCHEMELESS_USERINFO_RE =
 const SCHEMELESS_HOST_PATH_RE =
   /(^|[^A-Za-z0-9@._/:+-])([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?::\d+)?\/[^\s]+)/g;
 
+/** Upload sinks must also hide the credentials/paths the card reducer removes.
+ * search starts at zero and preserves lastIndex on these shared global regexes.
+ */
+export function containsPrivateSchemelessUrl(text: string): boolean {
+  if (text.length > RAW_INPUT_MAX) return true;
+  // Both patterns match within one whitespace-free token. Gate impossible
+  // candidates cheaply, and never expose their backtracking to a >4K run.
+  // Many short candidates still add work, bounded by the token cap times the
+  // aggregate RAW_INPUT_MAX budget; the cap is not a constant-time guarantee.
+  for (const [token] of text.matchAll(/\S+/g)) {
+    const userinfo = token.includes(":") && token.includes("@");
+    const path = token.includes("/");
+    if (!userinfo && !path) continue;
+    // Withhold the entire preview rather than scan or silently discard a tail.
+    if (token.length > REDUCE_INPUT_MAX) return true;
+    if ((userinfo && token.search(SCHEMELESS_USERINFO_RE) >= 0) ||
+        (path && token.search(SCHEMELESS_HOST_PATH_RE) >= 0)) return true;
+  }
+  return false;
+}
+
 /** 缺省谓词取最严的一档:不知道调用方是谁时,宁可过度隐藏。 */
 const DEFAULT_SENSITIVE: SensitivePredicate = sensitivePredicate(true);
 

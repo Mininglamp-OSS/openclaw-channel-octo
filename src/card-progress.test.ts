@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DocTaskTracker, registerDocTaskProgress, type DocTaskProgress } from "./doc-task-progress.js";
 import { ChannelType } from "./types.js";
+import { registerDocTaskToolPolicy } from "./doc-task-tool-policy.js";
 import {
   _resetCardProgressForTests,
   bindCardRun,
@@ -585,6 +587,68 @@ describe("server-driven Registry reasoning progress", () => {
       edits.map((_body, index) => index + 1),
     );
     expect(wire.calls.filter((call) => call.url.includes("/sendMessage"))).toHaveLength(1);
+  });
+
+  it.each([true, false])("keeps IM card continuation independent of the completed document receipt (card first: %s)", async cardFirst => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    // api.on appends in OpenClaw's typed-hook registry; exercise both modules
+    // with one dispatch, rather than the single-module makeApi test double.
+    const hooks = new Map<string, Hook[]>();
+    const api = { on: (name: string, handler: Hook) => {
+      hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+    } } as never;
+    for (const register of cardFirst ? [registerCardProgress, registerDocTaskProgress] : [registerDocTaskProgress, registerCardProgress]) register(api);
+    const fire = async (name: string, event: Record<string, unknown>, ctx: { sessionKey: string; runId: string }) => {
+      const results = [];
+      for (const handler of hooks.get(name) ?? []) results.push(await handler(event, ctx));
+      return results;
+    };
+    registerDocTaskToolPolicy(api);
+    const sessionKey = "agent:one:octo:acct:group:combined-continuation";
+    const docSessionKey = "agent:one:octo:acct:doctask:doc:thread";
+    const snapshots: DocTaskProgress[] = [];
+    const tracker = new DocTaskTracker(async snapshot => { snapshots.push(snapshot); });
+    const detach = tracker.attach(docSessionKey);
+    const docCtx = { sessionKey: docSessionKey, runId: "doc-run" };
+    const ctx = { sessionKey, runId: "run-1" };
+    try {
+      setCardContext(sessionKey, context());
+      expect(await fire("before_agent_run", {}, docCtx)).toEqual([{ outcome: "pass" }, { outcome: "pass" }]);
+      await fire("model_call_started", {}, docCtx);
+      await fire("before_tool_call", { toolName: "read", toolCallId: "doc-read" }, docCtx);
+      await fire("after_tool_call", { toolName: "read", toolCallId: "doc-read" }, docCtx);
+      expect(await fire("before_agent_run", {}, ctx)).toEqual([{ outcome: "pass" }, { outcome: "pass" }]);
+      await fire("model_call_started", { callId: "model-1" }, ctx);
+      await fire("before_tool_call", { toolName: "read", toolCallId: "read-1" }, ctx);
+      await fire("after_tool_call", { toolName: "read", toolCallId: "read-1", result: { text: "read complete" } }, ctx);
+      await vi.advanceTimersByTimeAsync(900);
+      expect(snapshots.at(-1)).toMatchObject({ state: "running", steps: [{ tool: "read", state: "finished" }] });
+      expect(wire.calls.filter(call => call.url.includes("/sendMessage"))).toHaveLength(1);
+      await fire("before_tool_call", { toolName: "sessions_spawn", toolCallId: "spawn-1" }, ctx);
+      await fire("after_tool_call", { toolName: "sessions_spawn", toolCallId: "spawn-1", result: { status: "accepted", childSessionKey: "child-1" } }, ctx);
+      await fire("before_tool_call", { toolName: "sessions_yield", toolCallId: "yield-1" }, ctx);
+      await fire("after_tool_call", { toolName: "sessions_yield", toolCallId: "yield-1" }, ctx);
+      await vi.advanceTimersByTimeAsync(900);
+      await finalizeCard(sessionKey, { success: false });
+    } finally { detach(); await tracker.finish({ finalDelivered: true }); }
+
+    const completedSnapshotCount = snapshots.length;
+    const resumedCtx = { sessionKey, runId: "run-2" };
+    try {
+      setCardContext(sessionKey, context());
+      expect(await fire("before_agent_run", { prompt: completionPrompt("child-1") }, resumedCtx))
+        .toEqual([{ outcome: "pass" }, { outcome: "pass" }]);
+      await fire("model_call_started", { callId: "model-2" }, resumedCtx);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(snapshots).toHaveLength(completedSnapshotCount);
+      expect(snapshots.at(-1)).toMatchObject({ state: "finished", replyDelivered: true });
+      await fire("agent_end", { runId: "run-2", success: true }, resumedCtx);
+      const edits = wire.calls.filter(call => call.url.includes("/message/edit")).map(call => call.body!);
+      expect(edits).toContainEqual(expect.objectContaining({ data: expect.objectContaining({ progressText: "Subtask returned. Wrapping up…" }) }));
+      expect(edits.at(-1)).toMatchObject({ state: "completed" });
+      expect(wire.calls.filter(call => call.url.includes("/sendMessage"))).toHaveLength(1);
+    } finally { clearCard(sessionKey); }
   });
 
   it("does not create a reasoning card for a display-card-only turn", async () => {

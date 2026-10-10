@@ -41,6 +41,7 @@ export interface OctoAccountConfig {
   cardDisplay?: boolean;
   /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
   cardInteraction?: boolean;
+  docTaskProgress?: boolean; // Default off; account setting overrides the channel default.
   docTasks?: boolean;  // Document comment @Bot tasks. Default on; boolean false opts out.
   botTasks?: boolean;  // Generic server-issued Bot Tasks. Default on; boolean false opts out.
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
@@ -72,6 +73,7 @@ export interface OctoConfig {
   cardDisplay?: boolean;
   /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
   cardInteraction?: boolean;
+  docTaskProgress?: boolean; // Default off; account setting overrides the channel default.
   docTasks?: boolean;  // Top-level default for document comment @Bot tasks
   botTasks?: boolean;  // Top-level default for generic Bot Tasks
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
@@ -108,6 +110,9 @@ export const EVENT_WAIT_SECONDS_DESCRIPTION =
 
 export const DOC_TASKS_DESCRIPTION =
   "Document comment @Bot tasks: routes task replies to the doc comment thread instead of IM. If a real HTTP 403 prevents comment delivery and the fallback comment also fails, one fixed, content-free requester DM may report that failure. Enabled by default; false disables document tasks only. Event polling may remain active for generic Bot Tasks or interactive cards.";
+
+export const DOC_TASK_PROGRESS_DESCRIPTION =
+  "Opt in to upload document task receipts and sanitized tool inputs/outputs to docsApiUrl, visible to all document readers. Off by default; true enables uploads, false disables them without disabling tasks or replies. Credential filtering does not classify confidential business data. Deploy the receipt endpoint first. Per-account values override the channel default.";
 
 export const BOT_TASKS_DESCRIPTION =
   "Generic server-issued Bot Tasks: runs the supplied business prompt in an isolated agent turn and requires business output through octo-cli. Enabled by default; set false to disable generic task execution. Set both botTasks and docTasks to false when the account should not run background tasks.";
@@ -190,6 +195,7 @@ export const OctoConfigJsonSchema = {
       historyLimit: { type: "number", minimum: 1, maximum: 100 },
       historyPromptTemplate: { type: "string" },
       docTasks: { type: "boolean", default: true, description: DOC_TASKS_DESCRIPTION },
+      docTaskProgress: { type: "boolean", default: false, description: DOC_TASK_PROGRESS_DESCRIPTION },
       botTasks: { type: "boolean", default: true, description: BOT_TASKS_DESCRIPTION },
       onBehalfOf: { type: "string" },
       secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
@@ -216,6 +222,7 @@ export const OctoConfigJsonSchema = {
             historyLimit: { type: "number", minimum: 1, maximum: 100 },
             historyPromptTemplate: { type: "string" },
             docTasks: { type: "boolean", default: true, description: DOC_TASKS_DESCRIPTION },
+            docTaskProgress: { type: "boolean", default: false, description: DOC_TASK_PROGRESS_DESCRIPTION },
             botTasks: { type: "boolean", default: true, description: BOT_TASKS_DESCRIPTION },
             onBehalfOf: { type: "string" },
             secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },

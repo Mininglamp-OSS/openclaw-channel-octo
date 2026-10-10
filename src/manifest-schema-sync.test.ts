@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { DOCS_CLI_PATH_DESCRIPTION, BOT_TASKS_DESCRIPTION, DOC_TASKS_DESCRIPTION, DOCS_API_URL_DESCRIPTION, OctoConfigJsonSchema } from "./config-schema.js";
+import { DOC_TASK_PROGRESS_DESCRIPTION, DOCS_CLI_PATH_DESCRIPTION, BOT_TASKS_DESCRIPTION, DOC_TASKS_DESCRIPTION, DOCS_API_URL_DESCRIPTION, OctoConfigJsonSchema } from "./config-schema.js";
 
 // Regression guard for OpenClaw v2026.5.x channel manifest requirement:
 // openclaw.plugin.json#channelConfigs.octo.schema must stay in sync
@@ -52,6 +52,7 @@ describe("openclaw.plugin.json channelConfigs", () => {
   // 会悄悄漂移。这里按 key 把两侧描述钉到 config-schema 的单一来源上。
   it.each([
     ["docTasks", DOC_TASKS_DESCRIPTION],
+    ["docTaskProgress", DOC_TASK_PROGRESS_DESCRIPTION],
     ["botTasks", BOT_TASKS_DESCRIPTION],
     ["docsApiUrl", DOCS_API_URL_DESCRIPTION],
     ["docsCliPath", DOCS_CLI_PATH_DESCRIPTION],
@@ -65,6 +66,15 @@ describe("openclaw.plugin.json channelConfigs", () => {
     expect(tsAccountProps[key]?.description).toBe(expected);
     expect(manifestProps[key]?.description).toBe(expected);
     expect(manifestAccountProps[key]?.description).toBe(expected);
+  });
+
+  it('advertises receipts as default-off booleans in both configuration surfaces', () => {
+    const manifestProps = manifest.channelConfigs.octo.schema.properties;
+    const tsProps = OctoConfigJsonSchema.schema.properties;
+    for (const props of [manifestProps, manifestProps.accounts.additionalProperties.properties,
+      tsProps, tsProps.accounts.additionalProperties.properties]) {
+      expect(props.docTaskProgress).toMatchObject({ type: 'boolean', default: false });
+    }
   });
 
   // Description drift guard: secretsFileRoot carries operator-facing semantics

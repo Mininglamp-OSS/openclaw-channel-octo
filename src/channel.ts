@@ -1,3 +1,4 @@
+import { postDocTaskProgress } from "./api-fetch.js";
 import { postPptDocReply, readPptRevision } from "./ppt-comment.js";
 import type {
   ChannelPlugin,
@@ -1576,6 +1577,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 不重投 —— 改文档的任务重放不幂等。见 doc-task-deadletter.ts 顶部。
       const docTaskDeadLetter = createFileDocTaskDeadLetterStore({ accountId: account.accountId, log });
       const handleDocMention = createDocMentionHandler({
+        reportProgress: account.config.docTaskProgress === true ? (mention, progress, events, signal) => postDocTaskProgress({
+          apiUrl: account.config.docsApiUrl, botToken: account.config.botToken ?? "",
+          docId: mention.docId, idempotencyKey: mention.idempotencyKey, progress, events, signal,
+        }) : undefined,
         botUid: credentials.robot_id,
         notifyPermissionFailure: (mention, signal) => sendDocPermissionNotice(account.config.apiUrl, account.config.botToken ?? '', mention, signal),
         // 整篇取回地址由这里的**已解析配置**拼,不让 agent 从载荷 url= 推域名。

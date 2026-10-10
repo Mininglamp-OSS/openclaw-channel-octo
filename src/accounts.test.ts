@@ -87,3 +87,18 @@ describe("resolveOctoAccount botTasks 默认值", () => {
     ).toBe("true");
   });
 });
+
+
+describe('document receipt opt-in configuration', () => {
+  const resolve = (octo: Record<string, unknown>, accountId = 'a1') =>
+    resolveOctoAccount({ cfg: { channels: { octo } } as never, accountId }).config;
+  it('keeps tasks enabled but receipts off on an unconfigured upgrade', () => {
+    expect(resolve({ accounts: { a1: { botToken: 'fixture' } } })).toMatchObject({ docTasks: true, docTaskProgress: false });
+  });
+  it('inherits the channel option and lets accounts opt out or in independently', () => {
+    const accounts = { a1: { botToken: 'fixture' }, a2: { botToken: 'fixture', docTaskProgress: false }, a3: { botToken: 'fixture', docTaskProgress: true } };
+    expect(resolve({ docTaskProgress: true, accounts }).docTaskProgress).toBe(true);
+    expect(resolve({ docTaskProgress: true, accounts }, 'a2').docTaskProgress).toBe(false);
+    expect(resolve({ docTaskProgress: false, accounts }, 'a3').docTaskProgress).toBe(true);
+  });
+});
