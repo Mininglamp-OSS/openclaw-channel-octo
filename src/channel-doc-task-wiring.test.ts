@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveOctoAccount } from "./accounts.js";
 
 /**
  * 文档任务在 **channel.ts 生产接线** 上的两条守卫。
@@ -110,7 +111,7 @@ const API = "http://octo.test";
  * `startAccount` 返回的 Promise 会一直挂着直到 abort(gateway 用 resolve 表示
  * 「账号已停止」),所以不能直接 await 它 —— 起完之后 abort 再收尾。
  */
-async function startAccount(config: Record<string, unknown>, setStatus: (patch: unknown) => void = () => {}): Promise<() => Promise<void>> {
+async function startAccount(config: Record<string, unknown>, setStatus: (patch: unknown) => void = () => {}, docTaskProgressDefaulted?: boolean): Promise<() => Promise<void>> {
   const { octoPlugin } = await import("./channel.js");
   const controller = new AbortController();
   const ctx = {
@@ -118,6 +119,7 @@ async function startAccount(config: Record<string, unknown>, setStatus: (patch: 
       accountId: "acct1",
       enabled: true,
       configured: true,
+      docTaskProgressDefaulted,
       config: { botToken: "tok", apiUrl: API, pollIntervalMs: 1000, heartbeatIntervalMs: 60_000, ...config },
     },
     cfg: {},
@@ -133,6 +135,15 @@ async function startAccount(config: Record<string, unknown>, setStatus: (patch: 
 
 function pollerOptions(): Array<Record<string, unknown>> {
   return (startEventPoller.mock.calls as unknown as Array<[Record<string, unknown>]>).map(([o]) => o);
+}
+
+// Exercise upgrade defaults through the real resolver, while the gate-only
+// cases keep supplying raw, already-resolved values to startAccount.
+async function startConfiguredAccount(config: Record<string, unknown>, channelDefaults: Record<string, unknown> = {}) {
+  const account = resolveOctoAccount({ accountId: 'acct1', cfg: { channels: { octo: {
+    botToken: 'tok', apiUrl: API, ...channelDefaults, accounts: { acct1: config },
+  } } } as never });
+  return startAccount(account.config, undefined, account.docTaskProgressDefaulted);
 }
 
 const docEvent = {
@@ -481,17 +492,18 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
   });
 
   /** 装一个 fetch,记下每次 POST 的 body,供断言最终 status。 */
-  function captureHtmlPosts(): Array<Record<string, unknown>> {
+  function captureHtmlPosts(receipts: Array<{ url: string; body: Record<string, unknown> }> = []): Array<Record<string, unknown>> {
     const sent: Array<Record<string, unknown>> = [];
     globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
       const body = JSON.parse(init?.body ?? "{}") as Record<string, unknown>;
-      sent.push(body);
+      if (String(_url).endsWith("/comment-task")) receipts.push({ url: String(_url), body });
+      else if (String(_url).endsWith("/docs-html/v1/agent/replies")) sent.push(body);
       return {
         ok: true,
         status: 200,
         headers: { get: () => "application/json" },
-        text: async () => JSON.stringify({ status: 1 }),
-        json: async () => ({ status: 1 }),
+        text: async () => JSON.stringify({ status: 1, accepted: true }),
+        json: async () => ({ status: 1, accepted: true }),
       };
     }) as unknown as typeof fetch;
     return sent;
@@ -502,7 +514,7 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
     event_data: { ...docEvent.event_data, doc_kind: "html", idempotency_key: "docs:comment:html-notice" },
   };
 
-  it("会话冲突回执 ⇒ status=question", async () => {
+  it.each([undefined, false, true])("HTML 会话冲突与 slug 回执接线 (docTaskProgress=%s)", async docTaskProgress => {
     const { setOctoRuntime } = await import("./runtime.js");
     setOctoRuntime({
       config: { current: () => ({}) },
@@ -524,14 +536,24 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
       },
     } as never);
 
-    const sent = captureHtmlPosts();
-    const stop = await startAccount({ docTasks: true, dispatchTimeoutMs: 1000, docsApiUrl: API });
+    const receipts: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const sent = captureHtmlPosts(receipts);
+    const stop = await startConfiguredAccount({ docTaskProgress, dispatchTimeoutMs: 1000, docsApiUrl: API });
     try {
       const options = pollerOptions().find((o) => typeof o.onDocMention === "function")!;
       const onDocMention = options.onDocMention as (mention: unknown) => Promise<void>;
       const { parseDocCommentMention } = await import("./doc-mention.js");
 
-      await onDocMention(parseDocCommentMention(htmlDocEvent));
+      const key = `docs:comment:html-receipt-${docTaskProgress}`;
+      await onDocMention(parseDocCommentMention({ ...htmlDocEvent, event_data: {
+        ...htmlDocEvent.event_data, doc_id: 'html-slug', idempotency_key: key,
+      } }));
+      if (docTaskProgress !== false) {
+        expect(receipts.length).toBeGreaterThanOrEqual(2);
+        expect(receipts.every(receipt => receipt.url === `${API}/v1/bot/docs/html-slug/comment-task` && receipt.body.idempotencyKey === key)).toBe(true);
+        expect(receipts[0].body.progress).toMatchObject({ state: 'waiting' });
+        expect(receipts.at(-1)?.body.progress).toMatchObject({ phase: 'ended', state: 'failed', errorCode: 'dispatch_failed', replyDelivered: false });
+      } else expect(receipts).toEqual([]);
 
       // HTML 分流生效:走的是 postHtmlDocReply(fetch),不是 postDocComment。
       expect(postDocComment).not.toHaveBeenCalled();
@@ -587,7 +609,7 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
 });
 
 describe("channel.ts:PPT 文档任务生产接线", () => {
-  it("使用 docsApiUrl 读取 revision，并把 threadId 作为回复 parentId", async () => {
+  it.each([undefined, false, 'true', true])("使用 docsApiUrl 读取 revision，并把 threadId 作为回复 parentId (docTaskProgress=%s)", async docTaskProgress => {
     const DOCS = "http://docs-backend.test:3000";
     const finalized = vi.fn((context: unknown) => context);
     const originalFetch = globalThis.fetch;
@@ -595,6 +617,7 @@ describe("channel.ts:PPT 文档任务生产接线", () => {
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       requests.push({ url, init });
+      if (url.endsWith("/comment-task")) return new Response(JSON.stringify({ accepted: true }), { status: 200 });
       if (init?.method === "POST") {
         return new Response(JSON.stringify({ id: 88 }), { status: 201 });
       }
@@ -623,7 +646,7 @@ describe("channel.ts:PPT 文档任务生产接线", () => {
       },
     } as never);
 
-    const stop = await startAccount({ docTasks: true, docsApiUrl: DOCS, docsCliPath: '/trusted/ppt-cli' });
+    const stop = await startConfiguredAccount({ docTaskProgress, docsApiUrl: DOCS, docsCliPath: '/trusted/ppt-cli' });
     try {
       const options = pollerOptions().find((o) => typeof o.onDocMention === "function")!;
       const onDocMention = options.onDocMention as (mention: unknown) => Promise<void>;
@@ -637,11 +660,20 @@ describe("channel.ts:PPT 文档任务生产接线", () => {
         },
       }));
 
-      expect(requests.map(({ url }) => url)).toEqual([
+      const processRequests = requests.filter(({ url }) => url.endsWith("/comment-task"));
+      if (docTaskProgress === undefined || docTaskProgress === true) {
+        expect(processRequests.length).toBeGreaterThanOrEqual(2);
+        expect(processRequests.every(({url}) => url === `${DOCS}/v1/bot/docs/d1/comment-task`)).toBe(true);
+        expect(processRequests.every(({ init }) => init?.signal?.aborted)).toBe(true);
+        expect(JSON.parse(String(processRequests[0].init?.body)).progress.state).toBe('waiting');
+        expect(JSON.parse(String(processRequests.at(-1)?.init?.body)).progress).toMatchObject({ phase: 'ended', state: 'failed', errorCode: 'dispatch_failed', replyDelivered: false });
+      } else expect(processRequests).toEqual([]);
+      const contentRequests = requests.filter(({ url }) => !url.endsWith("/comment-task"));
+      expect(contentRequests.map(({ url }) => url)).toEqual([
         `${DOCS}/v1/bot/docs/d1/ppt`,
         `${DOCS}/v1/bot/docs/d1/comments`,
       ]);
-      const post = requests[1]?.init;
+      const post = contentRequests[1]?.init;
       expect(JSON.parse(String(post?.body))).toEqual({
         body: "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
         parentId: 70,
@@ -666,6 +698,154 @@ describe("channel.ts:PPT 文档任务生产接线", () => {
       globalThis.fetch = originalFetch;
     }
   }, 60_000);
+});
+
+// Docs and Sheets use the same untagged mention path; HTML has a separate reply transport.
+describe.each([undefined, 'html'] as const)('account stop through channel/handler/inbound (kind=%s)', kind => {
+  it.each(['cancel', 'cancel-after-final', 'completed', 'timeout'] as const)('%s preserves the terminal evidence', async mode => {
+    const { setOctoRuntime } = await import('./runtime.js');
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    let runtimeSignal: AbortSignal | undefined;
+    const dispatch = vi.fn(async (args: {
+      replyOptions: { abortSignal?: AbortSignal };
+      dispatcherOptions: { deliver: (payload: { text: string }, info: { kind: string }) => Promise<void> };
+    }) => {
+      runtimeSignal = args.replyOptions.abortSignal;
+      if (mode === 'cancel-after-final' || mode === 'completed') {
+        await args.dispatcherOptions.deliver({ text: '已完成本次任务' }, { kind: 'final' });
+      }
+      entered();
+      if (mode !== 'completed') await pending;
+      if (mode.startsWith('cancel')) throw new Error('host stopped');
+    });
+    setOctoRuntime({
+      config: { current: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: { body: string }) => body,
+          finalizeInboundContext: (context: unknown) => context,
+        },
+        routing: { resolveAgentRoute: () => ({ agentId: 'agent1', sessionKey: 'sk', accountId: 'acct1' }) },
+        session: { resolveStorePath: () => '/tmp/store', readSessionUpdatedAt: () => undefined, recordInboundSession: async () => {} },
+      },
+    } as never);
+    const receipts: Array<{ state: string; errorCode?: string; phase: string; replyDelivered: boolean }> = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const receipt = String(input).endsWith('/comment-task');
+      if (receipt) receipts.push(JSON.parse(String(init?.body)).progress);
+      return new Response(JSON.stringify(receipt ? { accepted: true } : { status: 1 }), { status: 200 });
+    });
+    const stop = await startConfiguredAccount({ dispatchTimeoutMs: 1000 });
+    let task: Promise<void> | undefined;
+    try {
+      const onDocMention = pollerOptions().find(o => typeof o.onDocMention === 'function')!.onDocMention as (mention: unknown) => Promise<void>;
+      const { parseDocCommentMention } = await import('./doc-mention.js');
+      task = onDocMention(parseDocCommentMention({ ...docEvent, event_data: {
+        ...docEvent.event_data, doc_kind: kind, idempotency_key: `stop-receipt:${kind}:${mode}`,
+      } }));
+      await started;
+      if (mode.startsWith('cancel')) {
+        await stop();
+        release(); // A host may reject without honoring abortSignal; receipt still records cancellation.
+      }
+      await task;
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(receipts.at(-1)).toMatchObject({
+        phase: 'ended', state: mode === 'completed' ? 'finished' : 'unknown',
+        replyDelivered: mode === 'completed' || mode === 'cancel-after-final',
+      });
+      expect(receipts.at(-1)?.errorCode).toBe(mode === 'completed' ? undefined : 'interrupted');
+      expect(runtimeSignal).toBeInstanceOf(AbortSignal);
+      expect(runtimeSignal?.aborted).toBe(mode.startsWith('cancel'));
+      const terminal = JSON.stringify(receipts.at(-1));
+      await stop();
+      release();
+      await Promise.resolve();
+      expect(JSON.stringify(receipts.at(-1))).toBe(terminal);
+      expect(sendMessage).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await stop();
+      await task;
+    }
+  }, 15_000);
+});
+
+it.each([
+  { label: 'unconfigured upgrade', config: {}, defaults: {}, enabled: true, status: 200 },
+  { label: 'channel disabled', config: {}, defaults: { docTaskProgress: false }, enabled: false, status: 200 },
+  { label: 'account disabled', config: { docTaskProgress: false }, defaults: { docTaskProgress: true }, enabled: false, status: 200 },
+  { label: 'account enabled', config: { docTaskProgress: true }, defaults: { docTaskProgress: false }, enabled: true, status: 200 },
+  { label: 'null account value', config: { docTaskProgress: null }, defaults: { docTaskProgress: true }, enabled: false, status: 200 },
+  { label: 'older backend', config: {}, defaults: {}, enabled: true, status: 404 },
+])('preserves document execution and replies with $label', async ({ label, config, defaults, enabled, status }) => {
+  const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const { setOctoRuntime } = await import('./runtime.js');
+  const dispatch = vi.fn(async (args: { dispatcherOptions: { deliver: (payload: { text: string }, info: { kind: string }) => Promise<void> } }) => {
+    await args.dispatcherOptions.deliver({ text: '已完成本次任务' }, { kind: 'final' });
+  });
+  setOctoRuntime({
+    config: { current: () => ({}) },
+    channel: {
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: dispatch,
+        resolveEnvelopeFormatOptions: () => ({}),
+        formatAgentEnvelope: ({ body }: { body: string }) => body,
+        finalizeInboundContext: (context: unknown) => context,
+      },
+      routing: { resolveAgentRoute: () => ({ agentId: 'agent1', sessionKey: 'sk', accountId: 'acct1' }) },
+      session: { resolveStorePath: () => '/tmp/store', readSessionUpdatedAt: () => undefined, recordInboundSession: async () => {} },
+    },
+  } as never);
+  const receipts: Array<Record<string, unknown>> = [];
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    expect(String(input)).toBe(`${API}/v1/bot/docs/d1/comment-task`);
+    receipts.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify(status === 200 ? { accepted: true } : { error: 'not_found' }), { status });
+  });
+  const stop = await startConfiguredAccount(config, defaults);
+  try {
+    const onDocMention = pollerOptions().find(o => typeof o.onDocMention === 'function')!.onDocMention as (mention: unknown) => Promise<void>;
+    const { parseDocCommentMention } = await import('./doc-mention.js');
+    const mention = parseDocCommentMention({ ...docEvent, event_data: {
+      ...docEvent.event_data, idempotency_key: `default-receipts:${label}`,
+    } });
+    await onDocMention(mention);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(postDocComment).toHaveBeenCalledOnce();
+    const notices = info.mock.calls.flat().map(String).filter(text => text.includes('docTaskProgress'));
+    const defaulted = label === 'unconfigured upgrade' || label === 'older backend';
+    expect(notices).toHaveLength(defaulted ? 1 : 0);
+    if (defaulted) {
+      expect(notices[0]).toContain('enabled by default');
+      expect(notices[0]).toContain('all document readers');
+      expect(notices[0]).toContain('docTaskProgress: false');
+    }
+    const warnings = warn.mock.calls.flat().map(String).filter(text => text.includes('docTaskProgress'));
+    expect(warnings).toHaveLength(label === 'null account value' ? 1 : 0);
+    if (label === 'null account value') expect(warnings[0]).toContain('null');
+    expect(postDocComment).toHaveBeenCalledWith(expect.objectContaining({ body: '已完成本次任务', parentId: '70' }));
+    expect(sendMessage).not.toHaveBeenCalled();
+    if (!enabled) expect(receipts).toEqual([]);
+    else if (status === 404) expect(receipts).toHaveLength(1);
+    else {
+      expect(receipts.length).toBeGreaterThanOrEqual(2);
+      expect(receipts[0].progress).toMatchObject({ state: 'waiting' });
+      expect(receipts.at(-1)?.progress).toMatchObject({ state: 'finished', phase: 'ended', replyDelivered: true });
+    }
+    // Receipt failure cannot authorize replay of document edits or replies.
+    await onDocMention(mention);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(postDocComment).toHaveBeenCalledOnce();
+  } finally {
+    await stop();
+    fetchSpy.mockRestore();
+  }
 });
 
 it('wires unsupported document diagnostics into the existing dead-letter store',async()=>{
@@ -703,6 +883,9 @@ it.each([403, 404])("routes a document HTTP %s failure through the production re
   const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = String(input);
     requests.push(url);
+    if (url === `${DOCS}/v1/bot/docs/d1/comment-task`) {
+      return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+    }
     if (url === `${DOCS}/v1/bot/docs/d1/ppt`) {
       return new Response(JSON.stringify({ data: { baseRevision: 12 } }), { status: 200 });
     }

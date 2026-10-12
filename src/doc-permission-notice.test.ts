@@ -3,6 +3,7 @@ import { createDocMentionHandler } from './doc-mention-handler.js';
 import { createMemoryDocMentionDedupeStore } from './doc-mention-dedupe.js';
 import type { DocCommentMention } from './doc-mention.js';
 import { OctoApiError } from './api-error.js';
+import type { DocTaskProgress } from './doc-task-progress.js';
 import { postDocComment } from './api-fetch.js';
 
 it.each([
@@ -96,4 +97,26 @@ it.each(['unavailable', 'delivered', 'dm-failed', 'stopped'] as const)('remember
   expect(notifyPermissionFailure).toHaveBeenCalledTimes(mode === 'delivered' || mode === 'stopped' ? 0 : 1);
   expect(record).toHaveBeenCalledTimes(mode === 'dm-failed' || mode === 'stopped' ? 1 : 0);
   expect(postComment).toHaveBeenCalledTimes(mode === 'delivered' || mode === 'stopped' ? 2 : 4);
+});
+
+it.each([
+ { delivered: false, intent: 'final' as const }, { delivered: true, intent: 'final' as const },
+ { delivered: false, intent: 'notice' as const }, { delivered: true, intent: 'notice' as const },
+])('reports a $intent 403 only without a delivered final (delivered=$delivered)', async ({ delivered, intent }) => {
+ const sent: DocTaskProgress[] = [];
+ const handler = createDocMentionHandler({ botUid: 'bot', dedupe: createMemoryDocMentionDedupeStore(),
+  dispatch: async (_message, _route, { docTask }) => {
+   if (delivered) {
+    await docTask.postComment('first answer', undefined, 'final');
+    docTask.reportTurn({ finalDelivered: true, delivered: true, lost: false, noticed: false });
+   }
+   await docTask.postComment('answer', undefined, intent);
+   return 'completed';
+  },
+  postComment: async (_mention, _text, _signal, replyIntent) => { if (replyIntent === intent && _text !== 'first answer') throw new OctoApiError({ status: 403, path: '/comments', body: 'denied', retryAfterMs: 0 }); },
+  reportProgress: async (_mention, progress) => { sent.push(progress); },
+ });
+ await handler(mention);
+ expect(sent.at(-1)).toMatchObject({ state: delivered ? 'finished' : 'failed', replyDelivered: delivered });
+ expect(sent.at(-1)?.errorCode).toBe(delivered ? undefined : 'permission_denied');
 });

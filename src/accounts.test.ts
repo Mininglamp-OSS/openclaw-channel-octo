@@ -87,3 +87,27 @@ describe("resolveOctoAccount botTasks 默认值", () => {
     ).toBe("true");
   });
 });
+
+
+describe('document receipt configuration', () => {
+  const resolve = (octo: Record<string, unknown>, accountId = 'a1') =>
+    resolveOctoAccount({ cfg: { channels: { octo } } as never, accountId }).config;
+  it('enables tasks and receipts without adding configuration on upgrade', () => {
+    expect(resolve({ accounts: { a1: { botToken: 'fixture' } } })).toMatchObject({ docTasks: true, docTaskProgress: true });
+    expect(resolve({ botToken: 'fixture' }).docTaskProgress).toBe(true);
+  });
+  it('inherits the channel option and lets accounts opt out or in independently', () => {
+    const accounts = { a1: { botToken: 'fixture' }, a2: { botToken: 'fixture', docTaskProgress: false }, a3: { botToken: 'fixture', docTaskProgress: true } };
+    expect(resolve({ docTaskProgress: true, accounts }).docTaskProgress).toBe(true);
+    expect(resolve({ docTaskProgress: false, accounts }).docTaskProgress).toBe(false);
+    expect(resolve({ accounts }, 'a2').docTaskProgress).toBe(false);
+    expect(resolve({ docTaskProgress: true, accounts }, 'a2').docTaskProgress).toBe(false);
+    expect(resolve({ docTaskProgress: false, accounts }, 'a3').docTaskProgress).toBe(true);
+  });
+  it('leaves malformed values for the strict runtime gate to reject', () => {
+    expect(resolve({ docTaskProgress: 'true' }).docTaskProgress).toBe('true');
+    expect(resolve({ docTaskProgress: null }).docTaskProgress).toBeNull();
+    expect(resolve({ docTaskProgress: true, accounts: { a1: { docTaskProgress: null } } }).docTaskProgress).toBeNull();
+    expect(resolve({ docTaskProgress: null, accounts: { a1: { docTaskProgress: true } } }).docTaskProgress).toBe(true);
+  });
+});

@@ -29,6 +29,8 @@ import { createDisplayCardTool } from "./src/card-display-tool.js";
 import { createInteractiveCardTool } from "./src/card-tool.js";
 import { CHANNEL_ID, PLUGIN_ID, DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./src/constants.js";
 import { bindCardRun, registerCardProgress } from "./src/card-progress.js";
+import { bindDocTaskRun, registerDocTaskProgress } from "./src/doc-task-progress.js";
+import { registerDocTaskToolPolicy } from "./src/doc-task-tool-policy.js";
 
 // ---------------------------------------------------------------------------
 // Tool-availability self-diagnostic (issue #137)
@@ -319,7 +321,10 @@ export default defineBundledChannelEntry({
       // Bind progress ownership before any model/tool event. before_agent_run repeats this on
       // newer hosts; the prompt hook preserves compatibility where that gate is unavailable.
       // Provider gating prevents a same-key non-Octo session from claiming an Octo entry.
-      if (ctx.messageProvider === CHANNEL_ID) bindCardRun(ctx.sessionKey, ctx.runId);
+      if (ctx.messageProvider === CHANNEL_ID) {
+        bindCardRun(ctx.sessionKey, ctx.runId);
+        bindDocTaskRun(ctx.sessionKey, ctx.runId);
+      }
       // Sections destined for the user-prompt context block (group MD,
       // member list, inbound history). These belong to the conversation
       // surface, not the LLM's system identity.
@@ -404,6 +409,8 @@ export default defineBundledChannelEntry({
 
     // 波 B:注册卡片进度 hook(before/after_tool_call、model_call_started)。
     // 只处理 dispatch 经 setCardContext 登记的 octo session(见 src/card-progress.ts)。
+    registerDocTaskToolPolicy(api);
     registerCardProgress(api);
+    registerDocTaskProgress(api);
   },
 });

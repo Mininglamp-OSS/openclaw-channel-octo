@@ -1,14 +1,27 @@
+import type { DocTaskEvent } from './doc-task-events.js';
 /**
  * Lightweight fetch-based API helpers for use inside OpenClaw plugin context.
  * These are used by inbound/outbound where the full OctoAPI class is not available.
  */
 
 import { ChannelType, MessageType, CARD_INTERACTIVE_PROFILE, CARD_PROFILE, CARD_VERSION, type CardProfile, type MentionEntity, type RichTextBlock, type SendMessageResult, type TargetCandidate } from "./types.js";
-import { OctoApiError, OctoApiStatusMismatchError } from "./api-error.js";
+import { OctoApiError, OctoApiStatusMismatchError, OctoApiProtocolError } from "./api-error.js";
 import path from "path";
 import { open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { BotEvent } from "./card-action.js";
+import type { DocTaskProgress } from "./doc-task-progress.js";
+
+export async function postDocTaskProgress(params: {
+  apiUrl: string; botToken: string; docId: string; idempotencyKey: string; progress: DocTaskProgress; events?: DocTaskEvent[]; signal?: AbortSignal;
+}): Promise<void> {
+  const result = await postJson<{ accepted?: boolean }>(
+    params.apiUrl, params.botToken, `/v1/bot/docs/${encodeURIComponent(params.docId)}/comment-task`,
+    { idempotencyKey: params.idempotencyKey, progress: params.progress, ...(params.events ? { events: params.events } : {}) },
+    AbortSignal.any([AbortSignal.timeout(2500), ...(params.signal ? [params.signal] : [])]), { retryOn429: false, logRateLimit: false },
+  );
+  if (result?.accepted !== true) throw new OctoApiProtocolError("doc_task_progress_unconfirmed");
+}
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 // Card-event poll requests run in a single sequential loop; without a bound a hung
@@ -190,6 +203,8 @@ function backoffSleep(ms: number, signal: AbortSignal | undefined, cause: unknow
 
 interface JsonRequestOptions {
   retryOn429?: boolean;
+  /** Receipt uploads use the caller's throttled diagnostic instead. */
+  logRateLimit?: boolean;
   idempotencyKey?: string;
   expectedStatus?: number;
   redirect?: RequestRedirect;
@@ -268,7 +283,7 @@ async function requestJson<T>(
       try {
         return parseOctoJson<T>(text);
       } catch {
-        throw new Error(`Octo API ${path} returned invalid JSON: ${text.slice(0, 200)}`);
+        throw new OctoApiProtocolError(`Octo API ${path} returned invalid JSON: ${text.slice(0, 200)}`);
       }
     }
 
@@ -280,7 +295,7 @@ async function requestJson<T>(
     // Logged on every rate limit, including the one we give up on: the scope and the
     // remaining count are the only way to tell which bucket ran dry and whose traffic
     // filled it, and they are discarded once this error leaves here.
-    console.warn(
+    if (opts.logRateLimit !== false) console.warn(
       `octo: rate limited on ${path} (scope=${err.rateLimitScope ?? "?"} ` +
         `remaining=${err.rateLimitRemaining ?? "?"} retry_after=${err.retryAfterMs}ms) ` +
         `attempt=${attempt + 1}/${retryOn429 ? MAX_429_RETRIES + 1 : 1}`,

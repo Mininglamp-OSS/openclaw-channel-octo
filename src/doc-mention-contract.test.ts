@@ -15,6 +15,7 @@ import {
 } from "./doc-mention.js";
 import { createFileDocMentionDedupeStore, type DocMentionDedupeStore } from "./doc-mention-dedupe.js";
 import { createDocMentionHandler } from "./doc-mention-handler.js";
+import { registerDocTaskProgress, type DocTaskProgress } from "./doc-task-progress.js";
 import { getInboundQueueKey } from "./inbound-queue.js";
 import { handleInboundMessage } from "./inbound.js";
 import { postDocComment } from "./api-fetch.js";
@@ -146,10 +147,12 @@ function makeDocMentionHandler(params: {
   dedupe: DocMentionDedupeStore;
   promptSink?: (text: string) => void;
   finalText: string;
+  progress?: DocTaskProgress[];
 }) {
   return createDocMentionHandler({
     botUid: BOT_UID,
     dedupe: params.dedupe,
+    reportProgress: params.progress ? async (_mention, snapshot) => { params.progress!.push(snapshot); } : undefined,
     postComment: async (mention, text, signal) => {
       await postDocComment({
         apiUrl: API,
@@ -233,6 +236,34 @@ describe("server 事件契约", () => {
 });
 
 describe("端到端:server 事件 → bot 执行 → 评论区回帖", () => {
+  it.each(["onError", "reject", "agent_end"])("delivered final survives a late %s in the production handler/inbound chain", async failure => {
+    const captured = installFetch([]);
+    const { dispatch } = installRuntime("已完成");
+    const hooks = new Map<string, (event: any, ctx: any) => unknown>();
+    registerDocTaskProgress({ on: (name: string, handler: any) => hooks.set(name, handler) } as never);
+    dispatch.mockImplementation(async (args: any) => {
+      const ctx = { sessionKey: args.ctx.SessionKey, runId: "late-error-run" };
+      hooks.get("before_agent_run")!({}, ctx);
+      hooks.get("model_call_started")!({}, ctx);
+      await args.dispatcherOptions.deliver({ text: "已完成" }, { kind: "final" });
+      if (failure === "onError") await args.dispatcherOptions.onError(new Error("late failure"), { kind: "final" });
+      if (failure === "reject") throw new Error("late dispatch rejection");
+      if (failure === "agent_end") hooks.get("agent_end")!({ success: false }, ctx);
+    });
+    const progress: DocTaskProgress[] = [];
+    const dedupe = createFileDocMentionDedupeStore({ accountId: "acct1", baseDir: dir });
+    const handler = makeDocMentionHandler({ dedupe, finalText: "已完成", progress });
+    const mention = parseDocCommentMention(SERVER_EVENT as any)!;
+    await handler(mention);
+    expect(captured.docComments).toHaveLength(1);
+    expect(progress.at(-1)).toMatchObject({ state: "finished", phase: "ended", replyDelivered: true });
+    expect(progress.at(-1)?.errorCode).toBeUndefined();
+    // A late failure must not invite a replay of a possibly non-idempotent edit.
+    await handler(mention);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(captured.docComments).toHaveLength(1);
+  });
+
   it("轮询拿到 server 事件后完成一整轮,回帖挂在原评论串下并 ack", async () => {
     const captured = installFetch([SERVER_EVENT]);
     installRuntime("已把绝对化承诺改成有数据边界、保留人工复核的表述。");

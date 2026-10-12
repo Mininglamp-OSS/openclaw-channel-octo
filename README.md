@@ -71,6 +71,7 @@ Card policy is configured per Bot on the Octo server, not in `openclaw.json`. Th
 - `docsApiUrl` (optional): Base URL for the docs domain, which is where document comment `@Bot` task replies are posted. It covers **both** doc services: docs-backend (`/v1/bot/docs/**`, Yjs docs) and octo-doc (`/docs-html/v1/**`, HTML docs). Setting it therefore assumes those two share ONE origin; serving them from two different origins is not supported (if a deployment ever needs that, the fix is a separate `htmlDocsApiUrl`, not a heuristic). Omitted means `apiUrl` — correct whenever a single gateway origin fronts the IM server and both doc services, which is how hosted deployments are arranged. Set it only when the doc services answer on a different origin (e.g. a split local stack whose IM gateway has no `/v1/bot/docs` route). Getting this wrong is silent from the user's point of view: the reply POST fails with `404`, which is a permanent failure so it is not retried, and the fallback notice uses the same endpoint so it is lost too — meanwhile the agent has already edited the document, so the document changes and the comment thread stays empty.
 - `docsCliPath` (optional): Trusted local Octo CLI executable used by PPT comment tasks; defaults to `octo-cli`. Ordinary document and HTML tasks keep their existing CLI command path.
 - `docTasks` (optional, **default on**): Master switch for document comment `@Bot` tasks. Leaving it unset enables the feature. Set the boolean `false` to disable document tasks for an account (or at channel level for every account); this does not disable generic Bot Tasks or interactive-card polling. Only boolean `true` passes the gate, so a mistyped `docTasks: "true"` is rejected. Enabling it means any user who can comment on a document the Bot can read can direct that Bot with the Bot's own document permissions. Slash commands are disabled on this path and comment text enters the session as a quoted value, but the trust boundary remains "whoever can comment can task the Bot". Requires `docsApiUrl` (or a single-origin `apiUrl`) to be reachable.
+- `docTaskProgress` (optional, **default on**): Sends document-task receipts and sanitized tool input/output previews to `docsApiUrl` without extra configuration. All users with reader access to the target document can view this data, not just the person who mentioned the Bot. Set boolean `false` at channel level or per account to stop new receipt uploads while keeping document tasks and comment replies enabled; per-account settings take precedence. Credential filtering does not identify confidential business data. See [the preview policy](docs/doc-task-content-policy.md) and [receipt upgrade instructions](#upgrading-to-document-task-receipts).
 - `botTasks` (optional, **default on**): Master switch for generic server-issued `bot_task` events. Default-on is the intentional product rollout contract: installing/upgrading the plugin enables server-issued generic tasks unless the operator explicitly opts out. A task carries the complete business prompt plus optional JSON `context` and `metadata`; the plugin does not hard-code `source`, `task_type`, profiles, capabilities, steps, or whether tools are required. The event producer is therefore a trusted prompt issuer: Octo IM egress, message actions, and `octo_management` are closed for this path, but the agent's configured non-Octo tools (for example shell, filesystem, and browser tools) remain available. When business data must be read or changed, the prompt directs the Agent to the source-specific `octo-cli` commands; when a business-facing reply is required, it must also be sent through `octo-cli`. A task that needs no tool call is still valid. Any attempted Octo channel final is suppressed and logged, without replaying the task. Set `botTasks: false` on any account whose event producer is not trusted. Set both `botTasks: false` and `docTasks: false` when the account should not run background tasks (interactive cards can still start the event poller lazily).
 - `wsUrl` (optional): WebSocket URL. Auto-detected from `apiUrl` if omitted.
 - `cdnUrl` (optional): CDN base URL for media files
@@ -81,6 +82,67 @@ Card policy is configured per Bot on the Octo server, not in `openclaw.json`. Th
 - `dispatchTimeoutMs` (optional): Per-inbound dispatch timeout in milliseconds — an infrastructure backstop that releases the per-group message queue if an upstream dispatch hangs. When unset, it is derived from OpenClaw's `agents.defaults.timeoutSeconds` (600 if unset) as `timeoutSeconds * 1000 + 60000`, so it always fires *after* the agent-run timeout: the agent terminates gracefully first, and this timeout only catches genuinely hung dispatches. Set explicitly only if you need to decouple it from the agent timeout.
 
 Automatic reasoning progress uses only the exact Registry template ref selected by the server and advertised in the same profile response. If reasoning is disabled, the ref is missing/incompatible, or the profile cannot be read, no progress card is sent; the plugin never falls back to the old locally rendered Model B. Profile results are cached privately per Bot and invalidated immediately by the server's `bot_setting_updated` event.
+
+### Document comment execution limits
+
+Document comment tasks (Docs, Sheets, HTML and PPT) complete through the original
+comment dispatch. The plugin blocks `sessions_spawn` and `sessions_yield` before
+tool execution, independently of progress reporting. Host-initiated child-agent
+continuations do not retain the document comment transport, so enabling them
+would let work continue after the original receipt and reply callback have ended.
+The agent should use its current-run tools instead. Interactive IM subagents and
+the handler-owned PPT execution continuation are unaffected.
+
+A successfully posted final answer yields `finished`, even if a later dispatch
+or provider hook reports a non-interruption error. Actual timeout/cancellation
+still yields `unknown` with `interrupted`. A finished receipt confirms final
+reply delivery; it does not prove a document change was persisted. A cancelled or
+timed-out optional revision check after dispatch has returned cannot downgrade
+a delivered answer; it only disables the optional continuation. See the
+[terminal-state rules](docs/ppt-contract.md#terminal-state-rules).
+
+### Upgrading to document-task receipts
+
+This is a **breaking change for existing deployments' data visibility**:
+upgrading enables uploads of tool previews to the target document's readers.
+Receipt uploads for Docs, Sheets, HTML and PPT are enabled by default. Upgrading
+the plugin enables them without adding `docTaskProgress` to each account.
+HTML uses its source slug with the prepared task key on the same receipt endpoint;
+see the [HTML receipt contract](docs/ppt-contract.md#document-task-progress-receipts).
+Existing explicit `false` settings are preserved. This setting is independent
+of the default-on `docTasks` switch.
+When uploads are enabled by the default, each account start logs the audience
+and the `docTaskProgress: false` opt-out once. Explicitly configured values do
+not emit that default notice. Malformed values, including `null`, disable
+uploads and produce a warning without logging the supplied value.
+
+Deploy the Docs receipt endpoint and event-table migrations before rolling out
+the plugin upgrade, and confirm `docsApiUrl`. Uploads can include file contents, command output,
+and rows read from other systems: up to 4096 preview characters per event and
+1000 events per task. The credential filter does not classify business data.
+The audience is all document readers, not requester-only.
+
+To disable uploads for all accounts that have no explicit override, merge this
+optional setting into the existing channel configuration, then restart the accounts:
+
+```json
+{ "channels": { "octo": { "docTaskProgress": false } } }
+```
+
+An account-level `docTaskProgress: false` disables uploads only for that account;
+an explicit `true` overrides a channel-level `false`. Disabling uploads does not
+disable document execution or comment replies and does not remove previously
+stored receipts. After defaults and overrides are resolved, only boolean `true`
+enables uploads; malformed values are rejected by the strict runtime gate.
+Without a receipt, the viewer cannot confirm runtime progress.
+
+Reporting is best effort with a five-second terminal upload budget. An older
+backend returning HTTP 404 stops uploads for that task without preventing its
+execution or comment reply. An endpoint
+outage or slow transport can leave missing status or incomplete details; repeated
+upload-failure messages are limited to one per minute per account handler. The
+[content policy](docs/doc-task-content-policy.md) and [HTTP contract](docs/ppt-contract.md#document-task-progress-receipts)
+ship in the plugin package.
 
 ### Upgrading to the release that makes `docTasks` default on
 
