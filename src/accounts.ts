@@ -8,6 +8,8 @@ export type ResolvedOctoAccount = {
   name?: string;
   enabled: boolean;
   configured: boolean;
+  /** Startup diagnostic; not a user configuration option. */
+  docTaskProgressDefaulted?: boolean;
   config: {
     botToken?: string;
     apiUrl: string;
@@ -35,6 +37,7 @@ export type ResolvedOctoAccount = {
     historyPromptTemplate?: string;  // Template for group history context injection
     onBehalfOf?: string;  // Persona clone: grantor uid
     secretsFileRoot?: string;  // Jail root for write-secret file writes
+    docTaskProgress?: boolean; // Default on; false disables receipt and tool-preview uploads only.
     docTasks?: boolean;  // 文档评论 @Bot 任务(常驻事件轮询 + 出站改投评论区)。**默认开启**,布尔 false 关闭
     botTasks?: boolean;  // 通用服务端 Bot Task。**默认开启**,布尔 false 关闭
     dispatchTimeoutMs?: number;  // Explicit dispatch-timeout override; unset = derive from agents.defaults.timeoutSeconds (issue #113)
@@ -115,6 +118,7 @@ export function resolveOctoAccount(params: {
     name: accountConfig.name ?? channel.name,
     enabled,
     configured,
+    docTaskProgressDefaulted: accountConfig.docTaskProgress === undefined && channel.docTaskProgress === undefined,
     config: {
       botToken,
       apiUrl,
@@ -139,6 +143,10 @@ export function resolveOctoAccount(params: {
       // 注意这里只兜底 nullish —— 非布尔的真值(如字符串 "true")照旧透传下去,由
       // channel.ts 的严格 `=== true` 门禁拒掉,免得配置写错时静默地半开。
       docTasks: accountConfig.docTasks ?? channel.docTasks ?? true,
+      // Only absence selects a default. Explicit null stays invalid and is
+      // rejected by the same strict runtime gate as other malformed values.
+      docTaskProgress: accountConfig.docTaskProgress !== undefined ? accountConfig.docTaskProgress
+        : channel.docTaskProgress !== undefined ? channel.docTaskProgress : true,
       botTasks: accountConfig.botTasks ?? channel.botTasks ?? true,
       onBehalfOf: accountConfig.onBehalfOf ?? channel.onBehalfOf,
       secretsFileRoot: accountConfig.secretsFileRoot ?? channel.secretsFileRoot,

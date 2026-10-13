@@ -1,3 +1,4 @@
+import { DocTaskTracker, type DocTaskProgress } from './doc-task-progress.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ChannelType, MessageType } from "./types.js";
 import {
@@ -366,6 +367,34 @@ describe("dispatch timeout guard (issue #75)", () => {
     expect(dispatch).toHaveBeenCalledOnce();
     expect(rollback).toHaveBeenCalledTimes(synchronous ? 1 : 0);
   });
+
+  it.each(['aborted', 'expired', 'aborted during reservation', 'expired during reservation'])(
+    'reports pre-handoff %s as interrupted without running the agent', async mode => {
+      const { dispatch } = installImmediateRuntime();
+      installFetchStub();
+      const sent: DocTaskProgress[] = [];
+      const tracker = new DocTaskTracker(async p => { sent.push(p); });
+      const controller = new AbortController();
+      if (mode === 'aborted') controller.abort();
+      const deadlineAt = mode === 'expired' ? Date.now() - 1 : Date.now() + 10_000;
+      try {
+        await expect(runInbound({
+          log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+          docTask: {
+            docId: 'deck', threadId: '1', sessionScope: 'ppt:deck:1',
+            signal: controller.signal, deadlineAt, abortOnTimeout: true, progress: tracker,
+            onAgentTurnStarted: async () => {
+              if (mode === 'aborted during reservation') controller.abort();
+              if (mode === 'expired during reservation') vi.setSystemTime(deadlineAt + 1);
+            },
+            postComment: async () => {}, reportTurn: () => {},
+          },
+        })).rejects.toThrow(/dispatch timed out|account stopped/);
+      } finally { await tracker.finish({ finalDelivered: false }); }
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(sent.at(-1)).toMatchObject({ state: 'unknown', phase: 'ended', errorCode: 'interrupted' });
+    },
+  );
 
   it("does not hand an expired PPT task to the Agent runtime", async () => {
     const { dispatch } = installImmediateRuntime();

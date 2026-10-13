@@ -127,3 +127,6 @@ export class OctoApiStatusMismatchError extends OctoApiError {
     this.expectedStatus = expectedStatus;
   }
 }
+
+/** A successful HTTP response that cannot satisfy the endpoint's receipt protocol. */
+export class OctoApiProtocolError extends Error {}

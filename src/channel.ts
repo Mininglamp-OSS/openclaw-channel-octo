@@ -1,3 +1,4 @@
+import { postDocTaskProgress } from "./api-fetch.js";
 import { postPptDocReply, readPptRevision } from "./ppt-comment.js";
 import type {
   ChannelPlugin,
@@ -1551,6 +1552,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // enqueue 后 confirm 前崩溃重投,两条路径都靠 idempotency_key 收敛。
       const docTasksEnabled = account.config.docTasks === true;
       const botTasksEnabled = account.config.botTasks === true;
+      if (account.config.docTaskProgress !== undefined && typeof account.config.docTaskProgress !== "boolean") {
+        console.warn(`[octo:doc-progress] [${account.accountId}] docTaskProgress must be boolean; received ${account.config.docTaskProgress === null ? 'null' : typeof account.config.docTaskProgress}. Uploads are disabled; use boolean true or false.`);
+      } else if (docTasksEnabled && account.config.docTaskProgress === true && account.docTaskProgressDefaulted) {
+        // Once per account start, not once per task/retry/heartbeat.
+        const message = `[octo:doc-progress] [${account.accountId}] docTaskProgress enabled by default: sanitized tool inputs/outputs are uploaded and visible to all document readers. Set docTaskProgress: false to disable uploads without disabling tasks or replies.`;
+        if (log?.info) log.info(message);
+        else console.info(message);
+      }
       // 配置写错类型时说清楚。解析器只兜底 nullish,所以非布尔值(典型是 JSON 里写成
       // 字符串 "true")原样透传到这里,被下面的严格 `=== true` 拒掉 —— 得到的是**默认值
       // 的反面**:本想开,结果比不写还少。这条门禁本身是对的(不能让写错的配置静默半开),
@@ -1576,6 +1585,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 不重投 —— 改文档的任务重放不幂等。见 doc-task-deadletter.ts 顶部。
       const docTaskDeadLetter = createFileDocTaskDeadLetterStore({ accountId: account.accountId, log });
       const handleDocMention = createDocMentionHandler({
+        reportProgress: account.config.docTaskProgress === true ? (mention, progress, events, signal) => postDocTaskProgress({
+          apiUrl: account.config.docsApiUrl, botToken: account.config.botToken ?? "",
+          docId: mention.docId, idempotencyKey: mention.idempotencyKey, progress, events, signal,
+        }) : undefined,
         botUid: credentials.robot_id,
         notifyPermissionFailure: (mention, signal) => sendDocPermissionNotice(account.config.apiUrl, account.config.botToken ?? '', mention, signal),
         // 整篇取回地址由这里的**已解析配置**拼,不让 agent 从载荷 url= 推域名。

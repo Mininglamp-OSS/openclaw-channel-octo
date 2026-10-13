@@ -1,3 +1,4 @@
+import type { DocTaskEvent } from './doc-task-events.js';
 import { isPptPlanningReply, isValidPptThreadId } from "./ppt-comment.js";
 import { docTaskQueueScope, docTaskSessionScope, synthesizeDocMentionMessage, type DocCommentMention } from "./doc-mention.js";
 import type { DocMentionDedupeStore } from "./doc-mention-dedupe.js";
@@ -5,7 +6,8 @@ import type { DocTaskDeadLetterStore } from "./doc-task-deadletter.js";
 import type { BotMessage } from "./types.js";
 import { httpStatusFromApiFetchError, isPermanentDocCommentFailure } from "./api-fetch.js";
 import type { DocReplyIntent } from "./api-fetch.js";
-import { OctoApiError } from "./api-error.js";
+import { DocTaskTracker, type DocTaskProgress } from "./doc-task-progress.js";
+import { OctoApiError, OctoApiProtocolError } from "./api-error.js";
 
 /**
  * 一个回合到底发生了什么。**由跑这个回合的人如实上报四个事实,不预先归纳成结论。**
@@ -49,6 +51,7 @@ export type DocMentionDispatch = (
   extra: {
     queueScope: string;
     docTask: {
+      progress?: DocTaskTracker;
       docId: string;
       threadId: string;
       sessionScope: string;
@@ -70,7 +73,7 @@ export type DocMentionDispatch = (
       abortOnTimeout?: boolean;
       /** Shared absolute deadline across PPT attempts and the single continuation. */
       deadlineAt?: number;
-      /** Account shutdown must cancel an already-running PPT agent. */
+      /** Account shutdown cancels document agents of every kind. */
       signal?: AbortSignal;
       /** 立即在将回合交给 Agent runtime 前调用。 */
       onAgentTurnStarted?: () => void | Promise<void>;
@@ -81,6 +84,7 @@ export type DocMentionDispatch = (
 ) => Promise<"completed" | "dropped">;
 
 export interface DocMentionHandlerDeps {
+  reportProgress?: (mention: DocCommentMention, progress: DocTaskProgress, events?: DocTaskEvent[], signal?: AbortSignal) => Promise<void>;
   botUid: string;
   /**
    * 已解析的文档服务根(accounts.ts 的 docsApiUrl,缺省回退 apiUrl)。透传给
@@ -159,6 +163,16 @@ const POST_RETRY_BASE_MS = 200;
  *      已经有道歉或冲突回执时不再叠加,否则用户连着看两句废话。
  */
 export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
+  // One handler per account: avoid one identical error per retry/heartbeat/task.
+  let nextProgressWarningAt = -Infinity;
+  const warnProgress = (mention: DocCommentMention, error?: unknown, attemptId?: string) => {
+    if (Date.now() < nextProgressWarningAt) return;
+    nextProgressWarningAt = Date.now() + 60_000;
+    const kind = mention.docKind === "html" ? "html" : mention.docKind === "ppt" ? "ppt" : "doc";
+    const cause = error instanceof OctoApiError ? `http_${error.status}`
+      : error instanceof OctoApiProtocolError ? "protocol" : "transport_or_deadline";
+    deps.log?.error?.(`octo: document task progress could not be delivered kind=${kind} cause=${cause} attempt=${attemptId ?? 'unknown'} (further warnings suppressed for 60s)`);
+  };
   return async function handleDocMention(mention: DocCommentMention): Promise<void> {
     if (mention.botUid !== deps.botUid) {
       deps.log?.error?.(`octo: doc mention bot_uid=${mention.botUid} != this bot ${deps.botUid}, dropped`);
@@ -202,10 +216,18 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
     const deadlineAt = isPpt
       ? Date.now() + (typeof configuredBudget === "number" && Number.isFinite(configuredBudget) && configuredBudget > 0 ? configuredBudget : 660_000)
       : undefined;
-    const readRevision = async (): Promise<number | undefined> => {
+    // Admission can be interrupted before inbound owns a turn. A probe after
+    // a delivered answer only decides whether to admit an optional next turn.
+    let handlerInterrupted = false;
+    const taskIsStopped = (): boolean => deps.signal?.aborted === true || (deadlineAt !== undefined && Date.now() >= deadlineAt);
+    const observeTaskInterruption = (): boolean => {
+      handlerInterrupted ||= taskIsStopped();
+      return handlerInterrupted;
+    };
+    const readRevision = async (purpose: "admission" | "continuation" = "admission"): Promise<number | undefined> => {
       try {
         const remaining = deadlineAt === undefined ? 10_000 : deadlineAt - Date.now();
-        if (remaining <= 0 || deps.signal?.aborted) return undefined;
+        if (taskIsStopped()) return undefined;
         const timeout = AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(remaining, 10_000))));
         const signal = deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout;
         return await deps.readPptRevision?.(mention, signal);
@@ -215,6 +237,10 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           `octo: PPT revision read failed doc=${JSON.stringify(mention.docId)} thread=${JSON.stringify(mention.threadId)} status=${httpStatusFromApiFetchError(error) ?? "unknown"}; continuation disabled`,
         );
         return undefined;
+      } finally {
+        // Only initial admission owns an execution outcome. Optional probes
+        // must not relabel a completed turn, even when they exhaust its budget.
+        if (purpose === "admission") observeTaskInterruption();
       }
     };
     const initialRevision = mention.docKind === "ppt" ? await readRevision() : undefined;
@@ -264,24 +290,33 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
     };
 
     let reported: DocTaskTurnReport | undefined;
+    let progressAttemptId: string | undefined;
+    const progress = deps.reportProgress
+      ? new DocTaskTracker((value, events, signal) => {
+          progressAttemptId = value.attemptId;
+          return deps.reportProgress!(mention, value, events, signal);
+        }, error => warnProgress(mention, error, progressAttemptId))
+      : undefined;
     let outcome: "completed" | "dropped" = "dropped";
     let anyFinalDelivered = false;
     let agentStarted = false;
     try {
       const dispatch = async (message: BotMessage) => {
-        if (isPpt && (deps.signal?.aborted || Date.now() >= deadlineAt!)) {
-          throw new Error("PPT task stopped or its shared dispatch budget expired");
+        if (observeTaskInterruption()) {
+          throw new Error("Document task stopped or its shared dispatch budget expired");
         }
         const previouslyStarted = agentStarted;
         return deps.dispatch(message, undefined, {
           queueScope: docTaskQueueScope(mention),
           docTask: {
+            ...(progress ? { progress } : {}),
             docId: mention.docId,
             threadId: mention.threadId,
             sessionScope: docTaskSessionScope(mention),
             postComment: postWithRetry,
+            signal: deps.signal,
             ...(isPpt ? {
-              deadlineAt, abortOnTimeout: true, signal: deps.signal,
+              deadlineAt, abortOnTimeout: true,
               onAgentTurnStarted: async () => {
                 // Persist before runtime handoff. A cancelled or crashed editing
                 // turn may already have written; replay must not start it again.
@@ -320,8 +355,8 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
         Number.isSafeInteger(initialRevision) &&
         reported?.finalDelivered &&
         isPptPlanningReply(lastFinal) &&
-        await readRevision() === initialRevision &&
-        !deps.signal?.aborted && Date.now() < deadlineAt!
+        await readRevision("continuation") === initialRevision &&
+        !taskIsStopped()
       ) {
         const next = message();
         next.message_id += ":execute-once";
@@ -357,6 +392,9 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
     // contradict a delivered answer or prove whether an edit was committed.
     const planningSuspected = mention.docKind === "ppt" && isPptPlanningReply(lastFinal);
     const workLanded = report.finalDelivered;
+    // Start the bounded terminal drain, but do not put it ahead of a user's
+    // missing-answer notice. Await it before final dedupe/handler completion.
+    const finishingProgress = progress?.finish({ finalDelivered: workLanded, failed: outcome === "dropped", interrupted: handlerInterrupted, permissionDenied });
     /** 用户在干等:既没拿到答复,也没收到任何失败提示。 */
     const userLeftHanging = !workLanded && !report.noticed;
 
@@ -418,6 +456,8 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
         });
       }
     }
+
+    await finishingProgress;
 
     // A delivered plan followed by uncertain execution must not let replay of
     // the same event run a non-idempotent edit again. A new mention has a new key.

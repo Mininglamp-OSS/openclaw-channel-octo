@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Breaking changes
+
+- 文档评论任务默认上传执行回执和经过过滤的工具输入输出，目标文档的所有读者均可查看。升级后无需逐个账号配置；账号启动时会对使用默认值的账号提示数据范围及关闭方式。`docTaskProgress: false` 可在渠道或账号级关闭上传，账号设置优先；执行和评论回复不受影响。先部署配套后端接口及迁移，再升级插件。
+
+### Fixed
+
+- 普通 JSON 文件列表、搜索结果以及分开的 host/path 不再因拼接成 URL 而整块隐藏；键与自身字符串值之间拆开的已知凭据也会被过滤。预览处理增加全局节点、键及文本预算。
+- 无效 `docTaskProgress`（包括 `null`）关闭上传并输出诊断；上报失败日志包含执行批次 ID，429 同样遵守每账号限频且不记录上游响应或限流范围。
+
 ## [1.5.1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.0...v1.5.1) (2026-10-08)
 
 ### Fixed

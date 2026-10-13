@@ -29,9 +29,4 @@ jobs:
           test -f dist/setup-entry.js || (echo "::error::dist/setup-entry.js missing after build" && exit 1)
           echo "✓ dist/ artifacts present"
       - name: npm pack --dry-run (verify tarball contents)
-        run: |
-          npm pack --dry-run 2>&1 | tee /tmp/pack.txt
-          grep -q 'dist/index.js' /tmp/pack.txt || (echo "::error::dist/index.js not in tarball" && exit 1)
-          grep -q 'dist/setup-entry.js' /tmp/pack.txt || (echo "::error::dist/setup-entry.js not in tarball" && exit 1)
-          grep -q 'openclaw.plugin.json' /tmp/pack.txt || (echo "::error::openclaw.plugin.json not in tarball" && exit 1)
-          echo "✓ tarball contains required files"
+        run: node scripts/check-package.mjs
