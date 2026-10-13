@@ -298,6 +298,31 @@ afterEach(() => {
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
+  it("account stop aborts a buffered-final POST after dispatch has already settled", async () => {
+    installImmediateRuntime({ text: "buffered-final", kind: "block" });
+    const { sends } = installHangingSendFetchStub();
+    const controller = new AbortController();
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const fetchWithAbort = globalThis.fetch;
+    let sendSignal!: AbortSignal;
+    globalThis.fetch = vi.fn((input: any, init?: any) => {
+      if (String(input).includes("/sendMessage")) {
+        sendSignal = init.signal;
+        enter();
+      }
+      return fetchWithAbort(input, init);
+    }) as typeof fetch;
+    const running = runInbound({ signal: controller.signal, log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } });
+    await entered;
+    expect(sendSignal.aborted).toBe(false);
+    controller.abort(new Error("account stopped during final send"));
+    expect(sendSignal.aborted).toBe(true);
+    expect(sendSignal.reason).toBe(controller.signal.reason);
+    await running;
+    expect(sends).toEqual([{ content: "buffered-final", abortedBeforeResolve: true }]);
+  });
+
   it("stopping an ordinary IM account cancels the run without sending a failure notice", async () => {
     const { dispatch } = installImmediateRuntime();
     const { sends } = installFetchStub();

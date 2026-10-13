@@ -3067,6 +3067,10 @@ export async function handleInboundMessage(params: {
       await postDocTaskReply(withSuppressedToolTail(content), signal, { type: "notice" });
       return;
     }
+    if (accountSignal) {
+      signal = AbortSignal.any([accountSignal, ...(signal ? [signal] : [])]);
+      signal.throwIfAborted();
+    }
     await imSendMessage({
       apiUrl,
       botToken,
@@ -3163,7 +3167,11 @@ export async function handleInboundMessage(params: {
     },
   ): Promise<DocTaskReplyResult> => {
     if (!docTask && dispatchAbortController) {
-      signal = AbortSignal.any([dispatchAbortController.signal, ...(signal ? [signal] : [])]);
+      signal = AbortSignal.any([
+        dispatchAbortController.signal,
+        ...(accountSignal ? [accountSignal] : []),
+        ...(signal ? [signal] : []),
+      ]);
       signal.throwIfAborted();
     }
     if (docTask) {

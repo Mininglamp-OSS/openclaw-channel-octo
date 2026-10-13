@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { confirmsCurrentSourceReply, extractToolSendResult, targetsMatchForReplySuppression } from "./reply-delivery.js";
-import { toActionToolResult } from "./channel.js";
+import { octoPlugin, toActionToolResult } from "./channel.js";
 import { normalizeOctoMessagingTarget } from "./target.js";
 import { DOC_TASK_NON_ROUTABLE_PREFIX } from "./constants.js";
 import { ChannelType } from "./types.js";
@@ -66,11 +66,27 @@ describe("message-tool reply route evidence (#257)", () => {
   });
   it("extracts the successful action's corrected account and effective destination", () => {
     const receipt = extractToolSendResult({
-      result: toActionToolResult({ ok: true, data: { sent: true, resolvedTarget: "g____one", accountId: "correct-account" } }),
+      result: toActionToolResult({ ok: true, data: { sent: true, resolvedTarget: "g____one", channelType: ChannelType.CommunityTopic, accountId: "correct-account" } }),
       send: { to: "group:g", accountId: "wrong-account" },
     });
-    expect(receipt).toEqual({ to: "g____one", accountId: "correct-account", threadSuppressed: true });
+    expect(receipt).toEqual({ to: "group:g____one", accountId: "correct-account", threadSuppressed: true });
     expect(targetsMatchForReplySuppression({ originTarget: "octo:g____one", targetKey: receipt!.to })).toBe(true);
+  });
+  it.each([
+    { source: "octo:user:u", actual: "u", channelType: ChannelType.DM, expected: "user:u" },
+    { source: "octo:group:uncached", actual: "uncached", channelType: ChannelType.Group, expected: "group:uncached" },
+    { source: "octo:group:uncached____one", actual: "uncached____one", channelType: ChannelType.CommunityTopic, expected: "group:uncached____one" },
+  ])("reconciles delivery through the actual plugin hooks with a cold group cache: %o", ({ source, actual, channelType, expected }) => {
+    const pending = octoPlugin.actions!.extractToolSend!({ args: { target: expected, accountId: "bot" } } as never);
+    const confirmed = octoPlugin.actions!.extractToolSendResult!({
+      send: pending,
+      result: toActionToolResult({ ok: true, data: { sent: true, resolvedTarget: actual, channelType } }),
+    } as never)!;
+    expect(confirmed.to).toBe(expected);
+    const normalize = octoPlugin.messaging!.normalizeTarget!;
+    expect(normalize(source)).toBe(expected);
+    expect(normalize(confirmed.to!)).toBe(normalize(source));
+    expect(octoPlugin.outbound!.targetsMatchForReplySuppression!({ originTarget: source, targetKey: confirmed.to! })).toBe(true);
   });
   it.each([
     { ok: false, data: { sent: true, resolvedTarget: "g" } },

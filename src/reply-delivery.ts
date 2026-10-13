@@ -1,6 +1,13 @@
 import { normalizeOutboundChannelPrefix, normalizeOctoMessagingTarget } from "./target.js";
 import { ChannelType } from "./types.js";
 
+function receiptDestination(data: Record<string, unknown> | undefined): string | undefined {
+  if (typeof data?.resolvedTarget !== "string" || !data.resolvedTarget.trim()) return undefined;
+  const prefix = data.channelType === ChannelType.DM ? "user"
+    : data.channelType === ChannelType.Group || data.channelType === ChannelType.CommunityTopic ? "group" : undefined;
+  return prefix ? `${prefix}:${data.resolvedTarget.trim()}` : undefined;
+}
+
 /** Confirm source delivery from the actual receipt, rather than requested aliases. */
 export function confirmsCurrentSourceReply(params: {
   result: { ok: boolean; data?: unknown };
@@ -11,10 +18,8 @@ export function confirmsCurrentSourceReply(params: {
   if (!params.result.ok || data?.sent !== true || !params.currentTarget?.trim()
     || typeof data.resolvedTarget !== "string" || !data.resolvedTarget.trim()
     || Array.isArray(data.failedMedia) && data.failedMedia.length > 0) return false;
-  const prefix = data.channelType === ChannelType.DM ? "user"
-    : data.channelType === ChannelType.Group || data.channelType === ChannelType.CommunityTopic ? "group" : undefined;
-  if (!prefix) return false;
-  const delivered = `${prefix}:${data.resolvedTarget}`;
+  const delivered = receiptDestination(data);
+  if (!delivered) return false;
   return delivered === normalizeOctoMessagingTarget(params.currentTarget, params.knownGroupIds);
 }
 
@@ -54,10 +59,11 @@ export function extractToolSendResult(params: {
 }) {
   const details = (params.result as { details?: { ok?: boolean; data?: Record<string, unknown> } })?.details;
   const data = details?.data;
+  const to = receiptDestination(data);
   if (details?.ok !== true || data?.sent !== true
-    || typeof data.resolvedTarget !== "string" || !data.resolvedTarget.trim()) return undefined;
+    || !to) return undefined;
   return {
-    to: data.resolvedTarget,
+    to,
     accountId: typeof data.accountId === "string" ? data.accountId : params.send.accountId,
     // Octo encodes the effective thread in resolvedTarget; ignore stale host hints.
     threadSuppressed: true,

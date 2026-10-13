@@ -1,4 +1,4 @@
-/** The host moved per-agent configuration from list[] to entries in 2026.10. */
+/** Support keyed per-agent configuration as well as legacy list[] hosts. */
 export type CompatibleAgentEntry = {
   id?: string;
   workspace?: string;
