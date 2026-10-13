@@ -107,6 +107,32 @@ vi.mock("./api-fetch.js", async (importOriginal) => {
 
 const API = "http://octo.test";
 
+it("registers bindings before any inbound/bind and removes them when the account stops (#253/#258)", async () => {
+  const { getSessionBindingService } = await import("openclaw/plugin-sdk/conversation-runtime");
+  const stop = await startAccount({ docTasks: false, botTasks: false });
+  const service = getSessionBindingService();
+  const ref = { channel: "octo", accountId: "acct1", conversationId: "fresh-dm" };
+  try {
+    expect(service.getCapabilities(ref).adapterAvailable).toBe(true);
+    const resolved = "resolveByConversationAsync" in service
+      ? await (service as any).resolveByConversationAsync(ref) : service.resolveByConversation(ref);
+    expect(resolved).toBeNull();
+  } finally { await stop(); }
+  expect(service.getCapabilities(ref).adapterAvailable).toBe(false);
+});
+
+it("releases startup binding ownership when bot registration fails", async () => {
+  const { getSessionBindingService } = await import("openclaw/plugin-sdk/conversation-runtime");
+  const { registerBot } = await import("./api-fetch.js");
+  const { octoPlugin } = await import("./channel.js");
+  vi.mocked(registerBot).mockRejectedValueOnce(new Error("registration unavailable"));
+  await expect(octoPlugin.gateway!.startAccount!({
+    account: { accountId: "failed-start", configured: true, config: { botToken: "tok", apiUrl: API } },
+    cfg: {}, setStatus: () => {}, abortSignal: new AbortController().signal,
+  } as never)).rejects.toThrow("registration unavailable");
+  expect(getSessionBindingService().getCapabilities({ channel: "octo", accountId: "failed-start" }).adapterAvailable).toBe(false);
+});
+
 /**
  * `startAccount` 返回的 Promise 会一直挂着直到 abort(gateway 用 resolve 表示
  * 「账号已停止」),所以不能直接 await 它 —— 起完之后 abort 再收尾。

@@ -128,6 +128,23 @@ describe("toActionToolResult (helper)", () => {
 });
 
 describe("handleAction returns AgentToolResult (#171)", () => {
+  it.each([
+    { destination: "g____one", channelType: 5, expected: "current-source" },
+    { destination: "g", channelType: 2, expected: undefined },
+    { destination: "g____two", channelType: 5, expected: undefined },
+  ])("confirms the actual source route after a thread rewrite: %o", async ({ destination, channelType, expected }) => {
+    const { octoPlugin } = await import("./channel.js");
+    const { handleOctoMessageAction } = await import("./actions.js");
+    vi.mocked(handleOctoMessageAction).mockResolvedValue({ ok: true, data: {
+      sent: true, target: "group:g", resolvedTarget: destination, channelType,
+    } });
+    const result = await octoPlugin.actions!.handleAction!(makeCtx({
+      params: { target: "group:g", text: "hi" }, toolContext: { currentChannelId: "octo:g____one" },
+    }) as any);
+    expect((result.details as any).sourceReplyRoute).toBe(expected);
+    expect((result.details as any).data.accountId).toBe("default");
+  });
+
   it("success branch: content is an array and details preserves ok/data", async () => {
     const { octoPlugin } = await import("./channel.js");
     const { handleOctoMessageAction } = await import("./actions.js");

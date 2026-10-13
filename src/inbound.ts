@@ -22,6 +22,7 @@ import * as replyPayloadSdk from "openclaw/plugin-sdk/reply-payload";
 const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
 import { createImEgressGuard } from "./im-egress.js";
+import { findAgentConfig } from "./agent-config-compat.js";
 import type { DocTaskTurnReport } from "./doc-mention-handler.js";
 import type { GroupMember, DocReplyIntent } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
@@ -522,11 +523,14 @@ export async function uploadAndSendMedia(params: {
   channelId: string;
   channelType: ChannelType;
   onBehalfOf?: string;
+  signal?: AbortSignal;
   log?: ChannelLogSink;
 }): Promise<SendMessageResult | undefined> {
   const { mediaUrl, apiUrl, botToken, channelId, channelType, onBehalfOf, log } = params;
 
+  params.signal?.throwIfAborted();
   const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, log });
+  params.signal?.throwIfAborted();
 
   const msgType = uploaded.isImage ? MessageType.Image : MessageType.File;
 
@@ -543,6 +547,7 @@ export async function uploadAndSendMedia(params: {
     width: uploaded.width,
     height: uploaded.height,
     ...(onBehalfOf ? { onBehalfOf } : {}),
+    ...(params.signal ? { signal: params.signal } : {}),
   });
   return result;
 }
@@ -1592,6 +1597,8 @@ export async function handleInboundMessage(params: {
   statusSink?: OctoStatusSink;
   /** Trusted adapter-side route captured when an interactive card was authored. */
   routeOverride?: { sessionKey: string; agentId?: string };
+  /** Account lifecycle cancellation, also for ordinary IM turns. */
+  signal?: AbortSignal;
   /**
    * 文档评论任务上下文(octo-server `doc_comment_mention`)。
    *
@@ -1635,7 +1642,11 @@ export async function handleInboundMessage(params: {
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
   const docTask = params.docTask;
-  const dispatchAbortController = docTask?.abortOnTimeout || docTask?.signal ? new AbortController() : undefined;
+  const accountSignal = params.signal && docTask?.signal
+    ? AbortSignal.any([params.signal, docTask.signal])
+    : params.signal ?? docTask?.signal;
+  const dispatchAbortController = !docTask || docTask.abortOnTimeout || accountSignal
+    ? new AbortController() : undefined;
   // Server-authoritative robot map. Default to a throwaway Map when the caller
   // omits it so the gate logic below can read it unconditionally; the real
   // channel call site passes a persistent per-account map.
@@ -2812,8 +2823,7 @@ export async function handleInboundMessage(params: {
       );
     }
     if (!sessionReadFailed) {
-      const agentDefault = config.agents?.list?.find((entry) =>
-        entry.id?.toLowerCase() === route.agentId?.toLowerCase())?.reasoningDefault;
+      const agentDefault = findAgentConfig(config.agents, route.agentId)?.reasoningDefault;
       const resolved = persistedLevel ?? agentDefault ?? config.agents?.defaults?.reasoningDefault;
       if (resolved === "on" || resolved === "stream") reasoningVisibility = resolved;
     }
@@ -3152,6 +3162,10 @@ export async function handleInboundMessage(params: {
       referencedMedia?: readonly string[];
     },
   ): Promise<DocTaskReplyResult> => {
+    if (!docTask && dispatchAbortController) {
+      signal = AbortSignal.any([dispatchAbortController.signal, ...(signal ? [signal] : [])]);
+      signal.throwIfAborted();
+    }
     if (docTask) {
       return postDocTaskReply(
         content,
@@ -3348,8 +3362,9 @@ export async function handleInboundMessage(params: {
   // an upstream dispatch hang would leave the per-group queue's Promise chain
   // unresolved forever — see issue #75.
   //
-  // Ordinary IM/doc-comment turns retain the historical queue-unblocking
-  // behavior. Generic Bot Tasks are different: retrying while the timed-out
+  // Ordinary IM turns abort and release the queue; document-comment turns
+  // retain their historical queue-unblocking policy. Generic Bot Tasks are
+  // different: retrying while the timed-out
   // agent is still running can duplicate non-idempotent octo-cli writes. For
   // abortOnTimeout turns we therefore abort the underlying agent run
   // and wait up to a bounded grace period before releasing queueScope. The
@@ -3376,11 +3391,11 @@ export async function handleInboundMessage(params: {
     // Persist the at-most-once boundary before invoking the runtime. The
     // dispatch timeout starts afterwards so a slow state store cannot produce
     // an unhandled timer rejection while this callback is still pending.
-    if (docTask?.signal?.aborted) throw stoppedError;
+    if (accountSignal?.aborted) throw stoppedError;
     if (docTask?.deadlineAt !== undefined && Date.now() >= docTask.deadlineAt) throw timeoutError;
     await docTask?.onAgentTurnStarted?.();
     handoffRecorded = true;
-    if (docTask?.signal?.aborted) throw stoppedError;
+    if (accountSignal?.aborted) throw stoppedError;
     remainingDispatchMs = typeof docTask?.deadlineAt === "number" && Number.isFinite(docTask.deadlineAt)
       ? Math.min(dispatchTimeoutMs, docTask.deadlineAt - Date.now())
       : dispatchTimeoutMs;
@@ -3392,14 +3407,14 @@ export async function handleInboundMessage(params: {
         reject(stoppedError);
         dispatchAbortController?.abort(stoppedError);
       };
-      docTask?.signal?.addEventListener("abort", onStop, { once: true });
-      removeStopListener = () => docTask?.signal?.removeEventListener("abort", onStop);
+      accountSignal?.addEventListener("abort", onStop, { once: true });
+      removeStopListener = () => accountSignal?.removeEventListener("abort", onStop);
       dispatchTimeoutHandle = setTimeout(() => {
         taskInterrupted = true;
         reject(timeoutError);
         // A shutdown signal does not opt ordinary document tasks into the
         // stronger Bot/PPT timeout policy; their timeout only releases the queue.
-        if (abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
+        if (!docTask || abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
       }, remainingDispatchMs);
     });
     dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -3486,6 +3501,7 @@ export async function handleInboundMessage(params: {
                 botToken: account.config.botToken ?? "",
                 channelId: replyChannelId,
                 channelType: replyChannelType,
+                signal: dispatchAbortController?.signal,
                 ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
                 log,
               });
@@ -3496,6 +3512,7 @@ export async function handleInboundMessage(params: {
             }
           }
 
+          if (dispatchAbortController?.signal.aborted) return;
           // --- Text handling based on kind ---
           const content = payload.text?.trim() ?? "";
           if (!content && sentMediaUrls.size > 0) {
@@ -3617,6 +3634,8 @@ export async function handleInboundMessage(params: {
           log?.debug?.(`octo: [deliver-buffer] ${kind} text buffered (${content.length} chars)`);
         },
         onError: async (err: unknown, info: { kind: string }) => {
+          // Timeout/stop owns its notice; cancellation must not emit a second apology.
+          if (dispatchAbortController?.signal.aborted) return;
           clearInterval(typingInterval);
           log?.error?.(`octo ${info.kind} reply failed: ${String(err)}`);
           // Prevent finally block from sending stale buffered text after error
@@ -3702,7 +3721,7 @@ export async function handleInboundMessage(params: {
       // Emit the primary diagnostic before waiting for cooperative shutdown;
       // otherwise an abort-ignoring host makes the timeout itself invisible.
       log?.warn?.(
-        `octo: ${docTask?.signal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
+        `octo: ${accountSignal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
       );
       // Wait briefly only when an abort was actually sent. Ordinary document
       // timeouts still release the queue immediately; a signal-capable runtime
@@ -3724,7 +3743,7 @@ export async function handleInboundMessage(params: {
           // awaiting this promise.
           void dispatchPromise.catch(() => undefined);
           log?.error?.(
-            `octo: timed-out bot task dispatch ignored abort for ${DISPATCH_ABORT_GRACE_MS}ms; releasing queue and forbidding retry (session=${route?.sessionKey ?? "?"})`,
+            `octo: timed-out ${docTask ? "bot task" : "IM"} dispatch ignored abort for ${DISPATCH_ABORT_GRACE_MS}ms; releasing queue and forbidding retry (session=${route?.sessionKey ?? "?"})`,
           );
         }
       }
@@ -3739,7 +3758,9 @@ export async function handleInboundMessage(params: {
       // 也置位(见 kind === "tool" 分支),用它做守卫会让「只发过进度然后 hang」的
       // 回合彻底收不到终态信号 —— 而那正好是超时提示最该出现的场景,且这条路径
       // 在 docTasks 关着时也走,是普通 DM/群聊上的静默回归。
-      if (userFacingFinalDelivered) {
+      if (accountSignal?.aborted) {
+        log?.info?.("octo: account stopped; suppressing the timeout notice");
+      } else if (userFacingFinalDelivered) {
         log?.info?.("octo: dispatch timed out after a final answer already landed — suppressing the timeout notice");
       } else if (abortTimedOutDispatch) {
         // Aborted Bot/PPT tasks use their owning handler for fallback delivery.

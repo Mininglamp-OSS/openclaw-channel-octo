@@ -118,6 +118,17 @@ export function normalizeOutboundChannelPrefix(ctxTo: string): string {
   return bare;
 }
 
+/** Canonical conversation address used by OpenClaw's source-reply tracking. */
+export function normalizeOctoMessagingTarget(target: string, knownGroupIds?: Set<string>): string {
+  const trimmed = target.trim();
+  // Keep non-routable document sessions recognizable by the outbound guards.
+  if (!trimmed || isDocTaskNonRoutableTarget(trimmed)) return trimmed;
+  const normalized = normalizeOutboundChannelPrefix(trimmed);
+  if (normalized.startsWith("user:") || normalized.startsWith("group:")) return normalized;
+  const parent = parentGroupOf(normalized);
+  return `${normalized.includes(THREAD_SEP) || knownGroupIds?.has(parent) ? "group" : "user"}:${normalized}`;
+}
+
 /**
  * Resolve an outbound delivery target from the framework's ChannelOutboundContext.
  *

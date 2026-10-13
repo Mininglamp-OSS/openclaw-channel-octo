@@ -241,6 +241,7 @@ function runInbound(opts: {
   log?: any;
   routeOverride?: { sessionKey: string; agentId?: string };
   docTask?: Parameters<typeof handleInboundMessage>[0]["docTask"];
+  signal?: AbortSignal;
 } = {}) {
   return handleInboundMessage({
     account: makeAccount(),
@@ -254,6 +255,7 @@ function runInbound(opts: {
     log: opts.log,
     routeOverride: opts.routeOverride,
     docTask: opts.docTask,
+    signal: opts.signal,
   });
 }
 
@@ -296,6 +298,52 @@ afterEach(() => {
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
+  it("stopping an ordinary IM account cancels the run without sending a failure notice", async () => {
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    const controller = new AbortController();
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    dispatch.mockImplementation(async (args: any) => {
+      const signal = args.replyOptions.abortSignal as AbortSignal;
+      enter();
+      await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    });
+    const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("account stopped");
+    await entered;
+    controller.abort();
+    await rejected;
+    expect(sends).toEqual([]);
+  });
+
+  it("cancels an ordinary IM run and fences an abort-ignoring late final", async () => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    let release!: () => void;
+    let enter!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    let signal!: AbortSignal;
+    dispatch.mockImplementation(async (args: any) => {
+      signal = args.replyOptions.abortSignal;
+      enter();
+      await gate;
+      await args.dispatcherOptions.deliver({ text: "stale final" }, { kind: "final" });
+      await args.dispatcherOptions.onError(new Error("late cancellation"), { kind: "final" });
+    });
+    try {
+      const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered;
+      await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + ABORT_GRACE_MS_FOR_TESTS + 1);
+      await rejected;
+      expect(signal.aborted).toBe(true);
+      release();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。"]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
   it.each(["deadline", "account stop"])("PPT %s cancels the runtime before a late write or reply", async (reason) => {
     vi.useFakeTimers();
     let enterRuntime!: () => void;
@@ -323,6 +371,8 @@ describe("dispatch timeout guard (issue #75)", () => {
     });
     const rejected = expect(runInbound({
       log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      // The channel's lifecycle signal must not mask cancellation by the task.
+      signal: new AbortController().signal,
       docTask: {
         docId: "deck", threadId: "1", sessionScope: "ppt:deck:1",
         deadlineAt: Date.now() + (reason === "deadline" ? 40 : 1000), abortOnTimeout: true, signal: controller.signal,

@@ -1,0 +1,65 @@
+import { normalizeOutboundChannelPrefix, normalizeOctoMessagingTarget } from "./target.js";
+import { ChannelType } from "./types.js";
+
+/** Confirm source delivery from the actual receipt, rather than requested aliases. */
+export function confirmsCurrentSourceReply(params: {
+  result: { ok: boolean; data?: unknown };
+  currentTarget?: string;
+  knownGroupIds?: Set<string>;
+}): boolean {
+  const data = params.result.data as Record<string, unknown> | undefined;
+  if (!params.result.ok || data?.sent !== true || !params.currentTarget?.trim()
+    || typeof data.resolvedTarget !== "string" || !data.resolvedTarget.trim()
+    || Array.isArray(data.failedMedia) && data.failedMedia.length > 0) return false;
+  const prefix = data.channelType === ChannelType.DM ? "user"
+    : data.channelType === ChannelType.Group || data.channelType === ChannelType.CommunityTopic ? "group" : undefined;
+  if (!prefix) return false;
+  const delivered = `${prefix}:${data.resolvedTarget}`;
+  return delivered === normalizeOctoMessagingTarget(params.currentTarget, params.knownGroupIds);
+}
+
+function comparisonTarget(raw: string, threadId?: string) {
+  const normalized = normalizeOutboundChannelPrefix(raw.trim());
+  const explicitKind = normalized.startsWith("user:") ? "user"
+    : normalized.startsWith("group:") ? "group" : undefined;
+  let id = normalized.replace(/^(?:user:|group:)/, "");
+  if (explicitKind === "group") id = id.split("@")[0];
+  const kind = explicitKind ?? (id.includes("____") ? "group" : undefined);
+  if (kind !== "user" && threadId && !id.includes("____")) {
+    const thread = normalizeOutboundChannelPrefix(threadId.trim());
+    if (thread.includes("____")) {
+      if (!thread.startsWith(`${id}____`)) return undefined;
+      id = thread;
+    } else id = `${id}____${thread}`;
+  }
+  return id ? { id, kind } : undefined;
+}
+
+/** Compare conversation identity without changing explicit routing prefixes. */
+export function targetsMatchForReplySuppression(params: {
+  originTarget: string;
+  targetKey: string;
+  targetThreadId?: string;
+}): boolean {
+  const origin = comparisonTarget(params.originTarget);
+  const target = comparisonTarget(params.targetKey, params.targetThreadId);
+  return Boolean(origin && target && origin.id === target.id
+    && (!origin.kind || !target.kind || origin.kind === target.kind));
+}
+
+/** Use the actual sent route, including automatic thread/account corrections. */
+export function extractToolSendResult(params: {
+  result: unknown;
+  send: { to: string; accountId?: string };
+}) {
+  const details = (params.result as { details?: { ok?: boolean; data?: Record<string, unknown> } })?.details;
+  const data = details?.data;
+  if (details?.ok !== true || data?.sent !== true
+    || typeof data.resolvedTarget !== "string" || !data.resolvedTarget.trim()) return undefined;
+  return {
+    to: data.resolvedTarget,
+    accountId: typeof data.accountId === "string" ? data.accountId : params.send.accountId,
+    // Octo encodes the effective thread in resolvedTarget; ignore stale host hints.
+    threadSuppressed: true,
+  };
+}

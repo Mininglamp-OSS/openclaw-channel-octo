@@ -87,6 +87,8 @@ import { preloadGroupMemberCache, getGroupMembersFromCache } from "./member-cach
 import { preloadMentionPrefs } from "./mention-prefs.js";
 import { initPersonaPromptCache, stopPersonaPromptCache } from "./persona-prompt.js";
 import { registerOctoThreadBindingAdapter } from "./thread-binding-adapter.js";
+import { confirmsCurrentSourceReply, extractToolSendResult, targetsMatchForReplySuppression } from "./reply-delivery.js";
+import { normalizeOctoMessagingTarget } from "./target.js";
 import { normalizeAccountId } from "./account-id.js";
 import path from "node:path";
 import os from "node:os";
@@ -812,14 +814,15 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       return { actions, capabilities: [] };
     },
     extractToolSend: ({ args }: { args: Record<string, unknown> }) => {
-      const target = args.target as string | undefined;
+      const target = (args.target ?? args.to) as string | undefined;
       // Return the canonical `to` field that openclaw core uses in
       // isMessagingToolSendAction to recognise Octo sends as committed
       // delivery evidence.  Without `to`, isDeliveredMessagingToolResult
       // is false → messagingToolSentMediaUrls is never populated →
       // image-only agent turns are classified as non_deliverable_terminal_turn.
-      return target ? { to: target } : {};
+      return target ? { to: target, accountId: args.accountId } : {};
     },
+    extractToolSendResult,
     handleAction: async (ctx: any) => {
       // Resolve correct accountId: framework may pass wrong one when agent has multiple accounts.
       // Use currentChannelId to look up which account actually owns the group.
@@ -875,7 +878,16 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // Exceptions are intentionally not caught here: the host wraps tool
       // execution in its own try/catch and depends on the throw for the
       // after-tool-call error hook and failed-idempotency-key retention.
-      return toActionToolResult(result);
+      const data = result.data as Record<string, unknown> | undefined;
+      if (result.ok && data?.sent === true) result.data = { ...data, accountId };
+      const toolResult = toActionToolResult(result);
+      // The host checks requested targets before reconciling our receipt. A
+      // parent alias may have been rewritten to the current child thread;
+      // certify source delivery only when the actual sent route matches.
+      if (confirmsCurrentSourceReply({ result, currentTarget: currentChannelId, knownGroupIds: getKnownGroupIds() })) {
+        return { ...toolResult, details: { ...toolResult.details, sourceReplyRoute: "current-source" } };
+      }
+      return toolResult;
     },
   } as any, // TODO: remove when SDK types support this
   agentPrompt: {
@@ -910,7 +922,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
     }),
   },
   messaging: {
-    normalizeTarget: (target) => target.trim(),
+    normalizeTarget: (target) => normalizeOctoMessagingTarget(target, getKnownGroupIds()),
     targetResolver: {
       looksLikeId: (input) => Boolean(input.trim()),
       hint: "<userId or channelId>",
@@ -918,6 +930,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
   },
   outbound: {
     deliveryMode: "direct",
+    targetsMatchForReplySuppression,
     sendText: async (ctx) => {
       // Resolve correct accountId — framework may pass wrong one for multi-bot setups
       const accountId = resolveOutboundAccountId(
@@ -1250,6 +1263,13 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         );
       }
 
+      const stopThreadBindingAdapter = registerOctoThreadBindingAdapter({
+        accountId: account.accountId,
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken,
+        log: ctx.log,
+      });
+      try {
       const log = ctx.log;
       const statusSink: OctoStatusSink = (patch) =>
         ctx.setStatus({ accountId: account.accountId, ...patch });
@@ -1348,10 +1368,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         log,
       );
 
-      // NOTE: ACP thread-binding adapter is NOT registered here. The canonical
-      // wiring is via `octoPlugin.conversationBindings.createManager`, which
-      // OpenClaw runtime calls on demand and whose returned `{stop}` it owns.
-      // See the plugin declaration above and `src/thread-binding-adapter.ts`.
+      // Ordinary inbound dispatch already queries the adapter on 2026.10.
+      // Account startup owns registration; the finally block releases it even
+      // when registration or subsequent setup fails before the socket starts.
 
       // Prefetch GROUP.md and group members for all groups (fire-and-forget)
       const groupMdCache = getOrCreateGroupMdCache(account.accountId);
@@ -1497,6 +1516,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   log,
                   statusSink,
                   routeOverride,
+                  signal: ctx.abortSignal,
                   ...(extra?.docTask ? { docTask: extra.docTask } : {}),
                 }),
               { ...SESSION_INIT_RETRY, log },
@@ -1760,6 +1780,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                 ? msg.channel_id.split("____")[0]
                 : msg.channel_id;
               registerGroupToAccount(groupId, account.accountId);
+              registerBotGroupIds([groupId]);
             }
           }
 
@@ -1896,7 +1917,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       watchdog.start();
 
       // Keep Promise pending until stopped — gateway treats resolve as "account stopped"
-      return new Promise((resolve) => {
+      return await new Promise((resolve) => {
         const cleanup = () => {
           if (stopped) return;
           stopped = true;
@@ -1923,6 +1944,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           ctx.abortSignal.addEventListener("abort", cleanup, { once: true });
         }
       });
+      } finally {
+        stopThreadBindingAdapter();
+      }
     },
   },
 };

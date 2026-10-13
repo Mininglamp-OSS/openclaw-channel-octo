@@ -72,6 +72,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 //   • `~` home expansion via resolveUserPath.
 import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
+import { findAgentConfig, normalizeAgentId, type CompatibleAgentsConfig } from "./agent-config-compat.js";
 
 /**
  * Placeholder token replaced by the resolved plaintext secret inside the
@@ -237,29 +238,6 @@ async function confineSecretPath(
 }
 
 /**
- * Canonical agent-id matcher, aligned with the platform's `normalizeAgentId`
- * (openclaw/plugin-sdk/routing). Agent entries in `cfg.agents.list[]` are keyed
- * by OpenClaw agent id, which is lower-cased and slug-normalized; comparing raw
- * strings (the previous `a.id === agentAccountId`) misses legitimate matches
- * whenever casing or punctuation differs. We normalize BOTH sides before
- * comparison so the match key lives in the same namespace as the platform.
- */
-const VALID_AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
-function normalizeAgentId(value: string | undefined | null): string {
-  const trimmed = (value ?? "").trim();
-  if (!trimmed) return "main";
-  const lower = trimmed.toLowerCase();
-  if (VALID_AGENT_ID_RE.test(trimmed)) return lower;
-  return (
-    lower
-      .replace(/[^a-z0-9_-]+/g, "-")
-      .replace(/^-+/, "")
-      .replace(/-+$/, "")
-      .slice(0, 64) || "main"
-  );
-}
-
-/**
  * Expand `$VAR` / `${VAR}` (POSIX) and `%VAR%` (Windows) against the process
  * environment, returning `undefined` if ANY referenced variable is undefined.
  *
@@ -413,7 +391,7 @@ async function resolveAgentWorkspaceRoot(
   agentId: string | undefined,
   agentAccountId: string | undefined,
 ): Promise<string | undefined> {
-  const agents = cfg.agents;
+  const agents = cfg.agents as typeof cfg.agents & CompatibleAgentsConfig;
   if (!agents) return undefined;
 
   // Effective agent id: prefer the OpenClaw agent id, fall back to the Octo
@@ -426,9 +404,7 @@ async function resolveAgentWorkspaceRoot(
   // Find this agent's OWN configured workspace (if any) and the shared default,
   // matching the platform's id namespace (lower/slug-normalized).
   const list = agents.list;
-  const matched = list?.find(
-    (a) => a.id != null && normalizeAgentId(a.id) === normId,
-  );
+  const matched = findAgentConfig(agents, normId);
   const ownWorkspaceRaw = matched?.workspace?.trim();
   const defaultWorkspaceRaw = agents.defaults?.workspace?.trim();
 
@@ -472,15 +448,21 @@ async function resolveAgentWorkspaceRoot(
     agents: {
       ...agents,
       ...(usingOwnWorkspace
-        ? {
-            list: Array.isArray(list)
-              ? list.map((a) =>
-                  a.id != null && normalizeAgentId(a.id) === normId
-                    ? { ...a, workspace: configuredBaseExpanded }
-                    : a,
-                )
-              : list,
-          }
+        ? agents.entries
+          ? {
+              entries: Object.fromEntries(Object.entries(agents.entries).map(([id, entry]) => [
+                id, normalizeAgentId(id) === normId ? { ...entry, workspace: configuredBaseExpanded } : entry,
+              ])),
+            }
+          : {
+              list: Array.isArray(list)
+                ? list.map((a) =>
+                    a.id != null && normalizeAgentId(a.id) === normId
+                      ? { ...a, workspace: configuredBaseExpanded }
+                      : a,
+                  )
+                : list,
+            }
         : {
             defaults: {
               ...agents.defaults,
