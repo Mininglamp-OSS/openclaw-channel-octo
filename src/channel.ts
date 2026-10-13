@@ -884,7 +884,8 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // The host checks requested targets before reconciling our receipt. A
       // parent alias may have been rewritten to the current child thread;
       // certify source delivery only when the actual sent route matches.
-      if (confirmsCurrentSourceReply({ result, currentTarget: currentChannelId, knownGroupIds: getKnownGroupIds() })) {
+      if (ctx.requesterAccountId && normalizeAccountId(ctx.requesterAccountId) === accountId
+        && confirmsCurrentSourceReply({ result, currentTarget: currentChannelId, knownGroupIds: getKnownGroupIds() })) {
         return { ...toolResult, details: { ...toolResult.details, sourceReplyRoute: "current-source" } };
       }
       return toolResult;
