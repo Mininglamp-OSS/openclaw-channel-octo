@@ -651,6 +651,83 @@ describe("server-driven Registry reasoning progress", () => {
     } finally { clearCard(sessionKey); }
   });
 
+  it.each([
+    ["group-1", ChannelType.Group],
+    ["user-1", ChannelType.DM],
+    ["group-1____topic", ChannelType.CommunityTopic],
+    ["s1001_user-1", ChannelType.DM],
+  ])("completes a targetless message-tool reply to %s from its actual receipt", async (channelId, channelType) => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "implicit-reply";
+    setCardContext(sessionKey, context({ channelId, channelType, accountId: "bot-1" }));
+    await triggerFirstFrame(handlers, sessionKey);
+    const ctx = { sessionKey, runId: "run-1" };
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "send-1", params: { action: "send", message: "done", final: true } }, ctx);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "send-1", result: { details: {
+      ok: true, data: { sent: true, channelId, resolvedTarget: channelId, channelType, accountId: "bot-1" },
+      sourceReplyRoute: "current-source", messageDelivery: { status: "settled", sourceReplyDelivered: true },
+    } } }, ctx);
+    await finalizeCard(sessionKey, { success: false });
+    expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "completed" });
+  });
+
+  it.each([
+    { ok: false },
+    { data: { sent: false } },
+    { data: { resolvedTarget: "other-group", channelId: "other-group" } },
+    { data: { channelType: ChannelType.DM } },
+    { data: { accountId: "other-bot" } },
+    { data: { resolvedTarget: "" } },
+    { data: { failedMedia: [{ url: "failed.txt" }] } },
+    { data: { failedMedia: "malformed" } },
+  ])("does not let an explicit target override an unsuccessful or foreign receipt: %j", async override => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "receipt-rejected";
+    setCardContext(sessionKey, context({ accountId: "bot-1" }));
+    await triggerFirstFrame(handlers, sessionKey);
+    const ctx = { sessionKey, runId: "run-1" };
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "send-1", params: { action: "send", target: "group:group-1", message: "done" } }, ctx);
+    const details = { ok: true, ...override, data: { sent: true, resolvedTarget: "group-1", channelId: "group-1", channelType: ChannelType.Group, accountId: "bot-1", ...override.data } };
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "send-1", result: { details } }, ctx);
+    await finalizeCard(sessionKey, { success: false });
+    expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "error" });
+  });
+
+  it.each(["missing-receipt", "unpaired-call", "foreign-run", "tool-error", "dispatch-failed"])("keeps %s failed even for a current-source message", async failure => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "implicit-failure";
+    setCardContext(sessionKey, context());
+    await triggerFirstFrame(handlers, sessionKey);
+    const ctx = { sessionKey, runId: "run-1" };
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "send-1", params: { action: "send", message: "done" } }, ctx);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: failure === "unpaired-call" ? "unknown" : "send-1",
+      ...(failure === "tool-error" ? { error: "send failed" } : {}),
+      ...(failure === "missing-receipt" ? {} : { result: { details: { ok: true, data: { sent: true, channelId: "group-1", resolvedTarget: "group-1", channelType: ChannelType.Group } } } }),
+    }, { ...ctx, runId: failure === "foreign-run" ? "older-run" : ctx.runId });
+    await finalizeCard(sessionKey, { success: false, ...(failure === "dispatch-failed" ? { failed: true } : {}) });
+    expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "error" });
+  });
+
+  it("preserves explicit-target delivery on older hosts without structured receipts", async () => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "legacy-explicit-reply";
+    setCardContext(sessionKey, context());
+    await triggerFirstFrame(handlers, sessionKey);
+    const ctx = { sessionKey, runId: "run-1" };
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "send-1", params: { action: "send", target: "group:group-1", message: "done" } }, ctx);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "send-1" }, ctx);
+    await finalizeCard(sessionKey, { success: false });
+    expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "completed" });
+  });
+
   it("does not create a reasoning card for a display-card-only turn", async () => {
     const wire = mockFetch();
     global.fetch = wire.fetch as typeof fetch;

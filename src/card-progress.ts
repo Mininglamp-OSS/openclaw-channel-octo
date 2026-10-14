@@ -40,6 +40,7 @@ import {
 import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.js";
 import { collapseParentScope, parentGroupOf, resolveOutboundTarget } from "./target.js";
 import { getKnownGroupIds } from "./group-md.js";
+import { hasFailedMedia } from "./reply-delivery.js";
 import { requestCardEventPolling } from "./events-poll.js";
 
 /** dispatch 侧登记的发送上下文。 */
@@ -110,10 +111,10 @@ interface CardEntry {
   /** Stable for every frame, including paused continuation runs. */
   reasoningId?: string;
   /**
-   * `message` 工具调用中,目标已确认就是本卡频道的那些 toolCallId。before_tool_call 记录
-   * (只有它带 params),after_tool_call 用成功结果兑现成 `deliveredByTool`。
+   * 本 run 的 message send 调用,按 toolCallId 关联 before/after。布尔值记录请求目标
+   * 是否就是本卡频道,仅供没有结构化回执的旧 host 回退；新 host 以实际回执为准。
    */
-  pendingMessageToolCallIds?: Set<string>;
+  pendingMessageToolCalls?: Map<string, boolean>;
   /**
    * 本 run 已通过 `message` 或 Octo 自有卡片工具向本卡频道成功投递过内容。
    * `finalizeCard` 据此不把这类 turn 误判为失败。
@@ -1030,7 +1031,7 @@ export async function finalizeCard(
     if (retainForContinuation && !entry.skip && entry.messageId) {
       // 证据是 per-run 的事实。entry 从这里开始跨 run 存活,留着会被后续 run 误读。
       entry.deliveredByTool = undefined;
-      entry.pendingMessageToolCallIds = undefined;
+      entry.pendingMessageToolCalls = undefined;
       pausedCards.set(sessionKey, entry);
       schedulePausedCardExpiry(sessionKey, entry);
     }
@@ -1302,6 +1303,20 @@ function messageToolTargetsThisCard(entry: CardEntry, params: unknown): boolean 
     resolved.channelId === parentGroupOf(entry.ctx.channelId);
 }
 
+/** Undefined preserves the explicit-target fallback for older hosts without receipts. */
+function messageToolReceiptTargetsThisCard(entry: CardEntry, result: unknown): boolean | undefined {
+  const root = asRecord(result);
+  if (root?.isError === true) return false;
+  // A provided but malformed receipt must never fall back to requested routing.
+  if (!root || !Object.hasOwn(root, "details")) return undefined;
+  const details = asRecord(root.details);
+  const data = asRecord(details?.data);
+  if (details?.ok !== true || data?.sent !== true || hasFailedMedia(data)) return false;
+  if (entry.ctx.accountId && data.accountId !== entry.ctx.accountId) return false;
+  return data.resolvedTarget === entry.ctx.channelId && data.channelType === entry.ctx.channelType &&
+    (data.channelId === undefined || data.channelId === entry.ctx.channelId);
+}
+
 
 /**
  * runId 归属守卫。before_agent_run 是唯一绑定点;普通 hook 永不认领 entry。
@@ -1429,12 +1444,13 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       return;
     }
     dbg(`before_tool_call tool=${e.toolName} session=${sk}`);
-    // 只有 before 事件带 params;先记下「目标是本卡频道」的 send 调用,等 after 的成功结果兑现。
+    // 关联所有 send 调用,包括 host 自动回复当前会话时省略 target 的调用。
+    // after 优先核对实际投递回执；请求目标只用于旧 host 没有结构化回执时的回退。
     // 必须有 toolCallId:缺了就无法把 after 的成败对回具体调用,同一 turn 里「发往别处的调用
     // 成功」会兑现「发往本卡的调用」的 pending,把失败洗成成功。宁可旧 host 不享受该修复。
     if (e.toolName === MESSAGING_TOOL_NAME) {
-      if (e.toolCallId && messageToolTargetsThisCard(entry, e.params)) {
-        (entry.pendingMessageToolCallIds ??= new Set()).add(e.toolCallId);
+      if (e.toolCallId && asRecord(e.params)?.action === "send") {
+        (entry.pendingMessageToolCalls ??= new Map()).set(e.toolCallId, messageToolTargetsThisCard(entry, e.params));
       }
     } else if (messageToolTargetsThisCard(entry, e.params)) {
       // 形状像「发往本卡频道」却挂在别的工具名下:host 可能用了别名/自定义 messaging 工具,
@@ -1541,10 +1557,14 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       if (!e.error) target.resultSummary = summarizeToolResult(e.toolName, e.result);
     }
     // 成功投递到本卡频道 = 本轮已交付,即使 dispatcher 没拿到任何 final text。
-    if (e.toolName === MESSAGING_TOOL_NAME && !e.error && e.toolCallId &&
-        entry.pendingMessageToolCallIds?.delete(e.toolCallId)) {
-      entry.deliveredByTool = true;
-      dbg(`message tool delivered to this card session=${sk}`);
+    if (e.toolName === MESSAGING_TOOL_NAME && e.toolCallId &&
+        entry.pendingMessageToolCalls?.has(e.toolCallId)) {
+      const requestedThisCard = entry.pendingMessageToolCalls.get(e.toolCallId)!;
+      entry.pendingMessageToolCalls.delete(e.toolCallId);
+      if (!e.error && (messageToolReceiptTargetsThisCard(entry, e.result) ?? requestedThisCard)) {
+        entry.deliveredByTool = true;
+        dbg(`message tool delivered to this card session=${sk}`);
+      }
     }
     if (e.toolName === "sessions_spawn" && !e.error) {
       const childSessionKey = acceptedSpawnChildSessionKey(e.result);
