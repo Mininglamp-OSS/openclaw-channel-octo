@@ -8,6 +8,13 @@ function receiptDestination(data: Record<string, unknown> | undefined): string |
   return prefix ? `${prefix}:${data.resolvedTarget.trim()}` : undefined;
 }
 
+/** Only complete sends may become host delivery evidence. */
+export function hasFailedMedia(data: Record<string, unknown> | undefined): boolean {
+  const failed = data?.failedMedia;
+  // Treat malformed failure receipts conservatively, too.
+  return failed != null && (!Array.isArray(failed) || failed.length > 0);
+}
+
 /** Confirm source delivery from the actual receipt, rather than requested aliases. */
 export function confirmsCurrentSourceReply(params: {
   result: { ok: boolean; data?: unknown };
@@ -17,7 +24,7 @@ export function confirmsCurrentSourceReply(params: {
   const data = params.result.data as Record<string, unknown> | undefined;
   if (!params.result.ok || data?.sent !== true || !params.currentTarget?.trim()
     || typeof data.resolvedTarget !== "string" || !data.resolvedTarget.trim()
-    || Array.isArray(data.failedMedia) && data.failedMedia.length > 0) return false;
+    || hasFailedMedia(data)) return false;
   const delivered = receiptDestination(data);
   if (!delivered) return false;
   return delivered === normalizeOctoMessagingTarget(params.currentTarget, params.knownGroupIds);
@@ -61,7 +68,7 @@ export function extractToolSendResult(params: {
   const data = details?.data;
   const to = receiptDestination(data);
   if (details?.ok !== true || data?.sent !== true
-    || !to) return undefined;
+    || hasFailedMedia(data) || !to) return undefined;
   return {
     to,
     accountId: typeof data.accountId === "string" ? data.accountId : params.send.accountId,

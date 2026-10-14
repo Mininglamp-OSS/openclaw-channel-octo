@@ -92,6 +92,9 @@ describe("message-tool reply route evidence (#257)", () => {
     { ok: false, data: { sent: true, resolvedTarget: "g" } },
     { ok: true, data: { sent: false, resolvedTarget: "g" } },
     { ok: true, data: { sent: true, resolvedTarget: "" } },
+    ...[[{ url: "missing.png", error: "403" }], "malformed"].map(failedMedia => ({
+      ok: true, data: { sent: true, resolvedTarget: "g", channelType: ChannelType.Group, failedMedia },
+    })),
   ])("does not turn an unsuccessful action into delivery evidence", details => {
     expect(extractToolSendResult({ result: { details }, send: { to: "group:g" } })).toBeUndefined();
   });

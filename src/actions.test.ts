@@ -2118,7 +2118,8 @@ describe("handleOctoMessageAction", () => {
         botToken: "test-token",
       });
 
-      expect(result.ok).toBe(true);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("retry only failedMedia");
       expect(uploadSpy).toHaveBeenCalledTimes(3);
       const data = result.data as any;
       expect(data.mediaCount).toBe(2);
@@ -2147,7 +2148,7 @@ describe("handleOctoMessageAction", () => {
       expect(result.error).toContain("All 2 media upload(s) failed");
     });
 
-    it("should return ok:true when all uploads fail but text message was sent", async () => {
+    it("should report incomplete delivery while retaining the sent text receipt", async () => {
       const { uploadAndSendMedia } = await import("./inbound.js");
       const uploadSpy = vi.mocked(uploadAndSendMedia);
       uploadSpy.mockClear();
@@ -2169,8 +2170,11 @@ describe("handleOctoMessageAction", () => {
         botToken: "test-token",
       });
 
-      expect(result.ok).toBe(true);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("retry only failedMedia");
       const data = result.data as any;
+      expect(data.sent).toBe(true);
+      expect(data.messageId).toBe("1");
       expect(data.mediaCount).toBe(0);
       expect(data.failedMedia).toHaveLength(1);
     });

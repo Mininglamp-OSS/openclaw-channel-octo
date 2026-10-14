@@ -720,7 +720,10 @@ async function handleSend(params: {
       log,
     });
     return {
-      ok: true,
+      ok: richResult.failedMedia.length === 0,
+      ...(richResult.failedMedia.length > 0 ? {
+        error: "Some media uploads failed. Text and successful media were already sent; retry only failedMedia.",
+      } : {}),
       data: {
         sent: true,
         target,
@@ -803,8 +806,14 @@ async function handleSend(params: {
   // for image-only turns to pass hasCommittedMessagingDeliveryEvidence).
   const sentMediaUrls = sentMedia.map(m => m.url);
 
+  // OpenClaw records every requested URL on an ok:true send. An incomplete
+  // send must be a tool failure, otherwise it suppresses the final reply's
+  // failed media as already delivered. Keep actual receipts for selective retry.
   return {
-    ok: true,
+    ok: failedMedia.length === 0,
+    ...(failedMedia.length > 0 ? {
+      error: "Some media uploads failed. Text and successful media were already sent; retry only failedMedia.",
+    } : {}),
     ...(sentMediaUrls.length > 0 ? { mediaUrls: sentMediaUrls } : {}),
     data: {
       sent: true,
