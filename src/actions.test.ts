@@ -2127,6 +2127,24 @@ describe("handleOctoMessageAction", () => {
       expect(data.failedMedia[0].url).toBe("https://example.com/b.png");
     });
 
+    it("reports a RichText upload failure without certifying the already-sent text as complete", async () => {
+      const { uploadMedia } = await import("./inbound.js");
+      vi.mocked(uploadMedia).mockRejectedValueOnce(new Error("image PUT 403"));
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: "text-only", message_seq: 1 }),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send", args: { target: "user:uid1", message: "caption", media: "https://example.com/image.png", richText: true },
+        apiUrl: "http://localhost:8090", botToken: "test-token",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("retry only failedMedia");
+      expect(result.data).toMatchObject({ sent: true, messageId: "text-only", mediaCount: 0,
+        failedMedia: [{ url: "https://example.com/image.png", error: "image PUT 403" }],
+      });
+    });
+
     it("should return ok:false when all uploads fail and no text message", async () => {
       const { uploadAndSendMedia } = await import("./inbound.js");
       const uploadSpy = vi.mocked(uploadAndSendMedia);

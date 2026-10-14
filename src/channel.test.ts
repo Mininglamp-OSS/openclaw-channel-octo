@@ -705,6 +705,42 @@ describe("outbound.sendMedia — bare local absolute path (#183)", () => {
     } catch { /* best-effort */ }
   });
 
+  it("closes an unconsumed upload stream after PUT rejects", async () => {
+    const { octoPlugin } = await import("./channel.js");
+    const { uploadFileToPresignedUrl, sendMediaMessage } = await import("./api-fetch.js");
+    let stream: any;
+    vi.mocked(uploadFileToPresignedUrl).mockImplementationOnce(async args => {
+      stream = args.fileBody;
+      throw new Error("PUT rejected before body consumption");
+    });
+    await expect(octoPlugin.outbound!.sendMedia!({
+      cfg, to: "group:grp1", text: "", mediaUrl: tmpFile, accountId: "default",
+    } as any)).rejects.toThrow("PUT rejected before body consumption");
+    expect(stream.closed).toBe(true);
+    expect(sendMediaMessage).not.toHaveBeenCalled();
+  });
+
+  it("handles a late file-open error without an uncaught exception", async () => {
+    const { octoPlugin } = await import("./channel.js");
+    const { getUploadPresign, uploadFileToPresignedUrl } = await import("./api-fetch.js");
+    const { unlink } = await import("node:fs/promises");
+    let stream: any;
+    vi.mocked(getUploadPresign).mockImplementationOnce(async () => {
+      await unlink(tmpFile);
+      return { uploadUrl: "https://example.test/put", downloadUrl: "https://example.test/file", contentType: "text/plain" };
+    });
+    vi.mocked(uploadFileToPresignedUrl).mockImplementationOnce(async args => {
+      stream = args.fileBody;
+      // Let the deferred open fail without consuming the stream.
+      await new Promise(resolve => setTimeout(resolve, 20));
+      throw new Error("PUT rejected");
+    });
+    await expect(octoPlugin.outbound!.sendMedia!({
+      cfg, to: "group:grp1", text: "", mediaUrl: tmpFile, accountId: "default",
+    } as any)).rejects.toThrow("PUT rejected");
+    expect(stream.closed).toBe(true);
+  });
+
   it("uploads a bare absolute path via the local-file branch (no Invalid URL)", async () => {
     const { octoPlugin } = await import("./channel.js");
     const { getUploadPresign, uploadFileToPresignedUrl, sendMediaMessage } =
@@ -783,6 +819,38 @@ describe("outbound.sendMedia — HTTP streaming size cap", () => {
     const { readdir } = await import("node:fs/promises");
     try { return await readdir("/tmp/octo-upload"); } catch { return []; }
   }
+
+  it("cancels an outbound body read without relying on fetch cancellation", async () => {
+    const { octoPlugin } = await import("./channel.js");
+    const controller = new AbortController();
+    const reason = new Error("outbound cancelled");
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const cancel = vi.fn();
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(new ReadableStream<Uint8Array>({
+      start(c) { source = c; }, pull() { enter(); }, cancel,
+    }, { highWaterMark: 0 }))) as any;
+    const token = `outbound-cancel-${Date.now()}`;
+    const settled = octoPlugin.outbound!.sendMedia!({
+      cfg, to: "group:grp1", text: "", mediaUrl: `https://example.test/${token}.txt`,
+      accountId: "default", signal: controller.signal,
+    } as any).then(() => "sent", error => error);
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await entered;
+      controller.abort(reason);
+      expect(await Promise.race([settled, new Promise(resolve => {
+        deadline = setTimeout(() => resolve("still pending"), 500);
+      })])).toBe(reason);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect((await listOctoUploadTemp()).filter(name => name.includes(token))).toEqual([]);
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      try { source.error(reason); } catch { /* already cancelled */ }
+      await settled;
+    }
+  });
 
   it("rejects with 'exceeds max' on http(s) URL > 100MB; presign never called; temp cleaned", async () => {
     const apiFetch = await import("./api-fetch.js");

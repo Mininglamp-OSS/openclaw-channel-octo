@@ -4,7 +4,7 @@ import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { uploadAndSendMedia } from "./inbound.js";
+import { uploadMedia, uploadAndSendMedia } from "./inbound.js";
 import { streamToFileWithCap } from "./stream-helpers.js";
 import { ChannelType } from "./types.js";
 
@@ -58,6 +58,93 @@ describe("media upload cancellation", () => {
       server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));
       await settled;
+    }
+  });
+
+  it("forwards cancellation into a body that ignores fetch's signal", async () => {
+    const filename = `noncooperative-${randomUUID()}.txt`;
+    const cancel = vi.fn();
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { source = controller; },
+      pull(controller) {
+        if (pulls++ === 0) controller.enqueue(new Uint8Array([1]));
+        else enter();
+      }, cancel,
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body));
+    const controller = new AbortController();
+    const reason = new Error("stop noncooperative download");
+    const settled = uploadMedia({
+      mediaUrl: `https://example.test/${filename}`, apiUrl: "https://example.test", botToken: "test",
+      signal: controller.signal,
+    }).then(() => "uploaded", error => error);
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await entered;
+      controller.abort(reason);
+      expect(await Promise.race([
+        settled, new Promise(resolve => { deadline = setTimeout(() => resolve("still pending"), 500); }),
+      ])).toBe(reason);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetchMock).toHaveBeenCalledOnce(); // no presign after body cancellation
+      expect((await readdir("/tmp/octo-upload")).filter(name => name.endsWith(filename))).toEqual([]);
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      try { source.error(reason); } catch { /* already cancelled */ }
+      await settled;
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("preserves a real HTTP error coinciding with an abort", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+      controller.abort(new Error("account stopped"));
+      return new Response("forbidden", { status: 403 });
+    });
+    try {
+      await expect(uploadMedia({ mediaUrl: "https://example.test/error.txt", apiUrl: "https://example.test",
+        botToken: "test", signal: controller.signal,
+      })).rejects.toThrow("Failed to fetch media: 403");
+    } finally { fetchMock.mockRestore(); }
+  });
+
+  it.each(["presign", "PUT"])("bounds %s even when a tool caller has no signal", async stage => {
+    const dir = await mkdtemp(join(tmpdir(), "octo-default-budget-"));
+    const path = join(dir, "local.txt");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(path, "test");
+    const controller = new AbortController();
+    const reason = new DOMException("upload budget expired", "TimeoutError");
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const presign = String(url).includes("/presigned");
+      if (stage === "PUT" && presign) return Response.json({ uploadUrl: "https://example.test/put",
+        downloadUrl: "https://example.test/file", contentType: "text/plain" });
+      enter();
+      const signal = init!.signal!;
+      return new Promise<Response>((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+    const settled = uploadMedia({ mediaUrl: path, apiUrl: "https://example.test", botToken: "test" })
+      .then(() => "uploaded", error => error);
+    try {
+      await entered;
+      controller.abort(reason);
+      expect(await settled).toBe(reason);
+      expect(timeout).toHaveBeenCalledWith(300_000);
+    } finally {
+      controller.abort(reason);
+      await settled;
+      timeout.mockRestore(); fetchMock.mockRestore();
+      await rm(dir, { recursive: true, force: true });
     }
   });
 

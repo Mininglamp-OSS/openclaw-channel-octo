@@ -139,7 +139,10 @@ async function downloadToTempFile(url: string, filename: string, signal?: AbortS
   // caller derives from statSync() (SigV4 403 on any mismatch). Enforce the cap
   // while streaming the body — see streamToFileWithCap for the read loop /
   // backpressure / error / cancel logic.
-  const resp = await fetch(url, { signal: signal ?? AbortSignal.timeout(300_000) });
+  const downloadSignal = AbortSignal.any([
+    AbortSignal.timeout(300_000), ...(signal ? [signal] : []),
+  ]);
+  const resp = await fetch(url, { signal: downloadSignal });
   if (!resp.ok) throw new Error(`Failed to download media from ${url}: ${resp.status}`);
   const contentType = resp.headers.get("content-type") ?? undefined;
   if (!resp.body) throw new Error(`No response body from ${url}`);
@@ -148,6 +151,7 @@ async function downloadToTempFile(url: string, filename: string, signal?: AbortS
     body: resp.body as ReadableStream<Uint8Array>,
     destPath: tempPath,
     maxBytes: MAX_UPLOAD_SIZE,
+    signal: downloadSignal,
   });
   return { tempPath, contentType };
 }
@@ -1057,6 +1061,13 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       return toDeliveryResult(ctx.to, sendResult);
     },
     sendMedia: async (ctx) => {
+      // August hosts do not expose signal on outbound contexts. Honor it when
+      // provided by newer hosts and keep a deadline for legacy callers.
+      const callerSignal = "signal" in ctx && ctx.signal instanceof AbortSignal ? ctx.signal : undefined;
+      callerSignal?.throwIfAborted();
+      const signal = AbortSignal.any([
+        AbortSignal.timeout(300_000), ...(callerSignal ? [callerSignal] : []),
+      ]);
       // Resolve correct accountId — framework may pass wrong one for multi-bot setups
       const accountId = resolveOutboundAccountId(
         ctx.to,
@@ -1154,7 +1165,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         } catch {
           filename = rawFilename;
         }
-        const dl = await downloadToTempFile(mediaUrl, filename);
+        const dl = await downloadToTempFile(mediaUrl, filename, signal);
         tempPath = dl.tempPath;
         localFilePath = dl.tempPath;
         contentType = dl.contentType;
@@ -1167,7 +1178,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       contentType = contentType || "application/octet-stream";
 
       let sendResult: SendMessageResult | undefined;
+      let fileBody: Buffer | ReturnType<typeof createReadStream> | undefined;
       try {
+        signal.throwIfAborted();
         // 2. Upload via the server's backend-agnostic presigned PUT URL.
         //    fileSize is the exact body byte count (statSync / buffer length);
         //    it is signed into the SigV4 Content-Length (403 on mismatch).
@@ -1177,11 +1190,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           filename,
           fileSize,
           contentType: ensureTextCharset(contentType),
+          signal,
         });
         // Open the read stream lazily (after presign succeeds) so a presign
         // failure never leaves a dangling open() against an unlinked temp file.
-        const fileBody: Buffer | NodeJS.ReadableStream =
-          fileBuffer ?? createReadStream(bodyPath!);
+        signal.throwIfAborted();
+        fileBody = fileBuffer ?? createReadStream(bodyPath!);
+        // Fetch can reject without consuming the body; handle late open errors.
+        if (!Buffer.isBuffer(fileBody)) fileBody.on("error", () => {});
         const { url: cdnUrl } = await uploadFileToPresignedUrl({
           uploadUrl: presign.uploadUrl,
           downloadUrl: presign.downloadUrl,
@@ -1191,7 +1207,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           // (both folded into the SigV4 canonical headers, 403 otherwise).
           contentType: presign.contentType,
           contentDisposition: presign.contentDisposition,
+          signal,
         });
+        signal.throwIfAborted();
 
         // 4. Determine message type and send
         // (target already resolved + validated up front, before upload — #138)
@@ -1206,9 +1224,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             : Buffer.isBuffer(fileBody)
               ? parseImageDimensions(fileBody, contentType)
               : null;
+          signal.throwIfAborted();
           sendResult = await sendMediaMessage({
             apiUrl: account.config.apiUrl,
             botToken: account.config.botToken,
+            signal,
             channelId,
             channelType,
             type: msgType,
@@ -1219,9 +1239,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             size: fileSize,
           });
         } else {
+          signal.throwIfAborted();
           sendResult = await sendMediaMessage({
             apiUrl: account.config.apiUrl,
             botToken: account.config.botToken,
+            signal,
             channelId,
             channelType,
             type: msgType,
@@ -1231,6 +1253,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           });
         }
       } finally {
+        if (fileBody && !Buffer.isBuffer(fileBody)) {
+          const stream = fileBody;
+          stream.destroy();
+          if (!stream.closed) await new Promise<void>(resolve => stream.once("close", resolve));
+        }
         // Cleanup temp file
         if (tempPath) await unlink(tempPath).catch(() => {});
       }

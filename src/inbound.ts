@@ -414,6 +414,11 @@ export async function uploadMedia(params: {
 }): Promise<UploadedMedia> {
   const { mediaUrl, apiUrl, botToken, log } = params;
   params.signal?.throwIfAborted();
+  // Tool actions receive no host cancellation signal on current SDKs. Still
+  // bound preparation/PUT, including local files, with the existing 300s cap.
+  const signal = AbortSignal.any([
+    AbortSignal.timeout(300_000), ...(params.signal ? [params.signal] : []),
+  ]);
 
   const { createReadStream: fsCreateReadStream, statSync: fsStatSync } = await import("node:fs");
   const { basename, join: pathJoin } = await import("node:path");
@@ -444,10 +449,7 @@ export async function uploadMedia(params: {
       await fsMkdir(TEMP_DIR, { recursive: true });
       tempPath = pathJoin(TEMP_DIR, `${randomUUID()}-${filename}`);
 
-      const downloadSignal = AbortSignal.any([
-        AbortSignal.timeout(300_000), ...(params.signal ? [params.signal] : []),
-      ]);
-      const resp = await fetch(mediaUrl, { signal: downloadSignal });
+      const resp = await fetch(mediaUrl, { signal });
       if (!resp.ok) throw new Error(`Failed to fetch media: ${resp.status}`);
       contentType = resp.headers.get("content-type") || "application/octet-stream";
       if (!resp.body) throw new Error(`No response body from ${mediaUrl}`);
@@ -457,7 +459,7 @@ export async function uploadMedia(params: {
           body: resp.body as ReadableStream<Uint8Array>,
           destPath: tempPath,
           maxBytes: MAX_UPLOAD_SIZE,
-          signal: downloadSignal,
+          signal,
         });
       } catch (err) {
         // streamToFileWithCap unlinks the partial temp file on its own error
@@ -479,7 +481,7 @@ export async function uploadMedia(params: {
       contentType = inferContentType(filename);
     }
 
-    params.signal?.throwIfAborted();
+    signal.throwIfAborted();
     // Upload via the server's presigned PUT URL (backend-agnostic: MinIO/COS/S3/OSS).
     const presign = await getUploadPresign({
       apiUrl,
@@ -487,9 +489,9 @@ export async function uploadMedia(params: {
       filename,
       fileSize,
       contentType: ensureTextCharset(contentType),
-      signal: params.signal,
+      signal,
     });
-    params.signal?.throwIfAborted();
+    signal.throwIfAborted();
     const fileBody = fsCreateReadStream(bodyPath);
     // A rejected fetch may never consume the body. Prevent a late open error
     // from becoming unhandled; a consuming fetch still observes stream errors.
@@ -504,9 +506,9 @@ export async function uploadMedia(params: {
         // both are folded into the SigV4 canonical headers (403 otherwise).
         contentType: presign.contentType,
         contentDisposition: presign.contentDisposition,
-        signal: params.signal,
+        signal,
       });
-      params.signal?.throwIfAborted();
+      signal.throwIfAborted();
 
       // Determine media kind from MIME
       const isImage = contentType.startsWith("image/");
@@ -523,7 +525,7 @@ export async function uploadMedia(params: {
 
       log?.info?.(`octo: uploaded media as ${isImage ? "image" : "file"}: ${filename}${width ? ` (${width}x${height})` : ""}`);
 
-      params.signal?.throwIfAborted();
+      signal.throwIfAborted();
       return { url: uploadedUrl, filename, size: fileSize, contentType, isImage, width, height };
     } finally {
       // Fetch can reject before consuming the body; always close our file handle.
@@ -531,7 +533,11 @@ export async function uploadMedia(params: {
       if (!fileBody.closed) await new Promise<void>(resolve => fileBody.once("close", resolve));
     }
   } catch (error) {
-    params.signal?.throwIfAborted();
+    // Undici may turn a cancelled body into AbortError. Preserve an unrelated
+    // 403/size/disk error that happened concurrently with cancellation.
+    if (signal.aborted && error instanceof Error && error.name === "AbortError") {
+      throw signal.reason;
+    }
     throw error;
   } finally {
     if (tempPath) await fsUnlink(tempPath).catch(() => {});
@@ -552,8 +558,11 @@ export async function uploadAndSendMedia(params: {
   const { mediaUrl, apiUrl, botToken, channelId, channelType, onBehalfOf, log } = params;
 
   params.signal?.throwIfAborted();
-  const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, signal: params.signal, log });
-  params.signal?.throwIfAborted();
+  const signal = AbortSignal.any([
+    AbortSignal.timeout(300_000), ...(params.signal ? [params.signal] : []),
+  ]);
+  const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, signal, log });
+  signal.throwIfAborted();
 
   const msgType = uploaded.isImage ? MessageType.Image : MessageType.File;
 
@@ -570,7 +579,7 @@ export async function uploadAndSendMedia(params: {
     width: uploaded.width,
     height: uploaded.height,
     ...(onBehalfOf ? { onBehalfOf } : {}),
-    ...(params.signal ? { signal: params.signal } : {}),
+    signal,
   });
   return result;
 }
