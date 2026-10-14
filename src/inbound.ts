@@ -409,9 +409,11 @@ export async function uploadMedia(params: {
   mediaUrl: string;
   apiUrl: string;
   botToken: string;
+  signal?: AbortSignal;
   log?: ChannelLogSink;
 }): Promise<UploadedMedia> {
   const { mediaUrl, apiUrl, botToken, log } = params;
+  params.signal?.throwIfAborted();
 
   const { createReadStream: fsCreateReadStream, statSync: fsStatSync } = await import("node:fs");
   const { basename, join: pathJoin } = await import("node:path");
@@ -430,51 +432,54 @@ export async function uploadMedia(params: {
   // dangling open() that throws ENOENT.
   let bodyPath: string;
 
-  if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
-    filename = extractFilename(mediaUrl);
-    // Stream download to a temp file. We deliberately do NOT trust the HEAD
-    // Content-Length for the size check or for the presigned fileSize: a
-    // remote server may omit or lie about it, and the presigned PUT signs the
-    // exact byte count (SigV4 403 on any mismatch). Enforce the cap while
-    // streaming via streamToFileWithCap (shared helper), then use the real
-    // statSync().size for the signed fileSize.
-    await fsMkdir(TEMP_DIR, { recursive: true });
-    tempPath = pathJoin(TEMP_DIR, `${randomUUID()}-${filename}`);
+  try {
+    if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
+      filename = extractFilename(mediaUrl);
+      // Stream download to a temp file. We deliberately do NOT trust the HEAD
+      // Content-Length for the size check or for the presigned fileSize: a
+      // remote server may omit or lie about it, and the presigned PUT signs the
+      // exact byte count (SigV4 403 on any mismatch). Enforce the cap while
+      // streaming via streamToFileWithCap (shared helper), then use the real
+      // statSync().size for the signed fileSize.
+      await fsMkdir(TEMP_DIR, { recursive: true });
+      tempPath = pathJoin(TEMP_DIR, `${randomUUID()}-${filename}`);
 
-    const resp = await fetch(mediaUrl, {
-      signal: AbortSignal.timeout(300_000),
-    });
-    if (!resp.ok) throw new Error(`Failed to fetch media: ${resp.status}`);
-    contentType = resp.headers.get("content-type") || "application/octet-stream";
-    if (!resp.body) throw new Error(`No response body from ${mediaUrl}`);
+      const downloadSignal = AbortSignal.any([
+        AbortSignal.timeout(300_000), ...(params.signal ? [params.signal] : []),
+      ]);
+      const resp = await fetch(mediaUrl, { signal: downloadSignal });
+      if (!resp.ok) throw new Error(`Failed to fetch media: ${resp.status}`);
+      contentType = resp.headers.get("content-type") || "application/octet-stream";
+      if (!resp.body) throw new Error(`No response body from ${mediaUrl}`);
 
-    try {
-      await streamToFileWithCap({
-        body: resp.body as ReadableStream<Uint8Array>,
-        destPath: tempPath,
-        maxBytes: MAX_UPLOAD_SIZE,
-      });
-    } catch (err) {
-      // streamToFileWithCap unlinks the partial temp file on its own error
-      // path; clear our handle so the outer `finally` doesn't double-unlink.
-      tempPath = undefined;
-      throw err;
+      try {
+        await streamToFileWithCap({
+          body: resp.body as ReadableStream<Uint8Array>,
+          destPath: tempPath,
+          maxBytes: MAX_UPLOAD_SIZE,
+          signal: downloadSignal,
+        });
+      } catch (err) {
+        // streamToFileWithCap unlinks the partial temp file on its own error
+        // path; clear our handle so the outer `finally` doesn't double-unlink.
+        tempPath = undefined;
+        throw err;
+      }
+
+      const st = fsStatSync(tempPath);
+      bodyPath = tempPath;
+      fileSize = st.size;
+    } else {
+      // Local file path — stream, don't buffer
+      const st = fsStatSync(mediaUrl);
+      if (st.size > MAX_UPLOAD_SIZE) throw new Error(`File too large (${st.size} bytes, max ${MAX_UPLOAD_SIZE})`);
+      bodyPath = mediaUrl;
+      fileSize = st.size;
+      filename = basename(mediaUrl);
+      contentType = inferContentType(filename);
     }
 
-    const st = fsStatSync(tempPath);
-    bodyPath = tempPath;
-    fileSize = st.size;
-  } else {
-    // Local file path — stream, don't buffer
-    const st = fsStatSync(mediaUrl);
-    if (st.size > MAX_UPLOAD_SIZE) throw new Error(`File too large (${st.size} bytes, max ${MAX_UPLOAD_SIZE})`);
-    bodyPath = mediaUrl;
-    fileSize = st.size;
-    filename = basename(mediaUrl);
-    contentType = inferContentType(filename);
-  }
-
-  try {
+    params.signal?.throwIfAborted();
     // Upload via the server's presigned PUT URL (backend-agnostic: MinIO/COS/S3/OSS).
     const presign = await getUploadPresign({
       apiUrl,
@@ -482,34 +487,52 @@ export async function uploadMedia(params: {
       filename,
       fileSize,
       contentType: ensureTextCharset(contentType),
+      signal: params.signal,
     });
-    const { url: uploadedUrl } = await uploadFileToPresignedUrl({
-      uploadUrl: presign.uploadUrl,
-      downloadUrl: presign.downloadUrl,
-      fileBody: fsCreateReadStream(bodyPath),
-      fileSize,
-      // Replay the server-signed contentType / contentDisposition verbatim:
-      // both are folded into the SigV4 canonical headers (403 otherwise).
-      contentType: presign.contentType,
-      contentDisposition: presign.contentDisposition,
-    });
+    params.signal?.throwIfAborted();
+    const fileBody = fsCreateReadStream(bodyPath);
+    // A rejected fetch may never consume the body. Prevent a late open error
+    // from becoming unhandled; a consuming fetch still observes stream errors.
+    fileBody.on("error", () => {});
+    try {
+      const { url: uploadedUrl } = await uploadFileToPresignedUrl({
+        uploadUrl: presign.uploadUrl,
+        downloadUrl: presign.downloadUrl,
+        fileBody,
+        fileSize,
+        // Replay the server-signed contentType / contentDisposition verbatim:
+        // both are folded into the SigV4 canonical headers (403 otherwise).
+        contentType: presign.contentType,
+        contentDisposition: presign.contentDisposition,
+        signal: params.signal,
+      });
+      params.signal?.throwIfAborted();
 
-    // Determine media kind from MIME
-    const isImage = contentType.startsWith("image/");
+      // Determine media kind from MIME
+      const isImage = contentType.startsWith("image/");
 
-    // For images, parse dimensions from file (not full buffer)
-    let width: number | undefined;
-    let height: number | undefined;
-    if (isImage) {
-      const fileToParse = tempPath ?? mediaUrl;
-      const dims = await parseImageDimensionsFromFile(fileToParse, contentType);
-      width = dims?.width;
-      height = dims?.height;
+      // For images, parse dimensions from file (not full buffer)
+      let width: number | undefined;
+      let height: number | undefined;
+      if (isImage) {
+        const fileToParse = tempPath ?? mediaUrl;
+        const dims = await parseImageDimensionsFromFile(fileToParse, contentType);
+        width = dims?.width;
+        height = dims?.height;
+      }
+
+      log?.info?.(`octo: uploaded media as ${isImage ? "image" : "file"}: ${filename}${width ? ` (${width}x${height})` : ""}`);
+
+      params.signal?.throwIfAborted();
+      return { url: uploadedUrl, filename, size: fileSize, contentType, isImage, width, height };
+    } finally {
+      // Fetch can reject before consuming the body; always close our file handle.
+      fileBody.destroy();
+      if (!fileBody.closed) await new Promise<void>(resolve => fileBody.once("close", resolve));
     }
-
-    log?.info?.(`octo: uploaded media as ${isImage ? "image" : "file"}: ${filename}${width ? ` (${width}x${height})` : ""}`);
-
-    return { url: uploadedUrl, filename, size: fileSize, contentType, isImage, width, height };
+  } catch (error) {
+    params.signal?.throwIfAborted();
+    throw error;
   } finally {
     if (tempPath) await fsUnlink(tempPath).catch(() => {});
   }
@@ -529,7 +552,7 @@ export async function uploadAndSendMedia(params: {
   const { mediaUrl, apiUrl, botToken, channelId, channelType, onBehalfOf, log } = params;
 
   params.signal?.throwIfAborted();
-  const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, log });
+  const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, signal: params.signal, log });
   params.signal?.throwIfAborted();
 
   const msgType = uploaded.isImage ? MessageType.Image : MessageType.File;

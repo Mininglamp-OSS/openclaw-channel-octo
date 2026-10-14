@@ -298,6 +298,42 @@ afterEach(() => {
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
+  it("timeout cancels a stalled media presign, settles dispatch and allows the next IM turn", async () => {
+    _setDispatchTimeoutForTests(500);
+    _setDispatchAbortGraceForTests(500);
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    const fallbackFetch = globalThis.fetch;
+    let uploadSignal: AbortSignal | undefined;
+    let cancelUpload!: () => void;
+    let dispatchSettled = false;
+    const reason = new Error("test cleanup");
+    globalThis.fetch = vi.fn((input: any, init?: any) => {
+      const url = String(input);
+      if (url === "https://media.test/queue-cancel.txt") return Promise.resolve(new Response("media"));
+      if (url.includes("/upload/presigned")) {
+        uploadSignal = init?.signal;
+        return new Promise((_, reject) => {
+          cancelUpload = () => reject(reason);
+          uploadSignal?.addEventListener("abort", () => reject(uploadSignal!.reason), { once: true });
+        });
+      }
+      return fallbackFetch(input, init);
+    }) as typeof fetch;
+    dispatch.mockImplementation(async (args: any) => {
+      await args.dispatcherOptions.deliver({ mediaUrl: "https://media.test/queue-cancel.txt" }, { kind: "final" });
+      dispatchSettled = true;
+    });
+    try {
+      await expect(runInbound({ log: { warn: () => {}, error: () => {} } })).rejects.toThrow("dispatch timed out");
+      expect(uploadSignal?.aborted).toBe(true);
+      expect(dispatchSettled).toBe(true);
+      installImmediateRuntime({ text: "next turn works", kind: "final" });
+      await runInbound();
+      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。", "next turn works"]);
+    } finally { cancelUpload?.(); }
+  });
+
   it("account stop aborts a buffered-final POST after dispatch has already settled", async () => {
     installImmediateRuntime({ text: "buffered-final", kind: "block" });
     const { sends } = installHangingSendFetchStub();
