@@ -41,6 +41,7 @@ import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.
 import { collapseParentScope, parentGroupOf, resolveOutboundTarget } from "./target.js";
 import { getKnownGroupIds } from "./group-md.js";
 import { hasFailedMedia } from "./reply-delivery.js";
+import { normalizeAccountId } from "./account-id.js";
 import { requestCardEventPolling } from "./events-poll.js";
 
 /** dispatch 侧登记的发送上下文。 */
@@ -1312,7 +1313,8 @@ function messageToolReceiptTargetsThisCard(entry: CardEntry, result: unknown): b
   const details = asRecord(root.details);
   const data = asRecord(details?.data);
   if (details?.ok !== true || data?.sent !== true || hasFailedMedia(data)) return false;
-  if (entry.ctx.accountId && data.accountId !== entry.ctx.accountId) return false;
+  if (entry.ctx.accountId && (typeof data.accountId !== "string" ||
+      normalizeAccountId(data.accountId) !== normalizeAccountId(entry.ctx.accountId))) return false;
   return data.resolvedTarget === entry.ctx.channelId && data.channelType === entry.ctx.channelType &&
     (data.channelId === undefined || data.channelId === entry.ctx.channelId);
 }

@@ -667,8 +667,41 @@ describe("server-driven Registry reasoning progress", () => {
     handlers.before_tool_call?.({ toolName: "message", toolCallId: "send-1", params: { action: "send", message: "done", final: true } }, ctx);
     handlers.after_tool_call?.({ toolName: "message", toolCallId: "send-1", result: { details: {
       ok: true, data: { sent: true, channelId, resolvedTarget: channelId, channelType, accountId: "bot-1" },
-      sourceReplyRoute: "current-source", messageDelivery: { status: "settled", sourceReplyDelivered: true },
     } } }, ctx);
+    await finalizeCard(sessionKey, { success: false });
+    expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "completed" });
+  });
+
+  it.each([undefined, "group:group-1"])("normalizes the account in an actual receipt (requested target: %s)", async target => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "mixed-case-reply";
+    setCardContext(sessionKey, context({ accountId: "27pBwzf2F6bfa5cd142_bot" }));
+    await triggerFirstFrame(handlers, sessionKey);
+    const ctx = { sessionKey, runId: "run-1" };
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "send-1", params: { action: "send", message: "done", ...(target ? { target } : {}) } }, ctx);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "send-1", result: { details: {
+      ok: true, data: { sent: true, channelId: "group-1", resolvedTarget: "group-1", channelType: ChannelType.Group, accountId: "27pbwzf2f6bfa5cd142_bot" },
+    } } }, ctx);
+    await finalizeCard(sessionKey, { success: false });
+    expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "completed" });
+  });
+
+  it("pairs the nested message hook independently of its outer tool_call hook", async () => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "nested-message-reply";
+    setCardContext(sessionKey, context());
+    await triggerFirstFrame(handlers, sessionKey);
+    const ctx = { sessionKey, runId: "run-1" };
+    const params = { action: "send", message: "done" };
+    const result = { details: { ok: true, data: { sent: true, resolvedTarget: "group-1", channelType: ChannelType.Group } } };
+    handlers.before_tool_call?.({ toolName: "tool_call", toolCallId: "outer-1", params: { id: "message", args: params } }, ctx);
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "tool_call:outer-1:message:1", params }, ctx);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "tool_call:outer-1:message:1", result }, ctx);
+    handlers.after_tool_call?.({ toolName: "tool_call", toolCallId: "outer-1", result: { details: { result } } }, ctx);
     await finalizeCard(sessionKey, { success: false });
     expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "completed" });
   });
@@ -679,6 +712,7 @@ describe("server-driven Registry reasoning progress", () => {
     { data: { resolvedTarget: "other-group", channelId: "other-group" } },
     { data: { channelType: ChannelType.DM } },
     { data: { accountId: "other-bot" } },
+    { data: { accountId: undefined } },
     { data: { resolvedTarget: "" } },
     { data: { failedMedia: [{ url: "failed.txt" }] } },
     { data: { failedMedia: "malformed" } },
@@ -693,6 +727,26 @@ describe("server-driven Registry reasoning progress", () => {
     handlers.before_tool_call?.({ toolName: "message", toolCallId: "send-1", params: { action: "send", target: "group:group-1", message: "done" } }, ctx);
     const details = { ok: true, ...override, data: { sent: true, resolvedTarget: "group-1", channelId: "group-1", channelType: ChannelType.Group, accountId: "bot-1", ...override.data } };
     handlers.after_tool_call?.({ toolName: "message", toolCallId: "send-1", result: { details } }, ctx);
+    await finalizeCard(sessionKey, { success: false });
+    expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "error" });
+  });
+
+  it.each(["top-level-error", "successful-duplicate-after-error"])("does not credit %s even with a matching receipt", async failure => {
+    const wire = mockFetch();
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    const sessionKey = "receipt-error-ownership";
+    setCardContext(sessionKey, context());
+    await triggerFirstFrame(handlers, sessionKey);
+    const ctx = { sessionKey, runId: "run-1" };
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "send-1", params: { action: "send", target: "group:group-1", message: "done" } }, ctx);
+    if (failure === "successful-duplicate-after-error") {
+      handlers.after_tool_call?.({ toolName: "message", toolCallId: "send-1", error: "send failed" }, ctx);
+    }
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "send-1", result: {
+      ...(failure === "top-level-error" ? { isError: true } : {}),
+      details: { ok: true, data: { sent: true, resolvedTarget: "group-1", channelType: ChannelType.Group } },
+    } }, ctx);
     await finalizeCard(sessionKey, { success: false });
     expect(wire.calls.filter(call => call.url.includes("/message/edit")).at(-1)?.body).toMatchObject({ state: "error" });
   });
