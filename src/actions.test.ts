@@ -2018,6 +2018,43 @@ describe("handleOctoMessageAction", () => {
       expect((result.data as any).mediaCount).toBe(2);
     });
 
+    it.each([false, true])("retains original sideload retry URLs (image block present: %s)", async withImage => {
+      const { uploadMedia } = await import("./inbound.js");
+      const sources = ["https://source.example/doc.pdf", "/workspace/dimensionless.svg"];
+      if (withImage) vi.mocked(uploadMedia).mockResolvedValueOnce({
+        url: "https://cdn.example/image.png", filename: "image.png", size: 1,
+        contentType: "image/png", isImage: true, width: 10, height: 10,
+      });
+      vi.mocked(uploadMedia)
+        .mockResolvedValueOnce({ url: "https://cdn.example/doc.pdf?expired=true", filename: "doc.pdf", size: 2, contentType: "application/pdf", isImage: false })
+        .mockResolvedValueOnce({ url: "https://cdn.example/image.svg?expired=true", filename: "image.svg", size: 3, contentType: "image/svg+xml", isImage: true });
+      const attempts: any[] = [];
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async (_url, init) => {
+          const body = JSON.parse(init!.body as string);
+          attempts.push(body);
+          if ([2, 8].includes(body.payload.type)) return new Response("media rejected", { status: 403 });
+          return jsonResponse({ message_id: "caption", message_seq: 1 });
+        },
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send", args: { target: "user:uid1", message: "caption", richText: true,
+          mediaUrls: [...(withImage ? ["https://source.example/image.png"] : []), ...sources] },
+        apiUrl: "http://localhost:8090", botToken: "test-token",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("retry only failedMedia");
+      const data = result.data as any;
+      expect(data.sent).toBe(true);
+      expect(data.messageId).toBe("caption");
+      expect(data.mediaCount).toBe(withImage ? 1 : 0);
+      expect(data.failedMedia.map((failure: any) => failure.url)).toEqual(sources);
+      // Actual sends still use uploaded URLs; only retry inputs use the sources.
+      expect(attempts.filter(body => [2, 8].includes(body.payload.type)).map(body => body.payload.url))
+        .toEqual(["https://cdn.example/doc.pdf?expired=true", "https://cdn.example/image.svg?expired=true"]);
+    });
+
     it("routes dimensionless images (e.g. SVG) to sideload, not RichText image block", async () => {
       const { uploadMedia } = await import("./inbound.js");
       const uploadMediaSpy = vi.mocked(uploadMedia);
@@ -2118,12 +2155,31 @@ describe("handleOctoMessageAction", () => {
         botToken: "test-token",
       });
 
-      expect(result.ok).toBe(true);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("retry only failedMedia");
       expect(uploadSpy).toHaveBeenCalledTimes(3);
       const data = result.data as any;
       expect(data.mediaCount).toBe(2);
       expect(data.failedMedia).toHaveLength(1);
       expect(data.failedMedia[0].url).toBe("https://example.com/b.png");
+    });
+
+    it("reports a RichText upload failure without certifying the already-sent text as complete", async () => {
+      const { uploadMedia } = await import("./inbound.js");
+      vi.mocked(uploadMedia).mockRejectedValueOnce(new Error("image PUT 403"));
+      globalThis.fetch = mockFetch({
+        "/v1/bot/sendMessage": async () => jsonResponse({ message_id: "text-only", message_seq: 1 }),
+      });
+      const { handleOctoMessageAction } = await import("./actions.js");
+      const result = await handleOctoMessageAction({
+        action: "send", args: { target: "user:uid1", message: "caption", media: "https://example.com/image.png", richText: true },
+        apiUrl: "http://localhost:8090", botToken: "test-token",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("retry only failedMedia");
+      expect(result.data).toMatchObject({ sent: true, messageId: "text-only", mediaCount: 0,
+        failedMedia: [{ url: "https://example.com/image.png", error: "image PUT 403" }],
+      });
     });
 
     it("should return ok:false when all uploads fail and no text message", async () => {
@@ -2147,7 +2203,7 @@ describe("handleOctoMessageAction", () => {
       expect(result.error).toContain("All 2 media upload(s) failed");
     });
 
-    it("should return ok:true when all uploads fail but text message was sent", async () => {
+    it("should report incomplete delivery while retaining the sent text receipt", async () => {
       const { uploadAndSendMedia } = await import("./inbound.js");
       const uploadSpy = vi.mocked(uploadAndSendMedia);
       uploadSpy.mockClear();
@@ -2169,8 +2225,11 @@ describe("handleOctoMessageAction", () => {
         botToken: "test-token",
       });
 
-      expect(result.ok).toBe(true);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("retry only failedMedia");
       const data = result.data as any;
+      expect(data.sent).toBe(true);
+      expect(data.messageId).toBe("1");
       expect(data.mediaCount).toBe(0);
       expect(data.failedMedia).toHaveLength(1);
     });

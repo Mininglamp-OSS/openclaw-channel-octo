@@ -51,6 +51,7 @@ function cfgWithoutToken() {
 function makeCtx(overrides: Record<string, unknown> = {}) {
   return {
     accountId: "default",
+    requesterAccountId: "default",
     action: "send" as const,
     channel: "octo",
     params: { target: "user:u1", text: "hi" },
@@ -128,6 +129,36 @@ describe("toActionToolResult (helper)", () => {
 });
 
 describe("handleAction returns AgentToolResult (#171)", () => {
+  it.each([
+    { destination: "g____one", channelType: 5, requesterAccountId: "default", expected: "current-source" },
+    { destination: "g", channelType: 2, requesterAccountId: "default", expected: undefined },
+    { destination: "g____two", channelType: 5, requesterAccountId: "default", expected: undefined },
+    { destination: "g____one", channelType: 5, requesterAccountId: "other-bot", expected: undefined },
+  ])("confirms the actual source route after a thread rewrite: %o", async ({ destination, channelType, requesterAccountId, expected }) => {
+    const { octoPlugin } = await import("./channel.js");
+    const { handleOctoMessageAction } = await import("./actions.js");
+    vi.mocked(handleOctoMessageAction).mockResolvedValue({ ok: true, data: {
+      sent: true, target: "group:g", resolvedTarget: destination, channelType,
+    } });
+    const result = await octoPlugin.actions!.handleAction!(makeCtx({
+      params: { target: "group:g", text: "hi" }, toolContext: { currentChannelId: "octo:g____one", currentChannelProvider: "octo" }, requesterAccountId,
+    }) as any);
+    expect((result.details as any).sourceReplyRoute).toBe(expected);
+    expect((result.details as any).data.accountId).toBe("default");
+  });
+
+  it.each(["slack", undefined])("does not certify a foreign or unknown provider (%s)", async provider => {
+    const { octoPlugin } = await import("./channel.js");
+    const { handleOctoMessageAction } = await import("./actions.js");
+    vi.mocked(handleOctoMessageAction).mockResolvedValue({ ok: true, data: {
+      sent: true, resolvedTarget: "u1", channelType: 1,
+    } });
+    const result = await octoPlugin.actions!.handleAction!(makeCtx({
+      toolContext: { currentChannelId: "u1", currentChannelProvider: provider },
+    }) as any);
+    expect((result.details as any).sourceReplyRoute).toBeUndefined();
+  });
+
   it("success branch: content is an array and details preserves ok/data", async () => {
     const { octoPlugin } = await import("./channel.js");
     const { handleOctoMessageAction } = await import("./actions.js");

@@ -67,6 +67,12 @@ type Logger = {
  * matching the Telegram adapter's convention.
  */
 const _bindingsByAccount = new Map<string, Map<string, SessionBindingRecord>>();
+const _registrationsByAccount = new Map<string, Set<{
+  apiUrl: string;
+  botToken: string;
+  release: () => void;
+  acquire: () => () => void;
+}>>();
 
 function getOrCreateBindingMap(
   accountId: string,
@@ -138,6 +144,13 @@ export function registerOctoThreadBindingAdapter(
   // params.accountId. The SDK invokes adapter methods with already-normalized
   // refs, so this keeps both halves of the round-trip aligned.
   const accountId = normalizeAccountId(params.accountId);
+
+  // Older hosts also invoke createManager lazily. Share the startup adapter
+  // rather than changing its ownership while a first bind is in flight.
+  const registrations = _registrationsByAccount.get(accountId) ?? new Set();
+  for (const existing of registrations) {
+    if (existing.apiUrl === apiUrl && existing.botToken === botToken) return existing.acquire();
+  }
 
   const adapter: SessionBindingAdapter = {
     channel: CHANNEL_ID,
@@ -293,21 +306,40 @@ export function registerOctoThreadBindingAdapter(
     `octo: [${accountId}] registered SessionBindingAdapter (placements=current,child)`,
   );
 
-  let unregistered = false;
-  return function unregister() {
-    if (unregistered) return;
-    unregistered = true;
+  let references = 0;
+  const registration = { apiUrl, botToken, release, acquire };
+  registrations.add(registration);
+  _registrationsByAccount.set(accountId, registrations);
+  function release() {
     unregisterSessionBindingAdapter({
       channel: CHANNEL_ID,
       accountId,
       adapter,
     });
-    _bindingsByAccount.delete(accountId);
+    registrations.delete(registration);
+    if (registrations.size === 0) {
+      _registrationsByAccount.delete(accountId);
+      _bindingsByAccount.delete(accountId);
+    }
     log?.info?.(`octo: [${accountId}] unregistered SessionBindingAdapter`);
-  };
+  }
+  function acquire() {
+    references += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (--references === 0) release();
+    };
+  }
+  return acquire();
 }
 
 /** Test-only: clear the in-memory binding registry across all accounts. */
 export function __resetOctoThreadBindingsForTests(): void {
+  for (const registrations of _registrationsByAccount.values()) {
+    for (const registration of [...registrations]) registration.release();
+  }
+  _registrationsByAccount.clear();
   _bindingsByAccount.clear();
 }

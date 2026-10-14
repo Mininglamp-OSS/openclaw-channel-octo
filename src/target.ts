@@ -118,6 +118,18 @@ export function normalizeOutboundChannelPrefix(ctxTo: string): string {
   return bare;
 }
 
+/** Canonical conversation address used by OpenClaw's source-reply tracking. */
+export function normalizeOctoMessagingTarget(target: string): string {
+  const trimmed = target.trim();
+  // Keep non-routable document sessions recognizable by the outbound guards.
+  if (!trimmed || isDocTaskNonRoutableTarget(trimmed)) return trimmed;
+  const normalized = normalizeOutboundChannelPrefix(trimmed);
+  if (normalized.startsWith("user:") || normalized.startsWith("group:")) return normalized;
+  // Bare IDs are ambiguous. Do not freeze an early cache guess into a routing
+  // prefix: the host uses this normalized value for delivery as well as dedup.
+  return normalized.includes(THREAD_SEP) ? `group:${normalized}` : normalized;
+}
+
 /**
  * Resolve an outbound delivery target from the framework's ChannelOutboundContext.
  *

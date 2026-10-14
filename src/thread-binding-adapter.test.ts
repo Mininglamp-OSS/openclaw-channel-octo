@@ -108,6 +108,22 @@ describe("registerOctoThreadBindingAdapter", () => {
     unregister();
   });
 
+  it("shares startup and lazy manager ownership until both stop", async () => {
+    const startup = makeAdapterContext();
+    const adapter = _capturedAdapter!;
+    const manager = makeAdapterContext();
+    expect(_capturedAdapter).toBe(adapter);
+    const conversation = { channel: "octo", accountId: ACCOUNT_ID, conversationId: "first-dm" };
+    await adapter.bind!({ targetSessionKey: "agent:main:octo:first-dm", targetKind: "session", conversation, placement: "current" });
+    manager.unregister();
+    manager.unregister();
+    expect(_capturedAdapter).toBe(adapter);
+    expect(adapter.resolveByConversation(conversation)).not.toBeNull();
+    startup.unregister();
+    expect(_capturedAdapter).toBeNull();
+    expect(adapter.resolveByConversation(conversation)).toBeNull();
+  });
+
   it("bind(placement=current) records a binding using the existing conversationId without calling createThread", async () => {
     const { unregister } = makeAdapterContext();
     const conversationId = "groupNo_abc";

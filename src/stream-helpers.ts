@@ -41,8 +41,10 @@ export async function streamToFileWithCap(opts: {
   body: ReadableStream<Uint8Array>;
   destPath: string;
   maxBytes: number;
+  signal?: AbortSignal;
 }): Promise<void> {
   const { body, destPath, maxBytes } = opts;
+  opts.signal?.throwIfAborted();
   const ws = createWriteStream(destPath);
   let totalBytes = 0;
 
@@ -54,12 +56,18 @@ export async function streamToFileWithCap(opts: {
     ws.on("error", reject);
   });
   streamError.catch(() => {});
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(opts.signal!.reason);
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  aborted.catch(() => {});
 
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
     reader = body.getReader();
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), streamError, aborted]);
       if (done) break;
       totalBytes += value.byteLength;
       if (totalBytes > maxBytes) {
@@ -73,6 +81,7 @@ export async function streamToFileWithCap(opts: {
         await Promise.race([
           new Promise<void>(r => ws.once("drain", r)),
           streamError,
+          aborted,
         ]);
       }
     }
@@ -80,6 +89,7 @@ export async function streamToFileWithCap(opts: {
     await Promise.race([
       new Promise<void>(resolve => ws.on("finish", resolve)),
       streamError,
+      aborted,
     ]);
   } catch (err) {
     // Release the upstream fetch response stream on any failure path —
@@ -89,7 +99,10 @@ export async function streamToFileWithCap(opts: {
     // a network connection per failed download.
     reader?.cancel().catch(() => {});
     ws.destroy();
+    if (!ws.closed) await new Promise<void>(resolve => ws.once("close", resolve));
     await unlink(destPath).catch(() => {});
     throw err;
+  } finally {
+    opts.signal?.removeEventListener("abort", onAbort);
   }
 }

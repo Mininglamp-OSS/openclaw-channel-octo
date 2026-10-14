@@ -287,7 +287,7 @@ async function sendRichTextCombined(params: {
   //   requires image blocks to carry width/height > 0, so a dimensionless image
   //   would make the WHOLE RichText payload invalid; route it out instead.
   const imageBlocks: RichTextBlock[] = [];
-  const sideloads: Array<{ uploaded: UploadedMedia }> = [];
+  const sideloads: Array<{ mediaUrl: string; uploaded: UploadedMedia }> = [];
   const failedMedia: { url: string; error: string }[] = [];
 
   for (const mediaUrl of mediaUrls) {
@@ -306,7 +306,7 @@ async function sendRichTextCombined(params: {
       } else {
         // Non-image OR dimensionless image: deliver via the legacy single-send
         // path using the already-uploaded URL (no re-upload needed).
-        sideloads.push({ uploaded });
+        sideloads.push({ mediaUrl, uploaded });
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -323,7 +323,7 @@ async function sendRichTextCombined(params: {
   // returning null after uploads, which would orphan uploaded objects + re-upload).
   const deliverSideloads = async (): Promise<number> => {
     let delivered = 0;
-    for (const { uploaded } of sideloads) {
+    for (const { mediaUrl, uploaded } of sideloads) {
       try {
         await sendMediaMessage({
           apiUrl,
@@ -341,7 +341,7 @@ async function sendRichTextCombined(params: {
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         log?.error?.(`octo: sendMediaMessage failed for ${uploaded.url}: ${errMsg}`);
-        failedMedia.push({ url: uploaded.url, error: errMsg });
+        failedMedia.push({ url: mediaUrl, error: errMsg });
       }
     }
     return delivered;
@@ -720,7 +720,10 @@ async function handleSend(params: {
       log,
     });
     return {
-      ok: true,
+      ok: richResult.failedMedia.length === 0,
+      ...(richResult.failedMedia.length > 0 ? {
+        error: "Some media uploads failed. Text and successful media were already sent; retry only failedMedia.",
+      } : {}),
       data: {
         sent: true,
         target,
@@ -803,8 +806,14 @@ async function handleSend(params: {
   // for image-only turns to pass hasCommittedMessagingDeliveryEvidence).
   const sentMediaUrls = sentMedia.map(m => m.url);
 
+  // OpenClaw records every requested URL on an ok:true send. An incomplete
+  // send must be a tool failure, otherwise it suppresses the final reply's
+  // failed media as already delivered. Keep actual receipts for selective retry.
   return {
-    ok: true,
+    ok: failedMedia.length === 0,
+    ...(failedMedia.length > 0 ? {
+      error: "Some media uploads failed. Text and successful media were already sent; retry only failedMedia.",
+    } : {}),
     ...(sentMediaUrls.length > 0 ? { mediaUrls: sentMediaUrls } : {}),
     data: {
       sent: true,

@@ -117,10 +117,10 @@ function installRuntime(config: Record<string, unknown> = {}, deliver = false) {
   return { dispatch };
 }
 
-function runDm() {
+function runDm(message = makeDmMessage()) {
   return handleInboundMessage({
     account: makeAccount(),
-    message: makeDmMessage() as any,
+    message: message as any,
     botUid: BOT_UID,
     groupHistories: new Map(),
     lastBotReplySeqMap: new Map(),
@@ -157,6 +157,16 @@ afterEach(() => {
 });
 
 describe("#172 DM reply delivery mode", () => {
+  it("keeps space session isolation separate from the physical DM delivery address", async () => {
+    installFetchStub();
+    const { dispatch } = installRuntime({});
+    await runDm({ ...makeDmMessage(), from_uid: "s1001_u42", channel_id: "s1001_u42@s1001_bot" });
+    const ctx = dispatch.mock.calls[0][0].ctx;
+    expect(ctx.To).toBe("octo:user:s1001_u42");
+    expect(ctx.OriginatingTo).toBe(ctx.To);
+    expect(ctx.ThreadId).toBeUndefined();
+  });
+
   it("DM without configured visibleReplies → injects sourceReplyDeliveryMode=automatic", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({});
@@ -165,6 +175,7 @@ describe("#172 DM reply delivery mode", () => {
     expect(replyOptionsOf(dispatch)).toEqual({
       sourceReplyDeliveryMode: "automatic",
       onReasoningStream: expect.any(Function),
+      abortSignal: expect.any(AbortSignal),
     });
   });
 
@@ -172,14 +183,14 @@ describe("#172 DM reply delivery mode", () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { visibleReplies: "message_tool" } });
     await runDm();
-    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function) });
+    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function), abortSignal: expect.any(AbortSignal) });
   });
 
   it("DM with explicit messages.visibleReplies=automatic → not injected, left to host ({})", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { visibleReplies: "automatic" } });
     await runDm();
-    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function) });
+    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function), abortSignal: expect.any(AbortSignal) });
   });
 
   it("DM ignores groupChat.visibleReplies → still injects automatic (DM only reads messages.visibleReplies)", async () => {
@@ -193,6 +204,7 @@ describe("#172 DM reply delivery mode", () => {
     expect(replyOptionsOf(dispatch)).toEqual({
       sourceReplyDeliveryMode: "automatic",
       onReasoningStream: expect.any(Function),
+      abortSignal: expect.any(AbortSignal),
     });
   });
 
@@ -200,14 +212,14 @@ describe("#172 DM reply delivery mode", () => {
     installFetchStub();
     const { dispatch } = installRuntime({});
     await runGroup();
-    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function) });
+    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function), abortSignal: expect.any(AbortSignal) });
   });
 
   it("group with groupChat.visibleReplies=message_tool → preserved, not overridden ({})", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { groupChat: { visibleReplies: "message_tool" } } });
     await runGroup();
-    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function) });
+    expect(replyOptionsOf(dispatch)).toEqual({ onReasoningStream: expect.any(Function), abortSignal: expect.any(AbortSignal) });
   });
 
   // Plugin delivery-callback regression (NOT evidence that automatic makes the

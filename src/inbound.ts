@@ -22,6 +22,7 @@ import * as replyPayloadSdk from "openclaw/plugin-sdk/reply-payload";
 const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
 import { createImEgressGuard } from "./im-egress.js";
+import { findAgentConfig } from "./agent-config-compat.js";
 import type { DocTaskTurnReport } from "./doc-mention-handler.js";
 import type { GroupMember, DocReplyIntent } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
@@ -127,8 +128,11 @@ export function _setDispatchTimeoutForTests(ms: number | null): void {
  *   3. Derived from the agent-run timeout: `(agents.defaults.timeoutSeconds
  *      ?? 600) * 1000 + 60_000`. Single source of truth — raising
  *      `timeoutSeconds` automatically moves this guard with it, and the 60s
- *      buffer keeps it strictly behind the agent timeout so a healthy run is
- *      never killed by its own infrastructure backstop.
+ *      buffer normally places this guard after the agent timeout (subject to
+ *      Node's timer cap). An explicit shorter deadline cancels even a healthy
+ *      ordinary IM turn and discards its late reply; it is an intentional
+ *      earlier cutoff, not just a queue-occupancy setting. Document tasks
+ *      retain their task-specific cancellation policy.
  */
 export function resolveDispatchTimeoutMs(
   cfg: OpenClawConfig,
@@ -408,9 +412,16 @@ export async function uploadMedia(params: {
   mediaUrl: string;
   apiUrl: string;
   botToken: string;
+  signal?: AbortSignal;
   log?: ChannelLogSink;
 }): Promise<UploadedMedia> {
   const { mediaUrl, apiUrl, botToken, log } = params;
+  params.signal?.throwIfAborted();
+  // Tool actions receive no host cancellation signal on current SDKs. Still
+  // bound preparation/PUT, including local files, with the existing 300s cap.
+  const signal = AbortSignal.any([
+    AbortSignal.timeout(300_000), ...(params.signal ? [params.signal] : []),
+  ]);
 
   const { createReadStream: fsCreateReadStream, statSync: fsStatSync } = await import("node:fs");
   const { basename, join: pathJoin } = await import("node:path");
@@ -429,51 +440,51 @@ export async function uploadMedia(params: {
   // dangling open() that throws ENOENT.
   let bodyPath: string;
 
-  if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
-    filename = extractFilename(mediaUrl);
-    // Stream download to a temp file. We deliberately do NOT trust the HEAD
-    // Content-Length for the size check or for the presigned fileSize: a
-    // remote server may omit or lie about it, and the presigned PUT signs the
-    // exact byte count (SigV4 403 on any mismatch). Enforce the cap while
-    // streaming via streamToFileWithCap (shared helper), then use the real
-    // statSync().size for the signed fileSize.
-    await fsMkdir(TEMP_DIR, { recursive: true });
-    tempPath = pathJoin(TEMP_DIR, `${randomUUID()}-${filename}`);
+  try {
+    if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
+      filename = extractFilename(mediaUrl);
+      // Stream download to a temp file. We deliberately do NOT trust the HEAD
+      // Content-Length for the size check or for the presigned fileSize: a
+      // remote server may omit or lie about it, and the presigned PUT signs the
+      // exact byte count (SigV4 403 on any mismatch). Enforce the cap while
+      // streaming via streamToFileWithCap (shared helper), then use the real
+      // statSync().size for the signed fileSize.
+      await fsMkdir(TEMP_DIR, { recursive: true });
+      tempPath = pathJoin(TEMP_DIR, `${randomUUID()}-${filename}`);
 
-    const resp = await fetch(mediaUrl, {
-      signal: AbortSignal.timeout(300_000),
-    });
-    if (!resp.ok) throw new Error(`Failed to fetch media: ${resp.status}`);
-    contentType = resp.headers.get("content-type") || "application/octet-stream";
-    if (!resp.body) throw new Error(`No response body from ${mediaUrl}`);
+      const resp = await fetch(mediaUrl, { signal });
+      if (!resp.ok) throw new Error(`Failed to fetch media: ${resp.status}`);
+      contentType = resp.headers.get("content-type") || "application/octet-stream";
+      if (!resp.body) throw new Error(`No response body from ${mediaUrl}`);
 
-    try {
-      await streamToFileWithCap({
-        body: resp.body as ReadableStream<Uint8Array>,
-        destPath: tempPath,
-        maxBytes: MAX_UPLOAD_SIZE,
-      });
-    } catch (err) {
-      // streamToFileWithCap unlinks the partial temp file on its own error
-      // path; clear our handle so the outer `finally` doesn't double-unlink.
-      tempPath = undefined;
-      throw err;
+      try {
+        await streamToFileWithCap({
+          body: resp.body as ReadableStream<Uint8Array>,
+          destPath: tempPath,
+          maxBytes: MAX_UPLOAD_SIZE,
+          signal,
+        });
+      } catch (err) {
+        // streamToFileWithCap unlinks the partial temp file on its own error
+        // path; clear our handle so the outer `finally` doesn't double-unlink.
+        tempPath = undefined;
+        throw err;
+      }
+
+      const st = fsStatSync(tempPath);
+      bodyPath = tempPath;
+      fileSize = st.size;
+    } else {
+      // Local file path — stream, don't buffer
+      const st = fsStatSync(mediaUrl);
+      if (st.size > MAX_UPLOAD_SIZE) throw new Error(`File too large (${st.size} bytes, max ${MAX_UPLOAD_SIZE})`);
+      bodyPath = mediaUrl;
+      fileSize = st.size;
+      filename = basename(mediaUrl);
+      contentType = inferContentType(filename);
     }
 
-    const st = fsStatSync(tempPath);
-    bodyPath = tempPath;
-    fileSize = st.size;
-  } else {
-    // Local file path — stream, don't buffer
-    const st = fsStatSync(mediaUrl);
-    if (st.size > MAX_UPLOAD_SIZE) throw new Error(`File too large (${st.size} bytes, max ${MAX_UPLOAD_SIZE})`);
-    bodyPath = mediaUrl;
-    fileSize = st.size;
-    filename = basename(mediaUrl);
-    contentType = inferContentType(filename);
-  }
-
-  try {
+    signal.throwIfAborted();
     // Upload via the server's presigned PUT URL (backend-agnostic: MinIO/COS/S3/OSS).
     const presign = await getUploadPresign({
       apiUrl,
@@ -481,34 +492,56 @@ export async function uploadMedia(params: {
       filename,
       fileSize,
       contentType: ensureTextCharset(contentType),
+      signal,
     });
-    const { url: uploadedUrl } = await uploadFileToPresignedUrl({
-      uploadUrl: presign.uploadUrl,
-      downloadUrl: presign.downloadUrl,
-      fileBody: fsCreateReadStream(bodyPath),
-      fileSize,
-      // Replay the server-signed contentType / contentDisposition verbatim:
-      // both are folded into the SigV4 canonical headers (403 otherwise).
-      contentType: presign.contentType,
-      contentDisposition: presign.contentDisposition,
-    });
+    signal.throwIfAborted();
+    const fileBody = fsCreateReadStream(bodyPath);
+    // A rejected fetch may never consume the body. Prevent a late open error
+    // from becoming unhandled; a consuming fetch still observes stream errors.
+    fileBody.on("error", () => {});
+    try {
+      const { url: uploadedUrl } = await uploadFileToPresignedUrl({
+        uploadUrl: presign.uploadUrl,
+        downloadUrl: presign.downloadUrl,
+        fileBody,
+        fileSize,
+        // Replay the server-signed contentType / contentDisposition verbatim:
+        // both are folded into the SigV4 canonical headers (403 otherwise).
+        contentType: presign.contentType,
+        contentDisposition: presign.contentDisposition,
+        signal,
+      });
+      signal.throwIfAborted();
 
-    // Determine media kind from MIME
-    const isImage = contentType.startsWith("image/");
+      // Determine media kind from MIME
+      const isImage = contentType.startsWith("image/");
 
-    // For images, parse dimensions from file (not full buffer)
-    let width: number | undefined;
-    let height: number | undefined;
-    if (isImage) {
-      const fileToParse = tempPath ?? mediaUrl;
-      const dims = await parseImageDimensionsFromFile(fileToParse, contentType);
-      width = dims?.width;
-      height = dims?.height;
+      // For images, parse dimensions from file (not full buffer)
+      let width: number | undefined;
+      let height: number | undefined;
+      if (isImage) {
+        const fileToParse = tempPath ?? mediaUrl;
+        const dims = await parseImageDimensionsFromFile(fileToParse, contentType);
+        width = dims?.width;
+        height = dims?.height;
+      }
+
+      log?.info?.(`octo: uploaded media as ${isImage ? "image" : "file"}: ${filename}${width ? ` (${width}x${height})` : ""}`);
+
+      signal.throwIfAborted();
+      return { url: uploadedUrl, filename, size: fileSize, contentType, isImage, width, height };
+    } finally {
+      // Fetch can reject before consuming the body; always close our file handle.
+      fileBody.destroy();
+      if (!fileBody.closed) await new Promise<void>(resolve => fileBody.once("close", resolve));
     }
-
-    log?.info?.(`octo: uploaded media as ${isImage ? "image" : "file"}: ${filename}${width ? ` (${width}x${height})` : ""}`);
-
-    return { url: uploadedUrl, filename, size: fileSize, contentType, isImage, width, height };
+  } catch (error) {
+    // Undici may turn a cancelled body into AbortError. Preserve an unrelated
+    // 403/size/disk error that happened concurrently with cancellation.
+    if (signal.aborted && error instanceof Error && error.name === "AbortError") {
+      throw signal.reason;
+    }
+    throw error;
   } finally {
     if (tempPath) await fsUnlink(tempPath).catch(() => {});
   }
@@ -522,11 +555,17 @@ export async function uploadAndSendMedia(params: {
   channelId: string;
   channelType: ChannelType;
   onBehalfOf?: string;
+  signal?: AbortSignal;
   log?: ChannelLogSink;
 }): Promise<SendMessageResult | undefined> {
   const { mediaUrl, apiUrl, botToken, channelId, channelType, onBehalfOf, log } = params;
 
-  const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, log });
+  params.signal?.throwIfAborted();
+  const signal = AbortSignal.any([
+    AbortSignal.timeout(300_000), ...(params.signal ? [params.signal] : []),
+  ]);
+  const uploaded = await uploadMedia({ mediaUrl, apiUrl, botToken, signal, log });
+  signal.throwIfAborted();
 
   const msgType = uploaded.isImage ? MessageType.Image : MessageType.File;
 
@@ -543,6 +582,7 @@ export async function uploadAndSendMedia(params: {
     width: uploaded.width,
     height: uploaded.height,
     ...(onBehalfOf ? { onBehalfOf } : {}),
+    signal,
   });
   return result;
 }
@@ -1592,6 +1632,8 @@ export async function handleInboundMessage(params: {
   statusSink?: OctoStatusSink;
   /** Trusted adapter-side route captured when an interactive card was authored. */
   routeOverride?: { sessionKey: string; agentId?: string };
+  /** Account lifecycle cancellation, also for ordinary IM turns. */
+  signal?: AbortSignal;
   /**
    * 文档评论任务上下文(octo-server `doc_comment_mention`)。
    *
@@ -1635,7 +1677,11 @@ export async function handleInboundMessage(params: {
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
   const docTask = params.docTask;
-  const dispatchAbortController = docTask?.abortOnTimeout || docTask?.signal ? new AbortController() : undefined;
+  const accountSignal = params.signal && docTask?.signal
+    ? AbortSignal.any([params.signal, docTask.signal])
+    : params.signal ?? docTask?.signal;
+  const dispatchAbortController = !docTask || docTask.abortOnTimeout || accountSignal
+    ? new AbortController() : undefined;
   // Server-authoritative robot map. Default to a throwaway Map when the caller
   // omits it so the gate logic below can read it unconditionally; the real
   // channel call site passes a persistent per-account map.
@@ -2702,7 +2748,7 @@ export async function handleInboundMessage(params: {
     // `ctx.to` 指向发起人私聊 —— agent 调一次 message 工具就能把文档内容发进去,
     // 而那条出站在 channel.ts(框架侧 sendText),imEgress 闸门只管 inbound.ts,
     // 看不见也拦不住。改成不可路由哨兵后由 resolveOutboundTarget 统一 fail-closed。
-    To: docTask ? `${CHANNEL_ID}:${DOC_TASK_NON_ROUTABLE_PREFIX}${docTask.sessionScope}` : `${CHANNEL_ID}:${sessionId}`,
+    To: docTask ? `${CHANNEL_ID}:${DOC_TASK_NON_ROUTABLE_PREFIX}${docTask.sessionScope}` : `${CHANNEL_ID}:${isGroup ? "group" : "user"}:${effectiveChannelId}`,
     SessionKey: route.sessionKey,
     AccountId: route.accountId,
     ChatType: isGroup ? "group" : "direct",
@@ -2718,7 +2764,7 @@ export async function handleInboundMessage(params: {
     Provider: CHANNEL_ID,
     Surface: CHANNEL_ID,
     OriginatingChannel: CHANNEL_ID,
-    OriginatingTo: docTask ? `${CHANNEL_ID}:${DOC_TASK_NON_ROUTABLE_PREFIX}${docTask.sessionScope}` : `${CHANNEL_ID}:${sessionId}`,
+    OriginatingTo: docTask ? `${CHANNEL_ID}:${DOC_TASK_NON_ROUTABLE_PREFIX}${docTask.sessionScope}` : `${CHANNEL_ID}:${isGroup ? "group" : "user"}:${effectiveChannelId}`,
   });
 
   await core.channel.session.recordInboundSession({
@@ -2812,8 +2858,7 @@ export async function handleInboundMessage(params: {
       );
     }
     if (!sessionReadFailed) {
-      const agentDefault = config.agents?.list?.find((entry) =>
-        entry.id?.toLowerCase() === route.agentId?.toLowerCase())?.reasoningDefault;
+      const agentDefault = findAgentConfig(config.agents, route.agentId)?.reasoningDefault;
       const resolved = persistedLevel ?? agentDefault ?? config.agents?.defaults?.reasoningDefault;
       if (resolved === "on" || resolved === "stream") reasoningVisibility = resolved;
     }
@@ -3057,6 +3102,10 @@ export async function handleInboundMessage(params: {
       await postDocTaskReply(withSuppressedToolTail(content), signal, { type: "notice" });
       return;
     }
+    if (accountSignal) {
+      signal = AbortSignal.any([accountSignal, ...(signal ? [signal] : [])]);
+      signal.throwIfAborted();
+    }
     await imSendMessage({
       apiUrl,
       botToken,
@@ -3152,6 +3201,14 @@ export async function handleInboundMessage(params: {
       referencedMedia?: readonly string[];
     },
   ): Promise<DocTaskReplyResult> => {
+    if (!docTask && dispatchAbortController) {
+      signal = AbortSignal.any([
+        dispatchAbortController.signal,
+        ...(accountSignal ? [accountSignal] : []),
+        ...(signal ? [signal] : []),
+      ]);
+      signal.throwIfAborted();
+    }
     if (docTask) {
       return postDocTaskReply(
         content,
@@ -3348,8 +3405,9 @@ export async function handleInboundMessage(params: {
   // an upstream dispatch hang would leave the per-group queue's Promise chain
   // unresolved forever — see issue #75.
   //
-  // Ordinary IM/doc-comment turns retain the historical queue-unblocking
-  // behavior. Generic Bot Tasks are different: retrying while the timed-out
+  // Ordinary IM turns abort and release the queue; document-comment turns
+  // retain their historical queue-unblocking policy. Generic Bot Tasks are
+  // different: retrying while the timed-out
   // agent is still running can duplicate non-idempotent octo-cli writes. For
   // abortOnTimeout turns we therefore abort the underlying agent run
   // and wait up to a bounded grace period before releasing queueScope. The
@@ -3376,11 +3434,11 @@ export async function handleInboundMessage(params: {
     // Persist the at-most-once boundary before invoking the runtime. The
     // dispatch timeout starts afterwards so a slow state store cannot produce
     // an unhandled timer rejection while this callback is still pending.
-    if (docTask?.signal?.aborted) throw stoppedError;
+    if (accountSignal?.aborted) throw stoppedError;
     if (docTask?.deadlineAt !== undefined && Date.now() >= docTask.deadlineAt) throw timeoutError;
     await docTask?.onAgentTurnStarted?.();
     handoffRecorded = true;
-    if (docTask?.signal?.aborted) throw stoppedError;
+    if (accountSignal?.aborted) throw stoppedError;
     remainingDispatchMs = typeof docTask?.deadlineAt === "number" && Number.isFinite(docTask.deadlineAt)
       ? Math.min(dispatchTimeoutMs, docTask.deadlineAt - Date.now())
       : dispatchTimeoutMs;
@@ -3392,14 +3450,15 @@ export async function handleInboundMessage(params: {
         reject(stoppedError);
         dispatchAbortController?.abort(stoppedError);
       };
-      docTask?.signal?.addEventListener("abort", onStop, { once: true });
-      removeStopListener = () => docTask?.signal?.removeEventListener("abort", onStop);
+      accountSignal?.addEventListener("abort", onStop, { once: true });
+      removeStopListener = () => accountSignal?.removeEventListener("abort", onStop);
       dispatchTimeoutHandle = setTimeout(() => {
         taskInterrupted = true;
         reject(timeoutError);
-        // A shutdown signal does not opt ordinary document tasks into the
-        // stronger Bot/PPT timeout policy; their timeout only releases the queue.
-        if (abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
+        // Ordinary IM deadlines cancel the run and fence late replies, including
+        // explicitly configured deadlines below the agent timeout. Ordinary
+        // document tasks only release the queue unless their task opts into abort.
+        if (!docTask || abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
       }, remainingDispatchMs);
     });
     dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -3486,6 +3545,7 @@ export async function handleInboundMessage(params: {
                 botToken: account.config.botToken ?? "",
                 channelId: replyChannelId,
                 channelType: replyChannelType,
+                signal: dispatchAbortController?.signal,
                 ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
                 log,
               });
@@ -3496,6 +3556,7 @@ export async function handleInboundMessage(params: {
             }
           }
 
+          if (dispatchAbortController?.signal.aborted) return;
           // --- Text handling based on kind ---
           const content = payload.text?.trim() ?? "";
           if (!content && sentMediaUrls.size > 0) {
@@ -3617,6 +3678,8 @@ export async function handleInboundMessage(params: {
           log?.debug?.(`octo: [deliver-buffer] ${kind} text buffered (${content.length} chars)`);
         },
         onError: async (err: unknown, info: { kind: string }) => {
+          // Timeout/stop owns its notice; cancellation must not emit a second apology.
+          if (dispatchAbortController?.signal.aborted) return;
           clearInterval(typingInterval);
           log?.error?.(`octo ${info.kind} reply failed: ${String(err)}`);
           // Prevent finally block from sending stale buffered text after error
@@ -3697,12 +3760,12 @@ export async function handleInboundMessage(params: {
     // .catch() (channel.ts#enqueueInbound) can advance to the next message
     // — otherwise this group stays stuck forever, see issue #75.
     //
-    if (err === timeoutError || err === stoppedError || docTask?.signal?.aborted) {
+    if (err === timeoutError || err === stoppedError || accountSignal?.aborted) {
       taskInterrupted = true;
       // Emit the primary diagnostic before waiting for cooperative shutdown;
       // otherwise an abort-ignoring host makes the timeout itself invisible.
       log?.warn?.(
-        `octo: ${docTask?.signal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
+        `octo: ${accountSignal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
       );
       // Wait briefly only when an abort was actually sent. Ordinary document
       // timeouts still release the queue immediately; a signal-capable runtime
@@ -3724,7 +3787,7 @@ export async function handleInboundMessage(params: {
           // awaiting this promise.
           void dispatchPromise.catch(() => undefined);
           log?.error?.(
-            `octo: timed-out bot task dispatch ignored abort for ${DISPATCH_ABORT_GRACE_MS}ms; releasing queue and forbidding retry (session=${route?.sessionKey ?? "?"})`,
+            `octo: timed-out ${docTask ? "bot task" : "IM"} dispatch ignored abort for ${DISPATCH_ABORT_GRACE_MS}ms; releasing queue and forbidding retry (session=${route?.sessionKey ?? "?"})`,
           );
         }
       }
@@ -3739,7 +3802,9 @@ export async function handleInboundMessage(params: {
       // 也置位(见 kind === "tool" 分支),用它做守卫会让「只发过进度然后 hang」的
       // 回合彻底收不到终态信号 —— 而那正好是超时提示最该出现的场景,且这条路径
       // 在 docTasks 关着时也走,是普通 DM/群聊上的静默回归。
-      if (userFacingFinalDelivered) {
+      if (accountSignal?.aborted) {
+        log?.info?.("octo: account stopped; suppressing the timeout notice");
+      } else if (userFacingFinalDelivered) {
         log?.info?.("octo: dispatch timed out after a final answer already landed — suppressing the timeout notice");
       } else if (abortTimedOutDispatch) {
         // Aborted Bot/PPT tasks use their owning handler for fallback delivery.

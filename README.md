@@ -18,6 +18,10 @@ This plugin is published exclusively on ClawHub for fresh installs:
 openclaw plugins install clawhub:octo
 ```
 
+## Host compatibility
+
+The supported minimum remains OpenClaw `2026.6.9`. Full regression and local Gateway checks cover `2026.8.1`, `2026.9.9` and `2026.10.2`. Startup binding registration shares ownership with the older lazy-manager path. Duplicate suppression depends on the host invoking the target-normalization and delivery-receipt hooks; older hosts that do not invoke those hooks may still deliver the same tool reply and automatic final twice. Plugin installation alone does not guarantee those host capabilities.
+
 ## Configure a bot account
 
 After installing, use OpenClaw's standard `channels add` flow.
@@ -79,7 +83,7 @@ Card policy is configured per Bot on the Octo server, not in `openclaw.json`. Th
 - `pollIntervalMs` (optional): Short-poll interval for `card_action` callbacks after this account sends an interactive card (default `2000`, minimum `500`).
 - `eventWaitSeconds` (optional): Seconds to let the server hold an empty `/v1/bot/events` queue open, so a card action reaches the bot as soon as it is clicked instead of on the next poll tick (default `0` = plain short polling at `pollIntervalMs`; a non-zero value is clamped to 5–30 — below 5 a hold issues more requests than the short polling it replaces, and 30 matches the server's own clamp). Requires a server that supports the long poll; older servers answer immediately and the poller falls back to `pollIntervalMs` pacing, so setting it is safe but gives no benefit. Lower it if a reverse proxy in front of the server has an idle timeout below ~40s, since the client request timeout is derived as `eventWaitSeconds + 10s`.
 - `historyLimit` (optional): Group chat history message limit (default: 20)
-- `dispatchTimeoutMs` (optional): Per-inbound dispatch timeout in milliseconds — an infrastructure backstop that releases the per-group message queue if an upstream dispatch hangs. When unset, it is derived from OpenClaw's `agents.defaults.timeoutSeconds` (600 if unset) as `timeoutSeconds * 1000 + 60000`, so it always fires *after* the agent-run timeout: the agent terminates gracefully first, and this timeout only catches genuinely hung dispatches. Set explicitly only if you need to decouple it from the agent timeout.
+- `dispatchTimeoutMs` (optional): Per-inbound dispatch deadline in milliseconds. For ordinary IM, expiry cancels the agent dispatch, discards late replies, sends a bounded timeout notice and releases the per-group queue after bounded abort grace. This changes the earlier queue-only behavior: a late answer is no longer delivered after the timeout notice. When unset, the deadline follows `agents.defaults.timeoutSeconds` (600 if unset) as `timeoutSeconds * 1000 + 60000`, capped at Node's timer limit. **An explicit value below the agent timeout also cancels healthy long-running turns**; set a shorter deadline only when that earlier cutoff is intended. Document-task cancellation retains its task-specific policy.
 
 Automatic reasoning progress uses only the exact Registry template ref selected by the server and advertised in the same profile response. If reasoning is disabled, the ref is missing/incompatible, or the profile cannot be read, no progress card is sent; the plugin never falls back to the old locally rendered Model B. Profile results are cached privately per Bot and invalidated immediately by the server's `bot_setting_updated` event.
 

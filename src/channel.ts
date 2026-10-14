@@ -7,6 +7,9 @@ import type {
 import type {
   ChannelOutboundContext,
   ChannelMessageActionAdapter,
+  ChannelMessageActionContext,
+  ChannelMessageActionName,
+  ChannelLogSink,
 } from "openclaw/plugin-sdk/channel-contract";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
 import { createHeartbeatLoop } from "./heartbeat.js";
@@ -87,6 +90,8 @@ import { preloadGroupMemberCache, getGroupMembersFromCache } from "./member-cach
 import { preloadMentionPrefs } from "./mention-prefs.js";
 import { initPersonaPromptCache, stopPersonaPromptCache } from "./persona-prompt.js";
 import { registerOctoThreadBindingAdapter } from "./thread-binding-adapter.js";
+import { confirmsCurrentSourceReply, extractToolSendResult, targetsMatchForReplySuppression } from "./reply-delivery.js";
+import { normalizeOctoMessagingTarget } from "./target.js";
 import { normalizeAccountId } from "./account-id.js";
 import path from "node:path";
 import os from "node:os";
@@ -134,7 +139,10 @@ async function downloadToTempFile(url: string, filename: string, signal?: AbortS
   // caller derives from statSync() (SigV4 403 on any mismatch). Enforce the cap
   // while streaming the body — see streamToFileWithCap for the read loop /
   // backpressure / error / cancel logic.
-  const resp = await fetch(url, { signal: signal ?? AbortSignal.timeout(300_000) });
+  const downloadSignal = AbortSignal.any([
+    AbortSignal.timeout(300_000), ...(signal ? [signal] : []),
+  ]);
+  const resp = await fetch(url, { signal: downloadSignal });
   if (!resp.ok) throw new Error(`Failed to download media from ${url}: ${resp.status}`);
   const contentType = resp.headers.get("content-type") ?? undefined;
   if (!resp.body) throw new Error(`No response body from ${url}`);
@@ -143,6 +151,7 @@ async function downloadToTempFile(url: string, filename: string, signal?: AbortS
     body: resp.body as ReadableStream<Uint8Array>,
     destPath: tempPath,
     maxBytes: MAX_UPLOAD_SIZE,
+    signal: downloadSignal,
   });
   return { tempPath, contentType };
 }
@@ -481,7 +490,7 @@ export function resolveOutboundAccountId(ctxTo: string, fallbackAccountId: strin
 }
 
 /** Shared check: return available actions if at least one account is configured, else empty. */
-function getAvailableActions(cfg: any): string[] {
+function getAvailableActions(cfg: any): ChannelMessageActionName[] {
   try {
     const ids = listOctoAccountIds(cfg);
     const hasConfigured = ids.some((id) => {
@@ -801,10 +810,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       return { stop: () => unregister() };
     },
   },
-  actions: {
+  actions: ({
     listActions: ({ cfg }: { cfg: any }) => {
       const actions = getAvailableActions(cfg);
-      return actions as any; // TODO: remove when SDK types support this
+      return actions;
     },
     describeMessageTool: ({ cfg }: { cfg: any }) => {
       const actions = getAvailableActions(cfg);
@@ -812,15 +821,16 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       return { actions, capabilities: [] };
     },
     extractToolSend: ({ args }: { args: Record<string, unknown> }) => {
-      const target = args.target as string | undefined;
+      const target = (args.target ?? args.to) as string | undefined;
       // Return the canonical `to` field that openclaw core uses in
       // isMessagingToolSendAction to recognise Octo sends as committed
       // delivery evidence.  Without `to`, isDeliveredMessagingToolResult
       // is false → messagingToolSentMediaUrls is never populated →
       // image-only agent turns are classified as non_deliverable_terminal_turn.
-      return target ? { to: target } : {};
+      return target ? { to: target, accountId: typeof args.accountId === "string" ? args.accountId : undefined } : null;
     },
-    handleAction: async (ctx: any) => {
+    extractToolSendResult,
+    handleAction: async (ctx: ChannelMessageActionContext & { log?: ChannelLogSink }) => {
       // Resolve correct accountId: framework may pass wrong one when agent has multiple accounts.
       // Use currentChannelId to look up which account actually owns the group.
       // When multiple bots share the same group, do NOT correct — the caller's accountId is authoritative.
@@ -867,7 +877,8 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         groupMdCache,
         currentChannelId: ctx.toolContext?.currentChannelId ?? undefined,
         sessionKey: ctx.sessionKey ?? undefined,
-        threadId: ctx.toolContext?.threadId ?? ctx.params?.threadId ?? undefined,
+        threadId: (ctx.toolContext as { threadId?: string } | undefined)?.threadId
+          ?? (typeof ctx.params?.threadId === "string" ? ctx.params.threadId : undefined),
         requesterSenderId: ctx.requesterSenderId ?? undefined,
         accountId,
         log: ctx.log,
@@ -875,9 +886,23 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // Exceptions are intentionally not caught here: the host wraps tool
       // execution in its own try/catch and depends on the throw for the
       // after-tool-call error hook and failed-idempotency-key retention.
-      return toActionToolResult(result);
+      const data = result.data as Record<string, unknown> | undefined;
+      if (result.ok && data?.sent === true) result.data = { ...data, accountId };
+      const toolResult = toActionToolResult(result);
+      // The host checks requested targets before reconciling our receipt. A
+      // parent alias may have been rewritten to the current child thread;
+      // certify source delivery only when the actual sent route matches.
+      if (ctx.toolContext?.currentChannelProvider === CHANNEL_ID
+        && ctx.requesterAccountId && normalizeAccountId(ctx.requesterAccountId) === accountId
+        && confirmsCurrentSourceReply({ result, currentTarget: currentChannelId })) {
+        return { ...toolResult, details: { ...toolResult.details, sourceReplyRoute: "current-source" } };
+      }
+      return toolResult;
     },
-  } as any, // TODO: remove when SDK types support this
+  } satisfies ChannelMessageActionAdapter & {
+    // Retain the legacy discovery hook while checking the current host contract.
+    listActions: (params: { cfg: OpenClawConfig }) => ChannelMessageActionName[];
+  }) as ChannelMessageActionAdapter,
   agentPrompt: {
     messageToolHints: ({ cfg, accountId }: { cfg: any; accountId?: string | null }) => {
       if (!accountId) return [];
@@ -910,7 +935,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
     }),
   },
   messaging: {
-    normalizeTarget: (target) => target.trim(),
+    normalizeTarget: (target) => normalizeOctoMessagingTarget(target),
     targetResolver: {
       looksLikeId: (input) => Boolean(input.trim()),
       hint: "<userId or channelId>",
@@ -918,6 +943,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
   },
   outbound: {
     deliveryMode: "direct",
+    targetsMatchForReplySuppression,
     sendText: async (ctx) => {
       // Resolve correct accountId — framework may pass wrong one for multi-bot setups
       const accountId = resolveOutboundAccountId(
@@ -1035,6 +1061,13 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       return toDeliveryResult(ctx.to, sendResult);
     },
     sendMedia: async (ctx) => {
+      // August hosts do not expose signal on outbound contexts. Honor it when
+      // provided by newer hosts and keep a deadline for legacy callers.
+      const callerSignal = "signal" in ctx && ctx.signal instanceof AbortSignal ? ctx.signal : undefined;
+      callerSignal?.throwIfAborted();
+      const signal = AbortSignal.any([
+        AbortSignal.timeout(300_000), ...(callerSignal ? [callerSignal] : []),
+      ]);
       // Resolve correct accountId — framework may pass wrong one for multi-bot setups
       const accountId = resolveOutboundAccountId(
         ctx.to,
@@ -1132,7 +1165,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         } catch {
           filename = rawFilename;
         }
-        const dl = await downloadToTempFile(mediaUrl, filename);
+        const dl = await downloadToTempFile(mediaUrl, filename, signal);
         tempPath = dl.tempPath;
         localFilePath = dl.tempPath;
         contentType = dl.contentType;
@@ -1145,7 +1178,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       contentType = contentType || "application/octet-stream";
 
       let sendResult: SendMessageResult | undefined;
+      let fileBody: Buffer | ReturnType<typeof createReadStream> | undefined;
       try {
+        signal.throwIfAborted();
         // 2. Upload via the server's backend-agnostic presigned PUT URL.
         //    fileSize is the exact body byte count (statSync / buffer length);
         //    it is signed into the SigV4 Content-Length (403 on mismatch).
@@ -1155,11 +1190,14 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           filename,
           fileSize,
           contentType: ensureTextCharset(contentType),
+          signal,
         });
         // Open the read stream lazily (after presign succeeds) so a presign
         // failure never leaves a dangling open() against an unlinked temp file.
-        const fileBody: Buffer | NodeJS.ReadableStream =
-          fileBuffer ?? createReadStream(bodyPath!);
+        signal.throwIfAborted();
+        fileBody = fileBuffer ?? createReadStream(bodyPath!);
+        // Fetch can reject without consuming the body; handle late open errors.
+        if (!Buffer.isBuffer(fileBody)) fileBody.on("error", () => {});
         const { url: cdnUrl } = await uploadFileToPresignedUrl({
           uploadUrl: presign.uploadUrl,
           downloadUrl: presign.downloadUrl,
@@ -1169,7 +1207,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           // (both folded into the SigV4 canonical headers, 403 otherwise).
           contentType: presign.contentType,
           contentDisposition: presign.contentDisposition,
+          signal,
         });
+        signal.throwIfAborted();
 
         // 4. Determine message type and send
         // (target already resolved + validated up front, before upload — #138)
@@ -1184,9 +1224,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             : Buffer.isBuffer(fileBody)
               ? parseImageDimensions(fileBody, contentType)
               : null;
+          signal.throwIfAborted();
           sendResult = await sendMediaMessage({
             apiUrl: account.config.apiUrl,
             botToken: account.config.botToken,
+            signal,
             channelId,
             channelType,
             type: msgType,
@@ -1197,9 +1239,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
             size: fileSize,
           });
         } else {
+          signal.throwIfAborted();
           sendResult = await sendMediaMessage({
             apiUrl: account.config.apiUrl,
             botToken: account.config.botToken,
+            signal,
             channelId,
             channelType,
             type: msgType,
@@ -1209,6 +1253,11 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           });
         }
       } finally {
+        if (fileBody && !Buffer.isBuffer(fileBody)) {
+          const stream = fileBody;
+          stream.destroy();
+          if (!stream.closed) await new Promise<void>(resolve => stream.once("close", resolve));
+        }
         // Cleanup temp file
         if (tempPath) await unlink(tempPath).catch(() => {});
       }
@@ -1250,6 +1299,13 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         );
       }
 
+      const stopThreadBindingAdapter = registerOctoThreadBindingAdapter({
+        accountId: account.accountId,
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken,
+        log: ctx.log,
+      });
+      try {
       const log = ctx.log;
       const statusSink: OctoStatusSink = (patch) =>
         ctx.setStatus({ accountId: account.accountId, ...patch });
@@ -1348,10 +1404,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         log,
       );
 
-      // NOTE: ACP thread-binding adapter is NOT registered here. The canonical
-      // wiring is via `octoPlugin.conversationBindings.createManager`, which
-      // OpenClaw runtime calls on demand and whose returned `{stop}` it owns.
-      // See the plugin declaration above and `src/thread-binding-adapter.ts`.
+      // Ordinary inbound dispatch already queries the adapter on 2026.10.
+      // Account startup owns registration; the finally block releases it even
+      // when registration or subsequent setup fails before the socket starts.
 
       // Prefetch GROUP.md and group members for all groups (fire-and-forget)
       const groupMdCache = getOrCreateGroupMdCache(account.accountId);
@@ -1497,6 +1552,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                   log,
                   statusSink,
                   routeOverride,
+                  signal: ctx.abortSignal,
                   ...(extra?.docTask ? { docTask: extra.docTask } : {}),
                 }),
               { ...SESSION_INIT_RETRY, log },
@@ -1760,6 +1816,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
                 ? msg.channel_id.split("____")[0]
                 : msg.channel_id;
               registerGroupToAccount(groupId, account.accountId);
+              registerBotGroupIds([groupId]);
             }
           }
 
@@ -1896,7 +1953,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       watchdog.start();
 
       // Keep Promise pending until stopped — gateway treats resolve as "account stopped"
-      return new Promise((resolve) => {
+      return await new Promise((resolve) => {
         const cleanup = () => {
           if (stopped) return;
           stopped = true;
@@ -1923,6 +1980,9 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           ctx.abortSignal.addEventListener("abort", cleanup, { once: true });
         }
       });
+      } finally {
+        stopThreadBindingAdapter();
+      }
     },
   },
 };

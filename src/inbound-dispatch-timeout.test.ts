@@ -238,12 +238,14 @@ function pickTimeoutSends(sends: any[]) {
 }
 
 function runInbound(opts: {
+  account?: ResolvedOctoAccount;
   log?: any;
   routeOverride?: { sessionKey: string; agentId?: string };
   docTask?: Parameters<typeof handleInboundMessage>[0]["docTask"];
+  signal?: AbortSignal;
 } = {}) {
   return handleInboundMessage({
-    account: makeAccount(),
+    account: opts.account ?? makeAccount(),
     message: makeAtBotMessage() as any,
     botUid: BOT_UID,
     groupHistories: new Map(),
@@ -254,6 +256,7 @@ function runInbound(opts: {
     log: opts.log,
     routeOverride: opts.routeOverride,
     docTask: opts.docTask,
+    signal: opts.signal,
   });
 }
 
@@ -296,6 +299,154 @@ afterEach(() => {
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
+  it("timeout cancels a stalled media presign, settles dispatch and allows the next IM turn", async () => {
+    _setDispatchTimeoutForTests(500);
+    _setDispatchAbortGraceForTests(500);
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    const fallbackFetch = globalThis.fetch;
+    let uploadSignal: AbortSignal | undefined;
+    let cancelUpload!: () => void;
+    let dispatchSettled = false;
+    const reason = new Error("test cleanup");
+    globalThis.fetch = vi.fn((input: any, init?: any) => {
+      const url = String(input);
+      if (url === "https://media.test/queue-cancel.txt") return Promise.resolve(new Response("media"));
+      if (url.includes("/upload/presigned")) {
+        uploadSignal = init?.signal;
+        return new Promise((_, reject) => {
+          cancelUpload = () => reject(reason);
+          uploadSignal?.addEventListener("abort", () => reject(uploadSignal!.reason), { once: true });
+        });
+      }
+      return fallbackFetch(input, init);
+    }) as typeof fetch;
+    dispatch.mockImplementation(async (args: any) => {
+      await args.dispatcherOptions.deliver({ mediaUrl: "https://media.test/queue-cancel.txt" }, { kind: "final" });
+      dispatchSettled = true;
+    });
+    try {
+      await expect(runInbound({ log: { warn: () => {}, error: () => {} } })).rejects.toThrow("dispatch timed out");
+      expect(uploadSignal?.aborted).toBe(true);
+      expect(dispatchSettled).toBe(true);
+      installImmediateRuntime({ text: "next turn works", kind: "final" });
+      await runInbound();
+      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。", "next turn works"]);
+    } finally { cancelUpload?.(); }
+  });
+
+  it("account stop aborts a buffered-final POST after dispatch has already settled", async () => {
+    installImmediateRuntime({ text: "buffered-final", kind: "block" });
+    const { sends } = installHangingSendFetchStub();
+    const controller = new AbortController();
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const fetchWithAbort = globalThis.fetch;
+    let sendSignal!: AbortSignal;
+    globalThis.fetch = vi.fn((input: any, init?: any) => {
+      if (String(input).includes("/sendMessage")) {
+        sendSignal = init.signal;
+        enter();
+      }
+      return fetchWithAbort(input, init);
+    }) as typeof fetch;
+    const running = runInbound({ signal: controller.signal, log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } });
+    await entered;
+    expect(sendSignal.aborted).toBe(false);
+    controller.abort(new Error("account stopped during final send"));
+    expect(sendSignal.aborted).toBe(true);
+    expect(sendSignal.reason).toBe(controller.signal.reason);
+    await running;
+    expect(sends).toEqual([{ content: "buffered-final", abortedBeforeResolve: true }]);
+  });
+
+  it("stopping an ordinary IM account cancels the run without sending a failure notice", async () => {
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    const controller = new AbortController();
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    dispatch.mockImplementation(async (args: any) => {
+      const signal = args.replyOptions.abortSignal as AbortSignal;
+      enter();
+      await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    });
+    const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("account stopped");
+    await entered;
+    controller.abort();
+    await rejected;
+    expect(sends).toEqual([]);
+  });
+
+  it.each(["channel", "account"])("explicit %s deadline cancels a long IM turn, fences its final and permits recovery", async scope => {
+    // Exercise the real configuration branch, without the test timeout override.
+    _setDispatchTimeoutForTests(null);
+    vi.useFakeTimers();
+    const cfg = { agents: { defaults: { timeoutSeconds: 600 } }, channels: { octo: {
+      dispatchTimeoutMs: scope === "channel" ? 1000 : 5000,
+      accounts: { acct1: { botToken: "tok", apiUrl: API, requireMention: false,
+        ...(scope === "account" ? { dispatchTimeoutMs: 1000 } : {}) } },
+    } } };
+    const account = resolveOctoAccount({ cfg: cfg as any, accountId: "acct1" });
+    expect(resolveDispatchTimeoutMs(cfg as any, account)).toBe(1000);
+    const { dispatch } = installImmediateRuntime(undefined, { config: cfg });
+    const { sends } = installFetchStub();
+    let release!: () => void;
+    let enter!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    let signal!: AbortSignal;
+    dispatch.mockImplementation(async args => {
+      signal = args.replyOptions.abortSignal;
+      enter();
+      await gate;
+      await args.dispatcherOptions.deliver({ text: "late answer under explicit deadline" }, { kind: "final" });
+    });
+    try {
+      const rejected = expect(runInbound({ account })).rejects.toThrow("dispatch timed out after 1000ms");
+      await entered;
+      await vi.advanceTimersByTimeAsync(1000 + ABORT_GRACE_MS_FOR_TESTS + 1);
+      await rejected;
+      expect(signal.aborted).toBe(true);
+      release();
+      await dispatch.mock.results[0].value;
+      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。"]);
+      installImmediateRuntime({ text: "next explicit-config turn works", kind: "final" }, { config: cfg });
+      await runInbound({ account });
+      expect(sends.map(send => send.payload?.content)).toEqual([
+        "⚠️ 处理超时，请稍后重试。", "next explicit-config turn works",
+      ]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+  it("cancels an ordinary IM run and fences an abort-ignoring late final", async () => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    let release!: () => void;
+    let enter!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    let signal!: AbortSignal;
+    dispatch.mockImplementation(async (args: any) => {
+      signal = args.replyOptions.abortSignal;
+      enter();
+      await gate;
+      await args.dispatcherOptions.deliver({ text: "stale final" }, { kind: "final" });
+      await args.dispatcherOptions.onError(new Error("late cancellation"), { kind: "final" });
+    });
+    try {
+      const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered;
+      await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + ABORT_GRACE_MS_FOR_TESTS + 1);
+      await rejected;
+      expect(signal.aborted).toBe(true);
+      release();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。"]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
   it.each(["deadline", "account stop"])("PPT %s cancels the runtime before a late write or reply", async (reason) => {
     vi.useFakeTimers();
     let enterRuntime!: () => void;
@@ -323,6 +474,8 @@ describe("dispatch timeout guard (issue #75)", () => {
     });
     const rejected = expect(runInbound({
       log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      // The channel's lifecycle signal must not mask cancellation by the task.
+      signal: new AbortController().signal,
       docTask: {
         docId: "deck", threadId: "1", sessionScope: "ppt:deck:1",
         deadlineAt: Date.now() + (reason === "deadline" ? 40 : 1000), abortOnTimeout: true, signal: controller.signal,
