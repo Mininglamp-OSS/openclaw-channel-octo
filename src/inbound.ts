@@ -128,8 +128,11 @@ export function _setDispatchTimeoutForTests(ms: number | null): void {
  *   3. Derived from the agent-run timeout: `(agents.defaults.timeoutSeconds
  *      ?? 600) * 1000 + 60_000`. Single source of truth — raising
  *      `timeoutSeconds` automatically moves this guard with it, and the 60s
- *      buffer keeps it strictly behind the agent timeout so a healthy run is
- *      never killed by its own infrastructure backstop.
+ *      buffer normally places this guard after the agent timeout (subject to
+ *      Node's timer cap). An explicit shorter deadline cancels even a healthy
+ *      ordinary IM turn and discards its late reply; it is an intentional
+ *      earlier cutoff, not just a queue-occupancy setting. Document tasks
+ *      retain their task-specific cancellation policy.
  */
 export function resolveDispatchTimeoutMs(
   cfg: OpenClawConfig,
@@ -3452,8 +3455,9 @@ export async function handleInboundMessage(params: {
       dispatchTimeoutHandle = setTimeout(() => {
         taskInterrupted = true;
         reject(timeoutError);
-        // A shutdown signal does not opt ordinary document tasks into the
-        // stronger Bot/PPT timeout policy; their timeout only releases the queue.
+        // Ordinary IM deadlines cancel the run and fence late replies, including
+        // explicitly configured deadlines below the agent timeout. Ordinary
+        // document tasks only release the queue unless their task opts into abort.
         if (!docTask || abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
       }, remainingDispatchMs);
     });

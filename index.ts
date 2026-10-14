@@ -62,7 +62,8 @@ export const OCTO_TOOL_AVAILABILITY_HINT =
   "OpenClaw's restrictive profiles (`minimal`, `coding`, `messaging`) exclude plugin " +
   "tools by default; the `full` profile, or allowing it explicitly (global " +
   "`tools.alsoAllow: [\"octo_management\"]` or per-agent " +
-  "`agents.list[].tools.alsoAllow: [\"octo_management\"]`), makes it available. In that " +
+  "`agents.entries[agentId].tools.alsoAllow: [\"octo_management\"]` on keyed-roster hosts, " +
+  "or `agents.list[].tools.alsoAllow: [\"octo_management\"]` on legacy hosts), makes it available. In that " +
   "situation, tell the user plainly that `octo_management` is unavailable due to the " +
   "current tool policy (NOT that the feature is missing), and do NOT suggest switching " +
   "to another platform or pasting a secret in plaintext. Whether to adjust the " +

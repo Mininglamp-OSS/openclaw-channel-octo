@@ -238,13 +238,14 @@ function pickTimeoutSends(sends: any[]) {
 }
 
 function runInbound(opts: {
+  account?: ResolvedOctoAccount;
   log?: any;
   routeOverride?: { sessionKey: string; agentId?: string };
   docTask?: Parameters<typeof handleInboundMessage>[0]["docTask"];
   signal?: AbortSignal;
 } = {}) {
   return handleInboundMessage({
-    account: makeAccount(),
+    account: opts.account ?? makeAccount(),
     message: makeAtBotMessage() as any,
     botUid: BOT_UID,
     groupHistories: new Map(),
@@ -375,6 +376,47 @@ describe("dispatch timeout guard (issue #75)", () => {
     controller.abort();
     await rejected;
     expect(sends).toEqual([]);
+  });
+
+  it.each(["channel", "account"])("explicit %s deadline cancels a long IM turn, fences its final and permits recovery", async scope => {
+    // Exercise the real configuration branch, without the test timeout override.
+    _setDispatchTimeoutForTests(null);
+    vi.useFakeTimers();
+    const cfg = { agents: { defaults: { timeoutSeconds: 600 } }, channels: { octo: {
+      dispatchTimeoutMs: scope === "channel" ? 1000 : 5000,
+      accounts: { acct1: { botToken: "tok", apiUrl: API, requireMention: false,
+        ...(scope === "account" ? { dispatchTimeoutMs: 1000 } : {}) } },
+    } } };
+    const account = resolveOctoAccount({ cfg: cfg as any, accountId: "acct1" });
+    expect(resolveDispatchTimeoutMs(cfg as any, account)).toBe(1000);
+    const { dispatch } = installImmediateRuntime(undefined, { config: cfg });
+    const { sends } = installFetchStub();
+    let release!: () => void;
+    let enter!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    let signal!: AbortSignal;
+    dispatch.mockImplementation(async args => {
+      signal = args.replyOptions.abortSignal;
+      enter();
+      await gate;
+      await args.dispatcherOptions.deliver({ text: "late answer under explicit deadline" }, { kind: "final" });
+    });
+    try {
+      const rejected = expect(runInbound({ account })).rejects.toThrow("dispatch timed out after 1000ms");
+      await entered;
+      await vi.advanceTimersByTimeAsync(1000 + ABORT_GRACE_MS_FOR_TESTS + 1);
+      await rejected;
+      expect(signal.aborted).toBe(true);
+      release();
+      await dispatch.mock.results[0].value;
+      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。"]);
+      installImmediateRuntime({ text: "next explicit-config turn works", kind: "final" }, { config: cfg });
+      await runInbound({ account });
+      expect(sends.map(send => send.payload?.content)).toEqual([
+        "⚠️ 处理超时，请稍后重试。", "next explicit-config turn works",
+      ]);
+    } finally { release(); vi.useRealTimers(); }
   });
 
   it("cancels an ordinary IM run and fences an abort-ignoring late final", async () => {

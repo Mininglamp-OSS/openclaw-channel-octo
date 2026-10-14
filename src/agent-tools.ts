@@ -153,7 +153,7 @@ async function confineSecretPath(
     return {
       ok: false,
       error:
-        "write-secret is not configured: no jail root could be resolved. Set an explicit secretsFileRoot (the directory secrets may be written under), or configure the agent's workspace via agents.list[].workspace or agents.defaults.workspace, before this action can be used.",
+        "write-secret is not configured: no jail root could be resolved. Set an explicit secretsFileRoot (the directory secrets may be written under), or configure the agent's workspace via agents.entries[agentId].workspace (keyed-roster hosts), agents.list[].workspace (legacy hosts), or agents.defaults.workspace, before this action can be used.",
     };
   }
 
