@@ -15,6 +15,18 @@ All notable changes to this project will be documented in this file.
 - 普通 JSON 文件列表、搜索结果以及分开的 host/path 不再因拼接成 URL 而整块隐藏；键与自身字符串值之间拆开的已知凭据也会被过滤。预览处理增加全局节点、键及文本预算。
 - 无效 `docTaskProgress`（包括 `null`）关闭上传并输出诊断；上报失败日志包含执行批次 ID，429 同样遵守每账号限频且不记录上游响应或限流范围。
 
+## [1.6.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.1...v1.6.0) (2026-10-14)
+
+
+### Added
+
+* **docs:** report task progress and sanitized tool events ([#252](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/252)) ([2e710e9](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/2e710e903fa43ac9440723746f7395d2f7b4347e))
+
+
+### Fixed
+
+* **compat:** restore replies and prevent duplicate delivery on OpenClaw 2026.10 ([#261](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/261)) ([d887bd7](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/d887bd79dca97677bfd6f0315a7365b39e8c565e))
+
 ## [1.5.1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.0...v1.5.1) (2026-10-08)
 
 ### Fixed
