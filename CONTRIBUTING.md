@@ -42,6 +42,22 @@ PR titles (and squash-merge commit messages) must follow:
 Breaking change → add `!` after the type (`feat!: ...`) **or** include `BREAKING CHANGE:`
 in the commit body. This triggers a major version bump.
 
+**One-time release-owner exception: v1.5.2 (PR #256).** The release owner
+explicitly chose `1.5.2` to keep PR #252 and PR #261 in the existing `1.5` release series,
+overriding the computed minor version. For this release only, the feature and
+its documented breaking behavior may ship under a patch number. This is a
+versioning-policy exception, not a claim of SemVer patch compatibility; the
+normal feature/minor and breaking/major rules above remain in force for future
+releases. Consumers using `~1.5.1` or patch-only updates can receive the new
+default-on tool-preview uploads, visible to all target-document readers, and
+ordinary IM timeout cancellation that discards late replies. Check explicit
+`dispatchTimeoutMs` settings for unintended early cancellation.
+Deploy the companion receipt endpoint and event-table migrations first; review
+the upload audience or set `docTaskProgress: false` before upgrading, accounting
+for per-account overrides. Preserve this decision and the upgrade requirements
+in the PR and versioned release notes. See [RELEASE.md](RELEASE.md) for the full
+exception. Review approval, required checks and branch protection still apply.
+
 Examples:
 - `fix(inbound): set MediaPaths under Core-allowed root (#58)`
 - `feat(richtext): bot adapter supports RichText=14`
