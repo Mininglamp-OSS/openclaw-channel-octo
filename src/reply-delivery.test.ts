@@ -1,11 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { confirmsCurrentSourceReply, extractToolSendResult, targetsMatchForReplySuppression } from "./reply-delivery.js";
 import { octoPlugin, toActionToolResult } from "./channel.js";
-import { normalizeOctoMessagingTarget } from "./target.js";
+import { parseTarget, normalizeOctoMessagingTarget } from "./target.js";
 import { DOC_TASK_NON_ROUTABLE_PREFIX } from "./constants.js";
 import { ChannelType } from "./types.js";
 
 describe("actual source delivery confirmation", () => {
+  it("matches a space DM using its delivery address rather than session namespace", () => {
+    expect(confirmsCurrentSourceReply({ currentTarget: "octo:user:s1001_u42",
+      result: { ok: true, data: { sent: true, resolvedTarget: "s1001_u42", channelType: ChannelType.DM } },
+    })).toBe(true);
+  });
+  it("pins the host thread-placement contract: Octo threads are part of the target", () => {
+    expect(octoPlugin.threading).toBeUndefined();
+  });
   it("recognizes a parent request actually delivered to the current child", () => {
     expect(confirmsCurrentSourceReply({
       currentTarget: "octo:g____one",
@@ -24,14 +32,23 @@ describe("actual source delivery confirmation", () => {
 });
 
 describe("OpenClaw source-reply target normalization", () => {
-  it.each(["uid", " user:uid ", "octo:uid", "octo:user:uid"])("normalizes DM alias %s", target => {
+  it.each(["uid", "octo:uid", "g", "octo:g"])("leaves ambiguous bare IDs routable after cache warm-up: %s", target => {
+    const bare = target.replace(/^octo:/, "");
+    expect(normalizeOctoMessagingTarget(target)).toBe(bare);
+  });
+  it.each([" user:uid ", "octo:user:uid"])("normalizes explicit DM alias %s", target => {
     expect(normalizeOctoMessagingTarget(target)).toBe("user:uid");
   });
-  it.each(["g", "octo:g", "channel:octo:g", "group:g"])("normalizes known group alias %s", target => {
-    expect(normalizeOctoMessagingTarget(target, new Set(["g"]))).toBe("group:g");
+  it.each(["channel:octo:g", "group:g"])("preserves explicit group alias %s", target => {
+    expect(normalizeOctoMessagingTarget(target)).toBe("group:g");
+  });
+  it("lets routing classify a normalized bare group after the cache warms", () => {
+    const normalized = octoPlugin.messaging!.normalizeTarget!("octo:g");
+    expect(normalized).toBe("g");
+    expect(parseTarget(normalized, undefined, new Set(["g"]))).toEqual({ channelId: "g", channelType: ChannelType.Group });
   });
   it("preserves explicit routing, thread identity and mention recipients", () => {
-    expect(normalizeOctoMessagingTarget("user:g", new Set(["g"]))).toBe("user:g");
+    expect(normalizeOctoMessagingTarget("user:g")).toBe("user:g");
     expect(normalizeOctoMessagingTarget("group:uid")).toBe("group:uid");
     expect(normalizeOctoMessagingTarget("octo:g____one")).toBe("group:g____one");
     expect(normalizeOctoMessagingTarget("channel:octo:g@uid1,uid2")).toBe("group:g@uid1,uid2");
@@ -96,6 +113,6 @@ describe("message-tool reply route evidence (#257)", () => {
       ok: true, data: { sent: true, resolvedTarget: "g", channelType: ChannelType.Group, failedMedia },
     })),
   ])("does not turn an unsuccessful action into delivery evidence", details => {
-    expect(extractToolSendResult({ result: { details }, send: { to: "group:g" } })).toBeUndefined();
+    expect(extractToolSendResult({ result: { details }, send: { to: "group:g" } })).toBeNull();
   });
 });

@@ -117,10 +117,10 @@ function installRuntime(config: Record<string, unknown> = {}, deliver = false) {
   return { dispatch };
 }
 
-function runDm() {
+function runDm(message = makeDmMessage()) {
   return handleInboundMessage({
     account: makeAccount(),
-    message: makeDmMessage() as any,
+    message: message as any,
     botUid: BOT_UID,
     groupHistories: new Map(),
     lastBotReplySeqMap: new Map(),
@@ -157,6 +157,16 @@ afterEach(() => {
 });
 
 describe("#172 DM reply delivery mode", () => {
+  it("keeps space session isolation separate from the physical DM delivery address", async () => {
+    installFetchStub();
+    const { dispatch } = installRuntime({});
+    await runDm({ ...makeDmMessage(), from_uid: "s1001_u42", channel_id: "s1001_u42@s1001_bot" });
+    const ctx = dispatch.mock.calls[0][0].ctx;
+    expect(ctx.To).toBe("octo:user:s1001_u42");
+    expect(ctx.OriginatingTo).toBe(ctx.To);
+    expect(ctx.ThreadId).toBeUndefined();
+  });
+
   it("DM without configured visibleReplies → injects sourceReplyDeliveryMode=automatic", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({});

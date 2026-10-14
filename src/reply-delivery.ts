@@ -1,4 +1,4 @@
-import { normalizeOutboundChannelPrefix, normalizeOctoMessagingTarget } from "./target.js";
+import { normalizeOutboundChannelPrefix } from "./target.js";
 import { ChannelType } from "./types.js";
 
 function receiptDestination(data: Record<string, unknown> | undefined): string | undefined {
@@ -19,7 +19,6 @@ export function hasFailedMedia(data: Record<string, unknown> | undefined): boole
 export function confirmsCurrentSourceReply(params: {
   result: { ok: boolean; data?: unknown };
   currentTarget?: string;
-  knownGroupIds?: Set<string>;
 }): boolean {
   const data = params.result.data as Record<string, unknown> | undefined;
   if (!params.result.ok || data?.sent !== true || !params.currentTarget?.trim()
@@ -27,7 +26,7 @@ export function confirmsCurrentSourceReply(params: {
     || hasFailedMedia(data)) return false;
   const delivered = receiptDestination(data);
   if (!delivered) return false;
-  return delivered === normalizeOctoMessagingTarget(params.currentTarget, params.knownGroupIds);
+  return targetsMatchForReplySuppression({ originTarget: params.currentTarget, targetKey: delivered });
 }
 
 function comparisonTarget(raw: string, threadId?: string) {
@@ -62,13 +61,13 @@ export function targetsMatchForReplySuppression(params: {
 /** Use the actual sent route, including automatic thread/account corrections. */
 export function extractToolSendResult(params: {
   result: unknown;
-  send: { to: string; accountId?: string };
+  send: { to: string; accountId?: string | null };
 }) {
   const details = (params.result as { details?: { ok?: boolean; data?: Record<string, unknown> } })?.details;
   const data = details?.data;
   const to = receiptDestination(data);
   if (details?.ok !== true || data?.sent !== true
-    || hasFailedMedia(data) || !to) return undefined;
+    || hasFailedMedia(data) || !to) return null;
   return {
     to,
     accountId: typeof data.accountId === "string" ? data.accountId : params.send.accountId,

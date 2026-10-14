@@ -7,6 +7,9 @@ import type {
 import type {
   ChannelOutboundContext,
   ChannelMessageActionAdapter,
+  ChannelMessageActionContext,
+  ChannelMessageActionName,
+  ChannelLogSink,
 } from "openclaw/plugin-sdk/channel-contract";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
 import { createHeartbeatLoop } from "./heartbeat.js";
@@ -483,7 +486,7 @@ export function resolveOutboundAccountId(ctxTo: string, fallbackAccountId: strin
 }
 
 /** Shared check: return available actions if at least one account is configured, else empty. */
-function getAvailableActions(cfg: any): string[] {
+function getAvailableActions(cfg: any): ChannelMessageActionName[] {
   try {
     const ids = listOctoAccountIds(cfg);
     const hasConfigured = ids.some((id) => {
@@ -803,10 +806,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       return { stop: () => unregister() };
     },
   },
-  actions: {
+  actions: ({
     listActions: ({ cfg }: { cfg: any }) => {
       const actions = getAvailableActions(cfg);
-      return actions as any; // TODO: remove when SDK types support this
+      return actions;
     },
     describeMessageTool: ({ cfg }: { cfg: any }) => {
       const actions = getAvailableActions(cfg);
@@ -820,10 +823,10 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // delivery evidence.  Without `to`, isDeliveredMessagingToolResult
       // is false → messagingToolSentMediaUrls is never populated →
       // image-only agent turns are classified as non_deliverable_terminal_turn.
-      return target ? { to: target, accountId: args.accountId } : {};
+      return target ? { to: target, accountId: typeof args.accountId === "string" ? args.accountId : undefined } : null;
     },
     extractToolSendResult,
-    handleAction: async (ctx: any) => {
+    handleAction: async (ctx: ChannelMessageActionContext & { log?: ChannelLogSink }) => {
       // Resolve correct accountId: framework may pass wrong one when agent has multiple accounts.
       // Use currentChannelId to look up which account actually owns the group.
       // When multiple bots share the same group, do NOT correct — the caller's accountId is authoritative.
@@ -870,7 +873,8 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         groupMdCache,
         currentChannelId: ctx.toolContext?.currentChannelId ?? undefined,
         sessionKey: ctx.sessionKey ?? undefined,
-        threadId: ctx.toolContext?.threadId ?? ctx.params?.threadId ?? undefined,
+        threadId: (ctx.toolContext as { threadId?: string } | undefined)?.threadId
+          ?? (typeof ctx.params?.threadId === "string" ? ctx.params.threadId : undefined),
         requesterSenderId: ctx.requesterSenderId ?? undefined,
         accountId,
         log: ctx.log,
@@ -884,13 +888,17 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // The host checks requested targets before reconciling our receipt. A
       // parent alias may have been rewritten to the current child thread;
       // certify source delivery only when the actual sent route matches.
-      if (ctx.requesterAccountId && normalizeAccountId(ctx.requesterAccountId) === accountId
-        && confirmsCurrentSourceReply({ result, currentTarget: currentChannelId, knownGroupIds: getKnownGroupIds() })) {
+      if (ctx.toolContext?.currentChannelProvider === CHANNEL_ID
+        && ctx.requesterAccountId && normalizeAccountId(ctx.requesterAccountId) === accountId
+        && confirmsCurrentSourceReply({ result, currentTarget: currentChannelId })) {
         return { ...toolResult, details: { ...toolResult.details, sourceReplyRoute: "current-source" } };
       }
       return toolResult;
     },
-  } as any, // TODO: remove when SDK types support this
+  } satisfies ChannelMessageActionAdapter & {
+    // Retain the legacy discovery hook while checking the current host contract.
+    listActions: (params: { cfg: OpenClawConfig }) => ChannelMessageActionName[];
+  }) as ChannelMessageActionAdapter,
   agentPrompt: {
     messageToolHints: ({ cfg, accountId }: { cfg: any; accountId?: string | null }) => {
       if (!accountId) return [];
@@ -923,7 +931,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
     }),
   },
   messaging: {
-    normalizeTarget: (target) => normalizeOctoMessagingTarget(target, getKnownGroupIds()),
+    normalizeTarget: (target) => normalizeOctoMessagingTarget(target),
     targetResolver: {
       looksLikeId: (input) => Boolean(input.trim()),
       hint: "<userId or channelId>",

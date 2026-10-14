@@ -72,7 +72,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
 //   • `~` home expansion via resolveUserPath.
 import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
-import { findAgentConfig, normalizeAgentId, type CompatibleAgentsConfig } from "./agent-config-compat.js";
+import { hasAgentEntries, findAgentConfig, normalizeAgentId, type CompatibleAgentsConfig } from "./agent-config-compat.js";
 
 /**
  * Placeholder token replaced by the resolved plaintext secret inside the
@@ -448,9 +448,9 @@ async function resolveAgentWorkspaceRoot(
     agents: {
       ...agents,
       ...(usingOwnWorkspace
-        ? agents.entries
+        ? hasAgentEntries(agents)
           ? {
-              entries: Object.fromEntries(Object.entries(agents.entries).map(([id, entry]) => [
+              entries: Object.fromEntries(Object.entries(agents.entries ?? {}).map(([id, entry]) => [
                 id, normalizeAgentId(id) === normId ? { ...entry, workspace: configuredBaseExpanded } : entry,
               ])),
             }

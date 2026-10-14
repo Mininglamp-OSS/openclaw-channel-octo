@@ -2736,7 +2736,7 @@ export async function handleInboundMessage(params: {
     // `ctx.to` 指向发起人私聊 —— agent 调一次 message 工具就能把文档内容发进去,
     // 而那条出站在 channel.ts(框架侧 sendText),imEgress 闸门只管 inbound.ts,
     // 看不见也拦不住。改成不可路由哨兵后由 resolveOutboundTarget 统一 fail-closed。
-    To: docTask ? `${CHANNEL_ID}:${DOC_TASK_NON_ROUTABLE_PREFIX}${docTask.sessionScope}` : `${CHANNEL_ID}:${sessionId}`,
+    To: docTask ? `${CHANNEL_ID}:${DOC_TASK_NON_ROUTABLE_PREFIX}${docTask.sessionScope}` : `${CHANNEL_ID}:${isGroup ? "group" : "user"}:${effectiveChannelId}`,
     SessionKey: route.sessionKey,
     AccountId: route.accountId,
     ChatType: isGroup ? "group" : "direct",
@@ -2752,7 +2752,7 @@ export async function handleInboundMessage(params: {
     Provider: CHANNEL_ID,
     Surface: CHANNEL_ID,
     OriginatingChannel: CHANNEL_ID,
-    OriginatingTo: docTask ? `${CHANNEL_ID}:${DOC_TASK_NON_ROUTABLE_PREFIX}${docTask.sessionScope}` : `${CHANNEL_ID}:${sessionId}`,
+    OriginatingTo: docTask ? `${CHANNEL_ID}:${DOC_TASK_NON_ROUTABLE_PREFIX}${docTask.sessionScope}` : `${CHANNEL_ID}:${isGroup ? "group" : "user"}:${effectiveChannelId}`,
   });
 
   await core.channel.session.recordInboundSession({
@@ -3747,7 +3747,7 @@ export async function handleInboundMessage(params: {
     // .catch() (channel.ts#enqueueInbound) can advance to the next message
     // — otherwise this group stays stuck forever, see issue #75.
     //
-    if (err === timeoutError || err === stoppedError || docTask?.signal?.aborted) {
+    if (err === timeoutError || err === stoppedError || accountSignal?.aborted) {
       taskInterrupted = true;
       // Emit the primary diagnostic before waiting for cooperative shutdown;
       // otherwise an abort-ignoring host makes the timeout itself invisible.
