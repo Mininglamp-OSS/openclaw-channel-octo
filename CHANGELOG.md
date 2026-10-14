@@ -2,30 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## [1.5.2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.1...v1.5.2) (2026-10-14)
 
-### Breaking changes
+### ⚠ BREAKING CHANGES
 
-- 普通 IM 的 `dispatchTimeoutMs` 到期后会取消 Agent dispatch、丢弃迟到回复，并在有限取消等待后释放群消息队列；此前只释放队列，真实答复仍可能在超时提示之后到达。未配置时仍根据 `agents.defaults.timeoutSeconds` 加 60 秒推导，受 Node 定时器上限约束。显式配置得更短会提前终止正常长回合，仅在希望提前截止时使用；文档任务保留自身取消策略。
-- 文档评论任务默认上传执行回执和经过过滤的工具输入输出，目标文档的所有读者均可查看。升级后无需逐个账号配置；账号启动时会对使用默认值的账号提示数据范围及关闭方式。`docTaskProgress: false` 可在渠道或账号级关闭上传，账号设置优先；执行和评论回复不受影响。先部署配套后端接口及迁移，再升级插件。
-
-### Fixed
-
-- RichText 的文件或无尺寸图片附件上传成功、发送失败时，`failedMedia` 保留调用方的原始附件地址供选择性重试，不返回可能过期的临时 CDN 地址。
-- 普通 JSON 文件列表、搜索结果以及分开的 host/path 不再因拼接成 URL 而整块隐藏；键与自身字符串值之间拆开的已知凭据也会被过滤。预览处理增加全局节点、键及文本预算。
-- 无效 `docTaskProgress`（包括 `null`）关闭上传并输出诊断；上报失败日志包含执行批次 ID，429 同样遵守每账号限频且不记录上游响应或限流范围。
-
-## [1.6.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.1...v1.6.0) (2026-10-14)
-
+- **普通 IM 的 `dispatchTimeoutMs` 到期后会取消 Agent dispatch，并丢弃迟到回复**（PR #261）：此前只释放群消息队列，真实答复仍可能在超时提示之后到达；现在在有限取消等待后释放队列，账号停机也取消执行并阻止迟到的自动回复。未配置时仍按 `agents.defaults.timeoutSeconds` 加 60 秒推导，受 Node 定时器上限约束；显式设置比 Agent 超时更短的期限会提前终止正常长回合，仅在希望提前截止时使用。文档任务保留自身取消策略。
+- **升级后，文档评论任务默认上传执行回执和经过过滤的工具输入输出，目标文档的所有读者均可查看**（PR #252）：Docs、Sheets、HTML 与 PPT 都适用，无需逐个账号添加配置；可见范围不是仅限发起请求的人。预览可能包含文件正文、命令输出及其他系统中的业务数据，凭证过滤不识别保密业务信息，也不保证识别所有拆分或编码后的凭证。每条事件预览最多 4096 个 UTF-16 code unit，每次执行最多 1000 条事件。
+  - **先部署配套 Docs 回执接口及事件表迁移，再升级插件，并确认 `docsApiUrl` 指向正确服务**。账号每次启动时，对使用默认值的账号提示数据范围及关闭方式。
+  - `docTaskProgress: false` 可在渠道或账号级关闭新上传，账号设置优先：显式账号级 `true` 会覆盖渠道级 `false`。已有显式 `false` 继续生效；关闭上传不影响文档任务执行或原评论线程回复，也不删除此前已存储的回执。
 
 ### Added
 
-* **docs:** report task progress and sanitized tool events ([#252](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/252)) ([2e710e9](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/2e710e903fa43ac9440723746f7395d2f7b4347e))
-
+- **文档评论中的 `@Bot` 任务可上报等待、模型执行、工具调用和终态，便于查看任务是否仍在运行**（PR #252）：此前原评论回复只提供最终结果，现在增加执行批次、工具步骤、耗时、退出状态及过滤后的输入输出预览；上传为尽力而为，终态上传总预算五秒。旧后端返回 HTTP 404 时停止该任务的上报，不阻断执行或评论回复；接口故障可能导致回执或明细不完整。
+  - `finished` 表示最终答复已送达，不能证明文档修改已落库；实际超时或取消记为 `unknown` / `interrupted`。答复已送达后的非中断错误、或可选 PPT revision 探测超时，不会把已送达的答复改记为失败。
 
 ### Fixed
 
-* **compat:** restore replies and prevent duplicate delivery on OpenClaw 2026.10 ([#261](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/261)) ([d887bd7](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/d887bd79dca97677bfd6f0315a7365b39e8c565e))
+- **OpenClaw 2026.10.2 上第一条入站消息在模型执行前被拒绝、Bot 不答复的问题得到修复**（#257, #258, PR #261）：账号启动时即注册会话绑定适配器，与旧宿主懒创建 manager 的路径共享所有权，停机或启动失败时释放。Agent 配置同时兼容新版 `agents.entries` 与旧版 `agents.list`；新版显式空 roster 不回落到旧列表。
+- **消息工具已成功答复原会话后，不再重复发送同一轮自动答复**（PR #261）：以实际投递回执核对目标、路由类型及账号，处理父群转子区和空间私聊；跨会话发送仍保留原会话的自动答复。裸 ID 不再因冷缓存被永久解释为私聊，空间会话保持隔离、投递使用真实用户或群地址。
+- **多个附件部分失败时，失败附件仍可补发，不会被当作已送达而丢失**（PR #261）：工具结果标为不完整，同时保留已成功的消息 ID、地址与 `failedMedia`，只重试失败附件。RichText 的文件及无尺寸图片若上传成功、发送失败，回执保留调用方原始地址，避免重试依赖可能过期的 CDN 地址；自动 final 恢复附件时可能重复此前已送达的文字说明，完整发送仍保留去重。
+- **自动回复的下载与上传能随超时或停机中止，不再无限等待**（PR #261）：取消信号贯穿响应体读取、签名请求、上传和媒体发送，拒绝的文件流及时关闭，迟到的文件打开错误得到处理。宿主未提供取消信号的工具上传有 300 秒上限；取消发生在远端上传成功之后可能留下无引用对象，当前没有删除接口可回滚。
+- **普通文件列表和搜索结果不会因跨字段拼接而整块丢失预览**（PR #252）：普通 JSON 文件列表与分开的 host/path 不再被拼成 URL 后隐藏；键与自身字符串值之间拆开的已知凭据仍会被过滤。预览处理限制访问节点、键和文本的总预算，保留 Unicode 规范化、凭证过滤及截断标识；过滤后的工具对象不回写原数据。
+- **无效上报配置和上报故障不会影响文档执行**（PR #252）：`docTaskProgress` 的非布尔值（包括 `null`）关闭上传并输出诊断，不记录配置原值。上报失败日志带执行批次 ID，每账号每分钟最多一条，HTTP 429 同样受此限制；重试遵守服务端退避提示，日志不记录上游响应正文或限流范围。
+
+### Changed
+
+- **文档评论任务在当前调度中完成，不再允许调用 `sessions_spawn` 或 `sessions_yield`**（PR #252）：宿主发起的子 Agent 续跑无法保留原评论的回复通道，因此在工具执行前拦截，且与是否开启进度上传无关。交互式 IM 的子 Agent 能力和插件自行管理的 PPT 单次续跑不受影响。
+
+### Compatibility
+
+- **本版是发布负责人指定的一次性版本编号例外**（PR #256）：按 `1.5.2` 纳入现有 `1.5` 发布序列，包含 PR #252 的新功能及 PR #261 的兼容性修复和上述行为变化，不代表 SemVer 的 patch 兼容性保证。`~1.5.1` 或仅接受 patch 的自动更新策略也可能纳入本版，升级须显式评估上传范围、IM 超时设置及部署顺序；后续版本仍遵守既有 feature/minor、breaking/major 规则。
+- 本版增加 Docs 回执接口及事件表迁移依赖，部署顺序为**后端先、插件后**。升级前须确认目标文档读者可以看到执行预览，或显式设置 `docTaskProgress: false`。
+- 最低宿主声明仍为 `>=2026.6.9`；PR #261 在 OpenClaw `2026.8.1`、`2026.9.9`、`2026.10.2` 上完成全量回归及本地 Gateway 验证。投递去重依赖宿主调用目标规范化和回执提取 hook，缺少这些能力的旧宿主仍可能重复答复。工具上传能否立即随 turn 取消也取决于宿主是否提供信号，不能只凭安装插件保证。
+- 相对 v1.5.1，增加现有 Agent hook 的进度观察、工具拦截，以及 Channel 投递回执协调和启动绑定注册。运行依赖、依赖锁定版本及 Node.js 要求未改变，仓库开发与发布检查仍锁定 OpenClaw `2026.8.1`；实际运行须满足所安装 OpenClaw 自身的 Node.js 要求。本版不包含尚未合并的依赖升级 PR #251、#245、#244，也不宣称修复安装问题 #259。
+
+### Internal
+
+- 新增随包文档 `docs/doc-task-content-policy.md`；打包检查同时核实入口文件、manifest、PPT 回执契约和预览策略均随包发布。
 
 ## [1.5.1](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.0...v1.5.1) (2026-10-08)
 

@@ -15,6 +15,14 @@ PR 的 commit message 用 [Conventional Commits](https://www.conventionalcommits
 
 **关键**：commit message 前缀直接决定下次发什么版本号，认真写。
 
+### 1.5.2 的一次性版本编号例外（PR #256）
+
+本次发布负责人明确指定使用 `1.5.2`，将 PR #252 与 PR #261 一起纳入现有 `1.5` 发布序列，覆盖 release-please 根据 `feat` 自动计算的 minor 版本。这是仅适用于本版的发布决策例外：允许该功能、兼容性修复及已披露的行为变化以 patch 编号发布，不改变上表对后续版本的规则。
+
+此例外**不表示本版符合 SemVer 的 patch 兼容性保证**。升级默认开启文档任务回执及工具预览上传，可见范围为目标文档全部读者，并要求配套后端接口与事件表迁移先部署；普通 IM 超时改为取消执行并丢弃迟到回复。`~1.5.1` 或只接受 patch 的自动更新策略可能纳入本版；运维须按 `CHANGELOG.md` 的升级说明显式评估，不能仅凭编号认定行为不变。不接受新上传范围的账号应在升级前设置 `docTaskProgress: false`，同时核对账号级覆盖，并检查显式 `dispatchTimeoutMs` 是否会提前终止正常回合。
+
+PR 正文及版本化发布说明必须保留该例外、数据可见范围、关闭方式和部署顺序；五处版本信息统一为 `1.5.2`。本例外不豁免 reviewer 审查或任何必需检查，也不授权绕过分支保护。
+
 ### ⚠️ commit message 里的括号必须在同一行闭合
 
 conventional-commits parser 解析整条 commit message（标题 **加 body**）。遇到 `(` 就等 `)`，
@@ -118,8 +126,9 @@ skill 会引导你：
 1. 拿仓库 CHANGELOG.md 里 X.Y.Z 那一段作为原料
 2. 翻译成用户语言：去 PR # / 文件路径 / 函数名 / 根因分析；保留"用户能感受到的"
 3. 按 `【修复】/【新增】/【优化】` 分组
-4. **先发测试环境**（`im-test.deepminer.com.cn`）看页面渲染 OK
-5. **再发线上**（`im.deepminer.com.cn`）
+4. **末尾必须加贡献者署名**：`@contributors: 名称1、名称2`。按本版本实际合入的 PR 作者及共同作者核实名单、去重；优先用已确认的署名，否则用公开 GitHub 用户名，不把审批人或机器人自动计入。
+5. **先发测试环境**（`im-test.deepminer.com.cn`）看页面渲染 OK，并确认贡献者署名已展示
+6. **再发线上**（`im.deepminer.com.cn`），读回确认文案与贡献者署名一致
 
 ⚠️ **entry 一旦 POST 不可撤回**（API 不支持 PUT/PATCH/DELETE，重发同 version 会创建副本不会覆盖）。发线上前必须 100% 确认文案，发错只能找运维直接改 DB。
 
