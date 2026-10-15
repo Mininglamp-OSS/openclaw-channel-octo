@@ -103,6 +103,7 @@ interface CardEntry {
   templateEditPromise?: Promise<boolean>;
   /** paused 卡的有界回收定时器。 */
   pausedExpiryTimer?: ReturnType<typeof setTimeout>;
+  pausedTerminal?: PausedTerminalIntent;
   /** 限流冷却期结束后把最新一帧发出去的一次性唤醒定时器;见 armCooldownWake。 */
   cooldownTimer?: ReturnType<typeof setTimeout>;
   /** Bounded fresh-frame retries after the short same-body Registry retries fail. */
@@ -128,6 +129,15 @@ interface CardEntry {
    */
   deliveredByTool?: boolean;
 }
+
+type PausedTerminalIntent = {
+  phase: "done" | "error" | "stopped";
+  errorText?: string;
+  generation: object;
+  attempt: number;
+  expiresAt: number;
+  work?: Promise<void>;
+};
 
 type ReleasedCardRun = { sessionKey: string; entry: CardEntry; generation: object };
 type CardProgressSharedState = {
@@ -517,6 +527,7 @@ function armCooldownWake(sessionKey: string, entry: CardEntry, delayMs: number):
 }
 
 function scheduleFlush(sessionKey: string, entry: CardEntry): void {
+  if (entry.pausedTerminal) return;
   entry.dirty = true;
   if (entry.flushTimer) return;
   entry.flushTimer = setTimeout(() => {
@@ -824,7 +835,16 @@ function isTrackedEntry(sessionKey: string, entry: CardEntry): boolean {
   return (cards.get(sessionKey) === entry || pausedCards.get(sessionKey) === entry) && !entry.skip;
 }
 
+function clearPausedTerminal(entry: CardEntry): void {
+  if (!entry.pausedTerminal) return;
+  entry.pausedTerminal = undefined;
+  if (entry.pausedExpiryTimer) clearTimeout(entry.pausedExpiryTimer);
+  entry.pausedExpiryTimer = undefined;
+  entry.stateEditAbort?.abort(new Error("paused terminal superseded"));
+}
+
 function releasePausedCard(sessionKey: string, entry: CardEntry, reason: string): void {
+  clearPausedTerminal(entry);
   clearCooldownTimer(entry);
   if (entry.pausedExpiryTimer) {
     clearTimeout(entry.pausedExpiryTimer);
@@ -842,9 +862,12 @@ function schedulePausedCardExpiry(sessionKey: string, entry: CardEntry): void {
   entry.pausedExpiryTimer = setTimeout(() => {
     entry.pausedExpiryTimer = undefined;
     if (pausedCards.get(sessionKey) !== entry || entry.skip) return;
+    const generation = entry.generation;
     void (async () => {
       await editTrackedCardState(sessionKey, entry, "expired");
-      releasePausedCard(sessionKey, entry, "ttl expired");
+      if (!entry.pausedTerminal && entry.generation === generation && entry.phase === "expired") {
+        releasePausedCard(sessionKey, entry, "ttl expired");
+      }
     })();
   }, PAUSED_CARD_TTL_MS);
 }
@@ -870,7 +893,7 @@ async function editTrackedCardState(
   sessionKey: string,
   entry: CardEntry,
   phase: CardProgressState["phase"],
-  opts: { transient?: boolean; errorText?: string; progressFrame?: boolean } = {},
+  opts: { transient?: boolean; errorText?: string; progressFrame?: boolean; terminalIntent?: PausedTerminalIntent } = {},
 ): Promise<boolean> {
   const previous = entry.stateEditPromise;
   const work = (async () => {
@@ -886,6 +909,9 @@ async function editTrackedCardState(
     }
     clearCooldownTimer(entry);
     if (!isTrackedEntry(sessionKey, entry) || !entry.messageId) return false;
+    if (opts.terminalIntent && (entry.pausedTerminal !== opts.terminalIntent ||
+        entry.generation !== opts.terminalIntent.generation || entry.dispatchFinalizing)) return false;
+    if (entry.pausedTerminal && !opts.terminalIntent) return false;
     if (opts.progressFrame && cooldownRemainingMs(entry.ctx.apiUrl) > 0) {
       entry.dirty = true;
       armCooldownWake(sessionKey, entry, cooldownRemainingMs(entry.ctx.apiUrl));
@@ -905,13 +931,14 @@ async function editTrackedCardState(
     const abort = new AbortController();
     entry.stateEditAbort = abort;
     try {
-      await editEntryProgress({
+      const edited = await editEntryProgress({
         sessionKey,
         entry,
         state,
         ...(opts.transient ? { transient: true } : {}),
         signal: AbortSignal.any([abort.signal, AbortSignal.timeout(EDIT_TIMEOUT_MS)]),
       });
+      if (!edited) return false;
       if (opts.progressFrame) entry.progressRetryCount = 0;
       dbg(`transitioned session=${sessionKey} phase=${phase}`);
       return true;
@@ -923,9 +950,9 @@ async function editTrackedCardState(
       const status = semanticHttpStatusFromApiError(err) ?? httpStatusFromApiFetchError(err);
       if (status !== undefined && status >= 400 && status < 500 && status !== 429 &&
           errorCodeFromApiError(err) !== "err.shared.internal") entry.skip = true;
-      if (opts.progressFrame && err instanceof OctoApiError && err.isRateLimited) {
+      if ((opts.progressFrame || opts.terminalIntent) && err instanceof OctoApiError && err.isRateLimited) {
         noteRateLimited(entry.ctx.apiUrl, err.retryAfterMs);
-        if (isTrackedEntry(sessionKey, entry)) {
+        if (opts.progressFrame && isTrackedEntry(sessionKey, entry)) {
           entry.dirty = true;
           armCooldownWake(sessionKey, entry, cooldownRemainingMs(entry.ctx.apiUrl));
         }
@@ -957,6 +984,83 @@ async function editTrackedCardState(
   }
 }
 
+// Terminal UI delivery has its own bounded recovery; it never changes the task's
+// execution budget. Keep the exact outcome through expiry instead of turning a
+// successfully completed task into "waiting timed out" after a Registry outage.
+function retryPausedTerminal(sessionKey: string, entry: CardEntry, intent: PausedTerminalIntent): Promise<void> {
+  if (intent.work) return intent.work;
+  const current = () => entry.pausedTerminal === intent && entry.generation === intent.generation &&
+    !entry.dispatchFinalizing && isTrackedEntry(sessionKey, entry);
+  if (!current()) return Promise.resolve();
+  if (entry.pausedExpiryTimer) clearTimeout(entry.pausedExpiryTimer);
+  entry.pausedExpiryTimer = undefined;
+  const cooldown = cooldownRemainingMs(entry.ctx.apiUrl);
+  if (intent.attempt > 0 && cooldown > 0) {
+    if (Date.now() >= intent.expiresAt) {
+      warn(`terminal card recovery expired during shared cooldown for session=${sessionKey}; last frame may be stale`);
+      releasePausedCard(sessionKey, entry, "terminal recovery expired during cooldown");
+      return Promise.resolve();
+    }
+    entry.pausedExpiryTimer = setTimeout(() => {
+      entry.pausedExpiryTimer = undefined;
+      void retryPausedTerminal(sessionKey, entry, intent);
+    }, Math.min(cooldown, intent.expiresAt - Date.now()));
+    return Promise.resolve();
+  }
+  intent.work = (async () => {
+    const edited = await editTrackedCardState(sessionKey, entry, intent.phase, {
+      errorText: intent.errorText, terminalIntent: intent,
+    });
+    if (entry.pausedTerminal !== intent || entry.generation !== intent.generation || entry.dispatchFinalizing) return;
+    if (edited || entry.skip) {
+      releasePausedCard(sessionKey, entry, edited ? `terminal ${intent.phase} delivered` : "terminal rejected");
+      return;
+    }
+    if (!current()) return;
+    if (Date.now() >= intent.expiresAt) {
+      warn(`terminal card recovery exhausted for session=${sessionKey}; last frame may be stale`);
+      releasePausedCard(sessionKey, entry, "terminal recovery expired");
+      return;
+    }
+    const retryDelay = [1_000, 3_000, 10_000][intent.attempt++];
+    const delay = retryDelay === undefined ? intent.expiresAt - Date.now()
+      : Math.min(intent.expiresAt - Date.now(), Math.max(retryDelay, cooldownRemainingMs(entry.ctx.apiUrl)) + Math.floor(Math.random() * 500));
+    entry.pausedExpiryTimer = setTimeout(() => {
+      entry.pausedExpiryTimer = undefined;
+      if (!current()) return;
+      void retryPausedTerminal(sessionKey, entry, intent);
+    }, delay);
+  })().finally(() => { intent.work = undefined; });
+  return intent.work;
+}
+
+function requestPausedTerminal(sessionKey: string, entry: CardEntry, phase: PausedTerminalIntent["phase"], errorText?: string): Promise<void> {
+  if (entry.dispatchFinalizing || entry.skip) return Promise.resolve();
+  const previous = entry.pausedTerminal;
+  if (previous?.generation === entry.generation && previous.phase === "stopped") phase = "stopped";
+  const failed = entry.lifecycleFailure?.generation === entry.generation;
+  if (failed && phase !== "stopped") { phase = "error"; errorText = entry.lifecycleFailure?.errorText ?? errorText; }
+  if (phase === "error") entry.lifecycleFailure = { generation: entry.generation, errorText };
+  let intent = entry.pausedTerminal;
+  if (intent?.generation === entry.generation && intent.phase === phase) {
+    // Duplicate lifecycle/finalizer notifications observe the same recovery;
+    // they cannot skip its delay or create more attempts after exhaustion.
+    if (intent.work) return intent.work;
+    if (entry.pausedExpiryTimer) return Promise.resolve();
+  }
+  if (!intent || intent.generation !== entry.generation || intent.phase !== phase) {
+    clearPausedTerminal(entry);
+    const sameGeneration = previous?.generation === entry.generation;
+    intent = { phase, errorText, generation: entry.generation,
+      attempt: sameGeneration ? previous.attempt : 0,
+      expiresAt: sameGeneration ? previous.expiresAt : Date.now() + PAUSED_CARD_TTL_MS };
+    entry.pausedTerminal = intent;
+  }
+  entry.dirty = false;
+  clearCooldownTimer(entry);
+  return retryPausedTerminal(sessionKey, entry, intent);
+}
+
 /**
  * lifecycle 驱动的 paused 卡收尾。这里**不看**投递证据,与 finalizeCard /
  * finalizeOrphanedPausedCard 有意不对称:`end` 分支已由 host 明确判定为 done,`error` 分支带着
@@ -972,18 +1076,16 @@ function finishPausedCard(
     entry.lifecycleFailure = { generation: entry.generation, errorText };
     entry.phase = "error";
   }
-  return (async () => {
-    await editTrackedCardState(sessionKey, entry, phase, errorText ? { errorText } : {});
-    if (!entry.dispatchFinalizing) releasePausedCard(sessionKey, entry, `continuation ${phase}`);
-  })();
+  return requestPausedTerminal(sessionKey, entry, phase, errorText);
 }
 
 /** sessions_yield 的 lifecycle 元数据在旧 host/Codex lane 可能缺失；成功工具结果作为兼容兜底。 */
 function markCardPaused(sessionKey: string, runId?: string, expectedEntry?: CardEntry): void {
   const entry = expectedEntry ?? cards.get(sessionKey) ?? pausedCards.get(sessionKey);
-  if (!entry || entry.skip) return;
+  if (!entry || entry.skip || entry.lifecycleFailure?.generation === entry.generation) return;
   if (runId && entry.runId &&
       entry.runId !== runId && entry.pausedFromRunId !== runId && entry.continuationRunId !== runId) return;
+  clearPausedTerminal(entry);
   const now = Date.now();
   endRunningThinking(entry, now);
   startSubagentWait(entry, now);
@@ -991,6 +1093,7 @@ function markCardPaused(sessionKey: string, runId?: string, expectedEntry?: Card
   entry.continuationRunId = undefined;
   entry.phase = "paused";
   if (cards.get(sessionKey) === entry) {
+    if (pausedCards.get(sessionKey) === entry) schedulePausedCardExpiry(sessionKey, entry);
     scheduleFlush(sessionKey, entry);
   } else {
     schedulePausedCardExpiry(sessionKey, entry);
@@ -1036,13 +1139,7 @@ async function finalizeOrphanedPausedCard(
   const phase = succeededOrDeliveredByTool({ deliveredByTool: owner.deliveredByTool }, opts)
     ? "done"
     : "error";
-  await editTrackedCardState(
-    sessionKey,
-    paused,
-    phase,
-    opts.errorText ? { errorText: opts.errorText } : {},
-  );
-  releasePausedCard(sessionKey, paused, `finalized orphaned paused card phase=${phase}`);
+  await requestPausedTerminal(sessionKey, paused, phase, opts.errorText);
   dbg(`finalized orphaned paused card session=${sessionKey} phase=${phase} run=${owner.runId}`);
 }
 
@@ -1157,6 +1254,12 @@ async function finalizeCardEntry(sessionKey: string, entry: CardEntry | undefine
   const retainForContinuation = !opts.failed && !opts.errorText &&
     entry.lifecycleFailure?.generation !== entry.generation &&
     (entry.phase === "paused" || entry.phase === "resuming");
+  if (entry.pausedTerminal && isTrackedEntry(sessionKey, entry)) {
+    const failure = entry.lifecycleFailure?.generation === entry.generation ? entry.lifecycleFailure : undefined;
+    const phase = entry.phase === "stopped" ? "stopped" : failure || entry.phase === "error" || !succeededOrDeliveredByTool(entry, opts) ? "error" : "done";
+    await requestPausedTerminal(sessionKey, entry, phase, failure?.errorText ?? opts.errorText);
+    return;
+  }
   // 只在 entry 仍是当前登记项时删除。finalize 是 fire-and-forget 且上面 await 了 in-flight
   // flush;await 期间 per-group 队列可能推进,同 sessionKey 的下一 run setCardContext 已把
   // Map 换成新 entry —— 那时删 key 会误删新 run 的状态,使其全程无卡。终态帧仍发本 run。
@@ -1173,6 +1276,7 @@ async function finalizeCardEntry(sessionKey: string, entry: CardEntry | undefine
   }
 
   if (!retainForContinuation) {
+    clearPausedTerminal(entry);
     entry.dispatchFinalizing = true;
     // Detach both ownership slots before waiting: queued resuming edits must
     // not re-open a terminal card, and an in-flight edit must finish first.
@@ -1260,6 +1364,7 @@ export function clearCard(sessionKey: string): void {
   const entry = cards.get(sessionKey);
   const paused = pausedCards.get(sessionKey);
   for (const tracked of new Set([entry, paused].filter((item): item is CardEntry => !!item))) {
+    clearPausedTerminal(tracked);
     if (tracked.flushTimer) clearTimeout(tracked.flushTimer);
     if (tracked.pausedExpiryTimer) clearTimeout(tracked.pausedExpiryTimer);
     clearCooldownTimer(tracked);
@@ -1276,6 +1381,7 @@ export function _resetCardProgressForTests(): void {
   // 去重集合是模块级的,不清会跨测试泄漏(第二个用例拿不到本该出现的 warn)。
   warnedTemplateSkips.clear();
   for (const e of new Set([...cards.values(), ...pausedCards.values(), ...[...releasedRuns.values()].map(r => r.entry)])) {
+    clearPausedTerminal(e);
     if (e.flushTimer) clearTimeout(e.flushTimer);
     if (e.pausedExpiryTimer) clearTimeout(e.pausedExpiryTimer);
     clearCooldownTimer(e);
@@ -1566,7 +1672,7 @@ function bindPausedContinuation(
 ): void {
   if (!sessionKey || !runId) return;
   const entry = pausedCards.get(sessionKey);
-  if (!entry || entry.skip || !entry.pausedFromRunId || runId === entry.pausedFromRunId) return;
+  if (!entry || entry.skip || entry.pausedTerminal || !entry.pausedFromRunId || runId === entry.pausedFromRunId) return;
   if (entry.continuationRunId) return;
   // New hosts project internal events outside the hook's prompt. Their typed
   // producer provenance is the correlation evidence; never infer ownership
@@ -1589,6 +1695,7 @@ function bindPausedContinuation(
   if (continuationOwner?.flushTimer) clearTimeout(continuationOwner.flushTimer);
   // An unrelated live inbound owns its own finalizer/generation. Never lend it
   // the retained card merely because both turns share a session key.
+  clearPausedTerminal(entry);
   entry.generation = continuationOwner?.generation ?? {};
   if (continuationOwner) entry.ctx = continuationOwner.ctx;
   entry.runId = runId;
@@ -1612,6 +1719,7 @@ function toolEntryForHook(sessionKey: string | undefined, ctx: unknown): CardEnt
 }
 
 function flushToolProgress(sessionKey: string, entry: CardEntry): void {
+  if (entry.pausedTerminal) return;
   entry.progressRetryCount = 0;
   if (cards.get(sessionKey) === entry) scheduleFlush(sessionKey, entry);
   else {

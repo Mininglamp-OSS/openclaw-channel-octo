@@ -903,6 +903,177 @@ describe("server-driven Registry reasoning progress", () => {
     expect(edits()).toHaveLength(before + 1);
   });
 
+  async function pausedTerminalFixture(mode: "lifecycle" | "agent_end" | "orphan", keepCurrent = false,
+    beforeResume?: (wire: ReturnType<typeof mockFetch>) => void) {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(mode !== "agent_end"); const sk = "terminal-recovery";
+    const first = { sessionKey: sk, runId: "first" };
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "first");
+    if (mode !== "orphan") handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, first);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, first);
+    await finalizeCard(sk, { success: true });
+    const continuation = { sessionKey: sk, runId: mode === "orphan" ? "first" : "second",
+      ...(mode !== "orphan" ? { inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child" } } : {}),
+    };
+    if (mode === "orphan") setCardContext(sk, context());
+    beforeResume?.(wire);
+    handlers.before_agent_run?.({}, continuation);
+    await vi.advanceTimersByTimeAsync(0);
+    if (mode !== "orphan" && !keepCurrent) {
+      setCardContext(sk, context()); handlers.before_agent_run?.({}, { sessionKey: sk, runId: "unrelated" });
+    }
+    const finish = (error = false) => mode === "orphan" ? finalizeCard(sk, { success: !error, failed: error })
+      : mode === "agent_end" ? handlers.agent_end?.({ success: !error, ...(error ? { error: "real failure" } : {}) }, continuation)
+      : handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "second", stream: "lifecycle", data: { phase: error ? "error" : "end", ...(error ? { error: "real failure" } : {}) } }, continuation);
+    const edits = () => wire.fetch.mock.calls.filter(([url]) => String(url).includes("/message/edit"));
+    return { wire, handlers, sk, continuation, finish, edits };
+  }
+
+  it.each(["lifecycle", "agent_end", "orphan"] as const)("recovers a failed %s terminal edit without another lifecycle event", async mode => {
+    const { wire, finish, edits } = await pausedTerminalFixture(mode);
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    expect(edits()).toHaveLength(before + 3);
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(edits()).toHaveLength(before + 4);
+    const bodies = edits().slice(before).map(([, init]) => JSON.parse(String(init.body)));
+    expect(bodies.at(-1).state).toBe("completed");
+    expect(bodies.at(-1).card_seq).toBeGreaterThan(bodies[0].card_seq);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(edits()).toHaveLength(before + 4);
+  });
+
+  it.each(["network", "timeout", "semantic-500", "error-result"])("recovers the exact terminal result after %s", async kind => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => {
+      if (kind === "network") throw new TypeError("fetch failed");
+      if (kind === "timeout") throw new DOMException("timeout", "TimeoutError");
+      if (kind === "semantic-500") return new Response(JSON.stringify({ error: { code: "err.shared.internal", http_status: 500 } }), { status: 400 });
+      return new Response("unavailable", { status: 503 });
+    });
+    const finishing = finish(kind === "error-result"); await vi.advanceTimersByTimeAsync(350); await finishing;
+    await vi.advanceTimersByTimeAsync(1600);
+    const body = JSON.parse(String(edits().at(-1)![1].body));
+    expect(body.state).toBe(kind === "error-result" ? "error" : "completed");
+  });
+
+  it("bounds terminal retries and preserves Done at the final expiry recovery", async () => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    const normal = wire.fetch.getMockImplementation()!;
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(60_000); await finishing;
+    expect(edits()).toHaveLength(before + 12);
+    await vi.advanceTimersByTimeAsync(60_000); expect(edits()).toHaveLength(before + 12);
+    wire.fetch.mockImplementation(normal);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(edits()).toHaveLength(before + 13);
+    expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("completed");
+  });
+
+  it.each(["clear", "identity", "yield", "error"])("cancels stale terminal recovery on %s", async change => {
+    const { wire, finish, edits, sk, handlers, continuation } = await pausedTerminalFixture("lifecycle");
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    if (change === "clear") clearCard(sk);
+    else if (change === "identity") setCardContext(sk, context({ botToken: "another-bot" }));
+    else if (change === "error") await finish(true);
+    else {
+      handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, continuation);
+      await vi.advanceTimersByTimeAsync(850);
+    }
+    const before = edits().length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before);
+    if (change === "error") expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("error");
+    if (change === "yield") expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("reasoning");
+  });
+
+  it("does not discard terminal recovery when the matching dispatch finalizer settles", async () => {
+    const { wire, finish, edits, sk } = await pausedTerminalFixture("lifecycle", true);
+    for (let i = 0; i < 6; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    const finalizing = finalizeCard(sk, { success: true }); await vi.advanceTimersByTimeAsync(350); await finalizing;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it("retries terminal 429 only after shared cooldown and keeps retries finite", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response(JSON.stringify({ error: {
+      code: "err.shared.rate.limited", http_status: 429, details: { retry_after: 1 },
+    } }), { status: 429, headers: { "Retry-After": "1", "Content-Type": "application/json" } }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(2100); await finishing;
+    expect(edits()).toHaveLength(before + 3);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(edits()).toHaveLength(before + 4);
+    expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("completed");
+  });
+
+  it("keeps a real error authoritative over subsequent success and yield events", async () => {
+    const { wire, finish, edits, handlers, continuation } = await pausedTerminalFixture("lifecycle");
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const failing = finish(true); await vi.advanceTimersByTimeAsync(350); await failing;
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, continuation);
+    await finish(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("error");
+  });
+
+  it("reclaims exhausted terminal recovery without claiming a waiting timeout", async () => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(3_601_000); await finishing;
+    expect(edits()).toHaveLength(before + 15);
+    expect(edits().slice(before).every(([, init]) => JSON.parse(String(init.body)).state === "completed")).toBe(true);
+    await vi.advanceTimersByTimeAsync(3_600_000); await finish();
+    expect(edits()).toHaveLength(before + 15);
+  });
+
+  it("duplicate terminal notifications cannot skip backoff or exceed the recovery budget", async () => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    const first = finish(); await vi.advanceTimersByTimeAsync(350); await first;
+    const before = edits().length;
+    for (let i = 0; i < 5; i++) await finish();
+    expect(edits()).toHaveLength(before);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const exhausted = edits().length;
+    for (let i = 0; i < 5; i++) await finish();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(exhausted);
+  });
+
+  it("a finalizer racing a pending resume edit retains terminal intent through expiry", async () => {
+    let release!: (value: Response) => void;
+    const { wire, finish, sk } = await pausedTerminalFixture("lifecycle", true, wire => {
+      wire.fetch.mockImplementationOnce(() => new Promise<Response>(resolve => { release = resolve; }));
+    });
+    const normal = wire.fetch.getMockImplementation()!;
+    const ending = finish();
+    const finalizing = finalizeCard(sk, { success: true });
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    release(new Response("", { status: 200 }));
+    await vi.advanceTimersByTimeAsync(60_000); await ending; await finalizing;
+    wire.fetch.mockImplementation(normal);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    const terminal = wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body;
+    expect(terminal?.state).toBe("completed");
+    expect(JSON.stringify(terminal)).not.toContain("Wait timed out");
+  });
+
+  it("does not retry deterministic terminal rejection", async () => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    wire.fetch.mockImplementationOnce(async () => new Response("denied", { status: 403 }));
+    const before = edits().length; await finish();
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(edits()).toHaveLength(before + 1);
+  });
+
   it("persists a running card on queue release and finishes only that card after a new turn starts", async () => {
     const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
     const handlers = makeApi();
