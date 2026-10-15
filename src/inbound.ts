@@ -160,6 +160,7 @@ export function _setDispatchAbortGraceForTests(ms: number | null): void {
 // Own context by the preallocated host runId, never by the latest session entry.
 type PendingInboundContext = { sessionKey: string; accountId: string; historyPrefix: string; memberListPrefix: string };
 const inboundContextStateKey = Symbol.for("openclaw.octo.inbound-context.v3");
+const hostRunIdMismatchWarningKey = Symbol.for("openclaw.octo.host-run-id-mismatch-warning.v1");
 const inboundContextRoot = process as unknown as Record<PropertyKey, unknown>;
 export const pendingInboundContext = (inboundContextRoot[inboundContextStateKey] ??=
   new WeakValueMap<string, PendingInboundContext>()) as WeakValueMap<string, PendingInboundContext>;
@@ -2497,6 +2498,13 @@ export async function handleInboundMessage(params: {
     : [];
   const memberListPrefix = isGroup ? buildMemberListPrefix(currentGroupMembers) : "";
   const dispatchRunId = randomUUID();
+  // This callback is scoped to this dispatch. Unlike an arbitrary session hook,
+  // it can prove a host replaced our ID without misdiagnosing a late older run.
+  const observeHostRunId = (actualRunId: string): void => {
+    if (actualRunId === dispatchRunId || inboundContextRoot[hostRunIdMismatchWarningKey] || !log?.warn) return;
+    inboundContextRoot[hostRunIdMismatchWarningKey] = true;
+    log.warn("octo: host did not preserve replyOptions.runId in onAgentRunStart; progress-card hooks and per-run prompt context remain fail-closed. Check the host's public runId contract. This diagnostic is emitted once per process.");
+  };
 
   // Record (accountId, sessionKey) so the before_prompt_build hook can
   // resolve persona identity from ctx.sessionKey (hook ctx does not expose
@@ -3548,6 +3556,7 @@ export async function handleInboundMessage(params: {
           ? {
               sourceReplyDeliveryMode: "automatic" as const,
               runId: dispatchRunId,
+              onAgentRunStart: observeHostRunId,
               onReasoningStream: captureReasoning,
               ...(dispatchAbortController
                 ? { abortSignal: dispatchAbortController.signal }
@@ -3555,6 +3564,7 @@ export async function handleInboundMessage(params: {
             }
           : {
               runId: dispatchRunId,
+              onAgentRunStart: observeHostRunId,
               onReasoningStream: captureReasoning,
               ...(dispatchAbortController
                 ? { abortSignal: dispatchAbortController.signal }
@@ -3652,6 +3662,15 @@ export async function handleInboundMessage(params: {
             }
             statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
             replySucceeded = true;
+            // A final attachment is a completed answer just like final text. Only
+            // this payload's explicit, successfully sent references can claim it;
+            // earlier tool media, empty finals and error broadcasts cannot.
+            if (kind === "final" && !isToolErrorBroadcastFinal(payload) &&
+                outboundMediaUrls.length > 0 && outboundMediaUrls.every(url => sentMediaUrls.has(url))) {
+              finalOutputDelivered = true;
+              userFacingFinalDelivered = true;
+              pendingToolWarningFinal = undefined;
+            }
             return;
           }
           if (!content) return;

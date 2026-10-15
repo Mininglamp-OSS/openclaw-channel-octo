@@ -1009,8 +1009,9 @@ function markCardPaused(sessionKey: string, runId?: string, expectedEntry?: Card
  *
  * **归属校验(fail-closed)**:paused 卡可能在等待期间与无关消息交错,绝不能被任意后续
  * dispatch 收尾。只有能证明本次收尾 run **就是**该 paused 流程的 run 才接管:
- *   - `owner.runId === paused.pausedFromRunId`:同一 run resume 后收尾(bare yield 主场景;
- *     resumed run 保留原 runId,与 handleCardLifecycleEvent 的 error/finish 归属判定一致)。
+ *   - `owner.runId === paused.pausedFromRunId`:仅限宿主确实保留同一 runId 的恢复。
+ *     普通新入站是新 run,不能仅因前一轮裸 yield 就推定它在续跑。旧宿主允许没有子任务
+ *     的 yield,但并不提供把下一条任意消息绑定为该流程续跑的证据。
  * 其余守卫:同 identity(防跨账号)、有 messageId、未 skip,且**不属于**仍在等子任务
  * (`childSessionKeys` 非空)或已被 continuation 认领(`continuationRunId` 已设)的 subagent-yield
  * 流程——后者仍由 lifecycle / agent_end 的 finishPausedCard 收尾,不能在这里抢先关闭。

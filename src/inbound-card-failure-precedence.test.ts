@@ -8,6 +8,9 @@
  * evidence cannot launder it into a green card while the user is being sent an
  * apology message.
  */
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleInboundMessage, _setDispatchTimeoutForTests } from "./inbound.js";
 import {
@@ -74,7 +77,8 @@ function collectCardHooks(): Record<string, (event: unknown, ctx: unknown) => un
   return handlers;
 }
 
-function installFetchStub(opts: { failPlainSend?: boolean } = {}) {
+function installFetchStub(opts: { failPlainSend?: boolean; failUpload?: boolean; failMediaSend?: boolean; onMediaSent?: () => void } = {}) {
+  const media: Array<Record<string, unknown>> = [];
   const edits: Array<Record<string, unknown>> = [];
   const texts: string[] = [];
   globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -83,6 +87,14 @@ function installFetchStub(opts: { failPlainSend?: boolean } = {}) {
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 
+    if (url.includes("/upload/presigned")) {
+      if (opts.failUpload) return json({ error: { code: "err.server.bot_api.denied" } }, 400);
+      return json({ uploadUrl: `${API}/put`, downloadUrl: `${API}/file`, contentType: "application/octet-stream" });
+    }
+    if (url === `${API}/put`) {
+      for await (const _chunk of init?.body as any) { /* consume the real file stream */ }
+      return new Response(null, { status: 200 });
+    }
     if (url.includes("/card/profile")) {
       return json({
         enabled: true,
@@ -128,13 +140,19 @@ function installFetchStub(opts: { failPlainSend?: boolean } = {}) {
     if (url.includes("/sendMessage")) {
       const payload = body.payload as { type?: number; content?: string } | undefined;
       if (payload?.type === 17) return json({ message_id: "progress-message", message_seq: 0 });
+      if (payload?.type === MessageType.Image || payload?.type === MessageType.File) {
+        if (opts.failMediaSend) return json({ error: { code: "err.server.bot_api.denied" } }, 400);
+        media.push(payload);
+        opts.onMediaSent?.();
+        return json({ message_id: "media-message", message_seq: 1 });
+      }
       if (opts.failPlainSend) return json({ error: { code: "err.server.bot_api.denied" } }, 400);
       texts.push(String(payload?.content ?? ""));
       return json({ message_id: "text-message", message_seq: 0 });
     }
     return json({});
   }) as typeof fetch;
-  return { edits, texts };
+  return { edits, texts, media };
 }
 
 /**
@@ -145,6 +163,7 @@ function installRuntime(
   hooks: Record<string, (event: unknown, ctx: unknown) => unknown>,
   mode: "onError" | "swallowed-final-send" | "success" | "media-failure" | "empty" | "tool-only" | "warning-rejection" | "block-rejection" = "onError",
   gate?: Promise<void>,
+  deliverScenario?: (args: any) => Promise<void>,
 ) {
   setOctoRuntime({
     config: { current: () => ({}) },
@@ -165,6 +184,7 @@ function installRuntime(
           hooks.after_tool_call({ toolName, toolCallId: "msg-1", result: {} }, hookCtx);
           await new Promise((resolve) => setTimeout(resolve, 850));
           if (gate) await gate;
+          if (deliverScenario) return deliverScenario(args);
           if (mode === "empty" || mode === "tool-only") return;
           if (mode === "block-rejection") {
             await args.dispatcherOptions.deliver({ text: "recovered final answer" }, { kind: "block" });
@@ -239,6 +259,55 @@ describe("inbound progress-card failure precedence", () => {
     expect(texts.some(t => t.includes("任务仍在运行"))).toBe(true);
     release(); await vi.advanceTimersByTimeAsync(1);
     expect(edits.at(-1)?.state).toBe(mode === "success" || mode === "tool-only" || mode === "block-rejection" ? "completed" : "error");
+  });
+
+  it.each([
+    "file-final", "image-final", "referenced-final", "tool-media", "warning-media",
+    "empty-final", "upload-failure", "send-failure", "partial-failure", "account-stop",
+  ] as const)("background media completion preserves failure precedence: %s", async scenario => {
+    const fixture = await mkdtemp(join(tmpdir(), "octo-final-media-"));
+    const file = join(fixture, scenario === "image-final" ? "result.png" : "result.txt");
+    await writeFile(file, scenario === "image-final"
+      ? Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64")
+      : "completed result");
+    vi.useFakeTimers(); _setDispatchTimeoutForTests(1000);
+    const stop = new AbortController();
+    const { edits, media } = installFetchStub({
+      failUpload: scenario === "upload-failure", failMediaSend: scenario === "send-failure",
+      onMediaSent: scenario === "account-stop" ? () => stop.abort() : undefined,
+    });
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let delivered!: () => void;
+    const deliverySettled = new Promise<void>(r => { delivered = r; });
+    installRuntime(collectCardHooks(), "empty", gate, async args => {
+      try {
+        if (scenario === "referenced-final" || scenario === "empty-final") {
+          await args.dispatcherOptions.deliver({ mediaUrl: file }, { kind: "tool" });
+        }
+        await args.dispatcherOptions.deliver(scenario === "empty-final" ? {} : {
+          mediaUrls: scenario === "partial-failure" ? [file, join(fixture, "missing.txt")] : [file],
+          ...(scenario === "warning-media" ? { isError: true } : {}),
+        }, { kind: scenario === "tool-media" ? "tool" : "final" });
+        throw new Error("post-delivery background rejection");
+      } finally { delivered(); }
+    });
+    try {
+      const running = expect(handleInboundMessage({ account: makeAccount(), message: makeMessage() as any,
+        botUid: BOT_UID, groupHistories: new Map(), lastBotReplySeqMap: new Map(), memberMap: new Map(),
+        uidToNameMap: new Map(), groupCacheTimestamps: new Map(), signal: stop.signal,
+      })).rejects.toThrow("dispatch timed out");
+      await vi.advanceTimersByTimeAsync(1001); await running;
+      expect(edits.at(-1)?.state).toBe("reasoning");
+      release(); await deliverySettled; await vi.advanceTimersByTimeAsync(1);
+      const success = ["file-final", "image-final", "referenced-final"].includes(scenario);
+      expect(edits.at(-1)?.state).toBe(success ? "completed" : "error");
+      expect(media).toHaveLength(["upload-failure", "send-failure"].includes(scenario) ? 0 : 1);
+      if (media.length) expect(media[0].type).toBe(scenario === "image-final" ? MessageType.Image : MessageType.File);
+    } finally {
+      release(); await deliverySettled;
+      await rm(fixture, { recursive: true, force: true });
+    }
   });
 
   it("keeps the card in the error state when the turn failed after a tool delivery", async () => {

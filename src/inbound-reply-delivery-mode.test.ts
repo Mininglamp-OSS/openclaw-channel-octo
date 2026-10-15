@@ -175,7 +175,7 @@ describe("#172 DM reply delivery mode", () => {
     expect(replyOptionsOf(dispatch)).toEqual({
       runId: expect.any(String),
       sourceReplyDeliveryMode: "automatic",
-      onReasoningStream: expect.any(Function),
+      onReasoningStream: expect.any(Function), onAgentRunStart: expect.any(Function),
       abortSignal: expect.any(AbortSignal),
     });
   });
@@ -184,14 +184,14 @@ describe("#172 DM reply delivery mode", () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { visibleReplies: "message_tool" } });
     await runDm();
-    expect(replyOptionsOf(dispatch)).toEqual({ runId: expect.any(String), onReasoningStream: expect.any(Function), abortSignal: expect.any(AbortSignal) });
+    expect(replyOptionsOf(dispatch)).toEqual({ runId: expect.any(String), onReasoningStream: expect.any(Function), onAgentRunStart: expect.any(Function), abortSignal: expect.any(AbortSignal) });
   });
 
   it("DM with explicit messages.visibleReplies=automatic → not injected, left to host ({})", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { visibleReplies: "automatic" } });
     await runDm();
-    expect(replyOptionsOf(dispatch)).toEqual({ runId: expect.any(String), onReasoningStream: expect.any(Function), abortSignal: expect.any(AbortSignal) });
+    expect(replyOptionsOf(dispatch)).toEqual({ runId: expect.any(String), onReasoningStream: expect.any(Function), onAgentRunStart: expect.any(Function), abortSignal: expect.any(AbortSignal) });
   });
 
   it("DM ignores groupChat.visibleReplies → still injects automatic (DM only reads messages.visibleReplies)", async () => {
@@ -205,7 +205,7 @@ describe("#172 DM reply delivery mode", () => {
     expect(replyOptionsOf(dispatch)).toEqual({
       runId: expect.any(String),
       sourceReplyDeliveryMode: "automatic",
-      onReasoningStream: expect.any(Function),
+      onReasoningStream: expect.any(Function), onAgentRunStart: expect.any(Function),
       abortSignal: expect.any(AbortSignal),
     });
   });
@@ -214,14 +214,14 @@ describe("#172 DM reply delivery mode", () => {
     installFetchStub();
     const { dispatch } = installRuntime({});
     await runGroup();
-    expect(replyOptionsOf(dispatch)).toEqual({ runId: expect.any(String), onReasoningStream: expect.any(Function), abortSignal: expect.any(AbortSignal) });
+    expect(replyOptionsOf(dispatch)).toEqual({ runId: expect.any(String), onReasoningStream: expect.any(Function), onAgentRunStart: expect.any(Function), abortSignal: expect.any(AbortSignal) });
   });
 
   it("group with groupChat.visibleReplies=message_tool → preserved, not overridden ({})", async () => {
     installFetchStub();
     const { dispatch } = installRuntime({ messages: { groupChat: { visibleReplies: "message_tool" } } });
     await runGroup();
-    expect(replyOptionsOf(dispatch)).toEqual({ runId: expect.any(String), onReasoningStream: expect.any(Function), abortSignal: expect.any(AbortSignal) });
+    expect(replyOptionsOf(dispatch)).toEqual({ runId: expect.any(String), onReasoningStream: expect.any(Function), onAgentRunStart: expect.any(Function), abortSignal: expect.any(AbortSignal) });
   });
 
   // Plugin delivery-callback regression (NOT evidence that automatic makes the

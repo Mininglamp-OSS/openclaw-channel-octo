@@ -997,6 +997,41 @@ describe("dispatch timeout guard (issue #75)", () => {
     },
   );
 
+  it("diagnoses a host runId mismatch once without confusing late dispatches or weakening ownership", async () => {
+    const key = Symbol.for("openclaw.octo.host-run-id-mismatch-warning.v1");
+    const shared = process as unknown as Record<PropertyKey, unknown>;
+    const previous = shared[key]; delete shared[key];
+    const warn = vi.fn();
+    const { dispatch } = installImmediateRuntime(); installFetchStub();
+    const seen: any[] = [];
+    dispatch.mockImplementation(async (args: any) => {
+      seen.push(args.replyOptions);
+      args.replyOptions.onAgentRunStart(args.replyOptions.runId);
+      // An old callback may arrive after the new dispatch started: it still
+      // validates against its own expected ID, never against the latest session.
+      if (seen.length > 1) seen[0].onAgentRunStart(seen[0].runId);
+      expect(warn).not.toHaveBeenCalled();
+      if (seen.length === 2) {
+        args.replyOptions.onAgentRunStart("foreign-host-id");
+        args.replyOptions.onAgentRunStart(undefined);
+        seen[0].onAgentRunStart("another-foreign-id");
+        expect(takePendingInboundContext(args.ctx.SessionKey, "foreign-host-id")).toBeUndefined();
+        expect(takePendingInboundContext(args.ctx.SessionKey, args.replyOptions.runId)).toBeDefined();
+      }
+      await args.dispatcherOptions.deliver({ text: "ok" }, { kind: "final" });
+    });
+    try {
+      await runInbound({ log: { warn } });
+      await runInbound({ log: { warn } });
+      expect(seen[0].runId).not.toBe(seen[1].runId);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn.mock.calls[0][0]).toContain("host did not preserve replyOptions.runId");
+      expect(warn.mock.calls[0][0]).not.toContain(seen[1].runId);
+    } finally {
+      if (previous === undefined) delete shared[key]; else shared[key] = previous;
+    }
+  });
+
   it("可信 route override 保持原始 sessionKey", async () => {
     const { dispatch } = installImmediateRuntime();
     installFetchStub();
