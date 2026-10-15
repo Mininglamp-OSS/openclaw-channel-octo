@@ -26,12 +26,13 @@ import { findAgentConfig } from "./agent-config-compat.js";
 import type { DocTaskTurnReport } from "./doc-mention-handler.js";
 import type { GroupMember, DocReplyIntent } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
+import { subscribeAccountAbort } from "./account-abort.js";
 import { normalizeAccountId } from "./account-id.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
 import {
   setCardContext,
-  finalizeCard,
+  createCardFinalizer,
   finalizeCardWithResponse,
   markCardAnswering,
   createCardReasoningRecorder,
@@ -2875,6 +2876,7 @@ export async function handleInboundMessage(params: {
     });
   }
   const recordReasoningForGeneration = createCardReasoningRecorder(route.sessionKey);
+  const cardFinalizer = createCardFinalizer(route.sessionKey);
 
   // --- IM 出站闸门 ---
   // 文档任务下所有 IM 出站一律不发。下面每个显式的 `if (docTask)` 守卫都保留 ——
@@ -3417,6 +3419,11 @@ export async function handleInboundMessage(params: {
   let taskInterrupted = false;
   let imQueueReleased = false;
   let backgroundImSettled = false;
+  let backgroundRejected = false;
+  const finishBackgroundCard = () => cardFinalizer.finish({
+    success: !accountSignal?.aborted && !deliveryErrorOccurred && !dispatchFailed && (replySucceeded || !backgroundRejected),
+    failed: accountSignal?.aborted || deliveryErrorOccurred || dispatchFailed || backgroundRejected,
+  });
   const timeoutError = new Error("octo: dispatch timed out (shared budget expired)");
   const stoppedError = new Error("octo: account stopped during dispatch");
   let removeStopListener: (() => void) | undefined;
@@ -3445,9 +3452,9 @@ export async function handleInboundMessage(params: {
         taskInterrupted = true;
         reject(stoppedError);
         dispatchAbortController?.abort(stoppedError);
+        if (imQueueReleased) void cardFinalizer.finish({ success: false, failed: true, errorText: "Account stopped" });
       };
-      accountSignal?.addEventListener("abort", onStop, { once: true });
-      removeStopListener = () => accountSignal?.removeEventListener("abort", onStop);
+      removeStopListener = subscribeAccountAbort(accountSignal, onStop);
       dispatchTimeoutHandle = setTimeout(() => {
         taskInterrupted = true;
         reject(timeoutError);
@@ -3588,6 +3595,7 @@ export async function handleInboundMessage(params: {
           if (kind !== "tool" && !imQueueReleased) markCardAnswering(route.sessionKey);
 
           if (kind === "tool") {
+            if (imQueueReleased) return; // Keep late answers, not stale progress narration.
             // 文档任务:工具进度不进评论区。IM 会话里逐条发是**功能**(用户看着 Bot
             // 干活),但评论区是文档的一部分 —— 实测一次改单元格产生 9 条评论
             // (读 SKILL.md、读 sheet.md、get、edit 吃 400、重读、edit 吃 412、
@@ -3677,6 +3685,8 @@ export async function handleInboundMessage(params: {
           // Timeout/stop owns its notice; cancellation must not emit a second apology.
           if (dispatchAbortController?.signal.aborted) return;
           if (imQueueReleased) {
+            deliveryErrorOccurred = true;
+            dispatchFailed = true;
             deliverBuffer.lastText = null;
             deliverBuffer.textSent = true;
             log?.error?.(`octo: background IM dispatch failed after queue release: ${String(err)}`);
@@ -3754,21 +3764,34 @@ export async function handleInboundMessage(params: {
     // so blocks arriving after this handler's finally can still be flushed, and
     // keep account-stop cancellation wired until that background dispatch ends.
     if (!docTask) {
-      void dispatchPromise.then(async () => {
+      void dispatchPromise.catch((err) => {
+        backgroundRejected = true;
+        if (imQueueReleased && !dispatchAbortController?.signal.aborted) {
+          log?.error?.(`octo: background IM completion failed: ${String(err)}`);
+        }
+        // Match foreground blocks-only rejection recovery (PR #152): a
+        // terminal rejection does not invalidate a buffered answer. onError
+        // explicitly clears invalid output; account stop still fences sends.
+      }).then(async () => {
         if (imQueueReleased && !dispatchAbortController?.signal.aborted
           && deliverBuffer.lastText && !deliverBuffer.textSent) {
           const content = deliverBuffer.lastText;
           deliverBuffer.lastText = null;
           deliverBuffer.textSent = true;
-          await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { intent: "output" });
+          const result = await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { intent: "output" });
+          replySucceeded ||= result.delivered;
         }
       }).catch((err) => {
+        deliveryErrorOccurred = true;
         if (imQueueReleased && !dispatchAbortController?.signal.aborted) {
           log?.error?.(`octo: background IM completion failed: ${String(err)}`);
         }
-      }).finally(() => {
+      }).finally(async () => {
         backgroundImSettled = true;
-        if (imQueueReleased) removeStopListener?.();
+        if (imQueueReleased) {
+          removeStopListener?.();
+          await finishBackgroundCard();
+        }
       });
     }
     await Promise.race([dispatchPromise, dispatchTimeoutPromise]);
@@ -3785,6 +3808,7 @@ export async function handleInboundMessage(params: {
     //
     if (err === timeoutError || err === stoppedError || accountSignal?.aborted) {
       imQueueReleased = !docTask && err === timeoutError && !accountSignal?.aborted;
+      if (imQueueReleased) void cardFinalizer.pending();
       taskInterrupted = true;
       // Emit the primary diagnostic before waiting for cooperative shutdown;
       // otherwise an abort-ignoring host makes the timeout itself invisible.
@@ -3816,9 +3840,11 @@ export async function handleInboundMessage(params: {
         }
       }
       clearInterval(typingInterval);
-      dispatchFailed = true;
-      deliverBuffer.lastText = null;
-      deliverBuffer.textSent = true;
+      dispatchFailed ||= !imQueueReleased;
+      if (!imQueueReleased) {
+        deliverBuffer.lastText = null;
+        deliverBuffer.textSent = true;
+      }
       // 和下面 dispatch-rejected 分支同一条守卫(见其注释):答复已经发出去了就别再
       // 追一句「处理超时，请稍后重试」—— 用户会同时看到正确答复和自相矛盾的失败提示。
       // 对文档任务还多一层代价:那句道歉会把一个已经落地的回合拖成「未完成」。
@@ -3842,7 +3868,9 @@ export async function handleInboundMessage(params: {
           // The apology call itself MUST be bounded — otherwise a sick Octo API
           // hangs this sendMessage too, defeating the whole timeout fix. See
           // DISPATCH_TIMEOUT_APOLOGY_MS above.
-          await sendUserFacingFallback("⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+          await sendUserFacingFallback(imQueueReleased
+            ? "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。"
+            : "⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
         } catch (sendErr) {
           log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
         }
@@ -3917,7 +3945,7 @@ export async function handleInboundMessage(params: {
     log?.debug?.(`octo: [dispatch-result] replySucceeded=${replySucceeded} bufferedText=${deliverBuffer.lastText?.length ?? 0} textSent=${deliverBuffer.textSent} userFacingFinalDelivered=${userFacingFinalDelivered} effectiveOBO=${effectiveOnBehalfOf ?? 'none'}`);
 
     // --- Final send: deliver buffered text if only blocks arrived (no final/tool) ---
-    if (deliverBuffer.lastText && !deliverBuffer.textSent) {
+    if ((!imQueueReleased || backgroundImSettled) && deliverBuffer.lastText && !deliverBuffer.textSent) {
       deliverBuffer.textSent = true;
       try {
         // Bounded signal so a sick Octo API can't strand the per-group queue
@@ -3950,7 +3978,7 @@ export async function handleInboundMessage(params: {
     // 也无警告。判据不再依赖「分类器在不在」这种版本代理,所以这里补一次真正的
     // flush —— 到这一步 dispatch 已经结束,还挂着 pending 就说明没人接管。
     // 同样先净化,理由见 sanitizeToolErrorNoticeText。
-    if (pendingToolWarningFinal && !userFacingFinalDelivered && !deliveryErrorOccurred) {
+    if (!imQueueReleased && pendingToolWarningFinal && !userFacingFinalDelivered && !deliveryErrorOccurred) {
       const pendingFinal = pendingToolWarningFinal;
       pendingToolWarningFinal = undefined;
       const noticeText = sanitizeToolErrorNoticeText(pendingFinal.text);
@@ -3979,7 +4007,8 @@ export async function handleInboundMessage(params: {
     clearInterval(typingInterval);
     // 波 B:收尾进度卡(终态帧 + 清理);fire-and-forget，不阻塞 dispatch 结束/会话释放。
     // finalizeCard 内部同步删 Map(立即释放关联),终态 edit 后台异步发送。
-    void finalizeCard(route.sessionKey, {
+    if (imQueueReleased && backgroundImSettled) void finishBackgroundCard();
+    if (!imQueueReleased) void cardFinalizer.finish({
       success: replySucceeded,
       ...(!replySucceeded && dispatchFailed ? { failed: true } : {}),
     });

@@ -8,18 +8,23 @@ import {
   clearCard,
   finalizeCard,
   markCardAnswering,
+  createCardFinalizer,
+  createCardReasoningRecorder,
   recordCardReasoning,
   registerCardProgress,
   setCardContext,
 } from "./card-progress.js";
 import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.js";
 
-type Hook = (event: Record<string, unknown>, ctx: { sessionKey: string; runId?: string }) => unknown;
+type Hook = (event: Record<string, unknown>, ctx: { sessionKey: string; runId?: string; inputProvenance?: unknown }) => unknown;
 
-function makeApi(): Record<string, Hook> {
+function makeApi(lifecycle = false): Record<string, Hook> {
   const handlers: Record<string, Hook> = {};
   registerCardProgress({
     on: (name: string, handler: Hook) => { handlers[name] = handler; },
+    ...(lifecycle ? { agent: { events: { registerAgentEventSubscription: (subscription: { id: string; handle: Hook }) => {
+      handlers[subscription.id] = subscription.handle;
+    } } } } : {}),
   } as never);
   return handlers;
 }
@@ -555,10 +560,13 @@ describe("server-driven Registry reasoning progress", () => {
     expect(wire.calls).toEqual([]);
   });
 
-  it("keeps one Registry card across yield and a trusted continuation", async () => {
+  it.each([
+    ["legacy prompt", false], ["legacy prompt", true],
+    ["subagent_announce", false], ["subagent_announce", true], ["subagent_settle", true],
+  ] as const)("keeps one Registry card across acknowledgment, yield and a trusted continuation: %s (lifecycle: %s)", async (source, lifecycle) => {
     const wire = mockFetch();
     global.fetch = wire.fetch as typeof fetch;
-    const handlers = makeApi();
+    const handlers = makeApi(lifecycle);
     setCardContext("continuation", context());
     await triggerFirstFrame(handlers, "continuation", "run-1");
     const firstContext = { sessionKey: "continuation", runId: "run-1" };
@@ -571,13 +579,29 @@ describe("server-driven Registry reasoning progress", () => {
     }, firstContext);
     handlers.before_tool_call?.({ toolName: "sessions_yield", toolCallId: "yield-1" }, firstContext);
     handlers.after_tool_call?.({ toolName: "sessions_yield", toolCallId: "yield-1" }, firstContext);
+    // The host delivers a waiting acknowledgment after yielding. It is not a
+    // completed answer and must not undo the pause before dispatch finalizes.
+    markCardAnswering("continuation");
     await vi.advanceTimersByTimeAsync(900);
-    await finalizeCard("continuation", { success: false });
+    await finalizeCard("continuation", { success: true });
+    const waitingEdits = wire.calls.filter((call) => call.url.includes("/message/edit"));
+    expect(waitingEdits.at(-1)?.body).toMatchObject({ state: "reasoning" });
+    expect(waitingEdits.at(-1)?.body?.transient).not.toBe(true);
+    expect(waitingEdits.some((call) => call.body?.state === "completed")).toBe(false);
 
     setCardContext("continuation", context());
-    const secondContext = { sessionKey: "continuation", runId: "run-2" };
-    handlers.before_agent_run?.({ prompt: completionPrompt("child-1") }, secondContext);
-    await handlers.agent_end?.({ runId: "run-2", success: true }, secondContext);
+    const secondContext = {
+      sessionKey: "continuation", runId: "run-2",
+      ...(source !== "legacy prompt" ? { inputProvenance: {
+        kind: "inter_session", sourceTool: source, sourceSessionKey: "child-1",
+      } } : {}),
+    };
+    handlers.before_agent_run?.({ prompt: source === "legacy prompt" ? completionPrompt("child-1") : "A runtime event arrived." }, secondContext);
+    if (lifecycle) {
+      await handlers["octo-card-progress-lifecycle"]?.({ ...secondContext, stream: "lifecycle", data: { phase: "end" } }, secondContext);
+    } else {
+      await handlers.agent_end?.({ runId: "run-2", success: true }, secondContext);
+    }
 
     const edits = wire.calls
       .filter((call) => call.url.includes("/message/edit"))
@@ -587,6 +611,171 @@ describe("server-driven Registry reasoning progress", () => {
       edits.map((_body, index) => index + 1),
     );
     expect(wire.calls.filter((call) => call.url.includes("/sendMessage"))).toHaveLength(1);
+  });
+
+  it.each([false, true])("keeps the original card through two consecutive spawn/yield cycles (lifecycle: %s)", async lifecycle => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(lifecycle);
+    setCardContext("repeat-yield", context());
+    await triggerFirstFrame(handlers, "repeat-yield", "r1");
+    for (let n = 1; n <= 2; n++) {
+      const ctx = { sessionKey: "repeat-yield", runId: `r${n}` };
+      handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { details: { status: "accepted", childSessionKey: `child${n}` } } }, ctx);
+      handlers.after_tool_call?.({ toolName: "sessions_yield", result: { details: { status: "yielded" } } }, ctx);
+      markCardAnswering(ctx.sessionKey);
+      await finalizeCard(ctx.sessionKey, { success: true });
+      await handlers.agent_end?.({ success: true }, ctx);
+      expect(wire.calls.some(c => c.body?.state === "completed")).toBe(false);
+      setCardContext(ctx.sessionKey, context());
+      handlers.before_agent_run?.({ prompt: "Runtime event" }, { sessionKey: ctx.sessionKey, runId: `r${n+1}`, inputProvenance: {
+        kind: "inter_session", sourceTool: "subagent_settle", sourceSessionKey: `child${n}`,
+      } });
+    }
+    const ctx = { sessionKey: "repeat-yield", runId: "r3" };
+    if (lifecycle) await handlers["octo-card-progress-lifecycle"]?.({ ...ctx, stream: "lifecycle", data: { phase: "end" } }, ctx);
+    else await handlers.agent_end?.({ success: true }, ctx);
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(1);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it.each(["on", "off"] as const)("continuation uses current reasoning visibility and rejects previous generation callbacks: %s", async reasoningVisibility => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "reasoning-generation";
+    setCardContext(sk, { ...context(), reasoningVisibility: "on" });
+    const oldRecorder = createCardReasoningRecorder(sk);
+    await triggerFirstFrame(handlers, sk, "r1");
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, { sessionKey: sk, runId: "r1" });
+    handlers.after_tool_call?.({ toolName: "sessions_yield" }, { sessionKey: sk, runId: "r1" });
+    await finalizeCard(sk, { success: true });
+    setCardContext(sk, { ...context(), reasoningVisibility });
+    const currentRecorder = createCardReasoningRecorder(sk);
+    handlers.before_agent_run?.({ prompt: "event" }, { sessionKey: sk, runId: "r2", inputProvenance: {
+      kind: "inter_session", sourceTool: "subagent_settle", sourceSessionKey: "child",
+    } });
+    currentRecorder("current reasoning"); oldRecorder("STALE_SECRET_REASONING");
+    await vi.advanceTimersByTimeAsync(900);
+    const rendered = JSON.stringify(wire.calls);
+    expect(rendered).not.toContain("STALE_SECRET_REASONING");
+    if (reasoningVisibility === "on") expect(rendered).toContain("current reasoning");
+    else expect(rendered).not.toContain("current reasoning");
+  });
+
+  it.each([["end", false], ["error", true]] as const)("orders in-flight lifecycle %s against dispatch success=%s without losing a failure", async (phase, success) => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "resume-failure-order";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "r1");
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, { sessionKey: sk, runId: "r1" });
+    handlers.after_tool_call?.({ toolName: "sessions_yield" }, { sessionKey: sk, runId: "r1" });
+    await finalizeCard(sk, { success: true });
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>(r => { release = r; }); const started = new Promise<void>(r => { entered = r; });
+    global.fetch = (async (...args: Parameters<typeof fetch>) => {
+      if (String(args[0]).includes("/message/edit")) { entered(); await gate; }
+      return wire.fetch(...args);
+    }) as typeof fetch;
+    setCardContext(sk, context()); const finalizer = createCardFinalizer(sk);
+    handlers.before_agent_run?.({ prompt: "Runtime event" }, { sessionKey: sk, runId: "r2", inputProvenance: {
+      kind: "inter_session", sourceTool: "subagent_settle", sourceSessionKey: "child",
+    } });
+    await started;
+    const lifecycleEnd = handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "r2", stream: "lifecycle", data: { phase, error: "actual lifecycle failure" } }, { sessionKey: sk, runId: "r2" });
+    const failing = finalizer.finish({ success, failed: !success });
+    release(); await failing; await lifecycleEnd;
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
+    await handlers.agent_end?.({ success: true }, { sessionKey: sk, runId: "r2" });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
+  });
+
+  it("does not retain a yielded card after a real delivery failure", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("yield-failure", context());
+    await triggerFirstFrame(handlers, "yield-failure");
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, { sessionKey: "yield-failure", runId: "run-1" });
+    markCardAnswering("yield-failure");
+    await finalizeCard("yield-failure", { success: false, failed: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
+  });
+
+  it("persists a running card on queue release and finishes only that card after a new turn starts", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("queue-release", context());
+    const finalizer = createCardFinalizer("queue-release");
+    await triggerFirstFrame(handlers, "queue-release", "old-run");
+    await finalizer.pending();
+    const waiting = wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body;
+    expect(waiting?.state).toBe("reasoning");
+    expect(waiting?.transient).not.toBe(true);
+    setCardContext("queue-release", context());
+    await triggerFirstFrame(handlers, "queue-release", "new-run");
+    await finalizer.finish({ success: true });
+    const done = wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body;
+    expect(done?.state).toBe("completed");
+    expect(done?.message_id).toBe(waiting?.message_id);
+    await finalizeCard("queue-release", { success: true });
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(2);
+  });
+
+  it.each(["nothing_pending", "deferred", "already_pending", "error"])("does not pause on a sessions_yield no-op result: %s", async status => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("no-yield", context());
+    await triggerFirstFrame(handlers, "no-yield");
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { details: { status } } }, { sessionKey: "no-yield", runId: "run-1" });
+    await finalizeCard("no-yield", { success: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it("uses lifecycle-only yield evidence, ignores stale ends and preserves a real continuation failure", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true);
+    const ctx = { sessionKey: "lifecycle-wait", runId: "run-1" };
+    const lifecycle = (runId: string, data: Record<string, unknown>) =>
+      handlers["octo-card-progress-lifecycle"]?.({ sessionKey: ctx.sessionKey, runId, stream: "lifecycle", data }, ctx);
+    setCardContext(ctx.sessionKey, context());
+    await triggerFirstFrame(handlers, ctx.sessionKey);
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { details: { status: "accepted", childSessionKey: "child-1" } } }, ctx);
+    await lifecycle("run-1", { phase: "end", yielded: true });
+    markCardAnswering(ctx.sessionKey);
+    await finalizeCard(ctx.sessionKey, { success: true });
+    await lifecycle("unrelated", { phase: "end" });
+    await lifecycle("run-1", { phase: "end" });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("reasoning");
+    const continuation = { sessionKey: ctx.sessionKey, runId: "run-2", inputProvenance: {
+      kind: "inter_session", sourceTool: "subagent_settle", sourceSessionKey: "child-1",
+    } };
+    handlers.before_agent_run?.({ prompt: "Runtime event" }, continuation);
+    await lifecycle("unrelated", { phase: "error", error: "unrelated failure" });
+    await lifecycle("run-2", { phase: "error", error: "continuation failed" });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
+    expect(wire.calls.some(c => c.body?.state === "completed")).toBe(false);
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(1);
+  });
+
+  it.each([
+    undefined,
+    { kind: "external_user", sourceTool: "subagent_announce", sourceSessionKey: "child-1" },
+    { kind: "inter_session", sourceTool: "sessions_send", sourceSessionKey: "child-1" },
+    { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "unrelated-child" },
+  ])("does not let unrelated provenance finish the waiting card: %j", async inputProvenance => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("protected-wait", context());
+    await triggerFirstFrame(handlers, "protected-wait");
+    const ctx = { sessionKey: "protected-wait", runId: "run-1" };
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { details: { status: "accepted", childSessionKey: "child-1" } } }, ctx);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { details: { status: "yielded" } } }, ctx);
+    await finalizeCard(ctx.sessionKey, { success: true });
+    setCardContext(ctx.sessionKey, context());
+    const other = { sessionKey: ctx.sessionKey, runId: "other-run", inputProvenance };
+    handlers.before_agent_run?.({ prompt: inputProvenance
+      ? completionPrompt("child-1") // Contradictory provenance must defeat the legacy fallback.
+      : 'sourceTool: subagent_announce, sourceSessionKey: child-1' }, other);
+    markCardAnswering(ctx.sessionKey);
+    await handlers.agent_end?.({ success: true }, other);
+    await finalizeCard(ctx.sessionKey, { success: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("reasoning");
   });
 
   it.each([true, false])("keeps IM card continuation independent of the completed document receipt (card first: %s)", async cardFirst => {

@@ -40,7 +40,7 @@ export type ResolvedOctoAccount = {
     docTaskProgress?: boolean; // Default on; false disables receipt and tool-preview uploads only.
     docTasks?: boolean;  // 文档评论 @Bot 任务(常驻事件轮询 + 出站改投评论区)。**默认开启**,布尔 false 关闭
     botTasks?: boolean;  // 通用服务端 Bot Task。**默认开启**,布尔 false 关闭
-    dispatchTimeoutMs?: number;  // Explicit dispatch-timeout override; unset = derive from agents.defaults.timeoutSeconds (issue #113)
+    dispatchTimeoutMs?: number;  // Explicit dispatch-timeout override; unset = follow host agent budget for ordinary IM; business deadlines are separate (issue #113)
   };
 };
 

@@ -16,7 +16,8 @@
  * Both are cheap to assert statically and expensive to find by hand, so they
  * are checked here against the openclaw actually installed.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, expectTypeOf } from "vitest";
+import type { PluginRuntime } from "openclaw/plugin-sdk/core";
 import { readdirSync, readFileSync, lstatSync, existsSync } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -75,6 +76,13 @@ function readCode(file: string): string {
 }
 
 describe("OpenClaw SDK surface", () => {
+  it("pins the host agent timeout resolver used by IM and fork dispatch", () => {
+    // Runtime feature detection remains necessary for custom/older hosts.
+    // Supported official SDK removal must fail the type-check, not silently
+    // turn every ordinary message into the unknown-host fallback.
+    expectTypeOf<PluginRuntime["agent"]["resolveAgentTimeoutMs"]>().returns.toBeNumber();
+  });
+
   it("imports openclaw only through subpaths the installed version actually exports", () => {
     const pkg = JSON.parse(
       readFileSync(join(repoRoot, "node_modules", "openclaw", "package.json"), "utf8"),

@@ -9,7 +9,7 @@
  * apology message.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleInboundMessage } from "./inbound.js";
+import { handleInboundMessage, _setDispatchTimeoutForTests } from "./inbound.js";
 import {
   registerCardProgress,
   _resetCardProgressForTests,
@@ -143,7 +143,8 @@ function installFetchStub(opts: { failPlainSend?: boolean } = {}) {
  */
 function installRuntime(
   hooks: Record<string, (event: unknown, ctx: unknown) => unknown>,
-  mode: "onError" | "swallowed-final-send" = "onError",
+  mode: "onError" | "swallowed-final-send" | "success" | "media-failure" = "onError",
+  gate?: Promise<void>,
 ) {
   setOctoRuntime({
     config: { current: () => ({}) },
@@ -162,6 +163,15 @@ function installRuntime(
           );
           hooks.after_tool_call({ toolName: "message", toolCallId: "msg-1", result: {} }, hookCtx);
           await new Promise((resolve) => setTimeout(resolve, 850));
+          if (gate) await gate;
+          if (mode === "media-failure") {
+            await args.dispatcherOptions.deliver({ mediaUrl: "/tmp/octo270-intentionally-missing-attachment.png" }, { kind: "final" });
+            return;
+          }
+          if (mode === "success") {
+            await args.dispatcherOptions.deliver({ text: "long task answer" }, { kind: "final" });
+            return;
+          }
           if (mode === "onError") {
             await args.dispatcherOptions.onError(new Error("upstream exploded"), { kind: "final" });
             return;
@@ -196,10 +206,29 @@ describe("inbound progress-card failure precedence", () => {
   });
 
   afterEach(() => {
+    _setDispatchTimeoutForTests(null);
+    vi.useRealTimers();
     globalThis.fetch = originalFetch;
     _clearOwnerRegistry();
     _resetCardProgressForTests();
     vi.restoreAllMocks();
+  });
+
+  it.each(["onError", "success", "media-failure"] as const)("queue recovery leaves the card running until background %s", async mode => {
+    vi.useFakeTimers(); _setDispatchTimeoutForTests(1000);
+    const { edits, texts } = installFetchStub(); const hooks = collectCardHooks();
+    let release!: () => void; const gate = new Promise<void>(r => { release = r; });
+    installRuntime(hooks, mode, gate);
+    const running = expect(handleInboundMessage({ account: makeAccount(), message: makeMessage() as any,
+      botUid: BOT_UID, groupHistories: new Map(), lastBotReplySeqMap: new Map(), memberMap: new Map(),
+      uidToNameMap: new Map(), groupCacheTimestamps: new Map(),
+    })).rejects.toThrow("dispatch timed out");
+    await vi.advanceTimersByTimeAsync(1001); await running;
+    expect(edits.at(-1)?.state).toBe("reasoning");
+    expect(edits.some(e => e.state === "error" || e.state === "completed")).toBe(false);
+    expect(texts.some(t => t.includes("任务仍在运行"))).toBe(true);
+    release(); await vi.advanceTimersByTimeAsync(1);
+    expect(edits.at(-1)?.state).toBe(mode === "success" ? "completed" : "error");
   });
 
   it("keeps the card in the error state when the turn failed after a tool delivery", async () => {

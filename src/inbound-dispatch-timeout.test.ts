@@ -234,7 +234,7 @@ function installImmediateRuntime(
 
 function pickTimeoutSends(sends: any[]) {
   return sends.filter(
-    (body) => typeof body?.payload?.content === "string" && body.payload.content.includes("处理超时"),
+    (body) => typeof body?.payload?.content === "string" && (body.payload.content.includes("处理超时") || body.payload.content.includes("已放行后续消息")),
   );
 }
 
@@ -300,6 +300,26 @@ afterEach(() => {
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
+  it("an unknown host budget releases the queue after 30 minutes without aborting the run", async () => {
+    _setDispatchTimeoutForTests(null); vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    let release!: () => void; let enter!: () => void; let signal!: AbortSignal;
+    const gate = new Promise<void>(r => { release = r; }); const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      signal = args.replyOptions.abortSignal; enter(); await gate;
+      await args.dispatcherOptions.deliver({ text: "eventual answer" }, { kind: "final" });
+    });
+    try {
+      const running = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(720_000);
+      expect(sends).toEqual([]); expect(signal.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_080_001); await running;
+      expect(signal.aborted).toBe(false);
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "eventual answer"]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
   it("uses the host resolver in the real handler: a healthy silent turn survives the former 11-minute cutoff", async () => {
     _setDispatchTimeoutForTests(null);
     vi.useFakeTimers();
@@ -350,7 +370,7 @@ describe("dispatch timeout guard (issue #75)", () => {
       controller.abort();
       await vi.advanceTimersByTimeAsync(1);
       expect(signal.aborted).toBe(true);
-      expect(sends.map(s => s.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。"]);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。"]);
     } finally { controller.abort(); vi.useRealTimers(); }
   });
 
@@ -386,7 +406,7 @@ describe("dispatch timeout guard (issue #75)", () => {
       expect(dispatchSettled).toBe(false);
       installImmediateRuntime({ text: "next turn works", kind: "final" });
       await runInbound();
-      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。", "next turn works"]);
+      expect(sends.map(send => send.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "next turn works"]);
     } finally { cancelUpload?.(); await dispatch.mock.results[0].value; }
   });
 
@@ -465,11 +485,11 @@ describe("dispatch timeout guard (issue #75)", () => {
       expect(signal.aborted).toBe(false);
       release();
       await dispatch.mock.results[0].value;
-      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。", "late answer under explicit deadline"]);
+      expect(sends.map(send => send.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "late answer under explicit deadline"]);
       installImmediateRuntime({ text: "next explicit-config turn works", kind: "final" }, { config: cfg });
       await runInbound({ account });
       expect(sends.map(send => send.payload?.content)).toEqual([
-        "⚠️ 处理超时，请稍后重试。", "late answer under explicit deadline", "next explicit-config turn works",
+        "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "late answer under explicit deadline", "next explicit-config turn works",
       ]);
     } finally { release(); vi.useRealTimers(); }
   });
@@ -501,11 +521,11 @@ describe("dispatch timeout guard (issue #75)", () => {
       expect(signal.aborted).toBe(false);
       release();
       await vi.advanceTimersByTimeAsync(1);
-      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。", "late answer"]);
+      expect(sends.map(send => send.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "late answer"]);
     } finally { release(); vi.useRealTimers(); }
   });
 
-  it("does not flush an incomplete late block after background delivery reports an error", async () => {
+  it.each([false, true])("does not flush an incomplete late block after background delivery reports an error (reject: %s)", async (reject) => {
     vi.useFakeTimers();
     const { dispatch } = installImmediateRuntime();
     const { sends } = installFetchStub();
@@ -517,14 +537,65 @@ describe("dispatch timeout guard (issue #75)", () => {
       enter(); await gate;
       await args.dispatcherOptions.deliver({ text: "incomplete output" }, { kind: "block" });
       await args.dispatcherOptions.onError(new Error("background delivery failed"), { kind: "final" });
+      if (reject) throw new Error("terminal rejection");
     });
     try {
       const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
       await entered;
       await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
       release(); await vi.advanceTimersByTimeAsync(1);
-      expect(sends.map(s => s.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。"]);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。"]);
     } finally { release(); vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("keeps pre-timeout buffered output until background settles (reject: %s)", async reject => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    let release!: () => void; let enter!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      await args.dispatcherOptions.deliver({ text: "buffer before timeout" }, { kind: "block" });
+      enter(); await gate;
+      await args.dispatcherOptions.deliver({ text: "stale progress" }, { kind: "tool" });
+      if (reject) throw new Error("terminal rejection");
+    });
+    try {
+      const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      expect(sends.map(s => s.payload?.content)).not.toContain("buffer before timeout");
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "buffer before timeout"]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+  it.each(["block", "final then block", "account stop"])("recovers a late answer on background rejection: %s", async (mode) => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    const controller = new AbortController();
+    let release!: () => void;
+    let enter!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      enter(); await gate;
+      if (mode === "final then block") {
+        await args.dispatcherOptions.deliver({ text: "late answer" }, { kind: "final" });
+      }
+      await args.dispatcherOptions.deliver({ text: "late answer" }, { kind: "block" });
+      if (mode === "account stop") controller.abort();
+      throw new Error("non_deliverable_terminal_turn");
+    });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered;
+      await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(s => s.payload?.content)).toEqual([
+        "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", ...(mode === "account stop" ? [] : ["late answer"]),
+      ]);
+    } finally { release(); controller.abort(); vi.useRealTimers(); }
   });
 
   it.each(["deadline", "account stop"])("PPT %s cancels the runtime before a late write or reply", async (reason) => {
@@ -1030,7 +1101,7 @@ describe("dispatch timeout guard (issue #75)", () => {
     const elapsed = Date.now() - start;
     expect(elapsed, "must settle within bound, not hang forever").toBeLessThan(2000);
 
-    const apology = sends.find((s) => s.content?.includes("处理超时"));
+    const apology = sends.find((s) => s.content?.includes("已放行后续消息"));
     expect(apology, "apology sendMessage must reach fetch").toBeDefined();
     expect(apology!.abortedBeforeResolve, "apology must be aborted by its own AbortSignal.timeout").toBe(true);
   });

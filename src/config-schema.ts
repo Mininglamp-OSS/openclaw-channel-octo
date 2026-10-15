@@ -78,7 +78,7 @@ export interface OctoConfig {
   botTasks?: boolean;  // Top-level default for generic Bot Tasks
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret (see OctoAccountConfig)
-  dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms); see OctoAccountConfig
+  dispatchTimeoutMs?: number;  // Explicit queue wait override for IM (ms), not an execution deadline; see OctoAccountConfig
   commands?: OctoCommandsConfig;  // Per-command config (e.g. commands.fork.scope); v1 reads defaults only
   accounts?: Record<string, OctoAccountConfig | undefined>;
 }
@@ -94,11 +94,11 @@ export const SECRETS_FILE_ROOT_DESCRIPTION =
   "Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.entries[agentId].workspace on keyed-roster hosts or agents.list[].workspace on legacy hosts, else agents.defaults.workspace). If neither resolves to a usable directory, write-secret is unavailable (fail-closed); there is no process working-directory fallback.";
 
 // Shared description for dispatchTimeoutMs, kept identical to the wording in
-// openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
+// openclaw.plugin.json (manifest-schema-sync.test.ts asserts description sync).
 // Ordinary IM restores queue-only recovery (#83/#114/#269). The host owns the
 // execution budget; document/business deadlines remain separate.
 export const DISPATCH_TIMEOUT_MS_DESCRIPTION =
-  "Per-inbound queue wait limit in milliseconds. Ordinary IM expiry releases the per-group queue without cancelling the agent; late replies remain allowed. When unset, uses the host agent timeout resolver plus 60000ms, capped at Node's timer limit. On hosts without that API, an explicit agents.defaults.timeoutSeconds is used; unknown or unlimited timeouts use the timer-safe ceiling with no guessed default. Account shutdown still cancels active IM dispatches. Document and business tasks retain their task-specific deadline and cancellation policies.";
+  "Per-inbound queue wait limit in milliseconds. Ordinary IM expiry releases the per-group queue without cancelling the agent; late replies remain allowed. When unset, uses the host agent timeout resolver plus 60000ms, capped at Node's timer limit. On hosts without that API, an explicit agents.defaults.timeoutSeconds is used; unknown or unlimited timeouts release the queue after 30 minutes without imposing an execution deadline. Account shutdown still cancels active IM dispatches. Document and business tasks retain their task-specific deadline and cancellation policies.";
 
 export const EVENT_WAIT_SECONDS_DESCRIPTION =
   "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";
@@ -116,7 +116,7 @@ export const BOT_TASKS_DESCRIPTION =
   "Generic server-issued Bot Tasks: runs the supplied business prompt in an isolated agent turn and requires business output through octo-cli. Enabled by default; set false to disable generic task execution. Set both botTasks and docTasks to false when the account should not run background tasks.";
 
 // Shared description for docsApiUrl, kept identical to the wording in
-// openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
+// openclaw.plugin.json (manifest-schema-sync.test.ts asserts description sync).
 //
 // Why this knob exists: the docs domain (`/v1/bot/docs/**`, which is where doc
 // task replies are POSTed) is a **separate service** from the IM server that
@@ -150,7 +150,7 @@ export const DOCS_API_URL_DESCRIPTION =
 
 
 // Shared description for commands.fork.scope, kept identical to the wording in
-// openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
+// openclaw.plugin.json (manifest-schema-sync.test.ts asserts description sync).
 export const FORK_SCOPE_DESCRIPTION =
   "Authorization scope for the /fork command. v1 honors only the default (owner-mentioned); wiring inbound to read a configured value is a v1.1 TODO. The enum accepts all four values so a future config does not fail validation today.";
 

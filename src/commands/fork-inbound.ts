@@ -26,7 +26,7 @@ import type { ReplyPayload, ReplyDispatchKind } from "openclaw/plugin-sdk/reply-
 import { sendMessage } from "../api-fetch.js";
 import type { ResolvedOctoAccount } from "../accounts.js";
 import { CHANNEL_ID } from "../constants.js";
-import { resolveDispatchTimeoutMs } from "../inbound.js";
+import { resolveImDispatchTimeoutMs } from "../im-dispatch-timeout.js";
 import { convertStructuredMentions, parseStructuredMentions } from "../mention-utils.js";
 import { getOctoRuntime } from "../runtime.js";
 import { ChannelType, type MentionEntity } from "../types.js";
@@ -144,9 +144,9 @@ export async function dispatchForkSeedReply(params: {
   // onError). This seed is awaited synchronously inside the parent group's
   // enqueueInbound serial queue, so a bare await would lock that queue until the
   // gateway restarts. Race against the same per-inbound timeout as the normal
-  // path (inbound.ts:2636) and rethrow on timeout so spawnChildBoundSession
+  // ordinary-IM path and rethrow on timeout so spawnChildBoundSession
   // surfaces seedFailed and the parent queue can advance.
-  const dispatchTimeoutMs = resolveDispatchTimeoutMs(config, account);
+  const dispatchTimeoutMs = resolveImDispatchTimeoutMs(config, account.config.dispatchTimeoutMs, core, (message) => log?.warn?.(message));
   let dispatchTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const timeoutError = new Error(`octo: [fork-seed] dispatch timed out after ${dispatchTimeoutMs}ms`);
   const dispatchTimeoutPromise = new Promise<never>((_, reject) => {

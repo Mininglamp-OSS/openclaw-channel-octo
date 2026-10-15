@@ -3,7 +3,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // Mock the runtime + octo Bot API so we can drive dispatchForkSeedReply's deliver
 // state machine and assert the fork-trigger invariant (SessionKey comes from the
 // CHILD route, not the seed ctx) without a live runtime.
-const { mockResolveAgentRoute, mockFinalize, mockDispatch, mockSendMessage } = vi.hoisted(() => ({
+const { mockResolveAgentRoute, mockFinalize, mockDispatch, mockSendMessage, mockTimeout } = vi.hoisted(() => ({
+  mockTimeout: vi.fn(() => 600_000),
   mockResolveAgentRoute: vi.fn(),
   mockFinalize: vi.fn((ctx: unknown) => ctx),
   mockDispatch: vi.fn(),
@@ -12,6 +13,7 @@ const { mockResolveAgentRoute, mockFinalize, mockDispatch, mockSendMessage } = v
 
 vi.mock("../runtime.js", () => ({
   getOctoRuntime: () => ({
+    agent: { resolveAgentTimeoutMs: mockTimeout },
     channel: {
       routing: { resolveAgentRoute: mockResolveAgentRoute },
       reply: {
@@ -87,6 +89,7 @@ const run = (seedOverrides: Partial<ForkSeedContext> = {}) =>
 describe("dispatchForkSeedReply", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockTimeout.mockReturnValue(600_000);
     mockResolveAgentRoute.mockReturnValue({ sessionKey: "octo:acct1:group123____abc", accountId: "acct1" });
     mockFinalize.mockImplementation((ctx: unknown) => ctx);
     mockDispatch.mockResolvedValue(undefined);
@@ -222,8 +225,22 @@ describe("dispatchForkSeedReply", () => {
     expect(arg.mentionEntities && arg.mentionEntities.length).toBeGreaterThan(0);
   });
 
+  it.each([172_800_000, 0])("fork seed follows the host budget %i beyond the old 11-minute limit", async budget => {
+    vi.useFakeTimers();
+    mockTimeout.mockReturnValue(budget);
+    let release!: () => void;
+    mockDispatch.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    try {
+      const running = run();
+      await vi.advanceTimersByTimeAsync(720_000);
+      expect(mockTimeout).toHaveBeenCalledWith({ cfg: {} });
+      release();
+      await running;
+    } finally { vi.useRealTimers(); }
+  });
+
   it("TIMEOUT GUARD (issue #75): a hung dispatcher times out and rejects, never hangs forever", async () => {
-    _setDispatchTimeoutForTests(50);
+    mockTimeout.mockReturnValue(600_000);
     mockDispatch.mockImplementation(() => new Promise<void>(() => {})); // never settles
     const warn = vi.fn();
     await expect(
@@ -231,7 +248,7 @@ describe("dispatchForkSeedReply", () => {
         seedCtx: makeSeedCtx(),
         childChannelId: "group123____abc",
         accountId: "acct1",
-        account: { config: {} } as never,
+        account: { config: { dispatchTimeoutMs: 50 } } as never,
         apiUrl: "https://api.test",
         botToken: "bf_tok",
         config: {} as never,
