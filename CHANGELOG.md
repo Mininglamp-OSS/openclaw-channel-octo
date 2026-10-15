@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.3](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.2...v1.5.3) (2026-10-15)
+
+### Fixed
+
+- **机器人已成功回复，Reasoning 进度卡仍误显示 Failed 的问题得到修复**（#264, PR #263）：Agent 通过 `message` 工具回复当前会话并省略 `target` 时，宿主会自动补全目标；原先的进度卡只认工具调用前的显式目标，遗漏已成功投递的答复。
+  - 以实际 Octo 回执核对完整发送结果、目标地址、会话类型及账号；账号比较沿用统一的小写归一化，兼容历史上含大写字母的 Bot 账号。支持嵌套 `tool_call → message` 的内层发送回执，且不额外重发正文。
+  - 仅接受本轮运行内成对的工具调用与结果。失败或不完整的发送、其他会话或账号的回执、迟到或重复的错误回调，以及真实 dispatch 失败，仍不能作为成功完成的证据。
+  - 没有结构化回执的旧宿主保留原来的显式目标兼容路径；已有结构化回执但尚未确认交付的排队结果，不回退为“已完成”。
+  - 本次修复只调整卡片完成状态的判定。卡片首帧仍按既有工具事件和刷新节流创建，群聊回复方式仍遵循现有配置；简单问答是否出卡及卡片与正文的显示先后未作调整。
+
 ## [1.5.2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.1...v1.5.2) (2026-10-14)
 
 ### ⚠ BREAKING CHANGES
