@@ -17,6 +17,11 @@ import type { ResolvedOctoAccount } from "./accounts.js";
 import { createBotTaskHandler } from "./bot-task-handler.js";
 import type { BotTaskStateStore } from "./bot-task-store.js";
 import { botTaskDedupeKey } from "./bot-task.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { getEventListeners } from "node:events";
+import { _resetCardProgressForTests } from "./card-progress.js";
+import { subscribeAccountAbort } from "./account-abort.js";
 
 /**
  * Regression tests for issue #75 — upstream
@@ -262,6 +267,123 @@ function runInbound(opts: {
     signal: opts.signal,
   });
 }
+
+it("GC lifecycle: reclaims abandoned released dispatches but preserves live late delivery and cancellation", async () => {
+  if (!globalThis.gc) {
+    // Exercise the real handler in a separate V8 process; no fake WeakRef/GC.
+    await promisify(execFile)(process.execPath, ["node_modules/vitest/vitest.mjs", "run",
+      "src/inbound-dispatch-timeout.test.ts", "--execArgv=--expose-gc", "-t", "GC lifecycle:"],
+    { cwd: process.cwd(), timeout: 90_000, maxBuffer: 2 * 1024 * 1024 });
+    return;
+  }
+  const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+  const collect = async () => {
+    for (let i = 0; i < 12; i++) { await tick(); globalThis.gc!(); await tick(); }
+  };
+  const { dispatch } = installImmediateRuntime();
+  const { sends } = installFetchStub();
+  const account = new AbortController();
+  const state = (process as any)[Symbol.for("openclaw.octo.card-progress-state.v2")];
+  pendingInboundContext.clear(); _resetCardProgressForTests();
+  _setDispatchTimeoutForTests(10);
+  _setDispatchApologyTimeoutForTests(25);
+  let liveArgs: any;
+  const discardMockReferences = () => { dispatch.mockClear(); vi.mocked(globalThis.fetch).mockClear(); };
+  try {
+    dispatch.mockImplementation(() => new Promise(() => {}));
+    for (let i = 0; i < 4; i++) {
+      await expect(runInbound({ signal: account.signal })).rejects.toThrow("dispatch timed out");
+      discardMockReferences();
+    }
+    await collect();
+    expect(pendingInboundContext.size).toBe(0);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(state.cards.size).toBe(0);
+    expect(getEventListeners(account.signal, "abort")).toHaveLength(0);
+
+    // Host still owns only its callbacks, with no Promise/resolver reference.
+    dispatch.mockImplementation(args => { liveArgs = args; return new Promise(() => {}); });
+    await expect(runInbound({ signal: account.signal })).rejects.toThrow("dispatch timed out");
+    discardMockReferences();
+    await collect();
+    expect(pendingInboundContext.get(liveArgs.replyOptions.runId)?.memberListPrefix).toContain("Alice");
+    expect(state.releasedRuns.size).toBe(1);
+    expect(getEventListeners(account.signal, "abort")).toHaveLength(1);
+    await liveArgs.dispatcherOptions.deliver({ text: "live result after GC" }, { kind: "final" });
+    expect(sends.some(s => s.payload?.content === "live result after GC")).toBe(true);
+    account.abort();
+    expect(liveArgs.replyOptions.abortSignal.aborted).toBe(true);
+    await liveArgs.dispatcherOptions.deliver({ text: "must not send after stop" }, { kind: "final" });
+    expect(sends.some(s => s.payload?.content === "must not send after stop")).toBe(false);
+    await tick(); await tick();
+    expect(pendingInboundContext.size).toBe(0);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(getEventListeners(account.signal, "abort")).toHaveLength(0);
+    liveArgs = undefined;
+
+    // A host may retain just its native operation's run signal, not JS callbacks.
+    const signalAccount = new AbortController();
+    let signalOnly: AbortSignal | undefined;
+    dispatch.mockImplementation(args => {
+      signalOnly = args.replyOptions.abortSignal;
+      return new Promise(() => {});
+    });
+    await expect(runInbound({ signal: signalAccount.signal })).rejects.toThrow("dispatch timed out");
+    discardMockReferences(); await collect();
+    expect(signalOnly?.aborted).toBe(false);
+    expect(pendingInboundContext.size).toBe(1);
+    expect(state.releasedRuns.size).toBe(1);
+    signalAccount.abort();
+    expect(signalOnly?.aborted).toBe(true);
+    await tick(); await tick();
+    expect(pendingInboundContext.size).toBe(0);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(getEventListeners(signalAccount.signal, "abort")).toHaveLength(0);
+    signalOnly = undefined;
+
+    // A still-owned pending Promise is live work, even when it emits no events.
+    const promiseAccount = new AbortController();
+    let hostPromise: Promise<unknown> | undefined;
+    dispatch.mockImplementation(() => { hostPromise = new Promise(() => {}); return hostPromise; });
+    await expect(runInbound({ signal: promiseAccount.signal })).rejects.toThrow("dispatch timed out");
+    discardMockReferences(); await collect();
+    expect(hostPromise).toBeInstanceOf(Promise);
+    expect(pendingInboundContext.size).toBe(1);
+    expect(state.releasedRuns.size).toBe(1);
+    hostPromise = undefined; await collect();
+    expect(pendingInboundContext.size).toBe(0);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(state.cards.size).toBe(0);
+    expect(getEventListeners(promiseAccount.signal, "abort")).toHaveLength(0);
+
+    const { WeakValueMap } = await import("./weak-value-map.js");
+    const collectedKeys: string[] = [];
+    const index = new WeakValueMap<string, object>(key => collectedKeys.push(key));
+    (() => index.set("reused", {}))();
+    const replacement = {};
+    index.set("reused", replacement);
+    await collect();
+    expect(index.get("reused")).toBe(replacement);
+    expect(collectedKeys).toEqual([]);
+    (() => index.set("abandoned", {}))();
+    await collect();
+    expect(index.size).toBe(1);
+    expect(collectedKeys).toEqual(["abandoned"]);
+
+    const bulkAccount = new AbortController();
+    for (let i = 0; i < 2000; i++) {
+      const run = new AbortController();
+      subscribeAccountAbort(bulkAccount.signal, () => run.abort(), run.signal);
+    }
+    await collect();
+    expect(getEventListeners(bulkAccount.signal, "abort")).toHaveLength(0);
+  } finally {
+    account.abort(); liveArgs = undefined;
+    _resetCardProgressForTests(); pendingInboundContext.clear();
+    _setDispatchTimeoutForTests(null); _setDispatchApologyTimeoutForTests(null);
+    globalThis.fetch = originalFetch;
+  }
+}, 100_000);
 
 function createInboundBackedBotTaskDispatch(
   log: any,

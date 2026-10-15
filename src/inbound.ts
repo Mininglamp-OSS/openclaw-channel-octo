@@ -27,6 +27,7 @@ import type { DocTaskTurnReport } from "./doc-mention-handler.js";
 import type { GroupMember, DocReplyIntent } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
 import { subscribeAccountAbort } from "./account-abort.js";
+import { WeakValueMap } from "./weak-value-map.js";
 import { normalizeAccountId } from "./account-id.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
@@ -158,10 +159,10 @@ export function _setDispatchAbortGraceForTests(ms: number | null): void {
 // A released dispatch may reach prompt assembly after a newer turn has started.
 // Own context by the preallocated host runId, never by the latest session entry.
 type PendingInboundContext = { sessionKey: string; accountId: string; historyPrefix: string; memberListPrefix: string };
-const inboundContextStateKey = Symbol.for("openclaw.octo.inbound-context.v2");
+const inboundContextStateKey = Symbol.for("openclaw.octo.inbound-context.v3");
 const inboundContextRoot = process as unknown as Record<PropertyKey, unknown>;
 export const pendingInboundContext = (inboundContextRoot[inboundContextStateKey] ??=
-  new Map<string, PendingInboundContext>()) as Map<string, PendingInboundContext>;
+  new WeakValueMap<string, PendingInboundContext>()) as WeakValueMap<string, PendingInboundContext>;
 
 /** Missing/mismatched run IDs fail closed, without consuming another turn's data. */
 export function takePendingInboundContext(sessionKey: string, runId: string | undefined) {
@@ -169,7 +170,12 @@ export function takePendingInboundContext(sessionKey: string, runId: string | un
   const pending = pendingInboundContext.get(runId);
   if (pending?.sessionKey !== sessionKey) return undefined;
   pendingInboundContext.delete(runId);
-  return pending;
+  const consumed = { ...pending };
+  // The execution still owns the slot until settlement, but no longer needs
+  // potentially large history/member prefixes after the hook consumes them.
+  pending.historyPrefix = "";
+  pending.memberListPrefix = "";
+  return consumed;
 }
 
 // Per-(account, session) registry. The before_prompt_build hook receives
@@ -3475,6 +3481,18 @@ export async function handleInboundMessage(params: {
   let runtimeHandedOff = false;
   let dispatchTimeoutPromise: Promise<never> | undefined;
   let dispatchPromise: Promise<unknown> | undefined;
+  // The host's dispatch/settlement callbacks own this data, not the global index.
+  // Keep the exact object alive until settlement even if prompt assembly is late.
+  const pendingPromptContext = historyPrefix || memberListPrefix
+    ? { sessionKey: route.sessionKey, accountId: account.accountId, historyPrefix, memberListPrefix }
+    : undefined;
+  const clearPendingPromptContext = () => {
+    if (pendingInboundContext.get(dispatchRunId) === pendingPromptContext) pendingInboundContext.delete(dispatchRunId);
+    if (pendingPromptContext) {
+      pendingPromptContext.historyPrefix = "";
+      pendingPromptContext.memberListPrefix = "";
+    }
+  };
   const detachTaskProgress = docTask?.progress?.attach(route.sessionKey);
   try {
     // Persist the at-most-once boundary before invoking the runtime. The
@@ -3493,12 +3511,13 @@ export async function handleInboundMessage(params: {
     dispatchTimeoutPromise = new Promise<never>((_, reject) => {
       const onStop = () => {
         taskInterrupted = true;
-        pendingInboundContext.delete(dispatchRunId);
+        clearPendingPromptContext();
+        removeStopListener?.();
         reject(stoppedError);
         dispatchAbortController?.abort(stoppedError);
         if (imQueueReleased) void cardFinalizer.finish({ success: false, failed: true, errorText: "Account stopped" });
       };
-      removeStopListener = subscribeAccountAbort(accountSignal, onStop);
+      removeStopListener = subscribeAccountAbort(accountSignal, onStop, dispatchAbortController?.signal);
       dispatchTimeoutHandle = setTimeout(() => {
         taskInterrupted = true;
         reject(timeoutError);
@@ -3507,9 +3526,7 @@ export async function handleInboundMessage(params: {
         if (abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
       }, remainingDispatchMs);
     });
-    if (historyPrefix || memberListPrefix) {
-      pendingInboundContext.set(dispatchRunId, { sessionKey: route.sessionKey, accountId: account.accountId, historyPrefix, memberListPrefix });
-    }
+    if (pendingPromptContext) pendingInboundContext.set(dispatchRunId, pendingPromptContext);
     dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: config,
@@ -3839,7 +3856,7 @@ export async function handleInboundMessage(params: {
         }
       }).finally(async () => {
         backgroundImSettled = true;
-        pendingInboundContext.delete(dispatchRunId);
+        clearPendingPromptContext();
         if (imQueueReleased) {
           removeStopListener?.();
           await finishBackgroundCard();
@@ -4040,7 +4057,7 @@ export async function handleInboundMessage(params: {
     });
     // A live released turn may not have assembled its prompt yet. Its own
     // settlement/account-stop path cleans up without consuming the next turn.
-    if (!imQueueReleased || backgroundImSettled) pendingInboundContext.delete(dispatchRunId);
+    if (!imQueueReleased || backgroundImSettled) clearPendingPromptContext();
 
     // --- 文档任务:把本回合的事实上报一次 ---
     // 放在最外层 finally,所以正常结束、dispatch 抛错、超时三条路径都会走到;

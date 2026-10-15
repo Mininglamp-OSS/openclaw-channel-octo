@@ -777,6 +777,49 @@ describe("server-driven Registry reasoning progress", () => {
     expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
   });
 
+  it("debounces retained continuation tools and observes shared cooldown without delaying its terminal frame", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "retained-rate";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "first");
+    const first = { sessionKey: sk, runId: "first" };
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, first);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, first);
+    await finalizeCard(sk, { success: true });
+    const continuation = { sessionKey: sk, runId: "second", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child" } };
+    handlers.before_agent_run?.({}, continuation);
+    await vi.advanceTimersByTimeAsync(0);
+    setCardContext(sk, context());
+    handlers.before_agent_run?.({}, { sessionKey: sk, runId: "unrelated" });
+    const edits = () => wire.fetch.mock.calls.filter(([url]) => String(url).includes("/message/edit")).length;
+    const burst = (prefix: string) => {
+      for (let i = 0; i < 20; i++) {
+        handlers.before_tool_call?.({ toolName: "read", toolCallId: prefix + i }, continuation);
+        handlers.after_tool_call?.({ toolName: "read", toolCallId: prefix + i, result: {} }, continuation);
+      }
+    };
+    const before = edits();
+    burst("first-");
+    await vi.advanceTimersByTimeAsync(799); expect(edits()).toBe(before);
+    await vi.advanceTimersByTimeAsync(1); expect(edits()).toBe(before + 1);
+    wire.fetch.mockImplementationOnce(async () => new Response(JSON.stringify({ error: {
+      code: "err.shared.rate.limited", http_status: 429, details: { retry_after: 30 },
+    } }), { status: 429, headers: { "Retry-After": "30", "Content-Type": "application/json" } }));
+    burst("limited-"); await vi.advanceTimersByTimeAsync(850);
+    const limitedCount = edits();
+    burst("held-"); await vi.advanceTimersByTimeAsync(20_000);
+    expect(edits()).toBe(limitedCount);
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(edits()).toBe(limitedCount + 1);
+    wire.fetch.mockImplementationOnce(async () => new Response(JSON.stringify({ error: {
+      code: "err.shared.rate.limited", http_status: 429, details: { retry_after: 30 },
+    } }), { status: 429, headers: { "Retry-After": "30", "Content-Type": "application/json" } }));
+    burst("last-"); await vi.advanceTimersByTimeAsync(850);
+    await handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "second", stream: "lifecycle", data: { phase: "end" } }, continuation);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+    const doneCount = edits(); await vi.advanceTimersByTimeAsync(1000);
+    expect(edits()).toBe(doneCount);
+  });
+
   it("persists a running card on queue release and finishes only that card after a new turn starts", async () => {
     const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
     const handlers = makeApi();
