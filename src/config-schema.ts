@@ -46,7 +46,7 @@ export interface OctoAccountConfig {
   botTasks?: boolean;  // Generic server-issued Bot Tasks. Default on; boolean false opts out.
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.entries[agentId].workspace on keyed-roster hosts or agents.list[].workspace on legacy hosts, else agents.defaults.workspace); if neither resolves, write-secret fails closed (no process.cwd() fallback).
-  dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch deadline (ms); cancels ordinary IM turns at expiry. Unset = derived from agents.defaults.timeoutSeconds + 60s buffer (issue #113).
+  dispatchTimeoutMs?: number;  // Explicit queue wait limit (ms); ordinary IM expiry releases the queue without cancelling. Unset = host agent timeout + 60s (#269).
 }
 
 export interface OctoConfig {
@@ -95,13 +95,10 @@ export const SECRETS_FILE_ROOT_DESCRIPTION =
 
 // Shared description for dispatchTimeoutMs, kept identical to the wording in
 // openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
-// Ordinary IM expiry cancels the agent dispatch, discards late replies and
-// releases the queue after bounded abort grace. The unset value follows the
-// agent timeout with a 60s buffer, capped at Node's timer limit. An explicit
-// override may intentionally cancel a healthy turn before the agent timeout.
-// Document-task cancellation retains its task-specific policy.
+// Ordinary IM restores queue-only recovery (#83/#114/#269). The host owns the
+// execution budget; document/business deadlines remain separate.
 export const DISPATCH_TIMEOUT_MS_DESCRIPTION =
-  "Per-inbound dispatch deadline in milliseconds. For ordinary IM, expiry cancels the agent dispatch, discards late replies and releases the per-group queue after bounded abort grace. When unset, derived from agents.defaults.timeoutSeconds (default 600) as timeoutSeconds*1000 + 60000, capped at Node's timer limit. An explicit value below the agent timeout also cancels healthy long-running turns; set it only when this earlier cutoff is intended. Document-task cancellation follows its task-specific policy.";
+  "Per-inbound queue wait limit in milliseconds. Ordinary IM expiry releases the per-group queue without cancelling the agent; late replies remain allowed. When unset, uses the host agent timeout resolver plus 60000ms, capped at Node's timer limit. On hosts without that API, an explicit agents.defaults.timeoutSeconds is used; unknown or unlimited timeouts use the timer-safe ceiling with no guessed default. Account shutdown still cancels active IM dispatches. Document and business tasks retain their task-specific deadline and cancellation policies.";
 
 export const EVENT_WAIT_SECONDS_DESCRIPTION =
   "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";

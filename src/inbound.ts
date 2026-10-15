@@ -65,6 +65,7 @@ import { createWriteStream } from "node:fs";
 import { mkdir, unlink, readdir, stat } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { randomUUID } from "node:crypto";
+import { resolveImDispatchTimeoutMs } from "./im-dispatch-timeout.js";
 
 // Per-inbound dispatch timeout (issue #75; config derivation: issue #113).
 // The upstream OpenClaw runtime call
@@ -76,18 +77,10 @@ import { randomUUID } from "node:crypto";
 // restarts. This wrapper turns "silent permanent block" into "single-message
 // timeout with a warn log + user-facing apology + queue advances".
 //
-// This timeout is a pure infrastructure backstop — it must NOT double as an
-// agent-run timeout (OpenClaw core already bounds agent runs via
-// `agents.defaults.timeoutSeconds`). Issue #113: the old hardcoded 5-minute
-// value killed healthy long-running dispatches whenever operators raised
-// `timeoutSeconds` above 300s. The effective value is therefore resolved
-// per-inbound by `resolveDispatchTimeoutMs` (see below): an explicit
-// `dispatchTimeoutMs` channel/account config wins, otherwise the value is
-// DERIVED as `agents.defaults.timeoutSeconds (default 600) * 1000 + 60s`.
-// The 60s buffer guarantees by construction that this guard fires strictly
-// AFTER the agent-run timeout — core terminates the run gracefully first,
-// and the dispatch guard only catches genuinely hung infrastructure.
-// Tests override via `_setDispatchTimeoutForTests` to keep the suite fast.
+// Ordinary IM resolves its guard through the host's public timeout resolver;
+// it must not copy a host-version-specific default (#113, #269). Expiry only
+// releases the inbound queue; it does not cancel the agent. Account stop still
+// cancels. Business tasks retain their separate historical deadline policy.
 const DISPATCH_TIMEOUT_BUFFER_MS = 60_000;
 const DEFAULT_AGENT_TIMEOUT_SECONDS = 600;
 // issue #121: 上限 clamp。dispatch 超时最终值会喂给 setTimeout,后者 delay 上限是
@@ -118,7 +111,7 @@ export function _setDispatchTimeoutForTests(ms: number | null): void {
 }
 
 /**
- * Resolve the effective per-inbound dispatch timeout (issue #113).
+ * Resolve the historical document/business-task budget (issue #113).
  *
  * Precedence:
  *   1. `_setDispatchTimeoutForTests` override (tests only).
@@ -128,11 +121,9 @@ export function _setDispatchTimeoutForTests(ms: number | null): void {
  *   3. Derived from the agent-run timeout: `(agents.defaults.timeoutSeconds
  *      ?? 600) * 1000 + 60_000`. Single source of truth — raising
  *      `timeoutSeconds` automatically moves this guard with it, and the 60s
- *      buffer normally places this guard after the agent timeout (subject to
- *      Node's timer cap). An explicit shorter deadline cancels even a healthy
- *      ordinary IM turn and discards its late reply; it is an intentional
- *      earlier cutoff, not just a queue-occupancy setting. Document tasks
- *      retain their task-specific cancellation policy.
+ *      buffer is subject to Node's timer cap. Ordinary IM uses the host-driven
+ *      resolveImDispatchTimeoutMs instead; changing business budgets here would
+ *      also change PPT absolute deadlines and Bot Task retry safety.
  */
 export function resolveDispatchTimeoutMs(
   cfg: OpenClawConfig,
@@ -3367,6 +3358,7 @@ export async function handleInboundMessage(params: {
     const hasPotentialMention = content.includes("@");
     if (
       !docTask // 文档任务没有 IM 进度卡可合并(setCardContext 已跳过)
+      && !imQueueReleased // A later turn may now own this session's card.
       && process.env.OCTO_CARD_MERGE_FINAL === "1"
       && sentMediaUrls.size === 0
       && !hasPotentialMention
@@ -3405,8 +3397,8 @@ export async function handleInboundMessage(params: {
   // an upstream dispatch hang would leave the per-group queue's Promise chain
   // unresolved forever — see issue #75.
   //
-  // Ordinary IM turns abort and release the queue; document-comment turns
-  // retain their historical queue-unblocking policy. Generic Bot Tasks are
+  // Ordinary IM and document-comment guards release the inbound queue without
+  // cancelling a healthy run (#83/#114). Generic Bot Tasks are
   // different: retrying while the timed-out
   // agent is still running can duplicate non-idempotent octo-cli writes. For
   // abortOnTimeout turns we therefore abort the underlying agent run
@@ -3418,9 +3410,13 @@ export async function handleInboundMessage(params: {
   // is OUR timeout" by reference equality, never by string comparison —
   // protects against a same-text upstream error being misclassified.
   let dispatchTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const dispatchTimeoutMs = resolveDispatchTimeoutMs(config, account);
+  const dispatchTimeoutMs = dispatchTimeoutTestOverrideMs ?? (docTask
+    ? resolveDispatchTimeoutMs(config, account)
+    : resolveImDispatchTimeoutMs(config, account.config.dispatchTimeoutMs, core, (message) => log?.warn?.(message)));
   let remainingDispatchMs = dispatchTimeoutMs;
   let taskInterrupted = false;
+  let imQueueReleased = false;
+  let backgroundImSettled = false;
   const timeoutError = new Error("octo: dispatch timed out (shared budget expired)");
   const stoppedError = new Error("octo: account stopped during dispatch");
   let removeStopListener: (() => void) | undefined;
@@ -3455,10 +3451,9 @@ export async function handleInboundMessage(params: {
       dispatchTimeoutHandle = setTimeout(() => {
         taskInterrupted = true;
         reject(timeoutError);
-        // Ordinary IM deadlines cancel the run and fence late replies, including
-        // explicitly configured deadlines below the agent timeout. Ordinary
-        // document tasks only release the queue unless their task opts into abort.
-        if (!docTask || abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
+        // Queue waiting is not the agent's execution budget. Only business tasks
+        // opting into cancellation abort here; ordinary IM can still finish later.
+        if (abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
       }, remainingDispatchMs);
     });
     dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -3590,7 +3585,7 @@ export async function handleInboundMessage(params: {
 
           // OpenClaw has no exact "answer generation started" hook. The first
           // non-reasoning, non-tool text is the documented best-effort boundary.
-          if (kind !== "tool") markCardAnswering(route.sessionKey);
+          if (kind !== "tool" && !imQueueReleased) markCardAnswering(route.sessionKey);
 
           if (kind === "tool") {
             // 文档任务:工具进度不进评论区。IM 会话里逐条发是**功能**(用户看着 Bot
@@ -3675,11 +3670,18 @@ export async function handleInboundMessage(params: {
           // block 的附件都还没投递过,谁都不该被后一段挤掉。
           if (docTask) deliverBuffer.docTaskMedia.push(...docTaskOwnMedia);
           deliverBuffer.lastText = content;
+          if (imQueueReleased && !userFacingFinalDelivered) deliverBuffer.textSent = false;
           log?.debug?.(`octo: [deliver-buffer] ${kind} text buffered (${content.length} chars)`);
         },
         onError: async (err: unknown, info: { kind: string }) => {
           // Timeout/stop owns its notice; cancellation must not emit a second apology.
           if (dispatchAbortController?.signal.aborted) return;
+          if (imQueueReleased) {
+            deliverBuffer.lastText = null;
+            deliverBuffer.textSent = true;
+            log?.error?.(`octo: background IM dispatch failed after queue release: ${String(err)}`);
+            return;
+          }
           clearInterval(typingInterval);
           log?.error?.(`octo ${info.kind} reply failed: ${String(err)}`);
           // Prevent finally block from sending stale buffered text after error
@@ -3748,6 +3750,27 @@ export async function handleInboundMessage(params: {
       }),
     });
     runtimeHandedOff = true;
+    // A queue-only timeout does not end the upstream dispatch. Observe settlement
+    // so blocks arriving after this handler's finally can still be flushed, and
+    // keep account-stop cancellation wired until that background dispatch ends.
+    if (!docTask) {
+      void dispatchPromise.then(async () => {
+        if (imQueueReleased && !dispatchAbortController?.signal.aborted
+          && deliverBuffer.lastText && !deliverBuffer.textSent) {
+          const content = deliverBuffer.lastText;
+          deliverBuffer.lastText = null;
+          deliverBuffer.textSent = true;
+          await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { intent: "output" });
+        }
+      }).catch((err) => {
+        if (imQueueReleased && !dispatchAbortController?.signal.aborted) {
+          log?.error?.(`octo: background IM completion failed: ${String(err)}`);
+        }
+      }).finally(() => {
+        backgroundImSettled = true;
+        if (imQueueReleased) removeStopListener?.();
+      });
+    }
     await Promise.race([dispatchPromise, dispatchTimeoutPromise]);
   } catch (err) {
     if (handoffRecorded && !runtimeHandedOff) {
@@ -3761,11 +3784,12 @@ export async function handleInboundMessage(params: {
     // — otherwise this group stays stuck forever, see issue #75.
     //
     if (err === timeoutError || err === stoppedError || accountSignal?.aborted) {
+      imQueueReleased = !docTask && err === timeoutError && !accountSignal?.aborted;
       taskInterrupted = true;
       // Emit the primary diagnostic before waiting for cooperative shutdown;
       // otherwise an abort-ignoring host makes the timeout itself invisible.
       log?.warn?.(
-        `octo: ${accountSignal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
+        `octo: ${accountSignal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, ${imQueueReleased ? "releasing queue without cancelling agent" : "aborting to unblock per-group queue"} (session=${route?.sessionKey ?? "?"})`,
       );
       // Wait briefly only when an abort was actually sent. Ordinary document
       // timeouts still release the queue immediately; a signal-capable runtime
@@ -3888,7 +3912,7 @@ export async function handleInboundMessage(params: {
     throw err;
   } finally {
     if (dispatchTimeoutHandle) clearTimeout(dispatchTimeoutHandle);
-    removeStopListener?.();
+    if (!imQueueReleased || backgroundImSettled) removeStopListener?.();
     // --- Debug: log dispatch outcome ---
     log?.debug?.(`octo: [dispatch-result] replySucceeded=${replySucceeded} bufferedText=${deliverBuffer.lastText?.length ?? 0} textSent=${deliverBuffer.textSent} userFacingFinalDelivered=${userFacingFinalDelivered} effectiveOBO=${effectiveOnBehalfOf ?? 'none'}`);
 
