@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.3](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.2...v1.5.3) (2026-10-15)
+
+
+### Fixed
+
+* **cards:** complete targetless replies from delivery receipts ([#263](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/263)) ([fd68a44](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/fd68a44f8ec5d1da501dd221a56e309a27219033))
+
 ## [1.5.2](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.1...v1.5.2) (2026-10-14)
 
 ### ⚠ BREAKING CHANGES
