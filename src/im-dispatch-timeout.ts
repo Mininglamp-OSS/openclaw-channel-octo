@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
+import type { OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk/core";
 
 const TIMER_MAX_MS = 2 ** 31 - 1;
 const DISPATCH_GRACE_MS = 60_000;
@@ -6,8 +6,12 @@ const DISPATCH_GRACE_MS = 60_000;
 export const UNKNOWN_HOST_QUEUE_WAIT_MS = 30 * 60_000;
 const warnedHosts = new WeakSet<object>();
 
+// This file participates in tsc (test files do not): official SDK removal or
+// return-type drift must fail CI, while runtime detection supports custom hosts.
+type AssertNumber<T extends number> = T;
+type HostBudgetMs = AssertNumber<ReturnType<PluginRuntime["agent"]["resolveAgentTimeoutMs"]>>;
 type TimeoutHost = {
-  agent?: { resolveAgentTimeoutMs?: (opts: { cfg: OpenClawConfig }) => number };
+  agent?: { resolveAgentTimeoutMs?: (opts: { cfg: OpenClawConfig }) => HostBudgetMs };
 };
 
 /** Ordinary IM follows host policy; business-task budgets are resolved separately. */
