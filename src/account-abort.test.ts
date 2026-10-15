@@ -22,6 +22,18 @@ describe("account abort fanout", () => {
     subscribeAccountAbort(controller.signal, fn);
     controller.abort(); expect(fn).toHaveBeenCalledOnce();
   });
+  it("isolates a throwing subscriber so every remaining run is cancelled", () => {
+    const controller = new AbortController(); const next = vi.fn();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      subscribeAccountAbort(controller.signal, () => { throw new Error("cancel failed"); });
+      subscribeAccountAbort(controller.signal, next);
+      controller.abort();
+      expect(next).toHaveBeenCalledOnce();
+      expect(error).toHaveBeenCalledOnce();
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    } finally { error.mockRestore(); }
+  });
   it("immediately notifies a late subscriber to a stopped account", () => {
     const controller = new AbortController(); controller.abort(); const fn = vi.fn();
     subscribeAccountAbort(controller.signal, fn)();

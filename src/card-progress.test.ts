@@ -697,6 +697,86 @@ describe("server-driven Registry reasoning progress", () => {
     expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
   });
 
+  it("still sends the first progress card when queue release precedes its debounce", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "pending-first-send";
+    const ctx = { sessionKey: sk, runId: "run-1" };
+    setCardContext(sk, context());
+    const finalizer = createCardFinalizer(sk);
+    handlers.before_agent_run?.({}, ctx);
+    handlers.before_tool_call?.({ toolName: "exec", toolCallId: "first" }, ctx);
+    await finalizer.pending();
+    await vi.advanceTimersByTimeAsync(850);
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(1);
+    await finalizer.finish({ success: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it("continues flushing tool progress after a queue-release snapshot", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "pending-flush";
+    const ctx = { sessionKey: sk, runId: "run-1" };
+    setCardContext(sk, context());
+    const finalizer = createCardFinalizer(sk);
+    await triggerFirstFrame(handlers, sk);
+    handlers.before_tool_call?.({ toolName: "exec", toolCallId: "later" }, ctx);
+    await finalizer.pending();
+    const edits = wire.calls.filter(c => c.url.includes("/message/edit")).length;
+    handlers.after_tool_call?.({ toolName: "exec", toolCallId: "later", result: {} }, ctx);
+    await vi.advanceTimersByTimeAsync(850);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).length).toBeGreaterThan(edits);
+    await finalizer.finish({ success: true });
+  });
+
+  it.each(["delivered", "foreign target", "tool error", "failed run"])("retains only the released run's tool delivery evidence: %s", async mode => {
+    const wire = mockFetch({ sendResponses: [{ status: 200, messageId: "old-card" }, { status: 200, messageId: "new-card" }] });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "released-evidence";
+    const old = { sessionKey: sk, runId: "old-run" };
+    setCardContext(sk, context());
+    const finalizer = createCardFinalizer(sk);
+    await triggerFirstFrame(handlers, sk, old.runId);
+    await finalizer.pending();
+    setCardContext(sk, context());
+    await triggerFirstFrame(handlers, sk, "new-run");
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "late-send", params: {
+      action: "send", target: mode === "foreign target" ? "group:another-group" : "group:group-1",
+    } }, old);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "late-send", result: {},
+      ...(mode === "tool error" ? { error: "send failed" } : {}),
+    }, old);
+    await finalizer.finish({ success: false, failed: mode === "failed run" });
+    const oldFinal = wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "old-card").at(-1)?.body;
+    expect(oldFinal?.state).toBe(mode === "delivered" ? "completed" : "error");
+    await finalizeCard(sk, { success: false });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "new-card").at(-1)?.body?.state).toBe("error");
+  });
+
+  it.each(["before", "after"])("keeps a continuation's second spawn/yield when the unrelated inbound settles %s continuation start", async order => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "overlapping-continuation";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "first");
+    const first = { sessionKey: sk, runId: "first" };
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child-1" } }, first);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, first);
+    await finalizeCard(sk, { success: true });
+    const second = { sessionKey: sk, runId: "second", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child-1" } };
+    handlers.before_agent_run?.({}, second);
+    setCardContext(sk, context());
+    handlers.before_agent_run?.({}, { sessionKey: sk, runId: "unrelated" });
+    handlers.before_tool_call?.({ toolName: "sessions_spawn", toolCallId: "spawn-2" }, second);
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", toolCallId: "spawn-2", result: { status: "accepted", childSessionKey: "child-2" } }, second);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, second);
+    const unrelatedFinalizer = createCardFinalizer(sk);
+    if (order === "before") await unrelatedFinalizer.finish({ success: false, failed: true });
+    const third = { sessionKey: sk, runId: "third", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child-2" } };
+    handlers.before_agent_run?.({}, third);
+    if (order === "after") await unrelatedFinalizer.finish({ success: false, failed: true });
+    await handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "third", stream: "lifecycle", data: { phase: "end" } }, third);
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(1);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
   it("persists a running card on queue release and finishes only that card after a new turn starts", async () => {
     const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
     const handlers = makeApi();

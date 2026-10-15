@@ -129,6 +129,7 @@ interface CardEntry {
 type CardProgressSharedState = {
   cards: Map<string, CardEntry>;
   pausedCards: Map<string, CardEntry>;
+  releasedRuns: Map<string, { sessionKey: string; entry: CardEntry; generation: object }>;
   /**
    * 每个后端最早可以再发进度帧的时刻,按 apiUrl 归集。
    *
@@ -151,11 +152,13 @@ function getCardProgressSharedState(): CardProgressSharedState {
   if (existing) {
     // 惰性补齐:同一进程内两个实例跑的是同一份构建,但 key 复用而结构演进时缺字段会直接崩。
     existing.rateLimitedUntil ??= new Map();
+    existing.releasedRuns ??= new Map();
     return existing;
   }
   const created: CardProgressSharedState = {
     cards: new Map(),
     pausedCards: new Map(),
+    releasedRuns: new Map(),
     rateLimitedUntil: new Map(),
   };
   root[CARD_PROGRESS_STATE_KEY] = created;
@@ -172,6 +175,9 @@ const cards = sharedState.cards;
  * inbound 的 setCardContext 覆盖 messageId，导致后台任务回来后无法更新原卡。
  */
 const pausedCards = sharedState.pausedCards;
+// Delivery evidence for released runs survives replacement by the next inbound.
+// These records never own the current card or schedule its progress frames.
+const releasedRuns = sharedState.releasedRuns;
 
 const FLUSH_DEBOUNCE_MS = 800;
 const EDIT_TIMEOUT_MS = 10_000;
@@ -1025,15 +1031,29 @@ export function createCardFinalizer(sessionKey: string): {
   };
   let chain = Promise.resolve();
   let finished = false;
+  let releasedRunId: string | undefined;
   return {
     pending: () => {
+      resolveOwner();
+      if (entry?.runId && entry.generation === generation && !finished && !entry.skip) {
+        releasedRunId = entry.runId;
+        releasedRuns.set(entry.runId, { sessionKey, entry, generation });
+      }
       chain = chain.then(async () => {
         resolveOwner();
         if (!entry || entry.generation !== generation || finished || entry.skip) return;
         if (entry.flushPromise) await entry.flushPromise.catch(() => undefined);
-        if (entry.flushTimer) clearTimeout(entry.flushTimer);
+        if (entry.flushTimer) {
+          clearTimeout(entry.flushTimer);
+          entry.flushTimer = undefined;
+        }
+        if (entry.skip) return;
+        // Queue release is not finalization: keep first-send retries/cooldown alive.
+        if (!entry.messageId) {
+          if (isCurrentEntry(sessionKey, entry)) scheduleFlush(sessionKey, entry);
+          return;
+        }
         clearCooldownTimer(entry);
-        if (!entry.messageId || entry.skip) return;
         // Persist a non-terminal frame before allowing the next queued turn.
         await editEntryProgress({ sessionKey, entry,
           state: entryProgressState(sessionKey, entry, entry.phase, { elapsedMs: Date.now() - entry.startedAt }),
@@ -1043,6 +1063,7 @@ export function createCardFinalizer(sessionKey: string): {
     },
     finish: opts => {
       chain = chain.then(async () => {
+        if (releasedRunId && releasedRuns.get(releasedRunId)?.generation === generation) releasedRuns.delete(releasedRunId);
         resolveOwner();
         if (!entry || entry.generation !== generation || finished) return;
         finished = true;
@@ -1197,7 +1218,7 @@ export function clearCard(sessionKey: string): void {
 export function _resetCardProgressForTests(): void {
   // 去重集合是模块级的,不清会跨测试泄漏(第二个用例拿不到本该出现的 warn)。
   warnedTemplateSkips.clear();
-  for (const e of new Set([...cards.values(), ...pausedCards.values()])) {
+  for (const e of new Set([...cards.values(), ...pausedCards.values(), ...[...releasedRuns.values()].map(r => r.entry)])) {
     if (e.flushTimer) clearTimeout(e.flushTimer);
     if (e.pausedExpiryTimer) clearTimeout(e.pausedExpiryTimer);
     clearCooldownTimer(e);
@@ -1207,6 +1228,7 @@ export function _resetCardProgressForTests(): void {
   }
   cards.clear();
   pausedCards.clear();
+  releasedRuns.clear();
   _resetBotCardProfileCacheForTests();
   // 否则一个测试撞出的冷却窗口会静默让后面的测试全都不发帧。
   rateLimitedUntil.clear();
@@ -1505,17 +1527,56 @@ function bindPausedContinuation(
   // spawn/yield cycle), not to the fresh empty dispatch entry.
   const owner = cards.get(sessionKey);
   if (owner && owner.identity !== entry.identity) return;
-  if (owner?.flushTimer) clearTimeout(owner.flushTimer);
-  entry.generation = owner?.generation ?? {};
-  if (owner) entry.ctx = owner.ctx;
+  const ownsCurrentSlot = !owner || owner === entry || owner.runId === runId;
+  const continuationOwner = owner && owner !== entry && owner.runId === runId ? owner : undefined;
+  if (continuationOwner?.flushTimer) clearTimeout(continuationOwner.flushTimer);
+  // An unrelated live inbound owns its own finalizer/generation. Never lend it
+  // the retained card merely because both turns share a session key.
+  entry.generation = continuationOwner?.generation ?? {};
+  if (continuationOwner) entry.ctx = continuationOwner.ctx;
   entry.runId = runId;
   entry.deliveredByTool = undefined;
   entry.pendingMessageToolCalls = undefined;
-  cards.set(sessionKey, entry);
+  if (ownsCurrentSlot) cards.set(sessionKey, entry);
   endSubagentWait(entry, Date.now());
   entry.childSessionKeys.delete(childSessionKey);
   entry.continuationRunId = runId;
   void editTrackedCardState(sessionKey, entry, "resuming", { transient: true });
+}
+
+function toolEntryForHook(sessionKey: string | undefined, ctx: unknown): CardEntry | undefined {
+  if (!sessionKey) return;
+  const current = cards.get(sessionKey);
+  if (current && !current.skip && claimRun(current, ctx)) return current;
+  // A new inbound may arrive while a retained continuation is actively running.
+  // Its spawn/yield receipts still belong to the retained original card.
+  const retained = pausedCards.get(sessionKey);
+  if (retained && !retained.skip && claimRun(retained, ctx)) return retained;
+}
+
+function flushToolProgress(sessionKey: string, entry: CardEntry): void {
+  if (cards.get(sessionKey) === entry) scheduleFlush(sessionKey, entry);
+  else void editTrackedCardState(sessionKey, entry, entry.phase, { transient: true });
+}
+
+function releasedEntryForHook(ctx: unknown): CardEntry | undefined {
+  const { sessionKey, runId } = (ctx ?? {}) as { sessionKey?: string; runId?: string };
+  const owner = runId ? releasedRuns.get(runId) : undefined;
+  if (!owner || owner.sessionKey !== sessionKey || owner.entry.generation !== owner.generation || owner.entry.skip) return;
+  return owner.entry;
+}
+
+function recordToolDelivery(entry: CardEntry, e: { toolName?: string; toolCallId?: string; error?: string; result?: unknown }): void {
+  if (isOutputCardTool(e.toolName) && !e.error && outputCardToolDelivered(e.toolName, e.result)) entry.deliveredByTool = true;
+    // 成功投递到本卡频道 = 本轮已交付,即使 dispatcher 没拿到任何 final text。
+    if (e.toolName === MESSAGING_TOOL_NAME && e.toolCallId &&
+        entry.pendingMessageToolCalls?.has(e.toolCallId)) {
+      const requestedThisCard = entry.pendingMessageToolCalls.get(e.toolCallId)!;
+      entry.pendingMessageToolCalls.delete(e.toolCallId);
+      if (!e.error && (messageToolReceiptTargetsThisCard(entry, e.result) ?? requestedThisCard)) {
+        entry.deliveredByTool = true;
+      }
+    }
 }
 
 export function registerCardProgress(api: OpenClawPluginApi): void {
@@ -1532,9 +1593,15 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
   api.on("before_tool_call", (event: unknown, ctx: unknown) => {
     const e = (event ?? {}) as { toolName?: string; params?: unknown; toolCallId?: string };
     const sk = (ctx as { sessionKey?: string })?.sessionKey;
-    const entry = sk ? cards.get(sk) : undefined;
-    if (!entry || entry.skip || !e.toolName) return;
-    if (!claimRun(entry, ctx)) return; // 超时 run 的迟到 hook 落到新 run 的卡 → 丢弃
+    const entry = toolEntryForHook(sk, ctx);
+    if (!e.toolName) return;
+    if (!entry || entry.skip || !claimRun(entry, ctx)) {
+      const released = releasedEntryForHook(ctx);
+      if (released && e.toolName === MESSAGING_TOOL_NAME && e.toolCallId && asRecord(e.params)?.action === "send") {
+        (released.pendingMessageToolCalls ??= new Map()).set(e.toolCallId, messageToolTargetsThisCard(released, e.params));
+      }
+      return;
+    }
     // P1-h:agent 展示卡工具的产出**就是那张卡本身**,不该再有旁边的"正在处理/已中断"进度卡噪音。
     // 该工具不计入进度、不触发发卡。混合 turn 里其它真实工具照常显示,仅不含这步。
     if (isOutputCardTool(e.toolName)) {
@@ -1564,7 +1631,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       summary: summarizeToolParams(e.toolName, e.params),
       ...(e.toolCallId ? { toolCallId: e.toolCallId } : {}),
     });
-    scheduleFlush(sk!, entry);
+    flushToolProgress(sk!, entry);
   });
 
   // Intentionally do not register before_message_write for reasoning capture: that hook has no
@@ -1626,9 +1693,12 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       result?: unknown;
     };
     const sk = (ctx as { sessionKey?: string })?.sessionKey;
-    const entry = sk ? cards.get(sk) : undefined;
-    if (!entry || entry.skip) return;
-    if (!claimRun(entry, ctx)) return; // 同 §before_tool_call:外来 run 的迟到 after 事件 → 丢弃
+    const entry = toolEntryForHook(sk, ctx);
+    if (!entry || entry.skip || !claimRun(entry, ctx)) {
+      const released = releasedEntryForHook(ctx);
+      if (released) recordToolDelivery(released, e);
+      return;
+    }
     // P1-h:与 before_tool_call 对称,避免 display-card 触发 scheduleFlush 而误发进度卡。
     if (isOutputCardTool(e.toolName)) {
       if (!e.error && outputCardToolDelivered(e.toolName, e.result)) {
@@ -1655,16 +1725,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       if (e.error) target.error = e.error;
       if (!e.error) target.resultSummary = summarizeToolResult(e.toolName, e.result);
     }
-    // 成功投递到本卡频道 = 本轮已交付,即使 dispatcher 没拿到任何 final text。
-    if (e.toolName === MESSAGING_TOOL_NAME && e.toolCallId &&
-        entry.pendingMessageToolCalls?.has(e.toolCallId)) {
-      const requestedThisCard = entry.pendingMessageToolCalls.get(e.toolCallId)!;
-      entry.pendingMessageToolCalls.delete(e.toolCallId);
-      if (!e.error && (messageToolReceiptTargetsThisCard(entry, e.result) ?? requestedThisCard)) {
-        entry.deliveredByTool = true;
-        dbg(`message tool delivered to this card session=${sk}`);
-      }
-    }
+    recordToolDelivery(entry, e);
     if (e.toolName === "sessions_spawn" && !e.error) {
       const childSessionKey = acceptedSpawnChildSessionKey(e.result);
       if (childSessionKey) entry.childSessionKeys.add(childSessionKey);
@@ -1674,9 +1735,9 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     // host compatibility fallback.
     if (e.toolName === "sessions_yield" && !e.error &&
         (e.result === undefined || toolResultRecords(e.result).some(result => result.status === "yielded"))) {
-      markCardPaused(sk!, (ctx as { runId?: string })?.runId);
+      markCardPaused(sk!, (ctx as { runId?: string })?.runId, entry);
     }
-    scheduleFlush(sk!, entry);
+    flushToolProgress(sk!, entry);
   });
 
   api.on("model_call_started", (event: unknown, ctx: unknown) => {

@@ -3,6 +3,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ChannelType, MessageType } from "./types.js";
 import {
   handleInboundMessage,
+  pendingInboundContext,
+  takePendingInboundContext,
   resolveDispatchTimeoutMs,
   _setDispatchTimeoutForTests,
   _setDispatchApologyTimeoutForTests,
@@ -546,6 +548,61 @@ describe("dispatch timeout guard (issue #75)", () => {
       release(); await vi.advanceTimersByTimeAsync(1);
       expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。"]);
     } finally { release(); vi.useRealTimers(); }
+  });
+
+  it("retains the old prompt context after release and isolates the next dispatch by its supplied runId", async () => {
+    vi.useFakeTimers(); pendingInboundContext.clear();
+    const { dispatch } = installImmediateRuntime(); installFetchStub();
+    let releaseA!: () => void; let releaseB!: () => void;
+    let enterA!: () => void; let enterB!: () => void;
+    const gateA = new Promise<void>(r => { releaseA = r; });
+    const gateB = new Promise<void>(r => { releaseB = r; });
+    const enteredA = new Promise<void>(r => { enterA = r; });
+    const enteredB = new Promise<void>(r => { enterB = r; });
+    let runA = ""; let runB = "";
+    dispatch.mockImplementationOnce(async args => { runA = args.replyOptions.runId; enterA(); await gateA; })
+      .mockImplementationOnce(async args => { runB = args.replyOptions.runId; enterB(); await gateB; });
+    try {
+      const timedOut = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await enteredA; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await timedOut;
+      expect(pendingInboundContext.get(runA)?.memberListPrefix).toContain("Alice");
+      const second = runInbound(); await enteredB;
+      expect(runB).not.toBe(runA);
+      expect(takePendingInboundContext("sk1", runA)?.memberListPrefix).toContain("Alice");
+      releaseA(); await vi.advanceTimersByTimeAsync(1);
+      expect(pendingInboundContext.has(runB)).toBe(true);
+      expect(takePendingInboundContext("sk1", runB)?.memberListPrefix).toContain("Alice");
+      releaseB(); await second;
+      expect(pendingInboundContext.size).toBe(0);
+    } finally { releaseA(); releaseB(); pendingInboundContext.clear(); vi.useRealTimers(); }
+  });
+
+  it.each(["warning only", "buffered answer", "account stop"])("settles a deferred background tool warning without the optional host callback: %s", async mode => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    const controller = new AbortController();
+    let release!: () => void; let enter!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      await args.dispatcherOptions.deliver({ text: "⚠️ 🛠️ Exec: command failed", isError: true }, { kind: "final" });
+      enter(); await gate;
+      if (mode === "buffered answer") await args.dispatcherOptions.deliver({ text: "recovered answer" }, { kind: "block" });
+    });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      expect(sends).toHaveLength(1);
+      if (mode === "account stop") controller.abort();
+      release(); await vi.advanceTimersByTimeAsync(1);
+      const texts = sends.map(s => s.payload?.content);
+      expect(texts).toHaveLength(mode === "account stop" ? 1 : 2);
+      if (mode === "buffered answer") expect(texts[1]).toBe("recovered answer");
+      if (mode === "warning only") {
+        expect(texts[1]).toContain("⚠️");
+        expect(texts[1]).not.toContain("command failed");
+      }
+    } finally { release(); controller.abort(); vi.useRealTimers(); }
   });
 
   it.each([false, true])("keeps pre-timeout buffered output until background settles (reject: %s)", async reject => {

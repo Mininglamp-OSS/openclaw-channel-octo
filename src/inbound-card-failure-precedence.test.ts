@@ -143,7 +143,7 @@ function installFetchStub(opts: { failPlainSend?: boolean } = {}) {
  */
 function installRuntime(
   hooks: Record<string, (event: unknown, ctx: unknown) => unknown>,
-  mode: "onError" | "swallowed-final-send" | "success" | "media-failure" = "onError",
+  mode: "onError" | "swallowed-final-send" | "success" | "media-failure" | "empty" | "tool-only" | "warning-rejection" | "block-rejection" = "onError",
   gate?: Promise<void>,
 ) {
   setOctoRuntime({
@@ -151,19 +151,29 @@ function installRuntime(
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: async (args: any) => {
-          const hookCtx = { sessionKey: SESSION_KEY, runId: "run-failure" };
+          const hookCtx = { sessionKey: SESSION_KEY, runId: args.replyOptions.runId };
           hooks.before_agent_run({}, hookCtx);
+          const toolName = mode === "empty" ? "read" : "message";
           hooks.before_tool_call(
             {
-              toolName: "message",
+              toolName,
               toolCallId: "msg-1",
               params: { action: "send", target: `group:${GROUP_ID}` },
             },
             hookCtx,
           );
-          hooks.after_tool_call({ toolName: "message", toolCallId: "msg-1", result: {} }, hookCtx);
+          hooks.after_tool_call({ toolName, toolCallId: "msg-1", result: {} }, hookCtx);
           await new Promise((resolve) => setTimeout(resolve, 850));
           if (gate) await gate;
+          if (mode === "empty" || mode === "tool-only") return;
+          if (mode === "block-rejection") {
+            await args.dispatcherOptions.deliver({ text: "recovered final answer" }, { kind: "block" });
+            throw new Error("non_deliverable_terminal_turn");
+          }
+          if (mode === "warning-rejection") {
+            await args.dispatcherOptions.deliver({ text: "⚠️ 🛠️ Exec: command failed", isError: true }, { kind: "final" });
+            throw new Error("background failed");
+          }
           if (mode === "media-failure") {
             await args.dispatcherOptions.deliver({ mediaUrl: "/tmp/octo270-intentionally-missing-attachment.png" }, { kind: "final" });
             return;
@@ -214,7 +224,7 @@ describe("inbound progress-card failure precedence", () => {
     vi.restoreAllMocks();
   });
 
-  it.each(["onError", "success", "media-failure"] as const)("queue recovery leaves the card running until background %s", async mode => {
+  it.each(["onError", "success", "media-failure", "empty", "tool-only", "warning-rejection", "block-rejection"] as const)("queue recovery leaves the card running until background %s", async mode => {
     vi.useFakeTimers(); _setDispatchTimeoutForTests(1000);
     const { edits, texts } = installFetchStub(); const hooks = collectCardHooks();
     let release!: () => void; const gate = new Promise<void>(r => { release = r; });
@@ -228,7 +238,7 @@ describe("inbound progress-card failure precedence", () => {
     expect(edits.some(e => e.state === "error" || e.state === "completed")).toBe(false);
     expect(texts.some(t => t.includes("任务仍在运行"))).toBe(true);
     release(); await vi.advanceTimersByTimeAsync(1);
-    expect(edits.at(-1)?.state).toBe(mode === "success" ? "completed" : "error");
+    expect(edits.at(-1)?.state).toBe(mode === "success" || mode === "tool-only" || mode === "block-rejection" ? "completed" : "error");
   });
 
   it("keeps the card in the error state when the turn failed after a tool delivery", async () => {

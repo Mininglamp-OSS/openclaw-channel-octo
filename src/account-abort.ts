@@ -11,7 +11,10 @@ export function subscribeAccountAbort(signal: AbortSignal | undefined, callback:
       subscribers.delete(signal);
       const pending = [...callbacks];
       callbacks.clear();
-      for (const notify of pending) notify();
+      for (const notify of pending) {
+        try { notify(); }
+        catch (err) { console.error("[octo] account abort subscriber failed", err); }
+      }
     } };
     subscribers.set(signal, group);
     signal.addEventListener("abort", group.abort, { once: true });
