@@ -1256,7 +1256,11 @@ async function finalizeCardEntry(sessionKey: string, entry: CardEntry | undefine
     (entry.phase === "paused" || entry.phase === "resuming");
   if (entry.pausedTerminal && isTrackedEntry(sessionKey, entry)) {
     const failure = entry.lifecycleFailure?.generation === entry.generation ? entry.lifecycleFailure : undefined;
-    const phase = entry.phase === "stopped" ? "stopped" : failure || entry.phase === "error" || !succeededOrDeliveredByTool(entry, opts) ? "error" : "done";
+    // A retained terminal is an observed outcome, not a reply-delivery guess.
+    // Bare success:false means no reply and cannot undo host end. Preserve the
+    // existing success precedence for a delivered final followed by rejection.
+    const phase = entry.pausedTerminal.phase === "stopped" || entry.phase === "stopped" ? "stopped"
+      : failure || entry.phase === "error" || (!opts.success && (opts.failed || opts.errorText)) ? "error" : entry.pausedTerminal.phase;
     await requestPausedTerminal(sessionKey, entry, phase, failure?.errorText ?? opts.errorText);
     return;
   }

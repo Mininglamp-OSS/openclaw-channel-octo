@@ -999,6 +999,27 @@ describe("server-driven Registry reasoning progress", () => {
     expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
   });
 
+  it.each(["lifecycle", "agent_end"] as const)("preserves authoritative %s Done without reply evidence or after delivered-final rejection", async mode => {
+    const { wire, finish, edits, sk } = await pausedTerminalFixture(mode, true);
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    await finalizeCard(sk, { success: false });
+    await finalizeCard(sk, { success: true, failed: true });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(edits().slice(before).every(([, init]) => JSON.parse(String(init.body)).state === "completed")).toBe(true);
+    expect(edits()).toHaveLength(before + 4);
+  });
+
+  it.each([{ success: false, failed: true }, { success: false, errorText: "dispatch failed" }])("explicit finalizer failure overrides pending Done: %j", async opts => {
+    const { wire, finish, edits, sk } = await pausedTerminalFixture("lifecycle", true);
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    await finalizeCard(sk, opts);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("error");
+  });
+
   it("retries terminal 429 only after shared cooldown and keeps retries finite", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
     const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
