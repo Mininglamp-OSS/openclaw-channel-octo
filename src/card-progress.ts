@@ -97,7 +97,7 @@ interface CardEntry {
   /** 当前 in-flight flush 的 promise;finalizeCard 据此等待首帧 send/中间帧 edit 落定。 */
   flushPromise?: Promise<void>;
   /** paused/resuming/done 跨-run edit 的串行尾指针。 */
-  stateEditPromise?: Promise<void>;
+  stateEditPromise?: Promise<boolean>;
   stateEditAbort?: AbortController;
   /** All Registry edits share this tail so card_seq reservation order equals wire order. */
   templateEditPromise?: Promise<boolean>;
@@ -105,6 +105,8 @@ interface CardEntry {
   pausedExpiryTimer?: ReturnType<typeof setTimeout>;
   /** 限流冷却期结束后把最新一帧发出去的一次性唤醒定时器;见 armCooldownWake。 */
   cooldownTimer?: ReturnType<typeof setTimeout>;
+  /** Bounded fresh-frame retries after the short same-body Registry retries fail. */
+  progressRetryCount?: number;
   /** replacement/clear 时主动取消 profile/send/edit,缩小 stale side-effect 窗口。 */
   flushAbort?: AbortController;
   /** Server-selected ref, pinned for every frame of a Registry-authored message. */
@@ -450,6 +452,7 @@ function cooldownKey(apiUrl: string): string {
  * 静默停摆一整天,代价远大于偶尔早回去一次 —— 进度帧本来就是可丢弃的。
  */
 const MAX_CARD_COOLDOWN_MS = 5 * 60 * 1000;
+const RETAINED_PROGRESS_RETRY_DELAYS_MS = [1_000, 3_000, 10_000] as const;
 
 function noteRateLimited(apiUrl: string, retryAfterMs: number): void {
   if (retryAfterMs > MAX_CARD_COOLDOWN_MS) {
@@ -868,7 +871,7 @@ async function editTrackedCardState(
   entry: CardEntry,
   phase: CardProgressState["phase"],
   opts: { transient?: boolean; errorText?: string; progressFrame?: boolean } = {},
-): Promise<void> {
+): Promise<boolean> {
   const previous = entry.stateEditPromise;
   const work = (async () => {
     if (previous) {
@@ -882,11 +885,11 @@ async function editTrackedCardState(
       entry.flushTimer = undefined;
     }
     clearCooldownTimer(entry);
-    if (!isTrackedEntry(sessionKey, entry) || !entry.messageId) return;
+    if (!isTrackedEntry(sessionKey, entry) || !entry.messageId) return false;
     if (opts.progressFrame && cooldownRemainingMs(entry.ctx.apiUrl) > 0) {
       entry.dirty = true;
       armCooldownWake(sessionKey, entry, cooldownRemainingMs(entry.ctx.apiUrl));
-      return;
+      return false;
     }
 
     const now = Date.now();
@@ -909,14 +912,17 @@ async function editTrackedCardState(
         ...(opts.transient ? { transient: true } : {}),
         signal: AbortSignal.any([abort.signal, AbortSignal.timeout(EDIT_TIMEOUT_MS)]),
       });
+      if (opts.progressFrame) entry.progressRetryCount = 0;
       dbg(`transitioned session=${sessionKey} phase=${phase}`);
+      return true;
     } catch (err: unknown) {
       // Same policy as runFlush: only a deterministic 4xx is worth giving up on. A 5xx
       // or timeout that merely outlasted REGISTRY_EDIT_RETRY_DELAYS_MS must not be terminal —
       // the next edit takes a fresh nextCardSeq, still strictly greater than the server's last
       // commit, so retrying stays CAS-safe.
-      const status = httpStatusFromApiFetchError(err);
-      if (status !== undefined && status >= 400 && status < 500 && status !== 429) entry.skip = true;
+      const status = semanticHttpStatusFromApiError(err) ?? httpStatusFromApiFetchError(err);
+      if (status !== undefined && status >= 400 && status < 500 && status !== 429 &&
+          errorCodeFromApiError(err) !== "err.shared.internal") entry.skip = true;
       if (opts.progressFrame && err instanceof OctoApiError && err.isRateLimited) {
         noteRateLimited(entry.ctx.apiUrl, err.retryAfterMs);
         if (isTrackedEntry(sessionKey, entry)) {
@@ -924,16 +930,28 @@ async function editTrackedCardState(
           armCooldownWake(sessionKey, entry, cooldownRemainingMs(entry.ctx.apiUrl));
         }
       }
+      if (opts.progressFrame && !abort.signal.aborted && isTrackedEntry(sessionKey, entry) &&
+          !(err instanceof OctoApiError && err.isRateLimited) && isRetryableRegistryEditError(err)) {
+        entry.dirty = true;
+        const attempt = entry.progressRetryCount ?? 0;
+        entry.progressRetryCount = attempt + 1;
+        const delay = RETAINED_PROGRESS_RETRY_DELAYS_MS[attempt];
+        // This is a card-local wake, not an API-wide cooldown. Reuse the cancellable
+        // wake timer so completion/clear/replacement cancels it and 429 still wins.
+        // Exhaustion keeps the dirty snapshot for the next real event, without polling.
+        if (delay !== undefined) armCooldownWake(sessionKey, entry, delay);
+      }
       if (!abort.signal.aborted) {
         warn(`state transition failed: ${err instanceof Error ? err.message : String(err)}`);
       }
+      return false;
     } finally {
       if (entry.stateEditAbort === abort) entry.stateEditAbort = undefined;
     }
   })();
   entry.stateEditPromise = work;
   try {
-    await work;
+    return await work;
   } finally {
     if (entry.stateEditPromise === work) entry.stateEditPromise = undefined;
   }
@@ -1593,6 +1611,7 @@ function toolEntryForHook(sessionKey: string | undefined, ctx: unknown): CardEnt
 }
 
 function flushToolProgress(sessionKey: string, entry: CardEntry): void {
+  entry.progressRetryCount = 0;
   if (cards.get(sessionKey) === entry) scheduleFlush(sessionKey, entry);
   else {
     entry.dirty = true;
@@ -1609,8 +1628,8 @@ async function flushRetainedProgress(sessionKey: string, entry: CardEntry): Prom
   const remaining = cooldownRemainingMs(entry.ctx.apiUrl);
   if (remaining > 0) { armCooldownWake(sessionKey, entry, remaining); return; }
   entry.dirty = false;
-  await editTrackedCardState(sessionKey, entry, entry.phase, { transient: true, progressFrame: true });
-  if (entry.dirty && isTrackedEntry(sessionKey, entry)) flushToolProgress(sessionKey, entry);
+  const updated = await editTrackedCardState(sessionKey, entry, entry.phase, { transient: true, progressFrame: true });
+  if (updated && entry.dirty && isTrackedEntry(sessionKey, entry)) flushToolProgress(sessionKey, entry);
 }
 
 function releasedEntryForHook(ctx: unknown): CardEntry | undefined {

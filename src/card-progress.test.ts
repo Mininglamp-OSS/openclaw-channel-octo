@@ -820,6 +820,89 @@ describe("server-driven Registry reasoning progress", () => {
     expect(edits()).toBe(doneCount);
   });
 
+  async function retainedProgressFixture() {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "retained-retry";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "first");
+    const first = { sessionKey: sk, runId: "first" };
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, first);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, first);
+    await finalizeCard(sk, { success: true });
+    const continuation = { sessionKey: sk, runId: "second", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child" } };
+    handlers.before_agent_run?.({}, continuation);
+    await vi.advanceTimersByTimeAsync(0);
+    setCardContext(sk, context());
+    handlers.before_agent_run?.({}, { sessionKey: sk, runId: "unrelated" });
+    const edits = () => wire.fetch.mock.calls.filter(([url]) => String(url).includes("/message/edit"));
+    const event = (id = "retry-tool") => handlers.after_tool_call?.({ toolName: "read", toolCallId: id, result: {} }, continuation);
+    const finish = () => handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "second", stream: "lifecycle", data: { phase: "end" } }, continuation);
+    return { wire, handlers, sk, continuation, edits, event, finish };
+  }
+
+  it.each(["503", "network", "timeout", "semantic-500"])("retries a retained progress frame after exhausted short retries: %s", async kind => {
+    const { wire, edits, event, finish } = await retainedProgressFixture();
+    const fail = async () => {
+      if (kind === "network") throw new TypeError("fetch failed");
+      if (kind === "timeout") throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      if (kind === "semantic-500") return new Response(JSON.stringify({ error: { code: "err.shared.internal", http_status: 500 } }), { status: 400 });
+      return new Response("temporary", { status: 503 });
+    };
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(fail);
+    const before = edits().length;
+    event(); await vi.advanceTimersByTimeAsync(1_150);
+    expect(edits()).toHaveLength(before + 3);
+    // No new hook: the card-local wake must retry the failed snapshot itself.
+    await vi.advanceTimersByTimeAsync(999);
+    expect(edits()).toHaveLength(before + 3);
+    await vi.advanceTimersByTimeAsync(501);
+    expect(edits()).toHaveLength(before + 4);
+    const bodies = edits().slice(before).map(([, init]) => JSON.parse(String(init.body)));
+    expect(bodies[0].card_seq).toBe(bodies[2].card_seq);
+    expect(bodies[3].card_seq).toBeGreaterThan(bodies[2].card_seq);
+    expect(bodies[3].state).toBe("reasoning");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before + 4);
+    await finish();
+  });
+
+  it("bounds retained progress retries during an outage and recovers on a fresh tool event", async () => {
+    const { wire, edits, event, finish } = await retainedProgressFixture();
+    const original = wire.fetch.getMockImplementation()!;
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    event(); await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before + 12); // initial frame + 3 fresh-frame retries, each with 3 wire attempts
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before + 12);
+    wire.fetch.mockImplementation(original);
+    event("after-recovery"); await vi.advanceTimersByTimeAsync(800);
+    expect(edits()).toHaveLength(before + 13);
+    await finish();
+  });
+
+  it.each(["finish", "clear", "identity-replacement"])("cancels retained progress retry on %s without a stale frame", async end => {
+    const { wire, edits, event, finish, sk } = await retainedProgressFixture();
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("temporary", { status: 503 }));
+    event(); await vi.advanceTimersByTimeAsync(1_150);
+    if (end === "finish") {
+      await finish();
+      expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+    } else if (end === "clear") clearCard(sk);
+    else setCardContext(sk, context({ botToken: "another-bot", onBehalfOf: "different-owner" }));
+    const before = edits().length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before);
+  });
+
+  it.each([403, 422])("does not retry deterministic retained progress rejection %s", async status => {
+    const { wire, edits, event } = await retainedProgressFixture();
+    wire.fetch.mockImplementationOnce(async () => new Response("rejected", { status }));
+    const before = edits().length;
+    event(); await vi.advanceTimersByTimeAsync(60_000);
+    event("later"); await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before + 1);
+  });
+
   it("persists a running card on queue release and finishes only that card after a new turn starts", async () => {
     const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
     const handlers = makeApi();
