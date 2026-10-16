@@ -74,12 +74,12 @@ function driveDeliver(calls: DeliverCall[], opts: { throwAfter?: boolean } = {})
   });
 }
 
-const run = (seedOverrides: Partial<ForkSeedContext> = {}) =>
+const run = (seedOverrides: Partial<ForkSeedContext> = {}, dispatchTimeoutMs?: number) =>
   dispatchForkSeedReply({
     seedCtx: makeSeedCtx(seedOverrides),
     childChannelId: "group123____abc",
     accountId: "acct1",
-    account: { config: {} } as never,
+    account: { config: { dispatchTimeoutMs } } as never,
     apiUrl: "https://api.test",
     botToken: "bf_tok",
     config: {} as never,
@@ -239,7 +239,7 @@ describe("dispatchForkSeedReply", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("TIMEOUT GUARD (issue #75): a hung dispatcher times out and rejects, never hangs forever", async () => {
+  it("TIMEOUT GUARD (issue #75): a hung dispatcher releases the queue without declaring seed failure", async () => {
     mockTimeout.mockReturnValue(600_000);
     mockDispatch.mockImplementation(() => new Promise<void>(() => {})); // never settles
     const warn = vi.fn();
@@ -254,10 +254,9 @@ describe("dispatchForkSeedReply", () => {
         config: {} as never,
         log: { info: vi.fn(), warn, error: vi.fn(), debug: vi.fn() } as never,
       }),
-    ).rejects.toThrow(/timed out/i);
-    // The timeout rethrow is what lets spawnChildBoundSession surface seedFailed
-    // and the parent enqueueInbound queue advance instead of locking forever.
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("hung past"))).toBe(true);
+    ).resolves.toBeUndefined();
+    // The parent command can confirm the child exists without a false retry hint.
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("queue released"))).toBe(true);
   });
 
   it("normal dispatch resolves well within the timeout (guard does not fire)", async () => {
@@ -325,4 +324,86 @@ describe("dispatchForkSeedReply", () => {
     });
     await expect(run()).resolves.toBeUndefined();
   });
+  it.each(["final", "tool", "block"])("queue release preserves a late %s exactly once", async kind => {
+    vi.useFakeTimers();
+    let options: any; let finish!: () => void;
+    mockDispatch.mockImplementation(o => { options = o; return new Promise<void>(resolve => { finish = resolve; }); });
+    try {
+      const running = run({}, 50);
+      await options.dispatcherOptions.deliver({ text: "early partial" }, { kind: "block" });
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(running).resolves.toBeUndefined();
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      await options.dispatcherOptions.deliver({ text: "late answer" }, { kind });
+      finish(); await vi.advanceTimersByTimeAsync(0);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+      expect(mockSendMessage).toHaveBeenCalledWith(expect.objectContaining({ content: "late answer", channelId: "group123____abc" }));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("background rejection notifies once and fences callbacks after settlement", async () => {
+    vi.useFakeTimers();
+    let options: any; let fail!: (err: Error) => void;
+    mockDispatch.mockImplementation(o => { options = o; return new Promise<void>((_, reject) => { fail = reject; }); });
+    try {
+      const running = run({}, 50); await vi.advanceTimersByTimeAsync(50); await running;
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      fail(new Error("actual failure")); await vi.advanceTimersByTimeAsync(0);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+      expect(mockSendMessage).toHaveBeenCalledWith(expect.objectContaining({ content: "首条问题处理失败，请在此子区重试。" }));
+      await options.dispatcherOptions.deliver({ text: "too late" }, { kind: "final" });
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("successful late output prevents a contradictory background failure notice", async () => {
+    vi.useFakeTimers();
+    let options: any; let fail!: (err: Error) => void;
+    mockDispatch.mockImplementation(o => { options = o; return new Promise<void>((_, reject) => { fail = reject; }); });
+    try {
+      const running = run({}, 50); await vi.advanceTimersByTimeAsync(50); await running;
+      await options.dispatcherOptions.deliver({ text: "answer" }, { kind: "final" });
+      fail(new Error("tail failure")); await vi.advanceTimersByTimeAsync(0);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+      expect(mockSendMessage).toHaveBeenCalledWith(expect.objectContaining({ content: "answer" }));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("failed late final and failed late notice are observed without an unhandled rejection", async () => {
+    vi.useFakeTimers();
+    let options: any; let finish!: () => void;
+    mockDispatch.mockImplementation(o => { options = o; return new Promise<void>(resolve => { finish = resolve; }); });
+    try {
+      const running = run({}, 50); await vi.advanceTimersByTimeAsync(50); await running;
+      mockSendMessage.mockRejectedValue(new Error("transport failure"));
+      await options.dispatcherOptions.deliver({ text: "answer" }, { kind: "final" });
+      finish(); await vi.advanceTimersByTimeAsync(0);
+      expect(mockSendMessage).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("tool progress does not hide a failed final (released=%s)", async released => {
+    vi.useFakeTimers();
+    let options: any; let finish!: () => void;
+    mockDispatch.mockImplementation(o => { options = o; return new Promise<void>(resolve => { finish = resolve; }); });
+    try {
+      const running = run({}, 50);
+      const outcome = released ? running : expect(running).rejects.toThrow(/delivery failed/);
+      if (released) { await vi.advanceTimersByTimeAsync(50); await running; }
+      await options.dispatcherOptions.deliver({ text: "正在查询" }, { kind: "tool" });
+      mockSendMessage.mockRejectedValueOnce(new Error("final 503"));
+      await options.dispatcherOptions.deliver({ text: "answer" }, { kind: "final" });
+      finish(); await vi.advanceTimersByTimeAsync(0); await outcome;
+      expect(mockSendMessage).toHaveBeenCalledTimes(released ? 3 : 2);
+      if (released) expect(mockSendMessage).toHaveBeenLastCalledWith(expect.objectContaining({ content: "首条问题处理失败，请在此子区重试。" }));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("a successful final recovers an earlier tool send failure", async () => {
+    mockSendMessage.mockRejectedValueOnce(new Error("tool 503"));
+    driveDeliver([{ kind: "tool", text: "progress" }, { kind: "final", text: "answer" }]);
+    await expect(run()).resolves.toBeUndefined();
+    expect(mockSendMessage).toHaveBeenCalledTimes(2);
+  });
+
 });

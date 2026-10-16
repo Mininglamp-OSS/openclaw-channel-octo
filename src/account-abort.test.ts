@@ -39,4 +39,23 @@ describe("account abort fanout", () => {
     subscribeAccountAbort(controller.signal, fn)();
     expect(fn).toHaveBeenCalledOnce();
   });
+  it("isolates a throwing late subscriber without registering listeners", () => {
+    const controller = new AbortController(); controller.abort();
+    const failure = new Error("late cancel failed");
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const callback = vi.fn(() => { throw failure; });
+      let dispose!: () => void;
+      expect(() => { dispose = subscribeAccountAbort(controller.signal, callback); }).not.toThrow();
+      expect(callback).toHaveBeenCalledOnce();
+      expect(error).toHaveBeenCalledWith("[octo] account abort subscriber failed", failure);
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+      dispose(); dispose();
+      const next = vi.fn();
+      subscribeAccountAbort(controller.signal, next)();
+      expect(next).toHaveBeenCalledOnce();
+      expect(callback).toHaveBeenCalledOnce();
+    } finally { error.mockRestore(); }
+  });
+
 });

@@ -14,6 +14,11 @@ function removeEmptyGroup(signal: AbortSignal, group: Group): void {
   }
 }
 
+function notifySubscriber(callback: () => void): void {
+  try { callback(); }
+  catch (err) { console.error("[octo] account abort subscriber failed", err); }
+}
+
 // Separate closure scope: an account listener must never capture a subscriber.
 function createGroup(signal: AbortSignal): Group {
   const weakSignal = new WeakRef(signal);
@@ -25,10 +30,7 @@ function createGroup(signal: AbortSignal): Group {
     subscribers.delete(signal);
     const pending = [...callbacks.values()];
     callbacks.clear();
-    for (const notify of pending) {
-      try { notify(); }
-      catch (err) { console.error("[octo] account abort subscriber failed", err); }
-    }
+    for (const notify of pending) notifySubscriber(notify);
   } };
   return group;
 }
@@ -36,7 +38,7 @@ function createGroup(signal: AbortSignal): Group {
 /** The live dispatch MUST retain the returned disposer until settlement/stop. */
 export function subscribeAccountAbort(signal: AbortSignal | undefined, callback: () => void, runSignal?: AbortSignal): () => void {
   if (!signal) return () => {};
-  if (signal.aborted) { callback(); return () => {}; }
+  if (signal.aborted) { notifySubscriber(callback); return () => {}; }
   let group = subscribers.get(signal);
   if (!group) {
     group = createGroup(signal);

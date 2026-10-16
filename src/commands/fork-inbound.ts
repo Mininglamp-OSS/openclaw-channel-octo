@@ -135,47 +135,46 @@ export async function dispatchForkSeedReply(params: {
       channelId: childChannelId,
       channelType: ChannelType.CommunityTopic,
       content: finalContent,
+      signal: AbortSignal.timeout(RECEIPT_SEND_TIMEOUT_MS),
       ...(entities.length > 0 ? { mentionEntities: entities } : {}),
     });
   };
 
-  // Timeout guard (issue #75). dispatchReplyWithBufferedBlock-
-  // Dispatcher is observed to occasionally hang forever (no resolve/reject/
-  // onError). This seed is awaited synchronously inside the parent group's
-  // enqueueInbound serial queue, so a bare await would lock that queue until the
-  // gateway restarts. Race against the same per-inbound timeout as the normal
-  // ordinary-IM path and rethrow on timeout so spawnChildBoundSession
-  // surfaces seedFailed and the parent queue can advance.
+  // This budget only releases the parent queue. The seed keeps its child
+  // destination and can deliver a late answer; elapsed time is not seed failure.
   const dispatchTimeoutMs = resolveImDispatchTimeoutMs(config, account.config.dispatchTimeoutMs, core, (message) => log?.warn?.(message));
   let dispatchTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const timeoutError = new Error(`octo: [fork-seed] dispatch timed out after ${dispatchTimeoutMs}ms`);
-  const dispatchTimeoutPromise = new Promise<never>((_, reject) => {
-    dispatchTimeoutHandle = setTimeout(() => reject(timeoutError), dispatchTimeoutMs);
+  const queueReleased = Symbol("fork queue released");
+  const queueWait = new Promise<typeof queueReleased>(resolve => {
+    dispatchTimeoutHandle = setTimeout(() => resolve(queueReleased), dispatchTimeoutMs);
   });
 
   const buffer = { lastText: null as string | null };
   let delivered = false;
+  let answerDelivered = false;
   // The SDK dispatcher routes deliver()/onError failures WITHOUT
   // rejecting the outer promise, so a failed user-facing send would otherwise
   // look like fork success and the user gets "已开 fork 子区" while the first
   // reply never landed. Track delivery failure and convert it to a thrown error
   // after settle → spawnChildBoundSession seedFailed → ok_seed_failed.
   let deliverFailed = false;
-  try {
-    await Promise.race([
-      core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+  let settled = false;
+  const completion = (async () => {
+    try {
+      await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx: ctxPayload,
         cfg: config,
         replyOptions: {},
         dispatcherOptions: {
           deliver: async (payload: ReplyPayload, info: { kind: ReplyDispatchKind }) => {
-            if (payload.isReasoning) return;
+            if (settled || payload.isReasoning) return;
             const content = payload.text?.trim() ?? "";
             if (!content) return;
             if (info.kind === "final" || info.kind === "tool") {
               try {
                 await sendSeedText(content);
                 delivered = true;
+                if (info.kind === "final") answerDelivered = true;
                 buffer.lastText = null;
               } catch (sendErr) {
                 // User-facing answer failed to send → the seed did not land.
@@ -188,6 +187,7 @@ export async function dispatchForkSeedReply(params: {
             }
           },
           onError: async (err: unknown, info: { kind: string }) => {
+            if (settled) return;
             log?.error?.(`octo: [fork-seed] ${info.kind} reply failed: ${String(err)}`);
             // A final/tool error means the user-facing reply did not land.
             if (info.kind === "final" || info.kind === "tool") {
@@ -195,41 +195,47 @@ export async function dispatchForkSeedReply(params: {
             }
           },
         },
-      } as Parameters<typeof core.channel.reply.dispatchReplyWithBufferedBlockDispatcher>[0]),
-      dispatchTimeoutPromise,
-    ]);
-  } catch (err) {
-    if (err === timeoutError) {
-      log?.warn?.(
-        `octo: [fork-seed] dispatch hung past ${dispatchTimeoutMs}ms, aborting to unblock the ` +
-          `parent group queue (child=${childChannelId})`,
-      );
-      // Suppress stale buffered text so the finally-flush does not send a partial
-      // seed reply after we have already given up (mirrors inbound.ts:2797).
-      buffer.lastText = null;
-    }
-    throw err; // → spawnChildBoundSession catch → seedFailed: true
-  } finally {
-    if (dispatchTimeoutHandle) clearTimeout(dispatchTimeoutHandle);
-    // Isolate the flush. If the dispatcher already threw, a flush failure
-    // must NOT replace the original error (it carries the root-cause signal).
-    // Log and swallow the flush error; never let it shadow the dispatch error.
-    if (buffer.lastText && !delivered) {
-      try {
-        await sendSeedText(buffer.lastText);
-      } catch (flushErr) {
-        log?.error?.(
-          `octo: [fork-seed] finally flush failed: ${flushErr instanceof Error ? flushErr.message : String(flushErr)}`,
-        );
+      } as Parameters<typeof core.channel.reply.dispatchReplyWithBufferedBlockDispatcher>[0]);
+    } finally {
+      // Keep block buffering tied to actual settlement, not queue release.
+      // Closing callbacks also prevents a broken dispatcher from emitting an
+      // answer after its rejection has already produced a failure receipt.
+      settled = true;
+      if (buffer.lastText && !delivered) {
+        try {
+          await sendSeedText(buffer.lastText);
+          delivered = true;
+          answerDelivered = true;
+        } catch (flushErr) {
+          deliverFailed = true;
+          log?.error?.(`octo: [fork-seed] finally flush failed: ${String(flushErr)}`);
+        }
+        buffer.lastText = null;
       }
     }
-  }
+    if (deliverFailed && !answerDelivered) {
+      throw new Error("octo: [fork-seed] delivery failed: user-facing reply did not send");
+    }
+  })();
 
-  // Settled without throwing, but a final/tool delivery may have failed silently
-  // (the SDK does not reject the outer promise for deliver/onError failures).
-  // Surface it so spawnChildBoundSession reports seedFailed → ok_seed_failed.
-  if (deliverFailed) {
-    throw new Error("octo: [fork-seed] delivery failed: user-facing reply did not send");
+  try {
+    const result = await Promise.race([completion, queueWait]);
+    if (result === queueReleased) {
+      log?.warn?.(`octo: [fork-seed] queue released after ${dispatchTimeoutMs}ms; seed continues (child=${childChannelId})`);
+      // Observe late failures without rejecting an already-released parent
+      // command or asking the user to retry while the seed is still running.
+      void completion.catch(async err => {
+        log?.error?.(`octo: [fork-seed] background dispatch failed: ${String(err)}`);
+        if (answerDelivered) return;
+        try {
+          await sendSeedText("首条问题处理失败，请在此子区重试。");
+        } catch (noticeErr) {
+          log?.error?.(`octo: [fork-seed] background failure notice failed: ${String(noticeErr)}`);
+        }
+      });
+    }
+  } finally {
+    if (dispatchTimeoutHandle) clearTimeout(dispatchTimeoutHandle);
   }
 }
 
