@@ -3113,7 +3113,8 @@ export async function handleInboundMessage(params: {
    * `type: "notice"` 是关键:一句道歉证明不了任务做成了。提示与任务产出分开记账,
    * 这里只负责把「这是提示不是产出」这件事说清楚。
    */
-  const sendUserFacingFallback = async (content: string, signal?: AbortSignal): Promise<void> => {
+  let terminalNoticeDelivered = false;
+  const sendUserFacingFallback = async (content: string, signal?: AbortSignal, opts?: { terminal: boolean }): Promise<void> => {
     if (docTask) {
       await postDocTaskReply(withSuppressedToolTail(content), signal, { type: "notice" });
       return;
@@ -3131,6 +3132,7 @@ export async function handleInboundMessage(params: {
       ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
       ...(signal ? { signal } : {}),
     });
+    terminalNoticeDelivered ||= opts?.terminal === true;
   };
 
   /**
@@ -3393,6 +3395,7 @@ export async function handleInboundMessage(params: {
       if (merged) {
         statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
         finalOutputDelivered ||= opts.intent === "output" && opts.claimsCompletion !== false;
+        terminalNoticeDelivered ||= opts.intent === "notice";
         return { merged: true, delivered: true };
       }
     }
@@ -3404,6 +3407,7 @@ export async function handleInboundMessage(params: {
       referencedMedia: opts.referencedMedia,
     });
     finalOutputDelivered ||= opts.intent === "output" && opts.claimsCompletion !== false && delivery.finalDelivered;
+    terminalNoticeDelivered ||= opts.intent === "notice" && delivery.finalDelivered;
     return { merged: false, delivered: delivery.finalDelivered };
   };
 
@@ -3446,6 +3450,24 @@ export async function handleInboundMessage(params: {
   let imQueueReleased = false;
   let backgroundImSettled = false;
   let backgroundRejected = false;
+  let queueReleaseNotice: Promise<void> | undefined;
+  let backgroundFailureNoticeAttempted = false;
+  const notifyBackgroundFailure = async () => {
+    if (!imQueueReleased || !backgroundImSettled) return;
+    // A settlement racing the queue-release POST must not leave "still running"
+    // as the last notification. That POST already has its own bounded signal.
+    await queueReleaseNotice?.catch(() => undefined);
+    if (backgroundFailureNoticeAttempted || terminalNoticeDelivered || finalOutputDelivered
+      || cardFinalizer.hasDeliveredOutput() || dispatchAbortController?.signal.aborted || accountSignal?.aborted
+      || !(backgroundRejected || deliveryErrorOccurred || dispatchFailed)) return;
+    backgroundFailureNoticeAttempted = true;
+    try {
+      await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
+        AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { terminal: true });
+    } catch (err) {
+      log?.error?.(`octo: failed to send background dispatch-error fallback: ${String(err)}`);
+    }
+  };
   // Shared settlement backstop for hosts that omit onFreshSettledDelivery.
   const flushPendingToolWarning = async () => {
     if (dispatchAbortController?.signal.aborted) return;
@@ -3793,7 +3815,7 @@ export async function handleInboundMessage(params: {
           try {
             // 经唯一出口:文档任务改投评论区,其余仍直发 IM。同样用受限 signal ——
             // 上游报错且 Octo API 也病了时,别把队列卡到外层 dispatch 超时。
-            await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+            await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { terminal: true });
           } catch (sendErr) {
             log?.error?.(`octo: failed to send error message: ${String(sendErr)}`);
           }
@@ -3877,6 +3899,7 @@ export async function handleInboundMessage(params: {
         backgroundImSettled = true;
         clearPendingPromptContext();
         if (imQueueReleased) {
+          await notifyBackgroundFailure();
           removeStopListener?.();
           await finishBackgroundCard();
         }
@@ -3956,9 +3979,11 @@ export async function handleInboundMessage(params: {
           // The apology call itself MUST be bounded — otherwise a sick Octo API
           // hangs this sendMessage too, defeating the whole timeout fix. See
           // DISPATCH_TIMEOUT_APOLOGY_MS above.
-          await sendUserFacingFallback(imQueueReleased
+          const notice = sendUserFacingFallback(imQueueReleased
             ? "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。"
             : "⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+          if (imQueueReleased) queueReleaseNotice = notice;
+          await notice;
         } catch (sendErr) {
           log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
         }
@@ -4019,7 +4044,7 @@ export async function handleInboundMessage(params: {
         deliverBuffer.lastText = null;
         deliverBuffer.textSent = true;
         try {
-          await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+          await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { terminal: true });
         } catch (sendErr) {
           log?.error?.(`octo: failed to send dispatch-error fallback: ${String(sendErr)}`);
         }
@@ -4061,6 +4086,7 @@ export async function handleInboundMessage(params: {
       }
     }
     if (!imQueueReleased || backgroundImSettled) await flushPendingToolWarning();
+    if (imQueueReleased && backgroundImSettled) await notifyBackgroundFailure();
     // 缓冲里的附件没人接管(比如 onError 把缓冲文本清掉后只发了一句道歉)。
     // 提示不夹带产出是刻意的,但静默丢弃不行 —— 至少让运维能看见。
     if (deliverBuffer.docTaskMedia.length > 0) {

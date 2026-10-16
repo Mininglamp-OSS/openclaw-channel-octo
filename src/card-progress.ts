@@ -93,6 +93,8 @@ interface CardEntry {
   dirty: boolean;
   inFlight: boolean;
   skip: boolean;
+  /** Identity/explicit cleanup fences delivery evidence independently of rendering policy. */
+  deliveryEvidenceDisabled?: boolean;
   flushTimer?: ReturnType<typeof setTimeout>;
   /** 当前 in-flight flush 的 promise;finalizeCard 据此等待首帧 send/中间帧 edit 落定。 */
   flushPromise?: Promise<void>;
@@ -144,6 +146,8 @@ type CardProgressSharedState = {
   cards: Map<string, CardEntry>;
   pausedCards: Map<string, CardEntry>;
   releasedRuns: WeakValueMap<string, ReleasedCardRun>;
+  /** Card metadata only: never retain the weak host-owned ReleasedCardRun itself. */
+  releasedCards: Map<string, ReleasedCardRun>;
   /**
    * 每个后端最早可以再发进度帧的时刻,按 apiUrl 归集。
    *
@@ -167,12 +171,14 @@ function getCardProgressSharedState(): CardProgressSharedState {
     // 惰性补齐:同一进程内两个实例跑的是同一份构建,但 key 复用而结构演进时缺字段会直接崩。
     existing.rateLimitedUntil ??= new Map();
     existing.releasedRuns ??= new WeakValueMap(reclaimAbandonedReleasedCard);
+    existing.releasedCards ??= new Map();
     return existing;
   }
   const created: CardProgressSharedState = {
     cards: new Map(),
     pausedCards: new Map(),
     releasedRuns: new WeakValueMap(reclaimAbandonedReleasedCard),
+    releasedCards: new Map(),
     rateLimitedUntil: new Map(),
   };
   root[CARD_PROGRESS_STATE_KEY] = created;
@@ -189,22 +195,38 @@ const cards = sharedState.cards;
  * inbound 的 setCardContext 覆盖 messageId，导致后台任务回来后无法更新原卡。
  */
 const pausedCards = sharedState.pausedCards;
-// Delivery evidence for released runs survives replacement by the next inbound.
-// These records never own the current card or schedule its progress frames.
+// The weak record is owned by the host's finalizer, not by these card snapshots.
 const releasedRuns = sharedState.releasedRuns;
+const releasedCards = sharedState.releasedCards;
 
-/** No owner remains in the host. Do not keep its current-slot card alive either. */
+/** GC proves abandonment, not elapsed time. Healthy silent work has no new deadline. */
 function reclaimAbandonedReleasedCard(runId: string): void {
-  for (const [sessionKey, entry] of cards) {
-    // A yielded child has an independent continuation lifetime and existing TTL.
-    if (entry.runId !== runId || pausedCards.get(sessionKey) === entry) continue;
-    if (entry.flushTimer) clearTimeout(entry.flushTimer);
-    clearCooldownTimer(entry);
-    entry.flushAbort?.abort(new Error("released dispatch abandoned"));
-    entry.stateEditAbort?.abort(new Error("released dispatch abandoned"));
-    entry.skip = true;
-    cards.delete(sessionKey);
-  }
+  const record = releasedCards.get(runId);
+  if (!record) return;
+  releasedCards.delete(runId);
+  const { sessionKey, entry, generation } = record;
+  // A yielded child has an independent continuation lifetime and existing TTL.
+  if (entry.generation !== generation || pausedCards.get(sessionKey) === entry) return;
+  if (entry.flushTimer) clearTimeout(entry.flushTimer);
+  clearCooldownTimer(entry);
+  entry.dispatchFinalizing = true;
+  entry.deliveryEvidenceDisabled = true;
+  entry.flushAbort?.abort(new Error("released dispatch abandoned"));
+  entry.stateEditAbort?.abort(new Error("released dispatch abandoned"));
+  if (cards.get(sessionKey) === entry) cards.delete(sessionKey);
+  void (async () => {
+    try {
+      await entry.flushPromise?.catch(() => undefined);
+      await entry.stateEditPromise?.catch(() => undefined);
+      if (entry.skip || !entry.messageId || entry.generation !== generation) return;
+      await editEntryProgress({ sessionKey, entry,
+        state: entryProgressState(sessionKey, entry, "error", {
+          elapsedMs: Date.now() - entry.startedAt,
+          errorText: "任务执行上下文已释放，无法继续跟踪结果。",
+        }), signal: AbortSignal.timeout(EDIT_TIMEOUT_MS) });
+    } catch (err) { warn(`abandoned card finalization failed: ${String(err)}`); }
+    finally { entry.skip = true; }
+  })();
 }
 
 const FLUSH_DEBOUNCE_MS = 800;
@@ -257,7 +279,7 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
   if (existing) clearCooldownTimer(existing);
   existing?.flushAbort?.abort(new Error("card entry replaced"));
   if (collision) {
-    if (existing) existing.skip = true;
+    if (existing) { existing.skip = true; existing.deliveryEvidenceDisabled = true; }
     if (paused) releasePausedCard(sessionKey, paused, "cross-identity collision");
     warn(`sessionKey collision across identities; failing closed for session=${sessionKey}`);
   }
@@ -273,6 +295,7 @@ export function setCardContext(sessionKey: string, ctx: CardContext): void {
     inFlight: false,
     nextCardSeq: 1,
     skip: collision || !!ctx.onBehalfOf,
+    deliveryEvidenceDisabled: collision || !!ctx.onBehalfOf,
   });
   dbg(`context set session=${sessionKey} channel=${ctx.channelId} obo=${!!ctx.onBehalfOf} collision=${collision}`);
 }
@@ -853,6 +876,7 @@ function releasePausedCard(sessionKey: string, entry: CardEntry, reason: string)
   entry.stateEditAbort?.abort(new Error(`paused card released: ${reason}`));
   entry.stateEditAbort = undefined;
   entry.skip = true;
+  entry.deliveryEvidenceDisabled = true;
   if (cards.get(sessionKey) === entry) cards.delete(sessionKey);
   if (pausedCards.get(sessionKey) === entry) pausedCards.delete(sessionKey);
 }
@@ -1085,6 +1109,15 @@ function markCardPaused(sessionKey: string, runId?: string, expectedEntry?: Card
   if (!entry || entry.skip || entry.lifecycleFailure?.generation === entry.generation) return;
   if (runId && entry.runId &&
       entry.runId !== runId && entry.pausedFromRunId !== runId && entry.continuationRunId !== runId) return;
+  // A released dispatch may yield after another inbound owns the current slot.
+  // Keep its original card discoverable before the trusted completion can arrive.
+  if (cards.get(sessionKey) !== entry && pausedCards.get(sessionKey) !== entry) {
+    const retained = pausedCards.get(sessionKey);
+    const current = cards.get(sessionKey);
+    if (retained || (current && current.identity !== entry.identity)) return;
+    if (!entry.messageId) return;
+    pausedCards.set(sessionKey, entry);
+  }
   clearPausedTerminal(entry);
   const now = Date.now();
   endRunningThinking(entry, now);
@@ -1169,6 +1202,7 @@ type CardFinishOptions = { success: boolean; errorText?: string; failed?: boolea
 
 /** Capture the entry, so a released queue cannot finalize the next turn's card. */
 export function createCardFinalizer(sessionKey: string): {
+  hasDeliveredOutput: () => boolean;
   pending: () => Promise<void>;
   finish: (opts: CardFinishOptions) => Promise<void>;
 } {
@@ -1185,12 +1219,17 @@ export function createCardFinalizer(sessionKey: string): {
   // only borrows this record, so an unreachable pending Promise can be collected.
   let releasedOwner: ReleasedCardRun | undefined;
   return {
+    hasDeliveredOutput: () => {
+      resolveOwner();
+      return !!entry && entry.generation === generation && !entry.deliveryEvidenceDisabled && entry.deliveredByTool === true;
+    },
     pending: () => {
       resolveOwner();
-      if (entry?.runId && entry.generation === generation && !finished && !entry.skip) {
+      if (entry?.runId && entry.generation === generation && !finished && !entry.deliveryEvidenceDisabled) {
         releasedRunId = entry.runId;
         releasedOwner = { sessionKey, entry, generation };
         releasedRuns.set(entry.runId, releasedOwner);
+        releasedCards.set(entry.runId, { sessionKey, entry, generation });
       }
       chain = chain.then(async () => {
         resolveOwner();
@@ -1216,7 +1255,10 @@ export function createCardFinalizer(sessionKey: string): {
     },
     finish: opts => {
       chain = chain.then(async () => {
-        if (releasedRunId && releasedRuns.get(releasedRunId) === releasedOwner) releasedRuns.delete(releasedRunId);
+        if (releasedRunId && releasedRuns.get(releasedRunId) === releasedOwner) {
+          releasedRuns.delete(releasedRunId);
+          releasedCards.delete(releasedRunId);
+        }
         releasedOwner = undefined;
         resolveOwner();
         if (!entry || entry.generation !== generation || finished) return;
@@ -1269,14 +1311,16 @@ async function finalizeCardEntry(sessionKey: string, entry: CardEntry | undefine
   // Map 换成新 entry —— 那时删 key 会误删新 run 的状态,使其全程无卡。终态帧仍发本 run。
   if (cards.get(sessionKey) === entry) {
     cards.delete(sessionKey);
-    // 没发出 messageId 的懒卡没有可更新对象，不能长期滞留在 pausedCards。
-    if (retainForContinuation && !entry.skip && entry.messageId) {
-      // 证据是 per-run 的事实。entry 从这里开始跨 run 存活,留着会被后续 run 误读。
-      entry.deliveredByTool = undefined;
-      entry.pendingMessageToolCalls = undefined;
-      pausedCards.set(sessionKey, entry);
-      schedulePausedCardExpiry(sessionKey, entry);
-    }
+  }
+  // A released run can yield before or after replacement by the next inbound.
+  // Never overwrite an unrelated retained flow or a different identity.
+  if (retainForContinuation && !entry.skip && entry.messageId &&
+      (!pausedCards.has(sessionKey) || pausedCards.get(sessionKey) === entry) &&
+      (!cards.has(sessionKey) || cards.get(sessionKey)!.identity === entry.identity)) {
+    entry.deliveredByTool = undefined;
+    entry.pendingMessageToolCalls = undefined;
+    pausedCards.set(sessionKey, entry);
+    schedulePausedCardExpiry(sessionKey, entry);
   }
 
   if (!retainForContinuation) {
@@ -1375,6 +1419,7 @@ export function clearCard(sessionKey: string): void {
     tracked.flushAbort?.abort(new Error("card entry cleared"));
     tracked.stateEditAbort?.abort(new Error("card entry cleared"));
     tracked.skip = true;
+    tracked.deliveryEvidenceDisabled = true;
   }
   cards.delete(sessionKey);
   pausedCards.delete(sessionKey);
@@ -1384,7 +1429,7 @@ export function clearCard(sessionKey: string): void {
 export function _resetCardProgressForTests(): void {
   // 去重集合是模块级的,不清会跨测试泄漏(第二个用例拿不到本该出现的 warn)。
   warnedTemplateSkips.clear();
-  for (const e of new Set([...cards.values(), ...pausedCards.values(), ...[...releasedRuns.values()].map(r => r.entry)])) {
+  for (const e of new Set([...cards.values(), ...pausedCards.values(), ...[...releasedCards.values()].map(r => r.entry)])) {
     clearPausedTerminal(e);
     if (e.flushTimer) clearTimeout(e.flushTimer);
     if (e.pausedExpiryTimer) clearTimeout(e.pausedExpiryTimer);
@@ -1392,10 +1437,12 @@ export function _resetCardProgressForTests(): void {
     e.flushAbort?.abort(new Error("card progress reset"));
     e.stateEditAbort?.abort(new Error("card progress reset"));
     e.skip = true;
+    e.deliveryEvidenceDisabled = true;
   }
   cards.clear();
   pausedCards.clear();
   releasedRuns.clear();
+  releasedCards.clear();
   _resetBotCardProfileCacheForTests();
   // 否则一个测试撞出的冷却窗口会静默让后面的测试全都不发帧。
   rateLimitedUntil.clear();
@@ -1748,8 +1795,30 @@ async function flushRetainedProgress(sessionKey: string, entry: CardEntry): Prom
 function releasedEntryForHook(ctx: unknown): CardEntry | undefined {
   const { sessionKey, runId } = (ctx ?? {}) as { sessionKey?: string; runId?: string };
   const owner = runId ? releasedRuns.get(runId) : undefined;
-  if (!owner || owner.sessionKey !== sessionKey || owner.entry.generation !== owner.generation || owner.entry.skip) return;
+  if (!owner || owner.sessionKey !== sessionKey || owner.entry.generation !== owner.generation || owner.entry.deliveryEvidenceDisabled) return;
   return owner.entry;
+}
+
+/** Rendering may be disabled while successful tool delivery still belongs to this run. */
+function deliveryEntryForHook(ctx: unknown): CardEntry | undefined {
+  const sk = (ctx as { sessionKey?: string })?.sessionKey;
+  if (!sk) return;
+  return [cards.get(sk), pausedCards.get(sk)].find(entry =>
+    entry && !entry.deliveryEvidenceDisabled && claimRun(entry, ctx)) ?? releasedEntryForHook(ctx);
+}
+
+function recordContinuationTool(sessionKey: string, entry: CardEntry, e: {
+  toolName?: string; error?: string; result?: unknown;
+}, ctx: unknown): void {
+  if (entry.skip) return;
+  if (e.toolName === "sessions_spawn" && !e.error) {
+    const childSessionKey = acceptedSpawnChildSessionKey(e.result);
+    if (childSessionKey) entry.childSessionKeys.add(childSessionKey);
+  }
+  if (e.toolName === "sessions_yield" && !e.error &&
+      (e.result === undefined || toolResultRecords(e.result).some(result => result.status === "yielded"))) {
+    markCardPaused(sessionKey, (ctx as { runId?: string })?.runId, entry);
+  }
 }
 
 function recordToolDelivery(entry: CardEntry, e: { toolName?: string; toolCallId?: string; error?: string; result?: unknown }): void {
@@ -1782,7 +1851,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     const entry = toolEntryForHook(sk, ctx);
     if (!e.toolName) return;
     if (!entry || entry.skip || !claimRun(entry, ctx)) {
-      const released = releasedEntryForHook(ctx);
+      const released = deliveryEntryForHook(ctx);
       if (released && e.toolName === MESSAGING_TOOL_NAME && e.toolCallId && asRecord(e.params)?.action === "send") {
         (released.pendingMessageToolCalls ??= new Map()).set(e.toolCallId, messageToolTargetsThisCard(released, e.params));
       }
@@ -1881,8 +1950,11 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
     const sk = (ctx as { sessionKey?: string })?.sessionKey;
     const entry = toolEntryForHook(sk, ctx);
     if (!entry || entry.skip || !claimRun(entry, ctx)) {
-      const released = releasedEntryForHook(ctx);
-      if (released) recordToolDelivery(released, e);
+      const released = deliveryEntryForHook(ctx);
+      if (released) {
+        recordToolDelivery(released, e);
+        recordContinuationTool(sk!, released, e, ctx);
+      }
       return;
     }
     // P1-h:与 before_tool_call 对称,避免 display-card 触发 scheduleFlush 而误发进度卡。
@@ -1912,17 +1984,7 @@ export function registerCardProgress(api: OpenClawPluginApi): void {
       if (!e.error) target.resultSummary = summarizeToolResult(e.toolName, e.result);
     }
     recordToolDelivery(entry, e);
-    if (e.toolName === "sessions_spawn" && !e.error) {
-      const childSessionKey = acceptedSpawnChildSessionKey(e.result);
-      if (childSessionKey) entry.childSessionKeys.add(childSessionKey);
-    }
-    // New hosts also return successful tool envelopes for deferred/no-op
-    // yields. Only status=yielded pauses work; absent results remain the old
-    // host compatibility fallback.
-    if (e.toolName === "sessions_yield" && !e.error &&
-        (e.result === undefined || toolResultRecords(e.result).some(result => result.status === "yielded"))) {
-      markCardPaused(sk!, (ctx as { runId?: string })?.runId, entry);
-    }
+    recordContinuationTool(sk!, entry, e, ctx);
     flushToolProgress(sk!, entry);
   });
 
@@ -2091,7 +2153,7 @@ async function handleCardLifecycleEvent(event: CardLifecycleEvent): Promise<void
   }
 
   if (phase === "end" && event.data.yielded === true) {
-    const entry = findPausedFlowEntry(sessionKey, event.runId) ?? cards.get(sessionKey);
+    const entry = findPausedFlowEntry(sessionKey, event.runId) ?? releasedEntryForHook(event) ?? cards.get(sessionKey);
     if (entry?.runId === event.runId || entry?.continuationRunId === event.runId) {
       markCardPaused(sessionKey, event.runId, entry);
     }

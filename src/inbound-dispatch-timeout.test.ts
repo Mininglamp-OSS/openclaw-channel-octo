@@ -20,7 +20,7 @@ import { botTaskDedupeKey } from "./bot-task.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { getEventListeners } from "node:events";
-import { _resetCardProgressForTests } from "./card-progress.js";
+import { registerCardProgress, _resetCardProgressForTests } from "./card-progress.js";
 import { subscribeAccountAbort } from "./account-abort.js";
 
 /**
@@ -668,8 +668,108 @@ describe("dispatch timeout guard (issue #75)", () => {
       await entered;
       await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
       release(); await vi.advanceTimersByTimeAsync(1);
-      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。"]);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。"]);
     } finally { release(); vi.useRealTimers(); }
+  });
+
+  it.each(["reject", "progress then reject", "duplicate errors", "recover final", "recover block", "media final", "warning", "tool delivery", "stop", "foreground error"])("settled background failure visibility: %s", async mode => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    const controller = new AbortController();
+    const handlers: Record<string, (event: any, ctx: any) => any> = {};
+    registerCardProgress({ on: (name: string, fn: any) => { handlers[name] = fn; } } as any);
+    let release!: () => void; let enter!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      const options = args.dispatcherOptions;
+      const ctx = { sessionKey: "sk1", runId: args.replyOptions.runId };
+      if (mode === "tool delivery") handlers.before_agent_run?.({}, ctx);
+      if (mode === "progress then reject") await options.deliver({ text: "working" }, { kind: "tool" });
+      if (mode === "foreground error") await options.onError(new Error("initial failure"), { kind: "final" });
+      enter(); await gate;
+      if (mode === "stop") controller.abort();
+      if (mode === "duplicate errors" || mode.startsWith("recover")) {
+        await options.onError(new Error("failure one"), { kind: "final" });
+        await options.onError(new Error("failure two"), { kind: "final" });
+      }
+      if (mode.startsWith("recover")) await options.deliver({ text: "recovered answer" }, { kind: mode.endsWith("final") ? "final" : "block" });
+      if (mode === "media final") await options.deliver({ mediaUrl: "https://example.test/result.png" }, { kind: "final" });
+      if (mode === "warning") await options.deliver({ text: "⚠️ 🛠️ Exec: command failed", isError: true }, { kind: "final" });
+      if (mode === "tool delivery") {
+        handlers.before_tool_call?.({ toolName: "message", toolCallId: "sent", params: { action: "send", target: "group:" + GROUP_ID, message: "tool answer" } }, ctx);
+        handlers.after_tool_call?.({ toolName: "message", toolCallId: "sent", result: { status: "ok" } }, ctx);
+      }
+      throw new Error("terminal rejection");
+    });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      const noticesBeforeSettlement = sends.filter(s => s.payload?.content?.startsWith("⚠️ 抱歉"));
+      expect(noticesBeforeSettlement).toHaveLength(mode === "foreground error" ? 1 : 0);
+      release(); await vi.advanceTimersByTimeAsync(1);
+      const errors = sends.filter(s => s.payload?.content?.startsWith("⚠️ 抱歉"));
+      const shouldNotify = ["reject", "progress then reject", "duplicate errors", "foreground error"].includes(mode);
+      expect(errors).toHaveLength(shouldNotify ? 1 : 0);
+      if (mode.startsWith("recover")) expect(sends.filter(s => s.payload?.content === "recovered answer")).toHaveLength(1);
+      if (mode === "warning") expect(sends.filter(s => s.payload?.content?.includes("⚠️"))).toHaveLength(1);
+    } finally { release(); controller.abort(); await vi.advanceTimersByTimeAsync(0); vi.useRealTimers(); }
+  });
+
+  it("orders a racing background failure after the queue notice and sends it once", async () => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    const fetchStub = globalThis.fetch;
+    let release!: () => void; let enter!: () => void; let releaseNotice!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    const noticeGate = new Promise<void>(r => { releaseNotice = r; });
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const response = await fetchStub(input, init);
+      if (String(input).includes("/sendMessage") && init?.body?.includes("任务仍在运行")) await noticeGate;
+      return response;
+    }) as typeof fetch;
+    dispatch.mockImplementation(async () => { enter(); await gate; throw new Error("failed while notice was in flight"); });
+    try {
+      const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1);
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends).toHaveLength(1);
+      releaseNotice(); await vi.advanceTimersByTimeAsync(1); await rejected;
+      expect(sends.map(s => s.payload?.content)).toEqual([
+        "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。",
+        "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
+      ]);
+    } finally { release(); releaseNotice(); vi.useRealTimers(); }
+  });
+
+  it.each(["timeout", "account stop"])("bounds an in-flight background failure notice: %s", async mode => {
+    const { dispatch } = installImmediateRuntime(); installFetchStub();
+    const fetchStub = globalThis.fetch; const controller = new AbortController();
+    let release!: () => void; let enter!: () => void; let noticeStarted!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    const noticeEntered = new Promise<void>(r => { noticeStarted = r; });
+    let attempts = 0; let aborted = false;
+    globalThis.fetch = (async (input: any, init?: any) => {
+      if (String(input).includes("/sendMessage") && init?.body?.includes("⚠️ 抱歉")) {
+        attempts++; noticeStarted();
+        await new Promise<void>((_, reject) => {
+          const onAbort = () => { aborted = true; reject(new Error("notice aborted")); };
+          if (init.signal.aborted) onAbort(); else init.signal.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      return fetchStub(input, init);
+    }) as typeof fetch;
+    dispatch.mockImplementation(async () => { enter(); await gate; throw new Error("background failed"); });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered; await rejected; release(); await noticeEntered;
+      if (mode === "account stop") controller.abort();
+      await vi.waitFor(() => expect(aborted).toBe(true));
+      await vi.waitFor(() => expect(getEventListeners(controller.signal, "abort")).toHaveLength(0));
+      expect(attempts).toBe(1);
+    } finally { release(); controller.abort(); }
   });
 
   it("retains the old prompt context after release and isolates the next dispatch by its supplied runId", async () => {

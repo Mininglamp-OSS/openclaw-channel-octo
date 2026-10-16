@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DocTaskTracker, registerDocTaskProgress, type DocTaskProgress } from "./doc-task-progress.js";
 import { ChannelType } from "./types.js";
@@ -751,6 +753,76 @@ describe("server-driven Registry reasoning progress", () => {
     await finalizeCard(sk, { success: false });
     expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "new-card").at(-1)?.body?.state).toBe("error");
   });
+
+  it.each(["tool", "lifecycle", "yield before replacement", "no-op", "foreign run"])("released late yield keeps original flow ownership: %s", async mode => {
+    const wire = mockFetch({ sendResponses: [{ status: 200, messageId: "old-card" }, { status: 200, messageId: "new-card" }] });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "late-yield";
+    const old = { sessionKey: sk, runId: "old" };
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "old");
+    const finalizer = createCardFinalizer(sk); await finalizer.pending();
+    const yieldOld = async () => {
+      const ctx = mode === "foreign run" ? { sessionKey: sk, runId: "foreign" } : old;
+      handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, ctx);
+      if (mode === "lifecycle") await handlers["octo-card-progress-lifecycle"]?.({ ...ctx, stream: "lifecycle", data: { phase: "end", yielded: true } }, ctx);
+      else handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: mode === "no-op" ? "nothing_pending" : "yielded" } }, ctx);
+    };
+    if (mode === "yield before replacement") await yieldOld();
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "new");
+    if (mode !== "yield before replacement") await yieldOld();
+    await finalizer.finish({ success: true });
+    const oldEdits = () => wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "old-card");
+    const isPaused = !["no-op", "foreign run"].includes(mode);
+    expect(oldEdits().at(-1)?.body?.state).toBe(isPaused ? "reasoning" : "completed");
+    const next = { sessionKey: sk, runId: "continuation", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child" } };
+    handlers.before_agent_run?.({}, next);
+    await handlers["octo-card-progress-lifecycle"]?.({ ...next, stream: "lifecycle", data: { phase: "end" } }, next);
+    if (isPaused) expect(oldEdits().at(-1)?.body?.state).toBe("completed");
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "new-card")).toHaveLength(0);
+    await finalizeCard(sk, { success: false, failed: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "new-card").at(-1)?.body?.state).toBe("error");
+  });
+
+  it.each(["current", "replaced", "foreign receipt", "cleared"])("disabled card keeps only valid delivery evidence: %s", async mode => {
+    const wire = mockFetch({ profile: profile({ reasoningEnabled: false }) }); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "no-card-evidence";
+    setCardContext(sk, context({ accountId: "acct" })); await triggerFirstFrame(handlers, sk, "old");
+    const finalizer = createCardFinalizer(sk); await finalizer.pending();
+    if (mode === "replaced") { setCardContext(sk, context({ accountId: "acct" })); bindCardRun(sk, "new"); }
+    if (mode === "cleared") clearCard(sk);
+    const ctx = { sessionKey: sk, runId: "old" };
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "sent", params: { action: "send", target: "group:group-1" } }, ctx);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "sent", result: { details: { ok: true, data: { sent: true, accountId: mode === "foreign receipt" ? "other" : "acct", resolvedTarget: "group-1", channelType: ChannelType.Group } } } }, ctx);
+    expect(finalizer.hasDeliveredOutput()).toBe(!["foreign receipt", "cleared"].includes(mode));
+    await finalizer.finish({ success: false, failed: true });
+    expect(wire.calls.filter(c => /sendMessage|message\/edit/.test(c.url))).toHaveLength(0);
+  });
+
+  it("GC visible released cards: closes abandoned old cards without expiring live work", async () => {
+    if (!globalThis.gc) {
+      vi.useRealTimers();
+      await promisify(execFile)(process.execPath, ["node_modules/vitest/vitest.mjs", "run", "src/card-progress.test.ts", "--execArgv=--expose-gc", "-t", "GC visible released cards:"], { cwd: process.cwd(), timeout: 90_000, maxBuffer: 2 * 1024 * 1024 });
+      return;
+    }
+    const wire = mockFetch({ sendResponses: [{ status: 200, messageId: "old-card" }, { status: 200, messageId: "live-card" }] });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "gc-visible";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "old");
+    await (async () => { const owner = createCardFinalizer(sk); await owner.pending(); })();
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "live");
+    const live = createCardFinalizer(sk); await live.pending();
+    vi.useRealTimers();
+    const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+    for (let i = 0; i < 20; i++) { await tick(); globalThis.gc!(); await tick(); }
+    const state = (process as any)[Symbol.for("openclaw.octo.card-progress-state.v2")];
+    expect(state.releasedRuns.size).toBe(1);
+    expect(state.releasedCards.size).toBe(1);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "old-card").at(-1)?.body?.state).toBe("error");
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "live-card").every(c => c.body?.state === "reasoning")).toBe(true);
+    await live.finish({ success: true });
+    expect(state.releasedCards.size).toBe(0);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "live-card").at(-1)?.body?.state).toBe("completed");
+  }, 100_000);
 
   it.each(["before", "after"])("keeps a continuation's second spawn/yield when the unrelated inbound settles %s continuation start", async order => {
     const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
