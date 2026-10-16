@@ -181,7 +181,7 @@
                 "dispatchTimeoutMs": {
                   "type": "number",
                   "minimum": 1000,
-                  "description": "Per-inbound queue wait limit in milliseconds. Ordinary IM expiry releases the per-group queue without cancelling the agent; late replies remain allowed. When unset, uses the host agent timeout resolver plus 60000ms, capped at Node's timer limit. On hosts without that API, an explicit agents.defaults.timeoutSeconds is used; unknown or unlimited timeouts release the queue after 30 minutes without imposing an execution deadline. Account shutdown still cancels active IM dispatches. Document and business tasks retain their task-specific deadline and cancellation policies."
+                  "description": "Per-inbound queue wait limit in milliseconds. Ordinary IM expiry releases the per-group queue without cancelling the agent; late replies remain allowed. When unset, uses the host agent timeout resolver plus 60000ms, capped at Node's timer limit. On hosts without that API, an explicit agents.defaults.timeoutSeconds is used; when the timeout policy is unavailable, the historical 11-minute queue wait is retained; an explicitly unlimited policy releases the queue after 30 minutes. Neither imposes an execution deadline. Account shutdown still cancels active IM dispatches. Document and business tasks retain their task-specific deadline and cancellation policies."
                 },
                 "docsCliPath": {
                   "type": "string",
@@ -201,7 +201,7 @@
           "dispatchTimeoutMs": {
             "type": "number",
             "minimum": 1000,
-            "description": "Per-inbound queue wait limit in milliseconds. Ordinary IM expiry releases the per-group queue without cancelling the agent; late replies remain allowed. When unset, uses the host agent timeout resolver plus 60000ms, capped at Node's timer limit. On hosts without that API, an explicit agents.defaults.timeoutSeconds is used; unknown or unlimited timeouts release the queue after 30 minutes without imposing an execution deadline. Account shutdown still cancels active IM dispatches. Document and business tasks retain their task-specific deadline and cancellation policies."
+            "description": "Per-inbound queue wait limit in milliseconds. Ordinary IM expiry releases the per-group queue without cancelling the agent; late replies remain allowed. When unset, uses the host agent timeout resolver plus 60000ms, capped at Node's timer limit. On hosts without that API, an explicit agents.defaults.timeoutSeconds is used; when the timeout policy is unavailable, the historical 11-minute queue wait is retained; an explicitly unlimited policy releases the queue after 30 minutes. Neither imposes an execution deadline. Account shutdown still cancels active IM dispatches. Document and business tasks retain their task-specific deadline and cancellation policies."
           },
           "commands": {
             "type": "object",

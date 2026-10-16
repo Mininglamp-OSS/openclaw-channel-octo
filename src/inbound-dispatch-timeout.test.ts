@@ -424,7 +424,7 @@ afterEach(() => {
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
-  it("an unknown host budget releases the queue after 30 minutes without aborting the run", async () => {
+  it("an unknown host budget releases the queue after 11 minutes without aborting the run", async () => {
     _setDispatchTimeoutForTests(null); vi.useFakeTimers();
     const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
     let release!: () => void; let enter!: () => void; let signal!: AbortSignal;
@@ -435,9 +435,9 @@ describe("dispatch timeout guard (issue #75)", () => {
     });
     try {
       const running = expect(runInbound()).rejects.toThrow("dispatch timed out");
-      await entered; await vi.advanceTimersByTimeAsync(720_000);
+      await entered; await vi.advanceTimersByTimeAsync(659_999);
       expect(sends).toEqual([]); expect(signal.aborted).toBe(false);
-      await vi.advanceTimersByTimeAsync(1_080_001); await running;
+      await vi.advanceTimersByTimeAsync(2); await running;
       expect(signal.aborted).toBe(false);
       release(); await vi.advanceTimersByTimeAsync(1);
       expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "eventual answer"]);
