@@ -201,7 +201,10 @@ export async function dispatchForkSeedReply(params: {
       // Closing callbacks also prevents a broken dispatcher from emitting an
       // answer after its rejection has already produced a failure receipt.
       settled = true;
-      if (buffer.lastText && !delivered) {
+      // A buffered block is only a fallback when no terminal delivery failed.
+      // Sending stale partial text cannot recover a failed final/tool reply;
+      // only a successfully delivered final may supply that evidence.
+      if (buffer.lastText && !delivered && !deliverFailed) {
         try {
           await sendSeedText(buffer.lastText);
           delivered = true;
@@ -210,8 +213,8 @@ export async function dispatchForkSeedReply(params: {
           deliverFailed = true;
           log?.error?.(`octo: [fork-seed] finally flush failed: ${String(flushErr)}`);
         }
-        buffer.lastText = null;
       }
+      buffer.lastText = null;
     }
     if (deliverFailed && !answerDelivered) {
       throw new Error("octo: [fork-seed] delivery failed: user-facing reply did not send");

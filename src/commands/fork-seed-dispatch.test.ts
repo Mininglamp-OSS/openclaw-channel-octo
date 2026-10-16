@@ -399,6 +399,51 @@ describe("dispatchForkSeedReply", () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it.each([
+    ...[false, true].flatMap(released =>
+      ["final", "tool"].flatMap(kind =>
+        ["send", "onError"].map(source => ({ released, kind, source })))),
+  ])("buffered text cannot hide $kind $source failure (released=$released)", async ({ released, kind, source }) => {
+    vi.useFakeTimers();
+    let options: any; let finish!: () => void;
+    mockDispatch.mockImplementation(o => { options = o; return new Promise<void>(resolve => { finish = resolve; }); });
+    try {
+      const running = run({}, 50);
+      const outcome = released ? running : expect(running).rejects.toThrow(/delivery failed/);
+      await options.dispatcherOptions.deliver({ text: "partial" }, { kind: "block" });
+      if (released) { await vi.advanceTimersByTimeAsync(50); await running; }
+      if (source === "send") {
+        mockSendMessage.mockRejectedValueOnce(new Error("terminal 403"));
+        await options.dispatcherOptions.deliver({ text: "answer" }, { kind });
+      } else {
+        await options.dispatcherOptions.onError(new Error("terminal failure"), { kind });
+      }
+      finish(); await vi.advanceTimersByTimeAsync(0); await outcome;
+      const contents = mockSendMessage.mock.calls.map(call => (call[0] as { content: string }).content);
+      expect(contents).not.toContain("partial");
+      expect(contents).toEqual([
+        ...(source === "send" ? ["answer"] : []),
+        ...(released ? ["首条问题处理失败，请在此子区重试。"] : []),
+      ]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("a real final recovers buffered terminal failure (released=%s)", async released => {
+    vi.useFakeTimers();
+    let options: any; let finish!: () => void;
+    mockDispatch.mockImplementation(o => { options = o; return new Promise<void>(resolve => { finish = resolve; }); });
+    try {
+      const running = run({}, 50);
+      await options.dispatcherOptions.deliver({ text: "partial" }, { kind: "block" });
+      if (released) { await vi.advanceTimersByTimeAsync(50); await running; }
+      await options.dispatcherOptions.onError(new Error("failed attempt"), { kind: "final" });
+      await options.dispatcherOptions.deliver({ text: "complete answer" }, { kind: "final" });
+      finish(); await vi.advanceTimersByTimeAsync(0); await running;
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+      expect(mockSendMessage).toHaveBeenCalledWith(expect.objectContaining({ content: "complete answer" }));
+    } finally { vi.useRealTimers(); }
+  });
+
   it("a successful final recovers an earlier tool send failure", async () => {
     mockSendMessage.mockRejectedValueOnce(new Error("tool 503"));
     driveDeliver([{ kind: "tool", text: "progress" }, { kind: "final", text: "answer" }]);
