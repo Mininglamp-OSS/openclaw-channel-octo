@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DocTaskTracker, registerDocTaskProgress, type DocTaskProgress } from "./doc-task-progress.js";
 import { ChannelType } from "./types.js";
@@ -8,18 +10,23 @@ import {
   clearCard,
   finalizeCard,
   markCardAnswering,
+  createCardFinalizer,
+  createCardReasoningRecorder,
   recordCardReasoning,
   registerCardProgress,
   setCardContext,
 } from "./card-progress.js";
 import { DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NAME } from "./constants.js";
 
-type Hook = (event: Record<string, unknown>, ctx: { sessionKey: string; runId?: string }) => unknown;
+type Hook = (event: Record<string, unknown>, ctx: { sessionKey: string; runId?: string; inputProvenance?: unknown }) => unknown;
 
-function makeApi(): Record<string, Hook> {
+function makeApi(lifecycle = false): Record<string, Hook> {
   const handlers: Record<string, Hook> = {};
   registerCardProgress({
     on: (name: string, handler: Hook) => { handlers[name] = handler; },
+    ...(lifecycle ? { agent: { events: { registerAgentEventSubscription: (subscription: { id: string; handle: Hook }) => {
+      handlers[subscription.id] = subscription.handle;
+    } } } } : {}),
   } as never);
   return handlers;
 }
@@ -187,6 +194,41 @@ describe("server-driven Registry reasoning progress", () => {
     expect(edits[1]).not.toHaveProperty("transient");
     expect(edits.every((body) => !Object.hasOwn(body, "content_edit"))).toBe(true);
   });
+
+  it.each(["finalize", "pending"])("native abort bounds a genuinely hanging card edit: %s", async operation => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = `hanging-${operation}`;
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk);
+    const finalizer = createCardFinalizer(sk);
+    vi.useRealTimers();
+    // Keep the real native AbortSignal timer; shorten only the 10s card budget.
+    const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => nativeTimeout(ms === 10_000 ? 40 : ms));
+    let aborted = false;
+    global.fetch = vi.fn(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/v1/bot/message/edit");
+      const signal = init?.signal;
+      expect(signal).toBeDefined();
+      return new Promise<Response>((_, reject) => {
+        const onAbort = () => { aborted = true; reject(signal!.reason); };
+        if (signal!.aborted) onAbort();
+        else signal!.addEventListener("abort", onAbort, { once: true });
+      });
+    }) as typeof fetch;
+    if (operation === "pending") await finalizer.pending();
+    else await finalizer.finish({ success: true });
+    expect(aborted).toBe(true);
+    expect(timeout).toHaveBeenCalledWith(10_000);
+    const state = (process as any)[Symbol.for("openclaw.octo.card-progress-state.v2")];
+    if (operation === "pending") {
+      expect(state.cards.has(sk)).toBe(true); // A failed pending frame cannot finish a healthy run.
+      global.fetch = wire.fetch as typeof fetch;
+      await finalizer.finish({ success: true });
+    }
+    expect(state.cards.has(sk)).toBe(false);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(state.releasedCards.size).toBe(0);
+  }, 2_000);
 
   it("selects the exact configured ref from a multi-version catalog", async () => {
     const wire = mockFetch({
@@ -555,10 +597,13 @@ describe("server-driven Registry reasoning progress", () => {
     expect(wire.calls).toEqual([]);
   });
 
-  it("keeps one Registry card across yield and a trusted continuation", async () => {
+  it.each([
+    ["legacy prompt", false], ["legacy prompt", true],
+    ["subagent_announce", false], ["subagent_announce", true], ["subagent_settle", true],
+  ] as const)("keeps one Registry card across acknowledgment, yield and a trusted continuation: %s (lifecycle: %s)", async (source, lifecycle) => {
     const wire = mockFetch();
     global.fetch = wire.fetch as typeof fetch;
-    const handlers = makeApi();
+    const handlers = makeApi(lifecycle);
     setCardContext("continuation", context());
     await triggerFirstFrame(handlers, "continuation", "run-1");
     const firstContext = { sessionKey: "continuation", runId: "run-1" };
@@ -571,13 +616,29 @@ describe("server-driven Registry reasoning progress", () => {
     }, firstContext);
     handlers.before_tool_call?.({ toolName: "sessions_yield", toolCallId: "yield-1" }, firstContext);
     handlers.after_tool_call?.({ toolName: "sessions_yield", toolCallId: "yield-1" }, firstContext);
+    // The host delivers a waiting acknowledgment after yielding. It is not a
+    // completed answer and must not undo the pause before dispatch finalizes.
+    markCardAnswering("continuation");
     await vi.advanceTimersByTimeAsync(900);
-    await finalizeCard("continuation", { success: false });
+    await finalizeCard("continuation", { success: true });
+    const waitingEdits = wire.calls.filter((call) => call.url.includes("/message/edit"));
+    expect(waitingEdits.at(-1)?.body).toMatchObject({ state: "reasoning" });
+    expect(waitingEdits.at(-1)?.body?.transient).not.toBe(true);
+    expect(waitingEdits.some((call) => call.body?.state === "completed")).toBe(false);
 
     setCardContext("continuation", context());
-    const secondContext = { sessionKey: "continuation", runId: "run-2" };
-    handlers.before_agent_run?.({ prompt: completionPrompt("child-1") }, secondContext);
-    await handlers.agent_end?.({ runId: "run-2", success: true }, secondContext);
+    const secondContext = {
+      sessionKey: "continuation", runId: "run-2",
+      ...(source !== "legacy prompt" ? { inputProvenance: {
+        kind: "inter_session", sourceTool: source, sourceSessionKey: "child-1",
+      } } : {}),
+    };
+    handlers.before_agent_run?.({ prompt: source === "legacy prompt" ? completionPrompt("child-1") : "A runtime event arrived." }, secondContext);
+    if (lifecycle) {
+      await handlers["octo-card-progress-lifecycle"]?.({ ...secondContext, stream: "lifecycle", data: { phase: "end" } }, secondContext);
+    } else {
+      await handlers.agent_end?.({ runId: "run-2", success: true }, secondContext);
+    }
 
     const edits = wire.calls
       .filter((call) => call.url.includes("/message/edit"))
@@ -587,6 +648,639 @@ describe("server-driven Registry reasoning progress", () => {
       edits.map((_body, index) => index + 1),
     );
     expect(wire.calls.filter((call) => call.url.includes("/sendMessage"))).toHaveLength(1);
+  });
+
+  it.each([false, true])("keeps the original card through two consecutive spawn/yield cycles (lifecycle: %s)", async lifecycle => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(lifecycle);
+    setCardContext("repeat-yield", context());
+    await triggerFirstFrame(handlers, "repeat-yield", "r1");
+    for (let n = 1; n <= 2; n++) {
+      const ctx = { sessionKey: "repeat-yield", runId: `r${n}` };
+      handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { details: { status: "accepted", childSessionKey: `child${n}` } } }, ctx);
+      handlers.after_tool_call?.({ toolName: "sessions_yield", result: { details: { status: "yielded" } } }, ctx);
+      markCardAnswering(ctx.sessionKey);
+      await finalizeCard(ctx.sessionKey, { success: true });
+      await handlers.agent_end?.({ success: true }, ctx);
+      expect(wire.calls.some(c => c.body?.state === "completed")).toBe(false);
+      setCardContext(ctx.sessionKey, context());
+      handlers.before_agent_run?.({ prompt: "Runtime event" }, { sessionKey: ctx.sessionKey, runId: `r${n+1}`, inputProvenance: {
+        kind: "inter_session", sourceTool: "subagent_settle", sourceSessionKey: `child${n}`,
+      } });
+    }
+    const ctx = { sessionKey: "repeat-yield", runId: "r3" };
+    if (lifecycle) await handlers["octo-card-progress-lifecycle"]?.({ ...ctx, stream: "lifecycle", data: { phase: "end" } }, ctx);
+    else await handlers.agent_end?.({ success: true }, ctx);
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(1);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it.each(["on", "off"] as const)("continuation uses current reasoning visibility and rejects previous generation callbacks: %s", async reasoningVisibility => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "reasoning-generation";
+    setCardContext(sk, { ...context(), reasoningVisibility: "on" });
+    const oldRecorder = createCardReasoningRecorder(sk);
+    await triggerFirstFrame(handlers, sk, "r1");
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, { sessionKey: sk, runId: "r1" });
+    handlers.after_tool_call?.({ toolName: "sessions_yield" }, { sessionKey: sk, runId: "r1" });
+    await finalizeCard(sk, { success: true });
+    setCardContext(sk, { ...context(), reasoningVisibility });
+    const currentRecorder = createCardReasoningRecorder(sk);
+    handlers.before_agent_run?.({ prompt: "event" }, { sessionKey: sk, runId: "r2", inputProvenance: {
+      kind: "inter_session", sourceTool: "subagent_settle", sourceSessionKey: "child",
+    } });
+    currentRecorder("current reasoning"); oldRecorder("STALE_SECRET_REASONING");
+    await vi.advanceTimersByTimeAsync(900);
+    const rendered = JSON.stringify(wire.calls);
+    expect(rendered).not.toContain("STALE_SECRET_REASONING");
+    if (reasoningVisibility === "on") expect(rendered).toContain("current reasoning");
+    else expect(rendered).not.toContain("current reasoning");
+  });
+
+  it.each([["end", false], ["error", true]] as const)("orders in-flight lifecycle %s against dispatch success=%s without losing a failure", async (phase, success) => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "resume-failure-order";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "r1");
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, { sessionKey: sk, runId: "r1" });
+    handlers.after_tool_call?.({ toolName: "sessions_yield" }, { sessionKey: sk, runId: "r1" });
+    await finalizeCard(sk, { success: true });
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>(r => { release = r; }); const started = new Promise<void>(r => { entered = r; });
+    global.fetch = (async (...args: Parameters<typeof fetch>) => {
+      if (String(args[0]).includes("/message/edit")) { entered(); await gate; }
+      return wire.fetch(...args);
+    }) as typeof fetch;
+    setCardContext(sk, context()); const finalizer = createCardFinalizer(sk);
+    handlers.before_agent_run?.({ prompt: "Runtime event" }, { sessionKey: sk, runId: "r2", inputProvenance: {
+      kind: "inter_session", sourceTool: "subagent_settle", sourceSessionKey: "child",
+    } });
+    await started;
+    const lifecycleEnd = handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "r2", stream: "lifecycle", data: { phase, error: "actual lifecycle failure" } }, { sessionKey: sk, runId: "r2" });
+    const failing = finalizer.finish({ success, failed: !success });
+    release(); await failing; await lifecycleEnd;
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
+    await handlers.agent_end?.({ success: true }, { sessionKey: sk, runId: "r2" });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
+  });
+
+  it("does not retain a yielded card after a real delivery failure", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("yield-failure", context());
+    await triggerFirstFrame(handlers, "yield-failure");
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, { sessionKey: "yield-failure", runId: "run-1" });
+    markCardAnswering("yield-failure");
+    await finalizeCard("yield-failure", { success: false, failed: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
+  });
+
+  it("still sends the first progress card when queue release precedes its debounce", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "pending-first-send";
+    const ctx = { sessionKey: sk, runId: "run-1" };
+    setCardContext(sk, context());
+    const finalizer = createCardFinalizer(sk);
+    handlers.before_agent_run?.({}, ctx);
+    handlers.before_tool_call?.({ toolName: "exec", toolCallId: "first" }, ctx);
+    await finalizer.pending();
+    await vi.advanceTimersByTimeAsync(850);
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(1);
+    await finalizer.finish({ success: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it("continues flushing tool progress after a queue-release snapshot", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "pending-flush";
+    const ctx = { sessionKey: sk, runId: "run-1" };
+    setCardContext(sk, context());
+    const finalizer = createCardFinalizer(sk);
+    await triggerFirstFrame(handlers, sk);
+    handlers.before_tool_call?.({ toolName: "exec", toolCallId: "later" }, ctx);
+    await finalizer.pending();
+    const edits = wire.calls.filter(c => c.url.includes("/message/edit")).length;
+    handlers.after_tool_call?.({ toolName: "exec", toolCallId: "later", result: {} }, ctx);
+    await vi.advanceTimersByTimeAsync(850);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).length).toBeGreaterThan(edits);
+    await finalizer.finish({ success: true });
+  });
+
+  it.each(["delivered", "foreign target", "tool error", "failed run"])("retains only the released run's tool delivery evidence: %s", async mode => {
+    const wire = mockFetch({ sendResponses: [{ status: 200, messageId: "old-card" }, { status: 200, messageId: "new-card" }] });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "released-evidence";
+    const old = { sessionKey: sk, runId: "old-run" };
+    setCardContext(sk, context());
+    const finalizer = createCardFinalizer(sk);
+    await triggerFirstFrame(handlers, sk, old.runId);
+    await finalizer.pending();
+    setCardContext(sk, context());
+    await triggerFirstFrame(handlers, sk, "new-run");
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "late-send", params: {
+      action: "send", target: mode === "foreign target" ? "group:another-group" : "group:group-1",
+    } }, old);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "late-send", result: {},
+      ...(mode === "tool error" ? { error: "send failed" } : {}),
+    }, old);
+    await finalizer.finish({ success: false, failed: mode === "failed run" });
+    const oldFinal = wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "old-card").at(-1)?.body;
+    expect(oldFinal?.state).toBe(mode === "delivered" ? "completed" : "error");
+    await finalizeCard(sk, { success: false });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "new-card").at(-1)?.body?.state).toBe("error");
+  });
+
+  it.each(["tool", "lifecycle", "yield before replacement", "no-op", "foreign run"])("released late yield keeps original flow ownership: %s", async mode => {
+    const wire = mockFetch({ sendResponses: [{ status: 200, messageId: "old-card" }, { status: 200, messageId: "new-card" }] });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "late-yield";
+    const old = { sessionKey: sk, runId: "old" };
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "old");
+    const finalizer = createCardFinalizer(sk); await finalizer.pending();
+    const yieldOld = async () => {
+      const ctx = mode === "foreign run" ? { sessionKey: sk, runId: "foreign" } : old;
+      handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, ctx);
+      if (mode === "lifecycle") await handlers["octo-card-progress-lifecycle"]?.({ ...ctx, stream: "lifecycle", data: { phase: "end", yielded: true } }, ctx);
+      else handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: mode === "no-op" ? "nothing_pending" : "yielded" } }, ctx);
+    };
+    if (mode === "yield before replacement") await yieldOld();
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "new");
+    if (mode !== "yield before replacement") await yieldOld();
+    await finalizer.finish({ success: true });
+    const oldEdits = () => wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "old-card");
+    const isPaused = !["no-op", "foreign run"].includes(mode);
+    expect(oldEdits().at(-1)?.body?.state).toBe(isPaused ? "reasoning" : "completed");
+    const next = { sessionKey: sk, runId: "continuation", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child" } };
+    handlers.before_agent_run?.({}, next);
+    await handlers["octo-card-progress-lifecycle"]?.({ ...next, stream: "lifecycle", data: { phase: "end" } }, next);
+    if (isPaused) expect(oldEdits().at(-1)?.body?.state).toBe("completed");
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "new-card")).toHaveLength(0);
+    await finalizeCard(sk, { success: false, failed: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "new-card").at(-1)?.body?.state).toBe("error");
+  });
+
+  it.each(["current", "replaced", "foreign receipt", "cleared"])("disabled card keeps only valid delivery evidence: %s", async mode => {
+    const wire = mockFetch({ profile: profile({ reasoningEnabled: false }) }); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "no-card-evidence";
+    setCardContext(sk, context({ accountId: "acct" })); await triggerFirstFrame(handlers, sk, "old");
+    const finalizer = createCardFinalizer(sk); await finalizer.pending();
+    if (mode === "replaced") { setCardContext(sk, context({ accountId: "acct" })); bindCardRun(sk, "new"); }
+    if (mode === "cleared") clearCard(sk);
+    const ctx = { sessionKey: sk, runId: "old" };
+    handlers.before_tool_call?.({ toolName: "message", toolCallId: "sent", params: { action: "send", target: "group:group-1" } }, ctx);
+    handlers.after_tool_call?.({ toolName: "message", toolCallId: "sent", result: { details: { ok: true, data: { sent: true, accountId: mode === "foreign receipt" ? "other" : "acct", resolvedTarget: "group-1", channelType: ChannelType.Group } } } }, ctx);
+    expect(finalizer.hasDeliveredOutput()).toBe(!["foreign receipt", "cleared"].includes(mode));
+    await finalizer.finish({ success: false, failed: true });
+    expect(wire.calls.filter(c => /sendMessage|message\/edit/.test(c.url))).toHaveLength(0);
+  });
+
+  it("GC visible released cards: closes abandoned old cards without expiring live work", async () => {
+    if (!globalThis.gc) {
+      vi.useRealTimers();
+      await promisify(execFile)(process.execPath, ["node_modules/vitest/vitest.mjs", "run", "src/card-progress.test.ts", "--execArgv=--expose-gc", "-t", "GC visible released cards:"], { cwd: process.cwd(), timeout: 90_000, maxBuffer: 2 * 1024 * 1024 });
+      return;
+    }
+    const wire = mockFetch({ sendResponses: [{ status: 200, messageId: "old-card" }, { status: 200, messageId: "live-card" }] });
+    global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "gc-visible";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "old");
+    await (async () => { const owner = createCardFinalizer(sk); await owner.pending(); })();
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "live");
+    const live = createCardFinalizer(sk); await live.pending();
+    vi.useRealTimers();
+    const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+    for (let i = 0; i < 20; i++) { await tick(); globalThis.gc!(); await tick(); }
+    const state = (process as any)[Symbol.for("openclaw.octo.card-progress-state.v2")];
+    expect(state.releasedRuns.size).toBe(1);
+    expect(state.releasedCards.size).toBe(1);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "old-card").at(-1)?.body?.state).toBe("error");
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "live-card").every(c => c.body?.state === "reasoning")).toBe(true);
+    await live.finish({ success: true });
+    expect(state.releasedCards.size).toBe(0);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "live-card").at(-1)?.body?.state).toBe("completed");
+  }, 100_000);
+
+  it.each(["before", "after"])("keeps a continuation's second spawn/yield when the unrelated inbound settles %s continuation start", async order => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "overlapping-continuation";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "first");
+    const first = { sessionKey: sk, runId: "first" };
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child-1" } }, first);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, first);
+    await finalizeCard(sk, { success: true });
+    const second = { sessionKey: sk, runId: "second", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child-1" } };
+    handlers.before_agent_run?.({}, second);
+    setCardContext(sk, context());
+    handlers.before_agent_run?.({}, { sessionKey: sk, runId: "unrelated" });
+    handlers.before_tool_call?.({ toolName: "sessions_spawn", toolCallId: "spawn-2" }, second);
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", toolCallId: "spawn-2", result: { status: "accepted", childSessionKey: "child-2" } }, second);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, second);
+    const unrelatedFinalizer = createCardFinalizer(sk);
+    if (order === "before") await unrelatedFinalizer.finish({ success: false, failed: true });
+    const third = { sessionKey: sk, runId: "third", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child-2" } };
+    handlers.before_agent_run?.({}, third);
+    if (order === "after") await unrelatedFinalizer.finish({ success: false, failed: true });
+    await handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "third", stream: "lifecycle", data: { phase: "end" } }, third);
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(1);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it("debounces retained continuation tools and observes shared cooldown without delaying its terminal frame", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "retained-rate";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "first");
+    const first = { sessionKey: sk, runId: "first" };
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, first);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, first);
+    await finalizeCard(sk, { success: true });
+    const continuation = { sessionKey: sk, runId: "second", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child" } };
+    handlers.before_agent_run?.({}, continuation);
+    await vi.advanceTimersByTimeAsync(0);
+    setCardContext(sk, context());
+    handlers.before_agent_run?.({}, { sessionKey: sk, runId: "unrelated" });
+    const edits = () => wire.fetch.mock.calls.filter(([url]) => String(url).includes("/message/edit")).length;
+    const burst = (prefix: string) => {
+      for (let i = 0; i < 20; i++) {
+        handlers.before_tool_call?.({ toolName: "read", toolCallId: prefix + i }, continuation);
+        handlers.after_tool_call?.({ toolName: "read", toolCallId: prefix + i, result: {} }, continuation);
+      }
+    };
+    const before = edits();
+    burst("first-");
+    await vi.advanceTimersByTimeAsync(799); expect(edits()).toBe(before);
+    await vi.advanceTimersByTimeAsync(1); expect(edits()).toBe(before + 1);
+    wire.fetch.mockImplementationOnce(async () => new Response(JSON.stringify({ error: {
+      code: "err.shared.rate.limited", http_status: 429, details: { retry_after: 30 },
+    } }), { status: 429, headers: { "Retry-After": "30", "Content-Type": "application/json" } }));
+    burst("limited-"); await vi.advanceTimersByTimeAsync(850);
+    const limitedCount = edits();
+    burst("held-"); await vi.advanceTimersByTimeAsync(20_000);
+    expect(edits()).toBe(limitedCount);
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(edits()).toBe(limitedCount + 1);
+    wire.fetch.mockImplementationOnce(async () => new Response(JSON.stringify({ error: {
+      code: "err.shared.rate.limited", http_status: 429, details: { retry_after: 30 },
+    } }), { status: 429, headers: { "Retry-After": "30", "Content-Type": "application/json" } }));
+    burst("last-"); await vi.advanceTimersByTimeAsync(850);
+    await handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "second", stream: "lifecycle", data: { phase: "end" } }, continuation);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+    const doneCount = edits(); await vi.advanceTimersByTimeAsync(1000);
+    expect(edits()).toBe(doneCount);
+  });
+
+  async function retainedProgressFixture() {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true); const sk = "retained-retry";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "first");
+    const first = { sessionKey: sk, runId: "first" };
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, first);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, first);
+    await finalizeCard(sk, { success: true });
+    const continuation = { sessionKey: sk, runId: "second", inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child" } };
+    handlers.before_agent_run?.({}, continuation);
+    await vi.advanceTimersByTimeAsync(0);
+    setCardContext(sk, context());
+    handlers.before_agent_run?.({}, { sessionKey: sk, runId: "unrelated" });
+    const edits = () => wire.fetch.mock.calls.filter(([url]) => String(url).includes("/message/edit"));
+    const event = (id = "retry-tool") => handlers.after_tool_call?.({ toolName: "read", toolCallId: id, result: {} }, continuation);
+    const finish = () => handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "second", stream: "lifecycle", data: { phase: "end" } }, continuation);
+    return { wire, handlers, sk, continuation, edits, event, finish };
+  }
+
+  it.each(["503", "network", "timeout", "semantic-500"])("retries a retained progress frame after exhausted short retries: %s", async kind => {
+    const { wire, edits, event, finish } = await retainedProgressFixture();
+    const fail = async () => {
+      if (kind === "network") throw new TypeError("fetch failed");
+      if (kind === "timeout") throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      if (kind === "semantic-500") return new Response(JSON.stringify({ error: { code: "err.shared.internal", http_status: 500 } }), { status: 400 });
+      return new Response("temporary", { status: 503 });
+    };
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(fail);
+    const before = edits().length;
+    event(); await vi.advanceTimersByTimeAsync(1_150);
+    expect(edits()).toHaveLength(before + 3);
+    // No new hook: the card-local wake must retry the failed snapshot itself.
+    await vi.advanceTimersByTimeAsync(999);
+    expect(edits()).toHaveLength(before + 3);
+    await vi.advanceTimersByTimeAsync(501);
+    expect(edits()).toHaveLength(before + 4);
+    const bodies = edits().slice(before).map(([, init]) => JSON.parse(String(init.body)));
+    expect(bodies[0].card_seq).toBe(bodies[2].card_seq);
+    expect(bodies[3].card_seq).toBeGreaterThan(bodies[2].card_seq);
+    expect(bodies[3].state).toBe("reasoning");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before + 4);
+    await finish();
+  });
+
+  it("bounds retained progress retries during an outage and recovers on a fresh tool event", async () => {
+    const { wire, edits, event, finish } = await retainedProgressFixture();
+    const original = wire.fetch.getMockImplementation()!;
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    event(); await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before + 12); // initial frame + 3 fresh-frame retries, each with 3 wire attempts
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before + 12);
+    wire.fetch.mockImplementation(original);
+    event("after-recovery"); await vi.advanceTimersByTimeAsync(800);
+    expect(edits()).toHaveLength(before + 13);
+    await finish();
+  });
+
+  it.each(["finish", "clear", "identity-replacement"])("cancels retained progress retry on %s without a stale frame", async end => {
+    const { wire, edits, event, finish, sk } = await retainedProgressFixture();
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("temporary", { status: 503 }));
+    event(); await vi.advanceTimersByTimeAsync(1_150);
+    if (end === "finish") {
+      await finish();
+      expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+    } else if (end === "clear") clearCard(sk);
+    else setCardContext(sk, context({ botToken: "another-bot", onBehalfOf: "different-owner" }));
+    const before = edits().length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before);
+  });
+
+  it.each([403, 422])("does not retry deterministic retained progress rejection %s", async status => {
+    const { wire, edits, event } = await retainedProgressFixture();
+    wire.fetch.mockImplementationOnce(async () => new Response("rejected", { status }));
+    const before = edits().length;
+    event(); await vi.advanceTimersByTimeAsync(60_000);
+    event("later"); await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before + 1);
+  });
+
+  async function pausedTerminalFixture(mode: "lifecycle" | "agent_end" | "orphan", keepCurrent = false,
+    beforeResume?: (wire: ReturnType<typeof mockFetch>) => void) {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(mode !== "agent_end"); const sk = "terminal-recovery";
+    const first = { sessionKey: sk, runId: "first" };
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "first");
+    if (mode !== "orphan") handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { status: "accepted", childSessionKey: "child" } }, first);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, first);
+    await finalizeCard(sk, { success: true });
+    const continuation = { sessionKey: sk, runId: mode === "orphan" ? "first" : "second",
+      ...(mode !== "orphan" ? { inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "child" } } : {}),
+    };
+    if (mode === "orphan") setCardContext(sk, context());
+    beforeResume?.(wire);
+    handlers.before_agent_run?.({}, continuation);
+    await vi.advanceTimersByTimeAsync(0);
+    if (mode !== "orphan" && !keepCurrent) {
+      setCardContext(sk, context()); handlers.before_agent_run?.({}, { sessionKey: sk, runId: "unrelated" });
+    }
+    const finish = (error = false) => mode === "orphan" ? finalizeCard(sk, { success: !error, failed: error })
+      : mode === "agent_end" ? handlers.agent_end?.({ success: !error, ...(error ? { error: "real failure" } : {}) }, continuation)
+      : handlers["octo-card-progress-lifecycle"]?.({ sessionKey: sk, runId: "second", stream: "lifecycle", data: { phase: error ? "error" : "end", ...(error ? { error: "real failure" } : {}) } }, continuation);
+    const edits = () => wire.fetch.mock.calls.filter(([url]) => String(url).includes("/message/edit"));
+    return { wire, handlers, sk, continuation, finish, edits };
+  }
+
+  it.each(["lifecycle", "agent_end", "orphan"] as const)("recovers a failed %s terminal edit without another lifecycle event", async mode => {
+    const { wire, finish, edits } = await pausedTerminalFixture(mode);
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    expect(edits()).toHaveLength(before + 3);
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(edits()).toHaveLength(before + 4);
+    const bodies = edits().slice(before).map(([, init]) => JSON.parse(String(init.body)));
+    expect(bodies.at(-1).state).toBe("completed");
+    expect(bodies.at(-1).card_seq).toBeGreaterThan(bodies[0].card_seq);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(edits()).toHaveLength(before + 4);
+  });
+
+  it.each(["network", "timeout", "semantic-500", "error-result"])("recovers the exact terminal result after %s", async kind => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => {
+      if (kind === "network") throw new TypeError("fetch failed");
+      if (kind === "timeout") throw new DOMException("timeout", "TimeoutError");
+      if (kind === "semantic-500") return new Response(JSON.stringify({ error: { code: "err.shared.internal", http_status: 500 } }), { status: 400 });
+      return new Response("unavailable", { status: 503 });
+    });
+    const finishing = finish(kind === "error-result"); await vi.advanceTimersByTimeAsync(350); await finishing;
+    await vi.advanceTimersByTimeAsync(1600);
+    const body = JSON.parse(String(edits().at(-1)![1].body));
+    expect(body.state).toBe(kind === "error-result" ? "error" : "completed");
+  });
+
+  it("bounds terminal retries and preserves Done at the final expiry recovery", async () => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    const normal = wire.fetch.getMockImplementation()!;
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(60_000); await finishing;
+    expect(edits()).toHaveLength(before + 12);
+    await vi.advanceTimersByTimeAsync(60_000); expect(edits()).toHaveLength(before + 12);
+    wire.fetch.mockImplementation(normal);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(edits()).toHaveLength(before + 13);
+    expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("completed");
+  });
+
+  it.each(["clear", "identity", "yield", "error"])("cancels stale terminal recovery on %s", async change => {
+    const { wire, finish, edits, sk, handlers, continuation } = await pausedTerminalFixture("lifecycle");
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    if (change === "clear") clearCard(sk);
+    else if (change === "identity") setCardContext(sk, context({ botToken: "another-bot" }));
+    else if (change === "error") await finish(true);
+    else {
+      handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, continuation);
+      await vi.advanceTimersByTimeAsync(850);
+    }
+    const before = edits().length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(before);
+    if (change === "error") expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("error");
+    if (change === "yield") expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("reasoning");
+  });
+
+  it("does not discard terminal recovery when the matching dispatch finalizer settles", async () => {
+    const { wire, finish, edits, sk } = await pausedTerminalFixture("lifecycle", true);
+    for (let i = 0; i < 6; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    const finalizing = finalizeCard(sk, { success: true }); await vi.advanceTimersByTimeAsync(350); await finalizing;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it.each(["lifecycle", "agent_end"] as const)("preserves authoritative %s Done without reply evidence or after delivered-final rejection", async mode => {
+    const { wire, finish, edits, sk } = await pausedTerminalFixture(mode, true);
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    await finalizeCard(sk, { success: false });
+    await finalizeCard(sk, { success: true, failed: true });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(edits().slice(before).every(([, init]) => JSON.parse(String(init.body)).state === "completed")).toBe(true);
+    expect(edits()).toHaveLength(before + 4);
+  });
+
+  it.each([{ success: false, failed: true }, { success: false, errorText: "dispatch failed" }])("explicit finalizer failure overrides pending Done: %j", async opts => {
+    const { wire, finish, edits, sk } = await pausedTerminalFixture("lifecycle", true);
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(350); await finishing;
+    await finalizeCard(sk, opts);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("error");
+  });
+
+  it("retries terminal 429 only after shared cooldown and keeps retries finite", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response(JSON.stringify({ error: {
+      code: "err.shared.rate.limited", http_status: 429, details: { retry_after: 1 },
+    } }), { status: 429, headers: { "Retry-After": "1", "Content-Type": "application/json" } }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(2100); await finishing;
+    expect(edits()).toHaveLength(before + 3);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(edits()).toHaveLength(before + 4);
+    expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("completed");
+  });
+
+  it("keeps a real error authoritative over subsequent success and yield events", async () => {
+    const { wire, finish, edits, handlers, continuation } = await pausedTerminalFixture("lifecycle");
+    for (let i = 0; i < 3; i++) wire.fetch.mockImplementationOnce(async () => new Response("unavailable", { status: 503 }));
+    const failing = finish(true); await vi.advanceTimersByTimeAsync(350); await failing;
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { status: "yielded" } }, continuation);
+    await finish(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(JSON.parse(String(edits().at(-1)![1].body)).state).toBe("error");
+  });
+
+  it("reclaims exhausted terminal recovery without claiming a waiting timeout", async () => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    const before = edits().length;
+    const finishing = finish(); await vi.advanceTimersByTimeAsync(3_601_000); await finishing;
+    expect(edits()).toHaveLength(before + 15);
+    expect(edits().slice(before).every(([, init]) => JSON.parse(String(init.body)).state === "completed")).toBe(true);
+    await vi.advanceTimersByTimeAsync(3_600_000); await finish();
+    expect(edits()).toHaveLength(before + 15);
+  });
+
+  it("duplicate terminal notifications cannot skip backoff or exceed the recovery budget", async () => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    const first = finish(); await vi.advanceTimersByTimeAsync(350); await first;
+    const before = edits().length;
+    for (let i = 0; i < 5; i++) await finish();
+    expect(edits()).toHaveLength(before);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const exhausted = edits().length;
+    for (let i = 0; i < 5; i++) await finish();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(edits()).toHaveLength(exhausted);
+  });
+
+  it("a finalizer racing a pending resume edit retains terminal intent through expiry", async () => {
+    let release!: (value: Response) => void;
+    const { wire, finish, sk } = await pausedTerminalFixture("lifecycle", true, wire => {
+      wire.fetch.mockImplementationOnce(() => new Promise<Response>(resolve => { release = resolve; }));
+    });
+    const normal = wire.fetch.getMockImplementation()!;
+    const ending = finish();
+    const finalizing = finalizeCard(sk, { success: true });
+    wire.fetch.mockImplementation(async () => new Response("unavailable", { status: 503 }));
+    release(new Response("", { status: 200 }));
+    await vi.advanceTimersByTimeAsync(60_000); await ending; await finalizing;
+    wire.fetch.mockImplementation(normal);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    const terminal = wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body;
+    expect(terminal?.state).toBe("completed");
+    expect(JSON.stringify(terminal)).not.toContain("Wait timed out");
+  });
+
+  it("does not retry deterministic terminal rejection", async () => {
+    const { wire, finish, edits } = await pausedTerminalFixture("lifecycle");
+    wire.fetch.mockImplementationOnce(async () => new Response("denied", { status: 403 }));
+    const before = edits().length; await finish();
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(edits()).toHaveLength(before + 1);
+  });
+
+  it("persists a running card on queue release and finishes only that card after a new turn starts", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("queue-release", context());
+    const finalizer = createCardFinalizer("queue-release");
+    await triggerFirstFrame(handlers, "queue-release", "old-run");
+    await finalizer.pending();
+    const waiting = wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body;
+    expect(waiting?.state).toBe("reasoning");
+    expect(waiting?.transient).not.toBe(true);
+    setCardContext("queue-release", context());
+    await triggerFirstFrame(handlers, "queue-release", "new-run");
+    await finalizer.finish({ success: true });
+    const done = wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body;
+    expect(done?.state).toBe("completed");
+    expect(done?.message_id).toBe(waiting?.message_id);
+    await finalizeCard("queue-release", { success: true });
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(2);
+  });
+
+  it.each(["nothing_pending", "deferred", "already_pending", "error"])("does not pause on a sessions_yield no-op result: %s", async status => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("no-yield", context());
+    await triggerFirstFrame(handlers, "no-yield");
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { details: { status } } }, { sessionKey: "no-yield", runId: "run-1" });
+    await finalizeCard("no-yield", { success: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("completed");
+  });
+
+  it("uses lifecycle-only yield evidence, ignores stale ends and preserves a real continuation failure", async () => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(true);
+    const ctx = { sessionKey: "lifecycle-wait", runId: "run-1" };
+    const lifecycle = (runId: string, data: Record<string, unknown>) =>
+      handlers["octo-card-progress-lifecycle"]?.({ sessionKey: ctx.sessionKey, runId, stream: "lifecycle", data }, ctx);
+    setCardContext(ctx.sessionKey, context());
+    await triggerFirstFrame(handlers, ctx.sessionKey);
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { details: { status: "accepted", childSessionKey: "child-1" } } }, ctx);
+    await lifecycle("run-1", { phase: "end", yielded: true });
+    markCardAnswering(ctx.sessionKey);
+    await finalizeCard(ctx.sessionKey, { success: true });
+    await lifecycle("unrelated", { phase: "end" });
+    await lifecycle("run-1", { phase: "end" });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("reasoning");
+    const continuation = { sessionKey: ctx.sessionKey, runId: "run-2", inputProvenance: {
+      kind: "inter_session", sourceTool: "subagent_settle", sourceSessionKey: "child-1",
+    } };
+    handlers.before_agent_run?.({ prompt: "Runtime event" }, continuation);
+    await lifecycle("unrelated", { phase: "error", error: "unrelated failure" });
+    await lifecycle("run-2", { phase: "error", error: "continuation failed" });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("error");
+    expect(wire.calls.some(c => c.body?.state === "completed")).toBe(false);
+    expect(wire.calls.filter(c => c.url.includes("/sendMessage"))).toHaveLength(1);
+  });
+
+  it.each([
+    undefined,
+    { kind: "external_user", sourceTool: "subagent_announce", sourceSessionKey: "child-1" },
+    { kind: "inter_session", sourceTool: "sessions_send", sourceSessionKey: "child-1" },
+    { kind: "inter_session", sourceTool: "subagent_announce", sourceSessionKey: "unrelated-child" },
+  ])("does not let unrelated provenance finish the waiting card: %j", async inputProvenance => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi();
+    setCardContext("protected-wait", context());
+    await triggerFirstFrame(handlers, "protected-wait");
+    const ctx = { sessionKey: "protected-wait", runId: "run-1" };
+    handlers.after_tool_call?.({ toolName: "sessions_spawn", result: { details: { status: "accepted", childSessionKey: "child-1" } } }, ctx);
+    handlers.after_tool_call?.({ toolName: "sessions_yield", result: { details: { status: "yielded" } } }, ctx);
+    await finalizeCard(ctx.sessionKey, { success: true });
+    setCardContext(ctx.sessionKey, context());
+    const other = { sessionKey: ctx.sessionKey, runId: "other-run", inputProvenance };
+    handlers.before_agent_run?.({ prompt: inputProvenance
+      ? completionPrompt("child-1") // Contradictory provenance must defeat the legacy fallback.
+      : 'sourceTool: subagent_announce, sourceSessionKey: child-1' }, other);
+    markCardAnswering(ctx.sessionKey);
+    await handlers.agent_end?.({ success: true }, other);
+    await finalizeCard(ctx.sessionKey, { success: true });
+    expect(wire.calls.filter(c => c.url.includes("/message/edit")).at(-1)?.body?.state).toBe("reasoning");
   });
 
   it.each([true, false])("keeps IM card continuation independent of the completed document receipt (card first: %s)", async cardFirst => {

@@ -153,9 +153,7 @@ function installRuntime(
             opts.captureReasoningCallback(args.replyOptions.onReasoningStream);
             return;
           }
-          const hookCtx = opts.reasoningText
-            ? { sessionKey: "sk-merge", runId: "run-merge" }
-            : { sessionKey: "sk-merge" };
+          const hookCtx = { sessionKey: "sk-merge", runId: args.replyOptions.runId };
           if (opts.reasoningText) {
             hooks.before_agent_run({}, hookCtx);
             hooks.model_call_started({ callId: "call-merge" }, hookCtx);

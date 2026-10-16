@@ -26,12 +26,15 @@ import { findAgentConfig } from "./agent-config-compat.js";
 import type { DocTaskTurnReport } from "./doc-mention-handler.js";
 import type { GroupMember, DocReplyIntent } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
+import { subscribeAccountAbort } from "./account-abort.js";
+import { WeakValueMap } from "./weak-value-map.js";
 import { normalizeAccountId } from "./account-id.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
 import {
   setCardContext,
-  finalizeCard,
+  bindCardRun,
+  createCardFinalizer,
   finalizeCardWithResponse,
   markCardAnswering,
   createCardReasoningRecorder,
@@ -65,6 +68,7 @@ import { createWriteStream } from "node:fs";
 import { mkdir, unlink, readdir, stat } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { randomUUID } from "node:crypto";
+import { resolveImDispatchTimeoutMs } from "./im-dispatch-timeout.js";
 
 // Per-inbound dispatch timeout (issue #75; config derivation: issue #113).
 // The upstream OpenClaw runtime call
@@ -76,18 +80,10 @@ import { randomUUID } from "node:crypto";
 // restarts. This wrapper turns "silent permanent block" into "single-message
 // timeout with a warn log + user-facing apology + queue advances".
 //
-// This timeout is a pure infrastructure backstop — it must NOT double as an
-// agent-run timeout (OpenClaw core already bounds agent runs via
-// `agents.defaults.timeoutSeconds`). Issue #113: the old hardcoded 5-minute
-// value killed healthy long-running dispatches whenever operators raised
-// `timeoutSeconds` above 300s. The effective value is therefore resolved
-// per-inbound by `resolveDispatchTimeoutMs` (see below): an explicit
-// `dispatchTimeoutMs` channel/account config wins, otherwise the value is
-// DERIVED as `agents.defaults.timeoutSeconds (default 600) * 1000 + 60s`.
-// The 60s buffer guarantees by construction that this guard fires strictly
-// AFTER the agent-run timeout — core terminates the run gracefully first,
-// and the dispatch guard only catches genuinely hung infrastructure.
-// Tests override via `_setDispatchTimeoutForTests` to keep the suite fast.
+// Ordinary IM resolves its guard through the host's public timeout resolver;
+// it must not copy a host-version-specific default (#113, #269). Expiry only
+// releases the inbound queue; it does not cancel the agent. Account stop still
+// cancels. Business tasks retain their separate historical deadline policy.
 const DISPATCH_TIMEOUT_BUFFER_MS = 60_000;
 const DEFAULT_AGENT_TIMEOUT_SECONDS = 600;
 // issue #121: 上限 clamp。dispatch 超时最终值会喂给 setTimeout,后者 delay 上限是
@@ -118,7 +114,7 @@ export function _setDispatchTimeoutForTests(ms: number | null): void {
 }
 
 /**
- * Resolve the effective per-inbound dispatch timeout (issue #113).
+ * Resolve the historical document/business-task budget (issue #113).
  *
  * Precedence:
  *   1. `_setDispatchTimeoutForTests` override (tests only).
@@ -128,11 +124,9 @@ export function _setDispatchTimeoutForTests(ms: number | null): void {
  *   3. Derived from the agent-run timeout: `(agents.defaults.timeoutSeconds
  *      ?? 600) * 1000 + 60_000`. Single source of truth — raising
  *      `timeoutSeconds` automatically moves this guard with it, and the 60s
- *      buffer normally places this guard after the agent timeout (subject to
- *      Node's timer cap). An explicit shorter deadline cancels even a healthy
- *      ordinary IM turn and discards its late reply; it is an intentional
- *      earlier cutoff, not just a queue-occupancy setting. Document tasks
- *      retain their task-specific cancellation policy.
+ *      buffer is subject to Node's timer cap. Ordinary IM uses the host-driven
+ *      resolveImDispatchTimeoutMs instead; changing business budgets here would
+ *      also change PPT absolute deadlines and Bot Task retry safety.
  */
 export function resolveDispatchTimeoutMs(
   cfg: OpenClawConfig,
@@ -162,9 +156,28 @@ export function _setDispatchAbortGraceForTests(ms: number | null): void {
   DISPATCH_ABORT_GRACE_MS = ms === null ? DISPATCH_ABORT_GRACE_DEFAULT_MS : ms;
 }
 
-// Pending inbound context for before_prompt_build hook injection.
-// handleInboundMessage writes here; the hook reads and clears per sessionKey.
-export const pendingInboundContext = new Map<string, { historyPrefix: string; memberListPrefix: string }>();
+// A released dispatch may reach prompt assembly after a newer turn has started.
+// Own context by the preallocated host runId, never by the latest session entry.
+type PendingInboundContext = { sessionKey: string; accountId: string; historyPrefix: string; memberListPrefix: string };
+const inboundContextStateKey = Symbol.for("openclaw.octo.inbound-context.v3");
+const hostRunIdMismatchWarningKey = Symbol.for("openclaw.octo.host-run-id-mismatch-warning.v1");
+const inboundContextRoot = process as unknown as Record<PropertyKey, unknown>;
+export const pendingInboundContext = (inboundContextRoot[inboundContextStateKey] ??=
+  new WeakValueMap<string, PendingInboundContext>()) as WeakValueMap<string, PendingInboundContext>;
+
+/** Missing/mismatched run IDs fail closed, without consuming another turn's data. */
+export function takePendingInboundContext(sessionKey: string, runId: string | undefined) {
+  if (!runId) return undefined;
+  const pending = pendingInboundContext.get(runId);
+  if (pending?.sessionKey !== sessionKey) return undefined;
+  pendingInboundContext.delete(runId);
+  const consumed = { ...pending };
+  // The execution still owns the slot until settlement, but no longer needs
+  // potentially large history/member prefixes after the hook consumes them.
+  pending.historyPrefix = "";
+  pending.memberListPrefix = "";
+  return consumed;
+}
 
 // Per-(account, session) registry. The before_prompt_build hook receives
 // ctx.sessionKey but not ctx.accountId, so we record on every inbound message
@@ -2484,9 +2497,14 @@ export async function handleInboundMessage(params: {
     ? (currentGroupMembersMap.get(memberCacheGroupNo) ?? [])
     : [];
   const memberListPrefix = isGroup ? buildMemberListPrefix(currentGroupMembers) : "";
-  if (historyPrefix || memberListPrefix) {
-    pendingInboundContext.set(route.sessionKey, { historyPrefix, memberListPrefix });
-  }
+  const dispatchRunId = randomUUID();
+  // This callback is scoped to this dispatch. Unlike an arbitrary session hook,
+  // it can prove a host replaced our ID without misdiagnosing a late older run.
+  const observeHostRunId = (actualRunId: string): void => {
+    if (actualRunId === dispatchRunId || inboundContextRoot[hostRunIdMismatchWarningKey] || !log?.warn) return;
+    inboundContextRoot[hostRunIdMismatchWarningKey] = true;
+    log.warn("octo: host did not preserve replyOptions.runId in onAgentRunStart; progress-card hooks and per-run prompt context remain fail-closed. Check the host's public runId contract. This diagnostic is emitted once per process.");
+  };
 
   // Record (accountId, sessionKey) so the before_prompt_build hook can
   // resolve persona identity from ctx.sessionKey (hook ctx does not expose
@@ -2574,12 +2592,6 @@ export async function handleInboundMessage(params: {
       log,
     })
   ) {
-    // The fork hook handled this message and early-returns BEFORE the normal
-    // dispatch path's pendingInboundContext.delete (below) and before the
-    // before_prompt_build hook's get/delete (index.ts) — neither runs for a
-    // fork. Drop the entry set above (pendingInboundContext.set) so a fork does
-    // not leak a Map entry / inject a stale historyPrefix later.
-    pendingInboundContext.delete(route.sessionKey);
     return;
   }
 
@@ -2882,8 +2894,12 @@ export async function handleInboundMessage(params: {
       reasoningVisibility,
       ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
     });
+    // Allocate ownership before calling the host: a delayed older prompt hook
+    // must not claim the new turn's still-empty card.
+    bindCardRun(route.sessionKey, dispatchRunId);
   }
   const recordReasoningForGeneration = createCardReasoningRecorder(route.sessionKey);
+  const cardFinalizer = createCardFinalizer(route.sessionKey);
 
   // --- IM 出站闸门 ---
   // 文档任务下所有 IM 出站一律不发。下面每个显式的 `if (docTask)` 守卫都保留 ——
@@ -3097,7 +3113,8 @@ export async function handleInboundMessage(params: {
    * `type: "notice"` 是关键:一句道歉证明不了任务做成了。提示与任务产出分开记账,
    * 这里只负责把「这是提示不是产出」这件事说清楚。
    */
-  const sendUserFacingFallback = async (content: string, signal?: AbortSignal): Promise<void> => {
+  let terminalNoticeDelivered = false;
+  const sendUserFacingFallback = async (content: string, signal?: AbortSignal, opts?: { terminal: boolean }): Promise<void> => {
     if (docTask) {
       await postDocTaskReply(withSuppressedToolTail(content), signal, { type: "notice" });
       return;
@@ -3115,6 +3132,7 @@ export async function handleInboundMessage(params: {
       ...(effectiveOnBehalfOf ? { onBehalfOf: effectiveOnBehalfOf } : {}),
       ...(signal ? { signal } : {}),
     });
+    terminalNoticeDelivered ||= opts?.terminal === true;
   };
 
   /**
@@ -3342,6 +3360,7 @@ export async function handleInboundMessage(params: {
   // their notification / attachment semantics. A failed merge is transparent:
   // the caller still sends text and finally closes the progress card normally.
   /** 承载本回合最终产出的出站。文档任务据此判定「答复落地了没有」。 */
+  let finalOutputDelivered = false;
   const deliverFinalText = async (
     content: string,
     signal: AbortSignal | undefined,
@@ -3367,6 +3386,7 @@ export async function handleInboundMessage(params: {
     const hasPotentialMention = content.includes("@");
     if (
       !docTask // 文档任务没有 IM 进度卡可合并(setCardContext 已跳过)
+      && !imQueueReleased // A later turn may now own this session's card.
       && process.env.OCTO_CARD_MERGE_FINAL === "1"
       && sentMediaUrls.size === 0
       && !hasPotentialMention
@@ -3374,6 +3394,8 @@ export async function handleInboundMessage(params: {
       const merged = await finalizeCardWithResponse(route.sessionKey, content);
       if (merged) {
         statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
+        finalOutputDelivered ||= opts.intent === "output" && opts.claimsCompletion !== false;
+        terminalNoticeDelivered ||= opts.intent === "notice";
         return { merged: true, delivered: true };
       }
     }
@@ -3384,6 +3406,8 @@ export async function handleInboundMessage(params: {
       ownMedia: opts.ownMedia,
       referencedMedia: opts.referencedMedia,
     });
+    finalOutputDelivered ||= opts.intent === "output" && opts.claimsCompletion !== false && delivery.finalDelivered;
+    terminalNoticeDelivered ||= opts.intent === "notice" && delivery.finalDelivered;
     return { merged: false, delivered: delivery.finalDelivered };
   };
 
@@ -3405,8 +3429,8 @@ export async function handleInboundMessage(params: {
   // an upstream dispatch hang would leave the per-group queue's Promise chain
   // unresolved forever — see issue #75.
   //
-  // Ordinary IM turns abort and release the queue; document-comment turns
-  // retain their historical queue-unblocking policy. Generic Bot Tasks are
+  // Ordinary IM and document-comment guards release the inbound queue without
+  // cancelling a healthy run (#83/#114). Generic Bot Tasks are
   // different: retrying while the timed-out
   // agent is still running can duplicate non-idempotent octo-cli writes. For
   // abortOnTimeout turns we therefore abort the underlying agent run
@@ -3418,9 +3442,67 @@ export async function handleInboundMessage(params: {
   // is OUR timeout" by reference equality, never by string comparison —
   // protects against a same-text upstream error being misclassified.
   let dispatchTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const dispatchTimeoutMs = resolveDispatchTimeoutMs(config, account);
+  const dispatchTimeoutMs = dispatchTimeoutTestOverrideMs ?? (docTask
+    ? resolveDispatchTimeoutMs(config, account)
+    : resolveImDispatchTimeoutMs(config, account.config.dispatchTimeoutMs, core, (message) => log?.warn?.(message)));
   let remainingDispatchMs = dispatchTimeoutMs;
   let taskInterrupted = false;
+  let imQueueReleased = false;
+  let backgroundImSettled = false;
+  let backgroundRejected = false;
+  let queueReleaseNotice: Promise<void> | undefined;
+  let backgroundFailureNoticeAttempted = false;
+  const notifyBackgroundFailure = async () => {
+    if (!imQueueReleased || !backgroundImSettled) return;
+    // A settlement racing the queue-release POST must not leave "still running"
+    // as the last notification. That POST already has its own bounded signal.
+    await queueReleaseNotice?.catch(() => undefined);
+    if (backgroundFailureNoticeAttempted || terminalNoticeDelivered || finalOutputDelivered
+      || cardFinalizer.hasDeliveredOutput() || dispatchAbortController?.signal.aborted || accountSignal?.aborted
+      || !(backgroundRejected || deliveryErrorOccurred || dispatchFailed)) return;
+    backgroundFailureNoticeAttempted = true;
+    try {
+      await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
+        AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { terminal: true });
+    } catch (err) {
+      log?.error?.(`octo: failed to send background dispatch-error fallback: ${String(err)}`);
+    }
+  };
+  // Shared settlement backstop for hosts that omit onFreshSettledDelivery.
+  const flushPendingToolWarning = async () => {
+    if (dispatchAbortController?.signal.aborted) return;
+    // --- 兜底之兜底:延后的工具警告没被 onFreshSettledDelivery 消费掉 ---
+    // pendingToolWarningFinal 通常由 onFreshSettledDelivery flush。宿主没实现
+    // 那个回调、或 SDK 因新消息抢占跳过它时,延后就变成了静默吞掉:整回合既无答复
+    // 也无警告。判据不再依赖「分类器在不在」这种版本代理,所以这里补一次真正的
+    // flush —— 到这一步 dispatch 已经结束,还挂着 pending 就说明没人接管。
+    // 同样先净化,理由见 sanitizeToolErrorNoticeText。
+    if (pendingToolWarningFinal && !userFacingFinalDelivered && !deliveryErrorOccurred) {
+      const pendingFinal = pendingToolWarningFinal;
+      pendingToolWarningFinal = undefined;
+      const noticeText = sanitizeToolErrorNoticeText(pendingFinal.text);
+      try {
+        const delivered = await deliverFinalText(
+          noticeText,
+          AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
+          // notice 而非 output:它不是答复,不该让上游翻转父评论为 applied。
+          { intent: "notice", ownMedia: takeBufferedDocTaskMedia() },
+        );
+        replySucceeded ||= delivered.delivered;
+        userFacingFinalDelivered ||= delivered.delivered;
+        log?.info?.(
+          `octo: [deliver] pending tool warning flushed at settlement (${noticeText.length} chars)`,
+        );
+      } catch (warnFlushErr) {
+        dispatchFailed = true;
+        log?.error?.(`octo: [deliver] tool warning settlement-flush failed: ${String(warnFlushErr)}`);
+      }
+    }
+  };
+  const finishBackgroundCard = () => cardFinalizer.finish({
+    success: !accountSignal?.aborted && !deliveryErrorOccurred && !dispatchFailed && replySucceeded && (!backgroundRejected || finalOutputDelivered),
+    failed: accountSignal?.aborted || deliveryErrorOccurred || dispatchFailed || backgroundRejected,
+  });
   const timeoutError = new Error("octo: dispatch timed out (shared budget expired)");
   const stoppedError = new Error("octo: account stopped during dispatch");
   let removeStopListener: (() => void) | undefined;
@@ -3429,6 +3511,18 @@ export async function handleInboundMessage(params: {
   let runtimeHandedOff = false;
   let dispatchTimeoutPromise: Promise<never> | undefined;
   let dispatchPromise: Promise<unknown> | undefined;
+  // The host's dispatch/settlement callbacks own this data, not the global index.
+  // Keep the exact object alive until settlement even if prompt assembly is late.
+  const pendingPromptContext = historyPrefix || memberListPrefix
+    ? { sessionKey: route.sessionKey, accountId: account.accountId, historyPrefix, memberListPrefix }
+    : undefined;
+  const clearPendingPromptContext = () => {
+    if (pendingInboundContext.get(dispatchRunId) === pendingPromptContext) pendingInboundContext.delete(dispatchRunId);
+    if (pendingPromptContext) {
+      pendingPromptContext.historyPrefix = "";
+      pendingPromptContext.memberListPrefix = "";
+    }
+  };
   const detachTaskProgress = docTask?.progress?.attach(route.sessionKey);
   try {
     // Persist the at-most-once boundary before invoking the runtime. The
@@ -3447,20 +3541,22 @@ export async function handleInboundMessage(params: {
     dispatchTimeoutPromise = new Promise<never>((_, reject) => {
       const onStop = () => {
         taskInterrupted = true;
+        clearPendingPromptContext();
+        removeStopListener?.();
         reject(stoppedError);
         dispatchAbortController?.abort(stoppedError);
+        if (imQueueReleased) void cardFinalizer.finish({ success: false, failed: true, errorText: "Account stopped" });
       };
-      accountSignal?.addEventListener("abort", onStop, { once: true });
-      removeStopListener = () => accountSignal?.removeEventListener("abort", onStop);
+      removeStopListener = subscribeAccountAbort(accountSignal, onStop, dispatchAbortController?.signal);
       dispatchTimeoutHandle = setTimeout(() => {
         taskInterrupted = true;
         reject(timeoutError);
-        // Ordinary IM deadlines cancel the run and fence late replies, including
-        // explicitly configured deadlines below the agent timeout. Ordinary
-        // document tasks only release the queue unless their task opts into abort.
-        if (!docTask || abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
+        // Queue waiting is not the agent's execution budget. Only business tasks
+        // opting into cancellation abort here; ordinary IM can still finish later.
+        if (abortTimedOutDispatch) dispatchAbortController?.abort(timeoutError);
       }, remainingDispatchMs);
     });
+    if (pendingPromptContext) pendingInboundContext.set(dispatchRunId, pendingPromptContext);
     dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: config,
@@ -3481,23 +3577,27 @@ export async function handleInboundMessage(params: {
         docTask || (!isGroup && config.messages?.visibleReplies === undefined)
           ? {
               sourceReplyDeliveryMode: "automatic" as const,
+              runId: dispatchRunId,
+              onAgentRunStart: observeHostRunId,
               onReasoningStream: captureReasoning,
               ...(dispatchAbortController
                 ? { abortSignal: dispatchAbortController.signal }
                 : {}),
             }
           : {
+              runId: dispatchRunId,
+              onAgentRunStart: observeHostRunId,
               onReasoningStream: captureReasoning,
               ...(dispatchAbortController
                 ? { abortSignal: dispatchAbortController.signal }
                 : {}),
             },
       // onFreshSettledDelivery is not in the published dispatcher-options type,
-      // hence the cast. It is the *only* flush site for pendingToolWarningFinal,
+      // hence the cast. It is the primary flush site for pendingToolWarningFinal,
       // and the defer gate no longer piggybacks on the tool-warning classifier
       // as a version proxy -- so a host that ignores this callback would swallow
       // the warning. openclaw@2026.6.9 (the peerDependencies floor) already
-      // ships it; the dispatch finally block additionally flushes any warning
+      // ships it; foreground/background settlement additionally flushes any warning
       // this callback did not consume, so the property is not load-bearing.
       dispatcherOptions: ({
         deliver: async (payload: ReplyPayload, info: { kind: ReplyDispatchKind }) => {
@@ -3584,15 +3684,25 @@ export async function handleInboundMessage(params: {
             }
             statusSink?.({ lastOutboundAt: Date.now(), lastError: null });
             replySucceeded = true;
+            // A final attachment is a completed answer just like final text. Only
+            // this payload's explicit, successfully sent references can claim it;
+            // earlier tool media, empty finals and error broadcasts cannot.
+            if (kind === "final" && !isToolErrorBroadcastFinal(payload) &&
+                outboundMediaUrls.length > 0 && outboundMediaUrls.every(url => sentMediaUrls.has(url))) {
+              finalOutputDelivered = true;
+              userFacingFinalDelivered = true;
+              pendingToolWarningFinal = undefined;
+            }
             return;
           }
           if (!content) return;
 
           // OpenClaw has no exact "answer generation started" hook. The first
           // non-reasoning, non-tool text is the documented best-effort boundary.
-          if (kind !== "tool") markCardAnswering(route.sessionKey);
+          if (kind !== "tool" && !imQueueReleased) markCardAnswering(route.sessionKey);
 
           if (kind === "tool") {
+            if (imQueueReleased) return; // Keep late answers, not stale progress narration.
             // 文档任务:工具进度不进评论区。IM 会话里逐条发是**功能**(用户看着 Bot
             // 干活),但评论区是文档的一部分 —— 实测一次改单元格产生 9 条评论
             // (读 SKILL.md、读 sheet.md、get、edit 吃 400、重读、edit 吃 412、
@@ -3675,11 +3785,20 @@ export async function handleInboundMessage(params: {
           // block 的附件都还没投递过,谁都不该被后一段挤掉。
           if (docTask) deliverBuffer.docTaskMedia.push(...docTaskOwnMedia);
           deliverBuffer.lastText = content;
+          if (imQueueReleased && !userFacingFinalDelivered) deliverBuffer.textSent = false;
           log?.debug?.(`octo: [deliver-buffer] ${kind} text buffered (${content.length} chars)`);
         },
         onError: async (err: unknown, info: { kind: string }) => {
           // Timeout/stop owns its notice; cancellation must not emit a second apology.
           if (dispatchAbortController?.signal.aborted) return;
+          if (imQueueReleased) {
+            deliveryErrorOccurred = true;
+            dispatchFailed = true;
+            deliverBuffer.lastText = null;
+            deliverBuffer.textSent = true;
+            log?.error?.(`octo: background IM dispatch failed after queue release: ${String(err)}`);
+            return;
+          }
           clearInterval(typingInterval);
           log?.error?.(`octo ${info.kind} reply failed: ${String(err)}`);
           // Prevent finally block from sending stale buffered text after error
@@ -3696,7 +3815,7 @@ export async function handleInboundMessage(params: {
           try {
             // 经唯一出口:文档任务改投评论区,其余仍直发 IM。同样用受限 signal ——
             // 上游报错且 Octo API 也病了时,别把队列卡到外层 dispatch 超时。
-            await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+            await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { terminal: true });
           } catch (sendErr) {
             log?.error?.(`octo: failed to send error message: ${String(sendErr)}`);
           }
@@ -3748,6 +3867,44 @@ export async function handleInboundMessage(params: {
       }),
     });
     runtimeHandedOff = true;
+    // A queue-only timeout does not end the upstream dispatch. Observe settlement
+    // so blocks arriving after this handler's finally can still be flushed, and
+    // keep account-stop cancellation wired until that background dispatch ends.
+    if (!docTask) {
+      void dispatchPromise.catch((err) => {
+        backgroundRejected = true;
+        if (imQueueReleased && !dispatchAbortController?.signal.aborted) {
+          log?.error?.(`octo: background IM completion failed: ${String(err)}`);
+        }
+        // Match foreground blocks-only rejection recovery (PR #152): a
+        // terminal rejection does not invalidate a buffered answer. onError
+        // explicitly clears invalid output; account stop still fences sends.
+      }).then(async () => {
+        if (imQueueReleased && !dispatchAbortController?.signal.aborted
+          && deliverBuffer.lastText && !deliverBuffer.textSent) {
+          const content = deliverBuffer.lastText;
+          deliverBuffer.lastText = null;
+          deliverBuffer.textSent = true;
+          const result = await deliverFinalText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { intent: "output" });
+          replySucceeded ||= result.delivered;
+          userFacingFinalDelivered ||= result.delivered;
+        }
+        if (imQueueReleased) await flushPendingToolWarning();
+      }).catch((err) => {
+        deliveryErrorOccurred = true;
+        if (imQueueReleased && !dispatchAbortController?.signal.aborted) {
+          log?.error?.(`octo: background IM completion failed: ${String(err)}`);
+        }
+      }).finally(async () => {
+        backgroundImSettled = true;
+        clearPendingPromptContext();
+        if (imQueueReleased) {
+          await notifyBackgroundFailure();
+          removeStopListener?.();
+          await finishBackgroundCard();
+        }
+      });
+    }
     await Promise.race([dispatchPromise, dispatchTimeoutPromise]);
   } catch (err) {
     if (handoffRecorded && !runtimeHandedOff) {
@@ -3761,11 +3918,13 @@ export async function handleInboundMessage(params: {
     // — otherwise this group stays stuck forever, see issue #75.
     //
     if (err === timeoutError || err === stoppedError || accountSignal?.aborted) {
+      imQueueReleased = !docTask && err === timeoutError && !accountSignal?.aborted;
+      if (imQueueReleased) void cardFinalizer.pending();
       taskInterrupted = true;
       // Emit the primary diagnostic before waiting for cooperative shutdown;
       // otherwise an abort-ignoring host makes the timeout itself invisible.
       log?.warn?.(
-        `octo: ${accountSignal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
+        `octo: ${accountSignal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, ${imQueueReleased ? "releasing queue without cancelling agent" : "aborting to unblock per-group queue"} (session=${route?.sessionKey ?? "?"})`,
       );
       // Wait briefly only when an abort was actually sent. Ordinary document
       // timeouts still release the queue immediately; a signal-capable runtime
@@ -3792,9 +3951,11 @@ export async function handleInboundMessage(params: {
         }
       }
       clearInterval(typingInterval);
-      dispatchFailed = true;
-      deliverBuffer.lastText = null;
-      deliverBuffer.textSent = true;
+      dispatchFailed ||= !imQueueReleased;
+      if (!imQueueReleased) {
+        deliverBuffer.lastText = null;
+        deliverBuffer.textSent = true;
+      }
       // 和下面 dispatch-rejected 分支同一条守卫(见其注释):答复已经发出去了就别再
       // 追一句「处理超时，请稍后重试」—— 用户会同时看到正确答复和自相矛盾的失败提示。
       // 对文档任务还多一层代价:那句道歉会把一个已经落地的回合拖成「未完成」。
@@ -3818,7 +3979,11 @@ export async function handleInboundMessage(params: {
           // The apology call itself MUST be bounded — otherwise a sick Octo API
           // hangs this sendMessage too, defeating the whole timeout fix. See
           // DISPATCH_TIMEOUT_APOLOGY_MS above.
-          await sendUserFacingFallback("⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+          const notice = sendUserFacingFallback(imQueueReleased
+            ? "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。"
+            : "⚠️ 处理超时，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+          if (imQueueReleased) queueReleaseNotice = notice;
+          await notice;
         } catch (sendErr) {
           log?.error?.(`octo: failed to send timeout message: ${String(sendErr)}`);
         }
@@ -3879,7 +4044,7 @@ export async function handleInboundMessage(params: {
         deliverBuffer.lastText = null;
         deliverBuffer.textSent = true;
         try {
-          await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+          await sendUserFacingFallback("⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。", AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS), { terminal: true });
         } catch (sendErr) {
           log?.error?.(`octo: failed to send dispatch-error fallback: ${String(sendErr)}`);
         }
@@ -3888,12 +4053,12 @@ export async function handleInboundMessage(params: {
     throw err;
   } finally {
     if (dispatchTimeoutHandle) clearTimeout(dispatchTimeoutHandle);
-    removeStopListener?.();
+    if (!imQueueReleased || backgroundImSettled) removeStopListener?.();
     // --- Debug: log dispatch outcome ---
     log?.debug?.(`octo: [dispatch-result] replySucceeded=${replySucceeded} bufferedText=${deliverBuffer.lastText?.length ?? 0} textSent=${deliverBuffer.textSent} userFacingFinalDelivered=${userFacingFinalDelivered} effectiveOBO=${effectiveOnBehalfOf ?? 'none'}`);
 
     // --- Final send: deliver buffered text if only blocks arrived (no final/tool) ---
-    if (deliverBuffer.lastText && !deliverBuffer.textSent) {
+    if ((!imQueueReleased || backgroundImSettled) && deliverBuffer.lastText && !deliverBuffer.textSent) {
       deliverBuffer.textSent = true;
       try {
         // Bounded signal so a sick Octo API can't strand the per-group queue
@@ -3920,33 +4085,8 @@ export async function handleInboundMessage(params: {
         log?.error?.(`octo: [deliver-buffer] final text send failed: ${String(finalSendErr)}`);
       }
     }
-    // --- 兜底之兜底:延后的工具警告没被 onFreshSettledDelivery 消费掉 ---
-    // pendingToolWarningFinal 的唯一 flush 是 onFreshSettledDelivery。宿主没实现
-    // 那个回调、或 SDK 因新消息抢占跳过它时,延后就变成了静默吞掉:整回合既无答复
-    // 也无警告。判据不再依赖「分类器在不在」这种版本代理,所以这里补一次真正的
-    // flush —— 到这一步 dispatch 已经结束,还挂着 pending 就说明没人接管。
-    // 同样先净化,理由见 sanitizeToolErrorNoticeText。
-    if (pendingToolWarningFinal && !userFacingFinalDelivered && !deliveryErrorOccurred) {
-      const pendingFinal = pendingToolWarningFinal;
-      pendingToolWarningFinal = undefined;
-      const noticeText = sanitizeToolErrorNoticeText(pendingFinal.text);
-      try {
-        const delivered = await deliverFinalText(
-          noticeText,
-          AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS),
-          // notice 而非 output:它不是答复,不该让上游翻转父评论为 applied。
-          { intent: "notice", ownMedia: takeBufferedDocTaskMedia() },
-        );
-        replySucceeded ||= delivered.delivered;
-        userFacingFinalDelivered ||= delivered.delivered;
-        log?.info?.(
-          `octo: [deliver] pending tool warning flushed in finally (${noticeText.length} chars)`,
-        );
-      } catch (warnFlushErr) {
-        dispatchFailed = true;
-        log?.error?.(`octo: [deliver] tool warning finally-flush failed: ${String(warnFlushErr)}`);
-      }
-    }
+    if (!imQueueReleased || backgroundImSettled) await flushPendingToolWarning();
+    if (imQueueReleased && backgroundImSettled) await notifyBackgroundFailure();
     // 缓冲里的附件没人接管(比如 onError 把缓冲文本清掉后只发了一句道歉)。
     // 提示不夹带产出是刻意的,但静默丢弃不行 —— 至少让运维能看见。
     if (deliverBuffer.docTaskMedia.length > 0) {
@@ -3955,12 +4095,14 @@ export async function handleInboundMessage(params: {
     clearInterval(typingInterval);
     // 波 B:收尾进度卡(终态帧 + 清理);fire-and-forget，不阻塞 dispatch 结束/会话释放。
     // finalizeCard 内部同步删 Map(立即释放关联),终态 edit 后台异步发送。
-    void finalizeCard(route.sessionKey, {
+    if (imQueueReleased && backgroundImSettled) void finishBackgroundCard();
+    if (!imQueueReleased) void cardFinalizer.finish({
       success: replySucceeded,
       ...(!replySucceeded && dispatchFailed ? { failed: true } : {}),
     });
-    // Safety net: clean up pending inbound context in case the hook didn't fire
-    pendingInboundContext.delete(route.sessionKey);
+    // A live released turn may not have assembled its prompt yet. Its own
+    // settlement/account-stop path cleans up without consuming the next turn.
+    if (!imQueueReleased || backgroundImSettled) clearPendingPromptContext();
 
     // --- 文档任务:把本回合的事实上报一次 ---
     // 放在最外层 finally,所以正常结束、dispatch 抛错、超时三条路径都会走到;

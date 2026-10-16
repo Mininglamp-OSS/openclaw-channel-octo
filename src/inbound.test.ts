@@ -19,6 +19,7 @@ import {
   resolveCommandBody,
   resolveCommandAuthorized,
   pendingInboundContext,
+  takePendingInboundContext,
   sessionAccountMap,
   buildSessionAccountKey,
   recordSessionAccount,
@@ -1869,60 +1870,20 @@ describe("resolveCommandAuthorized", () => {
 });
 
 describe("pendingInboundContext", () => {
-  beforeEach(() => {
-    pendingInboundContext.clear();
+  beforeEach(() => pendingInboundContext.clear());
+  it("keeps two runs in one session isolated and consumes each once", () => {
+    pendingInboundContext.set("A", { sessionKey: "same", accountId: "bot", historyPrefix: "history A", memberListPrefix: "members A" });
+    pendingInboundContext.set("B", { sessionKey: "same", accountId: "bot", historyPrefix: "history B", memberListPrefix: "members B" });
+    expect(takePendingInboundContext("same", "A")?.historyPrefix).toBe("history A");
+    expect(takePendingInboundContext("same", "A")).toBeUndefined();
+    expect(takePendingInboundContext("same", "B")?.memberListPrefix).toBe("members B");
   });
-
-  it("should store and retrieve context by sessionKey", () => {
-    const key = "octo:group:test123";
-    pendingInboundContext.set(key, {
-      historyPrefix: "history...",
-      memberListPrefix: "members...",
-    });
-    expect(pendingInboundContext.has(key)).toBe(true);
-    const entry = pendingInboundContext.get(key);
-    expect(entry?.historyPrefix).toBe("history...");
-    expect(entry?.memberListPrefix).toBe("members...");
-  });
-
-  // Every group inbound sets pendingInboundContext before the
-  // command split; the fork hook early-returns BEFORE the normal dispatch
-  // delete and before the before_prompt_build get/delete, so the fork branch
-  // must delete the entry itself or it leaks. This documents that invariant by
-  // mirroring the set→fork-delete sequence. (The real call site is asserted via
-  // the dist build; inbound.test.ts has no full handleInboundMessage harness.)
-  it("fork early-return must delete the entry it set (no leak)", () => {
-    const key = "octo:acct1:group123";
-    pendingInboundContext.set(key, { historyPrefix: "h", memberListPrefix: "m" });
-    pendingInboundContext.delete(key); // the explicit delete added before `return`
-    expect(pendingInboundContext.has(key)).toBe(false);
-  });
-
-  it("should allow delete after read (consume-once pattern)", () => {
-    const key = "octo:group:consume";
-    pendingInboundContext.set(key, {
-      historyPrefix: "h",
-      memberListPrefix: "m",
-    });
-    const entry = pendingInboundContext.get(key);
-    pendingInboundContext.delete(key);
-    expect(entry).toBeDefined();
-    expect(pendingInboundContext.has(key)).toBe(false);
-  });
-
-  it("should keep separate entries for different sessionKeys", () => {
-    pendingInboundContext.set("key1", { historyPrefix: "h1", memberListPrefix: "" });
-    pendingInboundContext.set("key2", { historyPrefix: "", memberListPrefix: "m2" });
-    expect(pendingInboundContext.get("key1")?.historyPrefix).toBe("h1");
-    expect(pendingInboundContext.get("key2")?.memberListPrefix).toBe("m2");
-  });
-
-  it("should overwrite on repeated set for same key", () => {
-    const key = "octo:group:overwrite";
-    pendingInboundContext.set(key, { historyPrefix: "old", memberListPrefix: "" });
-    pendingInboundContext.set(key, { historyPrefix: "new", memberListPrefix: "ml" });
-    expect(pendingInboundContext.get(key)?.historyPrefix).toBe("new");
-    expect(pendingInboundContext.get(key)?.memberListPrefix).toBe("ml");
+  it("does not consume context for a missing run, foreign session or foreign run", () => {
+    pendingInboundContext.set("B", { sessionKey: "same", accountId: "bot", historyPrefix: "history B", memberListPrefix: "" });
+    expect(takePendingInboundContext("same", undefined)).toBeUndefined();
+    expect(takePendingInboundContext("foreign", "B")).toBeUndefined();
+    expect(takePendingInboundContext("same", "A")).toBeUndefined();
+    expect(takePendingInboundContext("same", "B")?.historyPrefix).toBe("history B");
   });
 });
 
