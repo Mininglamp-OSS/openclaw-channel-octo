@@ -195,6 +195,41 @@ describe("server-driven Registry reasoning progress", () => {
     expect(edits.every((body) => !Object.hasOwn(body, "content_edit"))).toBe(true);
   });
 
+  it.each(["finalize", "pending"])("native abort bounds a genuinely hanging card edit: %s", async operation => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = `hanging-${operation}`;
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk);
+    const finalizer = createCardFinalizer(sk);
+    vi.useRealTimers();
+    // Keep the real native AbortSignal timer; shorten only the 10s card budget.
+    const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => nativeTimeout(ms === 10_000 ? 40 : ms));
+    let aborted = false;
+    global.fetch = vi.fn(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/v1/bot/message/edit");
+      const signal = init?.signal;
+      expect(signal).toBeDefined();
+      return new Promise<Response>((_, reject) => {
+        const onAbort = () => { aborted = true; reject(signal!.reason); };
+        if (signal!.aborted) onAbort();
+        else signal!.addEventListener("abort", onAbort, { once: true });
+      });
+    }) as typeof fetch;
+    if (operation === "pending") await finalizer.pending();
+    else await finalizer.finish({ success: true });
+    expect(aborted).toBe(true);
+    expect(timeout).toHaveBeenCalledWith(10_000);
+    const state = (process as any)[Symbol.for("openclaw.octo.card-progress-state.v2")];
+    if (operation === "pending") {
+      expect(state.cards.has(sk)).toBe(true); // A failed pending frame cannot finish a healthy run.
+      global.fetch = wire.fetch as typeof fetch;
+      await finalizer.finish({ success: true });
+    }
+    expect(state.cards.has(sk)).toBe(false);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(state.releasedCards.size).toBe(0);
+  }, 2_000);
+
   it("selects the exact configured ref from a multi-version catalog", async () => {
     const wire = mockFetch({
       profile: profile({ configuredVersion: "0.3.0", catalogVersions: ["0.2.0", "0.3.0"] }),

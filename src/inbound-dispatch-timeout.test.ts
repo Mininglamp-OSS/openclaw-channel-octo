@@ -52,6 +52,7 @@ const BOT_UID = "bot_self_0000000000000000000000000000";
 const HUMAN_UID = "human_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const GROUP_ID = "g_room_1";
 
+const unexpectedRequests: string[] = [];
 const originalFetch = globalThis.fetch;
 const originalSetTimeout = globalThis.setTimeout;
 const originalClearTimeout = globalThis.clearTimeout;
@@ -99,10 +100,11 @@ function installFetchStub() {
   const sends: any[] = [];
   globalThis.fetch = vi.fn(async (input: any, init?: any) => {
     const url = typeof input === "string" ? input : input.toString();
+    const path = new URL(url).pathname;
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 
-    if (url.includes("/members")) {
+    if (/^\/v1\/bot\/groups\/[^/]+\/members$/.test(path)) {
       return json({
         members: [
           { uid: HUMAN_UID, name: "Alice", robot: false },
@@ -110,16 +112,19 @@ function installFetchStub() {
         ],
       });
     }
-    if (url.includes("/mention_pref")) return json({ no_mention: false });
-    if (url.includes("/md")) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
-    if (url.includes("/messages/sync")) return json({ messages: [] });
-    if (url.includes("/readReceipt")) return json({});
-    if (url.includes("/typing")) return json({});
-    if (url.includes("/sendMessage")) {
+    if (url === "https://example.test/result.png") return new Response("fixture unavailable", { status: 404 });
+    if (path === "/v1/bot/user/info") return json({ uid: HUMAN_UID, name: "Alice" });
+    if (/^\/v1\/bot\/groups\/[^/]+\/mention_pref$/.test(path)) return json({ no_mention: false });
+    if (/^\/v1\/bot\/groups\/[^/]+(?:\/threads\/[^/]+)?\/md$/.test(path)) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
+    if (path === "/v1/bot/messages/sync") return json({ messages: [] });
+    if (path === "/v1/bot/readReceipt") return json({});
+    if (path === "/v1/bot/typing") return json({});
+    if (path === "/v1/bot/sendMessage") {
       sends.push(init?.body ? JSON.parse(init.body) : {});
       return json({ message_id: "reply1", message_seq: 0 });
     }
-    return json({});
+    unexpectedRequests.push(url);
+    throw new Error(`Unexpected Octo endpoint: ${url}`);
   }) as unknown as typeof fetch;
   return { sends };
 }
@@ -136,10 +141,11 @@ function installHangingSendFetchStub(): {
   const sends: Array<{ content: string | null; abortedBeforeResolve: boolean }> = [];
   globalThis.fetch = vi.fn(async (input: any, init?: any) => {
     const url = typeof input === "string" ? input : input.toString();
+    const path = new URL(url).pathname;
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 
-    if (url.includes("/members")) {
+    if (/^\/v1\/bot\/groups\/[^/]+\/members$/.test(path)) {
       return json({
         members: [
           { uid: HUMAN_UID, name: "Alice", robot: false },
@@ -147,12 +153,14 @@ function installHangingSendFetchStub(): {
         ],
       });
     }
-    if (url.includes("/mention_pref")) return json({ no_mention: false });
-    if (url.includes("/md")) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
-    if (url.includes("/messages/sync")) return json({ messages: [] });
-    if (url.includes("/readReceipt")) return json({});
-    if (url.includes("/typing")) return json({});
-    if (url.includes("/sendMessage")) {
+    if (url === "https://example.test/result.png") return new Response("fixture unavailable", { status: 404 });
+    if (path === "/v1/bot/user/info") return json({ uid: HUMAN_UID, name: "Alice" });
+    if (/^\/v1\/bot\/groups\/[^/]+\/mention_pref$/.test(path)) return json({ no_mention: false });
+    if (/^\/v1\/bot\/groups\/[^/]+(?:\/threads\/[^/]+)?\/md$/.test(path)) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
+    if (path === "/v1/bot/messages/sync") return json({ messages: [] });
+    if (path === "/v1/bot/readReceipt") return json({});
+    if (path === "/v1/bot/typing") return json({});
+    if (path === "/v1/bot/sendMessage") {
       const body = init?.body ? JSON.parse(init.body) : null;
       const content: string | null = body?.payload?.content ?? null;
       const signal: AbortSignal | undefined = init?.signal;
@@ -176,7 +184,8 @@ function installHangingSendFetchStub(): {
       });
       return json({}); // unreachable
     }
-    return json({});
+    unexpectedRequests.push(url);
+    throw new Error(`Unexpected Octo endpoint: ${url}`);
   }) as unknown as typeof fetch;
   return { sends };
 }
@@ -407,6 +416,7 @@ function createInboundBackedBotTaskDispatch(
 }
 
 beforeEach(() => {
+  unexpectedRequests.length = 0;
   _clearKnownBots();
   _setDispatchTimeoutForTests(TIMEOUT_MS_FOR_TESTS);
   _setDispatchApologyTimeoutForTests(APOLOGY_TIMEOUT_MS_FOR_TESTS);
@@ -421,6 +431,7 @@ afterEach(() => {
   globalThis.setTimeout = originalSetTimeout;
   globalThis.clearTimeout = originalClearTimeout;
   vi.restoreAllMocks();
+  expect(unexpectedRequests).toEqual([]);
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
