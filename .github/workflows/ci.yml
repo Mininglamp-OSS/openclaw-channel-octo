@@ -45,6 +45,13 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm install --no-save --package-lock=false --ignore-scripts openclaw@${{ matrix.openclaw-version }}
+      - name: Use the exact official host archive for the runtime contract
+        # Only the SDK runtime contract is under test. Avoid npm's dependency
+        # graph rewrite when replacing the locked host (edgesOut crash on 6.9).
+        run: |
+          npm pack openclaw@${{ matrix.openclaw-version }} --ignore-scripts --pack-destination "$RUNNER_TEMP"
+          rm -rf node_modules/openclaw
+          mkdir -p node_modules/openclaw
+          tar -xzf "$RUNNER_TEMP/openclaw-${{ matrix.openclaw-version }}.tgz" --strip-components=1 -C node_modules/openclaw
       - name: Verify production runtime against the real host SDK
         run: node --test scripts/verify-runtime-store.mjs
