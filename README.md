@@ -20,7 +20,7 @@ openclaw plugins install clawhub:octo
 
 ## Host compatibility
 
-The supported minimum remains OpenClaw `2026.6.9`. Full regression and local Gateway checks cover `2026.8.1`, `2026.9.9` and `2026.10.2`. Startup binding registration shares ownership with the older lazy-manager path. Duplicate suppression depends on the host invoking the target-normalization and delivery-receipt hooks; older hosts that do not invoke those hooks may still deliver the same tool reply and automatic final twice. Plugin installation alone does not guarantee those host capabilities.
+The supported minimum remains OpenClaw `2026.6.9`. Full repository regression uses locked SDK `2026.8.1`; release-specific SDK contracts and synthetic host probes have separate coverage, detailed below. Startup binding registration shares ownership with the older lazy-manager path. Duplicate suppression depends on the host invoking the target-normalization and delivery-receipt hooks; older hosts that do not invoke those hooks may still deliver the same tool reply and automatic final twice. Plugin installation alone does not guarantee those host capabilities.
 
 Octo uses the official named runtime store. Verified SDK releases `2026.6.9`
 and `2026.8.1` share a process-wide named slot; `2026.9.9`, `2026.10.2` and
@@ -595,27 +595,29 @@ neutral withheld reason and action-status display names render `[redacted]`.
 
 ## Development
 
-Run the real container E2E for yielded progress cards in a disposable test
-container/profile with a configured Octo DM user. The runner builds this checkout,
-installs a test-only encrypted WebSocket peer in the `ocprobe` container, temporarily
-overrides the first account’s `wsUrl`, restarts its OpenClaw gateway, exercises
-`sessions_spawn` + `sessions_yield` + protected completion, and removes the
-peer/config again even when the test fails. It uses the host’s normal Octo
-routing and `/new` + `/reasoning stream` commands to isolate each scenario; use
-a dedicated test conversation because its active session is reset.
+Run the real host E2E only in an explicitly selected **idle, dedicated,
+disposable Linux container** with a synthetic Octo test account/recipient. The
+runner refuses an existing Gateway, builds this checkout, and creates a UUID-owned
+private profile, Gateway and encrypted WebSocket peer. Source configuration and
+sessions are never modified. The private Gateway/profile are cleaned up after
+success or failure; interrupted-run recovery is documented in the fixture guide.
 
-The peer includes a loopback OpenAI-compatible scripted provider so tool
-choices are deterministic. OpenClaw's tool execution, subagent scheduler,
-lifecycle stream, and Octo send/edit HTTP requests remain the real host paths.
+The peer includes a loopback OpenAI-compatible scripted provider so tool choices
+are deterministic. OpenClaw's tool execution, subagent scheduler, lifecycle hooks
+and Octo send/edit paths stay real. All five original card cases remain enabled.
 
 ```bash
-OCTO_E2E_TARGET_UID=<octo-user-uid> npm run test:e2e:openclaw
+OCTO_E2E_CONTAINER=my-disposable-container \
+OCTO_E2E_TARGET_UID=user_card_e2e_00000000000000000000 \
+npm run test:e2e:openclaw
 ```
 
-Override the default container with `OCTO_E2E_CONTAINER` when needed. The
-target user receives progress-card messages during the test. See the
-[runtime-scope acceptance notes](e2e/runtime-scope/README.md) for the currently
-observed 2026.10.5 yield-card compatibility failure; its assertions remain active.
+`OCTO_E2E_CONTAINER` is required; there is no default container. Use the runner to
+supply the owned profile, run UUID, request directory and Gateway log. Directly
+enabling the gated Vitest suite without complete, consistent runner state fails
+before any Docker command. See the [runtime-scope fixture and acceptance notes](e2e/runtime-scope/README.md)
+for setup, policy checks, recovery, version-specific test coverage and the known
+2026.10.5 yield-card compatibility failure; its assertions remain active.
 
 ## Disconnect
 

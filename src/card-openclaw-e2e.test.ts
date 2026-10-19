@@ -1,5 +1,5 @@
 /**
- * Real OpenClaw host E2E (container + real Octo server), explicitly gated.
+ * Real OpenClaw host E2E (dedicated container + synthetic peers), explicitly gated.
  *
  * The companion plugin under e2e/openclaw-host-plugin injects a synthetic
  * Octo DM through the production encrypted WebSocket. A scripted model makes tool
@@ -12,9 +12,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
+import { requireCardE2ERunState } from "../e2e/card-run-state.mjs";
 
 const execFileAsync = promisify(execFile);
 const enabled = process.env.OCTO_OPENCLAW_E2E === "1";
+// Validate at collection, before registering any enabled test or Docker call.
+const runState = enabled ? requireCardE2ERunState(process.env) : undefined;
 const suite = enabled ? describe : describe.skip;
 
 type Evidence = {
@@ -101,12 +104,8 @@ type BridgeResult = {
   error?: string;
 };
 
-const container = process.env.OCTO_E2E_CONTAINER ?? "ocprobe";
-const targetUid = process.env.OCTO_E2E_TARGET_UID ?? "";
-const runId = process.env.OCTO_E2E_RUN_ID ?? "";
-const requestRoot = process.env.OCTO_E2E_REQUEST_ROOT ?? "";
-const profile = process.env.OCTO_E2E_PROFILE ?? "";
-const gatewayLog = process.env.OCTO_E2E_GATEWAY_LOG ?? "";
+// Empty placeholders exist only for the disabled, skipped suite.
+const { container = "", targetUid = "", runId = "", requestRoot = "", profile = "", gatewayLog = "" } = runState ?? {};
 const primaryRequests = new Map<string, BridgeResult>();
 const openFlows = new Map<string, string>();
 afterEach(async () => {
@@ -115,6 +114,7 @@ afterEach(async () => {
 });
 
 async function dockerExec(args: string[], timeout = 120_000): Promise<string> {
+  if (!runState) throw new Error("OpenClaw E2E is not enabled with validated runner state");
   const { stdout } = await execFileAsync("docker", ["exec", "-e", `OCTO_E2E_RUN_ID=${runId}`, "-e", `OPENCLAW_STATE_DIR=${profile}`, ...args], {
     timeout,
     maxBuffer: 4 * 1024 * 1024,
