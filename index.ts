@@ -291,11 +291,10 @@ export default defineBundledChannelEntry({
     // with "Octo runtime not initialized" (1.0.4 regression; issue #77
     // SIGUSR1 path under OPENCLAW_NO_RESPAWN=1).
     //
-    // src/runtime.ts now stores state on globalThis under a Symbol.for key,
-    // so the dual-instance hazard is neutralized regardless of which loader
-    // wins. This manual call is still useful: it makes the "ESM-side
-    // instance has runtime" ordering explicit and predictable. Cheap, no
-    // regression risk, keeps the registration path obvious.
+    // src/runtime.ts uses the SDK's named runtime store so loader copies share
+    // state within the invoking managed instance (#271). On older supported
+    // hosts the SDK retains its named process-wide slot. Keep this defensive
+    // call to make runtime initialization before channel registration explicit.
     //
     // Guard: only wire runtime + channel + hooks in 'full' mode.
     if (api.registrationMode !== 'full') return;
