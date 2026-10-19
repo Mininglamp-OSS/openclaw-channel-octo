@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { acquire, prepare, dispose, status } from "../scripts/openclaw-e2e-state.mjs";
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
@@ -12,8 +13,12 @@ function fixture() {
   const source = { tools: { deny: ["dangerous-tool"] }, agents: { defaults: { workspace: "/must-not-write" } },
     plugins: { entries: { octo: { hooks: { allowConversationAccess: true } } } },
     channels: { octo: { accounts: { scope: { enabled: true, botToken: "synthetic", apiUrl: "http://fake.invalid" } } } } };
+  const hostRoot = fileURLToPath(new URL("../node_modules/openclaw", import.meta.url));
+  fs.mkdirSync(path.join(sourceRoot, "extensions/octo/node_modules"), { recursive: true });
+  fs.symlinkSync(hostRoot, path.join(sourceRoot, "extensions/octo/node_modules/openclaw"));
+  const cliEntry = path.join(hostRoot, "openclaw.mjs");
   const bytes = JSON.stringify(source); fs.writeFileSync(path.join(sourceRoot, "openclaw.json"), bytes);
-  return { root: path.join(dir, "control"), sourceRoot, bytes,
+  return { root: path.join(dir, "control"), sourceRoot, bytes, cliEntry,
     arg: { runId: randomUUID(), owner: { hostId: "test", pid: 1, birth: "test" }, sourceRoot, containerId: "fake-container" } };
 }
 it("exclusive acquisition precedes mutation and cannot overwrite another owner's backup", async () => {
@@ -30,18 +35,18 @@ it("simultaneous acquisitions cannot both win even before the outer flock", asyn
   await dispose(lease.runId, f.root);
 });
 it("private setup isolates configuration, sessions/workspace and preserves restrictions", async () => {
-  const f = fixture(); const run = await acquire(f.arg, f.root); const prepared = prepare(run.runId, f.root);
+  const f = fixture(); const run = await acquire(f.arg, f.root); const prepared = await prepare(run.runId, f.root, { cliEntry: f.cliEntry });
   const cfg = JSON.parse(fs.readFileSync(path.join(prepared.profile, "openclaw.json"), "utf8"));
   expect(cfg.tools.deny).toEqual(["dangerous-tool"]);
   expect(cfg.agents.defaults.workspace).toBe(path.join(prepared.profile, "workspace"));
   expect(cfg.session.store).toBeUndefined();
   expect(fs.readFileSync(path.join(f.sourceRoot, "openclaw.json"), "utf8")).toBe(f.bytes);
-  expect(() => prepare(run.runId, f.root)).toThrow(/not repeatable/);
+  await expect(prepare(run.runId, f.root, { cliEntry: f.cliEntry })).rejects.toThrow(/not repeatable/);
   await dispose(run.runId, f.root);
   expect(fs.existsSync(prepared.profile)).toBe(false);
 });
 it("foreign/stale recovery tokens cannot remove another run; disposal works from durable state", async () => {
-  const f = fixture(); const run = await acquire(f.arg, f.root); prepare(run.runId, f.root);
+  const f = fixture(); const run = await acquire(f.arg, f.root); await prepare(run.runId, f.root, { cliEntry: f.cliEntry });
   await expect(dispose(randomUUID(), f.root)).rejects.toThrow(/owner mismatch/);
   expect(status(f.root).runId).toBe(run.runId);
   await dispose(run.runId, f.root); expect(status(f.root)).toBeNull();
@@ -56,9 +61,9 @@ for (const layout of ["entries", "list"]) it(`preserves main-agent tool restrict
   const main = { tools: { deny: ["exec"] }, subagents: { allowAgents: ["main"] } };
   source.agents[layout] = layout === "entries" ? { main } : [{ id: "main", ...main }];
   fs.writeFileSync(path.join(f.sourceRoot, "openclaw.json"), JSON.stringify(source));
-  const run = await acquire(f.arg, f.root); const prepared = prepare(run.runId, f.root);
+  const run = await acquire(f.arg, f.root); const prepared = await prepare(run.runId, f.root, { cliEntry: f.cliEntry });
   const cfg = JSON.parse(fs.readFileSync(path.join(prepared.profile, "openclaw.json"), "utf8"));
-  const actual = layout === "entries" ? cfg.agents.entries.main : cfg.agents.list[0];
+  const actual = cfg.agents.entries.main;
   expect(actual.tools).toEqual(main.tools); expect(actual.subagents).toEqual(main.subagents);
   expect(actual.workspace).toBe(path.join(prepared.profile, "workspace"));
   await dispose(run.runId, f.root);

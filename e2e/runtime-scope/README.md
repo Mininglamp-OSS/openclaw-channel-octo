@@ -81,6 +81,44 @@ read only; an existing Gateway causes refusal and is never stopped. Source tool
 restrictions and Octo conversation-hook permissions are preserved. Unsupported
 remote/sandbox tool policies cause refusal instead of a policy override.
 
+Policy preflight validates the source snapshot and generated profile with the
+**actual installed host validator**, and verifies that the CLI binary and plugin
+SDK resolve to the same installation. It runs before build/Gateway startup.
+The root `tools` and canonical main-agent `tools` objects retain their separate
+allow/deny/alsoAllow/profile, sender, exec, elevated and filesystem settings;
+they are never flattened into a guessed merge. Supported defaults including
+`elevatedDefault`, sandbox-off settings, skills and subagent limits survive.
+Workspace/cwd/repository paths are rebased into the private workspace.
+
+The fixture accepts a fresh config-only synthetic source with one main agent.
+It refuses unsupported/unknown fields rather than discarding potential policy:
+extra agents or root security/session/routing configuration, another enabled
+plugin context, active sandbox/remote exec, provider-specific tool policy,
+model-scoped patch policy, or persisted execution-policy/state files require a
+separately verified fixture. Replacing the model provider cannot preserve those
+model-specific policies by blindly copying their old selectors. A missing host
+validator, mismatched CLI/SDK or invalid source also causes refusal before a
+runnable private config exists. In particular, **`agents.defaults.tools` is not
+supported by the verified 8.1/10.5 schema**; it is rejected, not silently moved or
+copied to a field the host ignores. Tool defaults live under root `tools`, with
+main-agent policy under canonical `agents.entries.main.tools`.
+
+```sh
+node --test scripts/verify-e2e-policy.mjs
+# Run only against a disposable exact host installation:
+OCTO_E2E_POLICY_HOST_ROOT=/path/to/openclaw node --test scripts/verify-e2e-policy.mjs
+```
+
+This offline contract probe executes the installed host's actual schema,
+ordered policy pipeline, sender policy, exec defaults, elevated gate and
+filesystem policy. It compares source/private permissions and exercises refusal
+negatives. The elevated test adds only a temporary export to a sibling copy of
+the host module; original SDK bytes and production code stay unchanged. CI runs
+it against locked 8.1 and the exact 10.5 archive under a supported Node version.
+The plugin runtime's older-host compatibility matrix is separate from these
+verified harness-policy contracts. A source deny may cause the tool E2E case to
+fail; the harness never removes a deny to make its workflow pass.
+
 SIGINT/SIGTERM and ordinary failures dispose only the exact owned private
 Gateway and descendants, verified by run/profile environment stamps and process
 start identity. **SIGKILL cannot execute a signal handler.** Its durable lease

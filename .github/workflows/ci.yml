@@ -21,6 +21,8 @@ jobs:
       - run: npm ci
       - run: npm run type-check
       - run: npm test
+      - name: Verify isolated profile policies against the locked host
+        run: node --test scripts/verify-e2e-policy.mjs
       - name: build (must produce dist/index.js + dist/setup-entry.js)
         run: npm run build
       - name: verify dist/ exists
@@ -59,3 +61,10 @@ jobs:
         run: node --test scripts/verify-runtime-store.mjs
       - name: Type-check the production runtime against this SDK
         run: npx tsc --ignoreConfig --noEmit --strict --skipLibCheck --module ESNext --moduleResolution bundler --target ES2022 src/runtime.ts
+      - name: Verify isolated profile policies against the complete exact 10.5 host
+        if: matrix.openclaw-version == '2026.10.5'
+        # Full validators/policy gates need the host's own dependency graph;
+        # the archive-only replacement above tests just the SDK store contract.
+        run: |
+          npm install --prefix "$RUNNER_TEMP/octo-policy-host" --ignore-scripts --omit=optional --no-audit --no-fund openclaw@2026.10.5
+          OCTO_E2E_POLICY_HOST_ROOT="$RUNNER_TEMP/octo-policy-host/node_modules/openclaw" node --test scripts/verify-e2e-policy.mjs

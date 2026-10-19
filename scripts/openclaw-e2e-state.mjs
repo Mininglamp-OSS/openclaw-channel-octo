@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
 import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 export const CONTROL_ROOT = "/var/lib/octo-host-e2e";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -78,10 +79,77 @@ export async function acquire({ runId, owner, sourceRoot, containerId }, root = 
   fs.linkSync(p.metadata, path.join(root, "lease.json"));
   return { ...record, ...p };
 }
-export function prepare(runId, root = CONTROL_ROOT) {
+// Test infrastructure only. Read the validator from the exact installed CLI/SDK,
+// never a hand-written approximation of its schema or a second host version.
+export async function loadHostConfigContract(hostRoot) {
+  hostRoot = fs.realpathSync(hostRoot);
+  const pkg = read(path.join(hostRoot, "package.json"));
+  const dir = path.join(hostRoot, "dist");
+  const candidates = fs.readdirSync(dir).filter((name) => /^(validation-core-|io\.types-).*\.m?js$/.test(name)).flatMap((name) => {
+    const source = fs.readFileSync(path.join(dir, name), "utf8");
+    const alias = source.match(/\bvalidateConfigObject as (\w+)/)?.[1];
+    return alias && source.includes("function validateConfigObject(") ? [{ name, alias }] : [];
+  });
+  if (candidates.length !== 1) throw new Error(`cannot verify installed OpenClaw ${pkg.version} config contract; refusing E2E setup`);
+  const { name, alias } = candidates[0];
+  const validate = (await import(pathToFileURL(path.join(dir, name)).href))[alias];
+  if (typeof validate !== "function") throw new Error("installed host validator unavailable; refusing E2E setup");
+  const buildInfo = path.join(dir, "build-info.json");
+  const sourceCommit = fs.existsSync(buildInfo) ? read(buildInfo).commit : undefined;
+  return { version: pkg.version, sourceCommit, hostRoot, cliEntry: fs.realpathSync(path.join(hostRoot, typeof pkg.bin === "string" ? pkg.bin : pkg.bin.openclaw)), validate };
+}
+function validateOrThrow(contract, config, label, profile) {
+  const result = contract.validate(config, { env: { ...process.env, OPENCLAW_STATE_DIR: profile } });
+  if (!result.ok) throw new Error(`${label} rejected by OpenClaw ${contract.version} schema: ` +
+    result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; "));
+  return result.config;
+}
+function knownFields(object, allowed, label) {
+  for (const key of Object.keys(object ?? {})) if (!allowed.includes(key)) {
+    throw new Error(`${label}.${key} cannot be preserved by this synthetic fixture; refusing E2E setup`);
+  }
+}
+function checkSourcePolicy(source, main, sourceRoot) {
+  // Rebuilding a profile changes model, identity/state and routing context. Only
+  // a clean synthetic config with explicitly supported policy scopes is safe.
+  knownFields(source, ["meta", "gateway", "plugins", "channels", "models", "agents", "tools"], "source");
+  knownFields(source.gateway, ["mode", "bind", "port", "auth"], "gateway");
+  knownFields(source.agents?.defaults, ["workspace", "cwd", "repoRoot", "model", "thinkingDefault", "reasoningDefault",
+    "elevatedDefault", "sandbox", "skills", "subagents", "maxConcurrent", "timeoutSeconds", "contextLimits"], "agents.defaults");
+  knownFields(main, ["id", "default", "name", "description", "workspace", "cwd", "agentDir", "model", "thinkingDefault",
+    "reasoningDefault", "tools", "subagents", "sandbox", "skills", "embeddedAgent"], "agents.entries.main");
+  knownFields(source.plugins, ["allow", "deny", "enabled", "entries"], "plugins");
+  if (source.plugins?.enabled === false || source.plugins?.deny?.includes("octo") ||
+      (source.plugins?.allow && !source.plugins.allow.includes("octo")) ||
+      Object.keys(source.plugins?.entries ?? {}).some((id) => id !== "octo")) {
+    throw new Error("source plugin admission cannot be preserved by this fixture; refusing E2E setup");
+  }
+  for (const [label, tools] of [["tools", source.tools], ["agents.entries.main.tools", main?.tools]]) {
+    if (Object.keys(tools?.byProvider ?? {}).length) {
+      throw new Error(`${label}.byProvider cannot be preserved when replacing the model provider; refusing E2E setup`);
+    }
+    if (tools?.exec?.applyPatch?.allowModels?.length) {
+      throw new Error(`${label}.exec.applyPatch.allowModels cannot be preserved when replacing the model; refusing E2E setup`);
+    }
+    if (tools?.exec?.host && !["gateway", "auto"].includes(tools.exec.host)) {
+      throw new Error(`${label}.exec.host requires a different execution context; refusing E2E setup`);
+    }
+  }
+  for (const file of ["exec-approvals.json", "state/openclaw.sqlite", "state/openclaw.sqlite-wal"]) {
+    if (fs.existsSync(path.join(sourceRoot, file))) throw new Error(`source has persisted policy/state (${file}); a fresh config-only synthetic profile is required`);
+  }
+}
+export async function prepare(runId, root = CONTROL_ROOT, { cliEntry } = {}) {
   const run = owned(root, runId);
   if (run.phase !== "acquired") throw new Error("E2E setup is not repeatable; refusing to overwrite a snapshot");
   const source = read(run.snapshot);
+  const contract = await loadHostConfigContract(path.join(run.sourceRoot, "extensions/octo/node_modules/openclaw"));
+  if (!cliEntry || fs.realpathSync(cliEntry) !== contract.cliEntry) throw new Error("Gateway CLI and plugin SDK must be the same exact host installation");
+  const validated = validateOrThrow(contract, source, "source config", run.profile);
+  const entries = Object.entries(validated.agents?.entries ?? {});
+  if (entries.length !== 1 || entries[0][0].toLowerCase() !== "main") throw new Error("fixture requires exactly one configured main agent; other agent policies will not be discarded");
+  const main = entries[0][1];
+  checkSourcePolicy(source, main, run.sourceRoot);
   const octo = source.channels?.octo;
   const accountId = Object.keys(octo?.accounts ?? {})[0];
   const account = accountId && octo.accounts[accountId];
@@ -89,12 +157,10 @@ export function prepare(runId, root = CONTROL_ROOT) {
     throw new Error("first Octo account must be an enabled, explicitly configured test account");
   }
   if (source.plugins?.entries?.octo?.enabled === false) throw new Error("Octo is disabled in source profile");
-  const main = source.agents?.entries?.main ?? source.agents?.list?.find((a) => a.id === "main");
-  const privateMain = main ? { workspace: path.join(run.profile, "workspace"), agentDir: path.join(run.profile, "agents/main/agent"),
-    ...(main.tools ? { tools: main.tools } : {}), ...(main.subagents ? { subagents: main.subagents } : {}),
-  } : undefined;
-  if ((source.tools?.exec?.host && source.tools.exec.host !== "gateway") ||
-      (source.agents?.defaults?.sandbox?.mode && source.agents.defaults.sandbox.mode !== "off") ||
+  const privateMain = { ...main, model: { primary: "octo-e2e/scripted" }, thinkingDefault: "low", reasoningDefault: "stream", workspace: path.join(run.profile, "workspace"), agentDir: path.join(run.profile, "agents/main/agent"),
+    ...(main.cwd ? { cwd: path.join(run.profile, "workspace") } : {}),
+  };
+  if ((source.agents?.defaults?.sandbox?.mode && source.agents.defaults.sandbox.mode !== "off") ||
       (main?.sandbox?.mode && main.sandbox.mode !== "off")) {
     throw new Error("fixture requires Gateway-local tools; source execution policy is not overridden");
   }
@@ -117,12 +183,13 @@ export function prepare(runId, root = CONTROL_ROOT) {
     models: { providers: { "octo-e2e": { baseUrl: `http://127.0.0.1:${run.modelPort}/runs/${runId}/v1`,
       apiKey: "synthetic-model-key", request: { allowPrivateNetwork: true }, models: [{ id: "scripted", name: "E2E Scripted",
         api: "openai-completions", reasoning: true, contextWindow: 131072, maxTokens: 4096 }] } } },
-    agents: { defaults: { workspace, model: { primary: "octo-e2e/scripted" }, thinkingDefault: "low", reasoningDefault: "stream",
-      ...(source.agents?.defaults?.subagents ? { subagents: source.agents.defaults.subagents } : {}),
-    }, ...(privateMain ? (source.agents?.entries ? { entries: { main: privateMain } } : { list: [{ id: "main", ...privateMain }] }) : {}) },
+    agents: { ...(source.agents?.ownership ? { ownership: source.agents.ownership } : {}), defaults: { ...source.agents?.defaults, workspace,
+      ...(source.agents?.defaults?.cwd ? { cwd: workspace } : {}), ...(source.agents?.defaults?.repoRoot ? { repoRoot: workspace } : {}), model: { primary: "octo-e2e/scripted" }, thinkingDefault: "low", reasoningDefault: "stream",
+    }, entries: { main: privateMain } },
   };
+  validateOrThrow(contract, config, "private config", run.profile);
   writeJson(path.join(run.profile, "openclaw.json"), config);
-  const next = { ...read(run.metadata), phase: "prepared", accountId };
+  const next = { ...read(run.metadata), phase: "prepared", accountId, hostVersion: contract.version, hostSourceCommit: contract.sourceCommit };
   writeJson(run.metadata, next); writeJson(path.join(root, "lease.json"), next);
   return { ...next, ...paths(root, runId) };
 }
@@ -172,7 +239,7 @@ if (process.argv[1] === "--control") {
   try {
     const value = arg.action === "status" ? status(root)
       : arg.action === "acquire" ? await acquire(arg, root)
-      : arg.action === "prepare" ? prepare(arg.runId, root)
+      : arg.action === "prepare" ? await prepare(arg.runId, root, { cliEntry: arg.cliEntry })
       : arg.action === "mark" ? mark(arg.runId, arg.phase, root)
       : arg.action === "dispose" ? await dispose(arg.runId, root)
       : (() => { throw new Error("unknown control operation"); })();

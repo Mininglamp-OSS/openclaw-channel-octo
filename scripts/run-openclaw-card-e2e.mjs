@@ -118,8 +118,9 @@ async function main() {
       owner: { hostId, pid: process.pid, birth: await stamp(process.pid) } });
     info(`run=${run.runId} artifacts=${run.runDir}`);
     check();
+    const cliEntry = (await docker(["exec", container, "which", "openclaw"])).stdout.trim();
+    run = await control({ action: "prepare", runId: run.runId, cliEntry });
     await streaming("npm", ["run", "build"]);
-    run = await control({ action: "prepare", runId: run.runId });
     check();
     await install(run);
     await gate("prepared", run);
