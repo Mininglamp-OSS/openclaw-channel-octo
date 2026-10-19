@@ -37,6 +37,7 @@ const steps = await hostExport('buildDefaultToolPolicyPipelineSteps', 'tool-poli
 const sender = await hostExport('resolveSenderToolPolicy', 'sender-tool-policy-');
 const fsBoundary = await hostExport('resolveEffectiveToolFsWorkspaceOnly', 'tool-fs-policy-');
 const execDefaults = await hostExport('resolveExecDefaults', 'exec-defaults-');
+const execToolConfig = await hostExport('resolveExecToolConfig', contract.version === '2026.10.5' ? 'lazy-exec-tool-' : 'core-coding-tools-');
 const corePolicy = contract.version === '2026.10.5' ? await hostExport('prepareCoreToolPolicy', 'prepared-tool-surface-') : undefined;
 // Test-only access to the real host's private elevated gate. Add only an export
 // in a temporary sibling module so its unmodified function/imports run normally.
@@ -141,6 +142,7 @@ test('main exec deny and inline-eval/approval restrictions retain native resolut
   c.tools.exec = {host:'gateway',mode:'allowlist',strictInlineEval:true,safeBins:[],applyPatch:{enabled:false,workspaceOnly:true,}};
   c.agents.entries.main.tools = {exec:{mode:'deny',strictInlineEval:true}};
 }, ({raw,privateConfig}) => {assert.equal(gates(privateConfig).exec.security,'deny');assert.equal(raw.tools.exec.strictInlineEval,true);assert.deepEqual(raw.tools.exec.safeBins,[]);assert.equal(raw.tools.exec.applyPatch.enabled,false);
+  const resolved=execToolConfig({cfg:privateConfig,agentId:'main'});assert.equal(resolved.strictInlineEval,true);assert.deepEqual(resolved.safeBins,[]);assert.equal(resolved.applyPatch.enabled,false);assert.equal(resolved.applyPatch.workspaceOnly,true);
   if(corePolicy){const policy=corePolicy({config:privateConfig,agentId:'main',modelProvider:'octo-e2e',modelId:'scripted'});assert.equal(policy.applyPatchEnabled,false);assert.equal(policy.applyPatchWorkspaceOnly,true);}}));
 test('main filesystem override follows actual host precedence without flattening layers', () => checkCase(c => {
   c.tools.fs = {workspaceOnly:true}; c.agents.entries.main.tools = {fs:{workspaceOnly:false}};
@@ -194,3 +196,6 @@ test('an unavailable installed-host validator fails closed', async () => {
   try {await assert.rejects(prepare(f.run.runId,f.root,{cliEntry:path.join(fake,'openclaw.mjs')}),/cannot verify installed OpenClaw/);assert.equal(fs.existsSync(path.join(f.run.profile,'openclaw.json')),false);}
   finally {await dispose(f.run.runId,f.root);}
 });
+test('an explicit denial of the test companion is respected', () => rejectCase(c => {
+  c.plugins.deny=['octo-host-e2e'];
+}, /plugin admission cannot be preserved/));

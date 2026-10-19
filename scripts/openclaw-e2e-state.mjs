@@ -119,7 +119,7 @@ function checkSourcePolicy(source, main, sourceRoot) {
   knownFields(main, ["id", "default", "name", "description", "workspace", "cwd", "agentDir", "model", "thinkingDefault",
     "reasoningDefault", "tools", "subagents", "sandbox", "skills", "embeddedAgent"], "agents.entries.main");
   knownFields(source.plugins, ["allow", "deny", "enabled", "entries"], "plugins");
-  if (source.plugins?.enabled === false || source.plugins?.deny?.includes("octo") ||
+  if (source.plugins?.enabled === false || ["octo", "octo-host-e2e"].some((id) => source.plugins?.deny?.includes(id)) ||
       (source.plugins?.allow && !source.plugins.allow.includes("octo")) ||
       Object.keys(source.plugins?.entries ?? {}).some((id) => id !== "octo")) {
     throw new Error("source plugin admission cannot be preserved by this fixture; refusing E2E setup");
