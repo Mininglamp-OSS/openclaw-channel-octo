@@ -1,21 +1,23 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { after, beforeEach, test } from "node:test";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 
 const require = createRequire(import.meta.url);
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const sdkEntry = require.resolve("openclaw/plugin-sdk/runtime-store");
 const hostRoot = resolve(dirname(sdkEntry), "../..");
 const { version } = JSON.parse(readFileSync(join(hostRoot, "package.json"), "utf8"));
-const source = readFileSync(resolve("src/runtime.ts"), "utf8");
+const source = readFileSync(join(repoRoot, "src/runtime.ts"), "utf8");
 const compiled = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
 // Keep files below this checkout so bare SDK imports resolve to its host.
-const temp = mkdtempSync(resolve("src/.tmp-runtime-"));
+const temp = mkdtempSync(join(repoRoot, "src/.tmp-runtime-"));
 const modules = await Promise.all(["a", "b"].map(async (name) => {
   const file = join(temp, `runtime-${name}.mjs`);
   writeFileSync(file, compiled);
@@ -61,7 +63,10 @@ test("standalone reset clears both production module copies", () => {
 const invocationFiles = readdirSync(join(hostRoot, "dist"))
   .filter((name) => /^plugin-instance-invocation-.*\.m?js$/.test(name));
 const [year, month, day] = version.split(".").map(Number);
-const managedHost = year > 2026 || (year === 2026 && (month > 10 || (month === 10 && day >= 5)));
+// 9.9 and 10.2 already contain instance-aware stores; 10.5 is not the
+// introduction boundary. Require scope on the verified managed releases and
+// later hosts, while detecting its presence on any earlier intermediate host.
+const managedHost = year > 2026 || (year === 2026 && (month > 9 || (month === 9 && day >= 9)));
 if (managedHost) assert.ok(invocationFiles.length > 0, "managed host invocation chunk must exist");
 let invocation;
 for (const file of invocationFiles) {
@@ -72,7 +77,46 @@ for (const file of invocationFiles) {
 }
 if (invocationFiles.length) assert.ok(invocation, "must locate the real host invocation scope");
 const managed = invocation ? {} : { skip: `SDK ${version} has no managed invocation scope` };
+console.log(`SDK ${version}: runtime-store mode=${invocation ? "managed-instance" : "process-wide"}`);
 const scope = () => ({ instance: { slots: new Map() } });
+
+test("timer-created work retains scope when an external emitter delivers after run returns", managed, async () => {
+  const emitter = new EventEmitter();
+  const live = scope();
+  const runtime = { name: "live" };
+  const delivered = new Promise((resolve, reject) => {
+    emitter.once("message", () => {
+      try { assert.equal(b.getOctoRuntime(), runtime); resolve(); }
+      catch (error) { reject(error); }
+    });
+  });
+  invocation.run(live, () => {
+    a.setOctoRuntime(runtime);
+    setTimeout(() => emitter.emit("message"), 0);
+  });
+  await delivered;
+});
+
+test("listener registration alone does not grant scope to unscoped delivery", managed, () => {
+  const emitter = new EventEmitter();
+  invocation.run(scope(), () => {
+    a.setOctoRuntime({ name: "live" });
+    emitter.on("message", () => b.getOctoRuntime());
+  });
+  assert.throws(() => emitter.emit("message"), /Octo runtime not initialized/);
+});
+
+test("another plugin's setter cannot initialize or replace the Octo instance", managed, () => {
+  const live = scope();
+  const bridge = scope();
+  bridge.instance.pluginId = "octo-host-e2e";
+  invocation.run(bridge, () => a.setOctoRuntime({ name: "bridge" }));
+  invocation.run(live, () => assert.throws(() => b.getOctoRuntime(), /Octo runtime not initialized/));
+  const runtime = { name: "octo" };
+  invocation.run(live, () => a.setOctoRuntime(runtime));
+  invocation.run(bridge, () => b._resetOctoRuntimeForTests());
+  invocation.run(live, () => assert.equal(b.getOctoRuntime(), runtime));
+});
 
 test("candidate B cannot replace live A's runtime (#271)", managed, () => {
   const live = scope();

@@ -6,7 +6,7 @@ OpenClaw channel plugin for **Octo**. Connects via WebSocket for real-time messa
 
 ## Prerequisites
 
-- Node.js >= 22 (OpenClaw >= 2026.4.15 requires Node 22)
+- Node.js >= 22, also satisfying the chosen OpenClaw host's engine requirement (see Host compatibility below)
 - OpenClaw installed and configured (`npm i -g openclaw`)
 - A bot created via BotFather in Octo (send `/newbot` to BotFather)
 
@@ -21,6 +21,23 @@ openclaw plugins install clawhub:octo
 ## Host compatibility
 
 The supported minimum remains OpenClaw `2026.6.9`. Full regression and local Gateway checks cover `2026.8.1`, `2026.9.9` and `2026.10.2`. Startup binding registration shares ownership with the older lazy-manager path. Duplicate suppression depends on the host invoking the target-normalization and delivery-receipt hooks; older hosts that do not invoke those hooks may still deliver the same tool reply and automatic final twice. Plugin installation alone does not guarantee those host capabilities.
+
+Octo uses the official named runtime store. Verified SDK releases `2026.6.9`
+and `2026.8.1` share a process-wide named slot; `2026.9.9`, `2026.10.2` and
+`2026.10.5` resolve it from the current managed plugin instance. These are tested
+release points, not a claim that instance scoping first appeared in 10.5.
+Callbacks must originate from the host-admitted Octo account lifecycle. Actual
+WebSocket callbacks created during `startAccount` retain that scope; importing
+Octo's setter from another plugin cannot initialize Octo's instance. A missing
+runtime rejects inbound with `reason=runtime-unavailable`; it does not borrow
+another instance or silently dispatch with a process-global fallback.
+
+The runtime contract and runtime-only strict type check are CI-gated on
+`2026.6.9`, `2026.9.9`, `2026.10.2` and `2026.10.5`; the normal full repository
+job retains locked SDK `2026.8.1`. Use the host's own supported Node version:
+OpenClaw `2026.10.5` requires Node `>=24.16.0 <25 || >=26.1.0`, even though
+Octo's own Node minimum remains 22. See [synthetic runtime-scope tests](e2e/runtime-scope/README.md)
+for production-path and isolated Gateway probes and their validation boundaries.
 
 ## Configure a bot account
 

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { it } from "vitest";
 
 // Native Node keeps the official SDK's private invocation scope and its runtime
@@ -8,7 +8,7 @@ import { it } from "vitest";
 it("preserves the runtime store contract against the installed host SDK", () => {
   try {
     execFileSync(process.execPath, [
-      "--test", resolve("scripts/verify-runtime-store.mjs"),
+      "--test", fileURLToPath(new URL("../scripts/verify-runtime-store.mjs", import.meta.url)),
     ], { encoding: "utf8", timeout: 30_000, stdio: "pipe" });
   } catch (error) {
     const output = error as { stdout?: string; stderr?: string };

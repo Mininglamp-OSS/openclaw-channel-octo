@@ -2381,7 +2381,19 @@ export async function handleInboundMessage(params: {
     log?.info?.(`octo: [MENTION] 历史保留（按 message_seq 分段标注） | session=${sessionId}`);
   }
 
-  const core = getOctoRuntime();
+  let core: ReturnType<typeof getOctoRuntime>;
+  try {
+    core = getOctoRuntime();
+  } catch (error) {
+    log?.error?.(
+      `octo: inbound dropped account=${account.accountId} session=${sessionId} ` +
+      `reason=runtime-unavailable: ${error instanceof Error ? error.message : String(error)}; ` +
+      "no Agent dispatch attempted; check Octo instance initialization and callback scope",
+    );
+    // Preserve failure semantics for queue/task callers. A diagnostic must not
+    // turn an unprocessed message into a successful dispatch or borrow a runtime.
+    throw error;
+  }
   if (!core?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
     log?.error?.(`octo: OpenClaw runtime missing required functions. Available: config=${!!core?.config}, channel=${!!core?.channel}, reply=${!!core?.channel?.reply}, routing=${!!core?.channel?.routing}, session=${!!core?.channel?.session}`);
     log?.error?.(`octo: reply methods: ${core?.channel?.reply ? Object.keys(core.channel.reply).join(",") : "N/A"}`);

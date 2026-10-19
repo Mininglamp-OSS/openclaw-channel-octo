@@ -13,7 +13,7 @@
  */
 import { resolveOctoAccount } from "../octo/dist/src/accounts.js";
 import { handleInboundMessage } from "../octo/dist/src/inbound.js";
-import { setOctoRuntime } from "../octo/dist/src/runtime.js";
+import { getOctoRuntime } from "../octo/dist/src/runtime.js";
 import { ChannelType, MessageType } from "../octo/dist/src/types.js";
 import fs from "node:fs";
 import http from "node:http";
@@ -436,7 +436,9 @@ export default {
   register(api) {
     ensureEditObserver(api);
     ensureModelServer(api);
-    setOctoRuntime(api.runtime);
+    // Octo initializes its own runtime during its own registration. Writing
+    // from this bridge would seed the bridge instance, not the Octo instance,
+    // on managed hosts, and would conceal that direct injection has wrong scope.
     let watcher;
 
     // Keep the test deterministic and avoid mutating the operator's default
@@ -464,6 +466,16 @@ export default {
           throw new Error("childDelaySeconds must be an integer between 10 and 90");
         }
 
+        try {
+          getOctoRuntime();
+        } catch (error) {
+          throw new Error(
+            "octo-host-e2e: direct cross-plugin inbound has no Octo runtime in this callback. " +
+            "On managed hosts use e2e/runtime-scope/gateway.mjs to inject through Octo's WebSocket; " +
+            "do not initialize Octo from the bridge plugin.",
+            { cause: error },
+          );
+        }
         const config = api.runtime.config.current();
         const accountId = resolveAccountId(
           config,
