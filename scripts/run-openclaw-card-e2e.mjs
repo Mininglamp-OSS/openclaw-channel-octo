@@ -84,13 +84,16 @@ async function start(run) {
   await docker(["exec", "-d", "-e", `OPENCLAW_STATE_DIR=${run.profile}`, "-e", `OPENCLAW_CONFIG_PATH=${run.profile}/openclaw.json`,
     "-e", "OPENCLAW_NO_RESPAWN=1", "-e", "OPENCLAW_SKIP_UPDATE_CHECK=1", "-e", `OCTO_E2E_RUN_ID=${run.runId}`,
     "-e", "OCTO_CARD_DEBUG=1", container, "node", "-e", launch, run.gatewayLog]);
+  let lastLog = "";
   for (let i = 0; i < 60; i++) {
     check();
     const { stdout } = await docker(["exec", container, "node", "-e", "const fs=require('fs');try{process.stdout.write(fs.readFileSync(process.argv[1],'utf8'))}catch{}", run.gatewayLog]);
+    lastLog = stdout;
     if (stdout.includes("[gateway] ready") && stdout.includes("octo-host-e2e: request bridge ready")) return;
     await new Promise((r) => setTimeout(r, 500));
   }
-  throw new Error(`private Gateway failed to become ready; evidence: ${run.gatewayLog}`);
+  if (lastLog) console.error(`[openclaw-e2e] startup log tail before cleanup:\n${lastLog.slice(-16_384)}`);
+  throw new Error("private Gateway failed to become ready");
 }
 async function gate(phase, run) {
   if (process.env.OCTO_E2E_TEST_GATE !== phase) return;
@@ -116,7 +119,7 @@ async function main() {
   try {
     run = await control({ action: "acquire", runId: randomUUID(), sourceRoot, containerId,
       owner: { hostId, pid: process.pid, birth: await stamp(process.pid) } });
-    info(`run=${run.runId} artifacts=${run.runDir}`);
+    info(`run=${run.runId} temp=${run.runDir}`);
     check();
     const cliEntry = (await docker(["exec", container, "which", "openclaw"])).stdout.trim();
     run = await control({ action: "prepare", runId: run.runId, cliEntry });

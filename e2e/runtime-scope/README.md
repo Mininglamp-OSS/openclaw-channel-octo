@@ -134,11 +134,26 @@ node scripts/run-openclaw-card-e2e.mjs --recover EXACT_RUN_UUID
 
 Recovery verifies the lease token, container identity and dead local owner PID
 with process birth time. It refuses a live owner or another machine's owner.
-It removes only that private profile and snapshot; it retains non-secret run
-metadata and diagnostic ledgers/logs. Container restart preserves the ledger;
-deleting the container filesystem does not. The original profile needs no
-restoration, including after SIGKILL. Keep the task container until evidence is
-collected. `infra-recovery.mjs` exercises real concurrent-run refusal, live/wrong
+After process teardown, completed disposal removes the entire exclusive-created
+UUID directory: private profile, source snapshot, requests/results, Gateway log
+and metadata. This applies after both passing and ordinary failing tests; there
+is **zero automatic artifact retention** after completed cleanup. Only then is
+the lease released. Startup failures print a bounded log tail, and Vitest failure
+evidence remains in runner output; redirect stdout/stderr to a chosen file if
+needed.
+
+Failed/interrupted cleanup retains the lease and remaining directory for exact
+recovery. A durable `removing` phase allows retries after partial deletion or
+failure to release the lease, even if metadata/the directory is already gone.
+Repeated completed cleanup while idle is a no-op. Directory device/inode/birth
+identity and metadata/lease ownership are checked before deletion; a replaced
+or symlink directory is refused. Existing UUID directories are never claimed,
+and unrelated/unleased or legacy artifacts are never swept. Legacy leases
+without creation identity require manual inspection rather than automatic
+whole-directory deletion. Container restart preserves the ledger; deleting the
+container filesystem does not. The original source profile needs no restoration.
+
+`infra-recovery.mjs` exercises real concurrent-run refusal, live/wrong
 recovery refusal, SIGTERM cleanup, SIGKILL after a real Gateway starts, exact
 recovery, source byte preservation and unrelated-process survival in a dedicated
 synthetic container using the same two environment variables above.

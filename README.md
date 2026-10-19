@@ -599,8 +599,8 @@ Run the real host E2E only in an explicitly selected **idle, dedicated,
 disposable Linux container** with a synthetic Octo test account/recipient. The
 runner refuses an existing Gateway, builds this checkout, and creates a UUID-owned
 private profile, Gateway and encrypted WebSocket peer. Source configuration and
-sessions are never modified. The private Gateway/profile are cleaned up after
-success or failure; interrupted-run recovery is documented in the fixture guide.
+sessions are never modified. Completed cleanup removes the private Gateway and entire run directory after
+success or ordinary failure; interrupted-run recovery is documented in the fixture guide.
 
 The peer includes a loopback OpenAI-compatible scripted provider so tool choices
 are deterministic. OpenClaw's tool execution, subagent scheduler, lifecycle hooks

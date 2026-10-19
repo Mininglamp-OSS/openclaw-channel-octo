@@ -5,17 +5,43 @@ import path from "node:path";
 import net from "node:net";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 export const CONTROL_ROOT = "/var/lib/octo-host-e2e";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function checkId(id) { if (!uuid.test(id)) throw new Error("invalid E2E run id"); }
+function syncDirectory(dir) {
+  const fd = fs.openSync(dir, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+function directoryIdentity(dir) {
+  const stat = fs.lstatSync(dir, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("refusing a non-directory or symlink E2E path");
+  return { device: String(stat.dev), inode: String(stat.ino), birth: String(stat.birthtimeNs) };
+}
+function existsNoFollow(file) {
+  try { fs.lstatSync(file); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+function sameRun(a, b) {
+  return ["version", "runId", "createdAt", "owner", "sourceRoot", "containerId", "sourceConfigSha256", "directoryIdentity"]
+    .every((key) => isDeepStrictEqual(a[key], b[key]));
+}
+function verifyDirectory(root, run, allowAbsent = false) {
+  directoryIdentity(root); directoryIdentity(path.join(root, "runs"));
+  if (!run.directoryIdentity) throw new Error("lease has no directory ownership identity; manual inspection required");
+  if (allowAbsent && !existsNoFollow(run.runDir)) return;
+  if (!isDeepStrictEqual(directoryIdentity(run.runDir), run.directoryIdentity)) throw new Error("E2E run directory identity changed; refusing deletion");
+}
+function verifyMetadata(run) {
+  const stat = fs.lstatSync(run.metadata);
+  if (!stat.isFile() || stat.isSymbolicLink() || !sameRun(read(run.metadata), run)) throw new Error("E2E metadata owner mismatch; refusing deletion");
+}
 function writeJson(file, value) {
   const tmp = `${file}.${process.pid}.tmp`;
   const fd = fs.openSync(tmp, "w", 0o600);
   try { fs.writeFileSync(fd, JSON.stringify(value)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(tmp, file);
-  const dir = fs.openSync(path.dirname(file), "r");
-  try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+  syncDirectory(path.dirname(file));
 }
 const read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 function paths(root, id) {
@@ -64,20 +90,31 @@ export async function acquire({ runId, owner, sourceRoot, containerId }, root = 
     throw new Error("E2E requires an idle dedicated container; existing Gateway will not be stopped");
   }
   if (!path.isAbsolute(sourceRoot)) throw new Error("source profile must be absolute");
-  const p = paths(root, runId);
-  fs.mkdirSync(p.runDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(p.requests, { mode: 0o700 });
   const bytes = fs.readFileSync(path.join(sourceRoot, "openclaw.json"));
-  const snapshotFd = fs.openSync(p.snapshot, "wx", 0o600);
-  try { fs.writeFileSync(snapshotFd, bytes); fs.fsyncSync(snapshotFd); } finally { fs.closeSync(snapshotFd); }
   const [gatewayPort, modelPort] = await freePorts();
-  const record = { version: 1, runId, owner, sourceRoot, containerId, gatewayPort, modelPort,
-    sourceConfigSha256: createHash("sha256").update(bytes).digest("hex"), phase: "acquired", createdAt: Date.now() };
-  writeJson(p.metadata, record);
-  // Also fail closed if a caller forgot the outer flock. Hard-link only a
-  // complete, fsynced owner record; there is no empty-lock crash window.
-  fs.linkSync(p.metadata, path.join(root, "lease.json"));
-  return { ...record, ...p };
+  const p = paths(root, runId);
+  directoryIdentity(root);
+  fs.mkdirSync(path.dirname(p.runDir), { recursive: true, mode: 0o700 });
+  directoryIdentity(path.dirname(p.runDir));
+  // Never claim a pre-existing UUID directory, even if it has no metadata.
+  fs.mkdirSync(p.runDir, { mode: 0o700 });
+  const identity = directoryIdentity(p.runDir);
+  try {
+    fs.mkdirSync(p.requests, { mode: 0o700 });
+    const snapshotFd = fs.openSync(p.snapshot, "wx", 0o600);
+    try { fs.writeFileSync(snapshotFd, bytes); fs.fsyncSync(snapshotFd); } finally { fs.closeSync(snapshotFd); }
+    const record = { version: 1, runId, owner, sourceRoot, containerId, gatewayPort, modelPort,
+      directoryIdentity: identity, sourceConfigSha256: createHash("sha256").update(bytes).digest("hex"), phase: "acquired", createdAt: Date.now() };
+    writeJson(p.metadata, record);
+    // Link only a complete fsynced record; even a caller without flock cannot
+    // overwrite another run's lease. A losing candidate removes only itself.
+    fs.linkSync(p.metadata, path.join(root, "lease.json"));
+    return { ...record, ...p };
+  } catch (error) {
+    if (!isDeepStrictEqual(directoryIdentity(p.runDir), identity)) throw new AggregateError([error], `unleased candidate identity changed; inspect ${p.runDir}`);
+    fs.rmSync(p.runDir, { recursive: true, force: true });
+    throw error;
+  }
 }
 // Test infrastructure only. Read the validator from the exact installed CLI/SDK,
 // never a hand-written approximation of its schema or a second host version.
@@ -200,8 +237,17 @@ export function mark(runId, phase, root = CONTROL_ROOT) {
   return { ...next, ...paths(root, runId) };
 }
 export async function dispose(runId, root = CONTROL_ROOT) {
+  checkId(runId);
+  const p = paths(root, runId);
+  if (!status(root)) {
+    if (existsNoFollow(p.runDir)) throw new Error("unleased E2E directory cannot be proven owned; refusing deletion");
+    return { runId, cleaned: true, alreadyRemoved: true };
+  }
   const run = owned(root, runId);
-  mark(runId, "disposing", root);
+  verifyDirectory(root, run, run.phase === "removing");
+  // The durable removing phase permits recovery after partial rmtree or after
+  // rmtree succeeded but releasing the lease failed. Metadata may be gone then.
+  if (run.phase !== "removing") { verifyMetadata(run); mark(runId, "disposing", root); }
   const identities = new Map();
   function discover() {
     const all = proc();
@@ -223,14 +269,18 @@ export async function dispose(runId, root = CONTROL_ROOT) {
   signal(discover(), "SIGKILL");
   for (let i = 0; i < 20 && discover().length; i++) await new Promise((r) => setTimeout(r, 100));
   if (discover().length) throw new Error("owned processes remain; lease retained for recovery");
-  // Original profile/config/dist/sessions were never written. Delete only the
-  // recomputed private paths of the exact lease owner, never paths from JSON.
-  fs.rmSync(run.profile, { recursive: true, force: true });
-  fs.rmSync(run.snapshot, { force: true });
-  writeJson(run.metadata, { ...read(run.metadata), phase: "cleaned", finishedAt: Date.now() });
-  if (status(root)?.runId !== runId) throw new Error("lease changed during disposal");
+  const current = owned(root, runId);
+  if (!sameRun(current, run)) throw new Error("lease changed during disposal");
+  verifyDirectory(root, run, current.phase === "removing");
+  if (current.phase !== "removing") { verifyMetadata(run); mark(runId, "removing", root); }
+  // No retention after completed disposal, including ordinary failed tests.
+  // Only the exclusive-created, inode-verified UUID directory is removed.
+  fs.rmSync(run.runDir, { recursive: true, force: true });
+  syncDirectory(path.dirname(run.runDir));
+  const final = owned(root, runId);
+  if (!sameRun(final, run) || final.phase !== "removing") throw new Error("lease changed during disposal");
   fs.unlinkSync(path.join(root, "lease.json"));
-  return { runId, cleaned: true, artifacts: run.runDir };
+  return { runId, cleaned: true, removed: run.runDir };
 }
 
 if (process.argv[1] === "--control") {
