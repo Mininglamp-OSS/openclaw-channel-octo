@@ -5,8 +5,7 @@
  * A loopback OpenAI-compatible provider scripts only the model outputs; host
  * tool execution, subagent scheduling, lifecycle, and channel I/O stay real.
  *
- * Install beside the active plugin:
- *   ~/.openclaw-dev/extensions/octo-host-e2e
+ * Installed by the runner only in its UUID-owned private profile.
  *
  * Never ship this directory in the octo package. The runner enables it only
  * for the duration of an explicit container E2E and removes it afterwards.
@@ -16,56 +15,59 @@ import { createSocketPeer } from "./socket-peer.mjs";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { appendEvent, events, ownerKey, inputTag, bindInput, toolCardId } from "./evidence.mjs";
 
-const TEST_SESSIONS = Symbol.for("octo.host-e2e.sessions");
-const testSessions = globalThis[TEST_SESSIONS] ??= new Set();
-const TEST_CHILDREN = Symbol.for("octo.host-e2e.children");
-const testChildren = globalThis[TEST_CHILDREN] ??= new Set();
 const PROVIDER = "octo-e2e";
 const MODEL = "scripted";
 const MODEL_REF = `${PROVIDER}/${MODEL}`;
-const MODEL_PORT = 19123;
-const REQUEST_DIR = "/tmp/octo-host-e2e";
-const EDIT_LOG = `${REQUEST_DIR}/card-edits.jsonl`;
-const MODEL_SERVER = Symbol.for("octo.host-e2e.model-server");
-const EDIT_OBSERVER = Symbol.for("octo.host-e2e.edit-observer");
-
-function ensureEditObserver(api) {
-  if (globalThis[EDIT_OBSERVER] || typeof globalThis.fetch !== "function") return;
+let run;
+let testSessions;
+let testChildren;
+let REQUEST_DIR;
+let MODEL_PORT;
+let MODEL_SERVER;
+function configure(api) {
+  const settings = api.pluginConfig ?? api.config?.plugins?.entries?.["octo-host-e2e"]?.config;
+  if (!settings?.runId || !/^[0-9a-f-]{36}$/i.test(settings.runId) || !settings.requestRoot?.startsWith(`/var/lib/octo-host-e2e/runs/${settings.runId}/`)) throw new Error("missing owned E2E run configuration");
+  if (run && run.runId !== settings.runId) throw new Error("cannot mix E2E run owners in one module");
+  run = settings;
+  REQUEST_DIR = run.requestRoot; MODEL_PORT = run.modelPort;
+  testSessions = globalThis[Symbol.for(`octo.host-e2e.sessions:${run.runId}`)] ??= new Set();
+  testChildren = globalThis[Symbol.for(`octo.host-e2e.children:${run.runId}`)] ??= new Set();
+  MODEL_SERVER = Symbol.for(`octo.host-e2e.model:${run.runId}`);
+}
+function ensureEditObserver() {
+  const key = Symbol.for(`octo.host-e2e.observer:${run.runId}`);
+  if (globalThis[key]) return;
+  const currentRun = run;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
     const response = await originalFetch(input, init);
-    const url = typeof input === "string" || input instanceof URL
-      ? String(input)
-      : input?.url ?? "";
-    if (url.endsWith("/v1/bot/message/edit") && typeof init?.body === "string") {
-      try {
-        const request = JSON.parse(init.body);
-        const envelope = typeof request.content_edit === "string"
-          ? JSON.parse(request.content_edit)
-          : request.template_ref ? request : undefined;
-        if (!envelope) return response;
-        fs.mkdirSync(REQUEST_DIR, { recursive: true });
-        fs.appendFileSync(EDIT_LOG, JSON.stringify({
-          timestampMs: Date.now(),
-          messageId: String(request.message_id ?? ""),
-          status: response.status,
-          ok: response.ok,
-          transient: envelope.transient === true,
-          plain: typeof envelope.plain === "string" ? envelope.plain : "",
-          ...(envelope.template_ref ? { templateRef: envelope.template_ref } : {}),
-          ...(typeof envelope.state === "string" ? { state: envelope.state } : {}),
-          ...(envelope.data && typeof envelope.data === "object" ? { data: envelope.data } : {}),
-          ...(Number.isSafeInteger(envelope.card_seq) ? { cardSeq: envelope.card_seq } : {}),
-        }) + "\n");
-      } catch (error) {
-        api.logger.warn(`octo-host-e2e edit observer: ${error}`);
+    const url = typeof input === "string" || input instanceof URL ? String(input) : input?.url ?? "";
+    try {
+      if (typeof init?.body !== "string") return response;
+      const request = JSON.parse(init.body);
+      const parsed = new URL(url);
+      const authorization = new Headers(init.headers).get("Authorization") ?? "";
+      const base = url.slice(0, url.indexOf("/v1/bot/"));
+      const owner = ownerKey(base, authorization);
+      if (parsed.pathname.endsWith("/v1/bot/sendMessage") && request.payload?.type === 17) {
+        const result = await response.clone().json();
+        const id = result.message_idstr ?? result.message_id;
+        const exact = typeof id === "string" || Number.isSafeInteger(id);
+        appendEvent(currentRun, { type: "card-created", owner, channelId: request.channel_id, channelType: request.channel_type,
+          messageId: exact ? String(id) : "", clientMsgNo: request.client_msg_no, payload: request.payload,
+          ok: response.ok && (!result.client_msg_no || result.client_msg_no === request.client_msg_no) });
       }
-    }
+      if (parsed.pathname.endsWith("/v1/bot/message/edit")) {
+        const envelope = typeof request.content_edit === "string" ? JSON.parse(request.content_edit) : request;
+        appendEvent(currentRun, { type: "card-edited", owner, messageId: String(request.message_id ?? ""), envelope, ok: response.ok });
+      }
+    } catch (error) { console.error(`octo-host-e2e evidence failure: ${error.message}`); }
     return response;
   };
-  globalThis[EDIT_OBSERVER] = true;
+  globalThis[key] = true;
 }
 
 function contentText(content) {
@@ -156,7 +158,7 @@ function scriptedReply(body) {
   }
 
   if (allText.includes(`FILES_E2E_WORKFLOW:${marker}`)) {
-    const workDir = `/tmp/octo-realistic-e2e/${marker}`;
+    const workDir = `${run.stateRoot}/workspace/file-tools/${marker}`;
     const inputPath = `${workDir}/input.txt`;
     const reportPath = `${workDir}/report.txt`;
     if (toolMessages.length === 0) {
@@ -334,7 +336,7 @@ function sendScriptedResponse(res, body, reply) {
 function ensureModelServer(api) {
   if (globalThis[MODEL_SERVER]) return;
   const server = http.createServer((req, res) => {
-    if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+    if (req.method !== "POST" || req.url !== `/runs/${run.runId}/v1/chat/completions`) {
       res.writeHead(404).end();
       return;
     }
@@ -356,14 +358,13 @@ function ensureModelServer(api) {
       }
     });
   });
-  const socketPeer = createSocketPeer(server);
-  server.on("error", (error) => {
-    if (error?.code !== "EADDRINUSE") api.logger.error(`octo-host-e2e model server: ${error}`);
+  const socketPeer = createSocketPeer(server, `/runs/${run.runId}/ws`);
+  const ready = new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(MODEL_PORT, "127.0.0.1", () => { console.log(`octo-host-e2e: scripted model ready on 127.0.0.1:${MODEL_PORT}`); resolve(); });
   });
-  server.listen(MODEL_PORT, "127.0.0.1", () => {
-    api.logger.info(`octo-host-e2e: scripted model ready on 127.0.0.1:${MODEL_PORT}`);
-  });
-  globalThis[MODEL_SERVER] = { server, socketPeer };
+  ready.catch((error) => console.error(`octo-host-e2e model server: ${error.message}`));
+  globalThis[MODEL_SERVER] = { server, socketPeer, ready };
 }
 
 function requiredString(params, key) {
@@ -404,7 +405,7 @@ function buildPrompt(kind, marker, childDelaySeconds, targetUid) {
     return `Ordinary user follow-up for ${marker}. Do not call tools. Reply exactly FOLLOWUP_E2E_OK:${marker}`;
   }
   if (kind === "file-tools") {
-    const workDir = `/tmp/octo-realistic-e2e/${marker}`;
+    const workDir = `${run.stateRoot}/workspace/file-tools/${marker}`;
     return [
       `FILES_E2E_WORKFLOW:${marker}`,
       `Read ${workDir}/input.txt.`,
@@ -437,7 +438,8 @@ export default {
   name: "Octo Host E2E Bridge",
   version: "0.0.0",
   register(api) {
-    ensureEditObserver(api);
+    configure(api);
+    ensureEditObserver();
     ensureModelServer(api);
     // Only the production account socket receives messages. This bridge never
     // reads/writes the Octo runtime or calls its inbound handler.
@@ -471,14 +473,26 @@ export default {
       }
     });
 
+    api.on("before_agent_run", (event, ctx) => {
+      bindInput(run, event.prompt, ctx.sessionKey, ctx.runId);
+      return { outcome: "pass" };
+    });
+    api.on("after_tool_call", (event, ctx) => {
+      if (event.toolName === "octo_send_display_card" || event.toolName === "octo_send_interactive_card") {
+        appendEvent(run, { type: "card-tool", agentRunId: ctx.runId, sessionKey: ctx.sessionKey,
+          messageId: toolCardId(event.result), clientMsgNo: event.result?.details?.client_msg_no, ok: !event.error });
+      }
+    });
     const runRequest = async (params) => {
       try {
-        const kind = params.kind === "followup" || params.kind === "configure-reasoning" ||
+        if (params.runId !== run.runId || !/^[0-9a-f-]{36}$/i.test(params.requestId)) throw new Error("wrong E2E run/request owner");
+        const kind = params.kind === "close-flow" || params.kind === "followup" || params.kind === "configure-reasoning" ||
           params.kind === "file-tools" || params.kind === "tool-delivery" ||
           params.kind === "display-card-delivery"
           ? params.kind
           : "spawn";
         const marker = requiredString(params, "marker");
+        if (!/^[0-9a-f-]{36}$/i.test(marker)) throw new Error("invalid flow marker");
         const targetUid = requiredString(params, "targetUid");
         const delay = Number(params.childDelaySeconds ?? 25);
         if (!Number.isInteger(delay) || delay < 10 || delay > 90) {
@@ -500,22 +514,34 @@ export default {
         if (params.sessionKey && params.sessionKey !== sessionKey) throw new Error("request differs from host Octo route");
         testSessions.add(sessionKey);
         const { socketPeer } = globalThis[MODEL_SERVER];
+        const lockDir = path.join(REQUEST_DIR, "flows", createHash("sha256").update(sessionKey).digest("hex"));
+        fs.mkdirSync(path.dirname(lockDir), { recursive: true });
         if (kind === "configure-reasoning") {
-          const response = await fetch(`${account.config.apiUrl.replace(/\/+$/, "")}/v1/bot/messages/sync`, {
-            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${account.config.botToken}` },
-            body: JSON.stringify({ channel_id: targetUid, channel_type: 1, limit: 100, start_message_seq: 0, end_message_seq: 0, pull_mode: 1 }),
-          });
-          if (!response.ok) throw new Error(`baseline message sync failed: ${response.status}`);
-          const baseline = await response.json();
-          fs.writeFileSync(path.join(REQUEST_DIR, `${marker}.baseline.json`), JSON.stringify(
-            (baseline.messages ?? []).map((m) => String(m.message_idstr ?? m.message_id ?? "")),
-          ));
-          fs.writeFileSync(path.join(REQUEST_DIR, "session-keys.json"), JSON.stringify([...testSessions]));
-          // Reset via the same supported command path, not by editing host state.
-          await socketPeer.send(accountId, targetUid, "/new");
+          try { fs.mkdirSync(lockDir); } catch (e) { if (e.code === "EEXIST") throw new Error("another flow owns this session"); throw e; }
+          fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ marker, sessionKey }));
+        } else {
+          const owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"));
+          if (owner.marker !== marker || owner.sessionKey !== sessionKey) throw new Error("flow owner mismatch");
         }
-        const ack = await socketPeer.send(accountId, targetUid, buildPrompt(kind, marker, delay, targetUid));
-        return { ok: true, accepted: true, kind, marker, sessionKey, transport: "websocket", ...ack };
+        if (kind === "close-flow") {
+          fs.rmSync(lockDir, { recursive: true });
+          return { ok: true, closed: true, runId: run.runId, requestId: params.requestId, marker, sessionKey };
+        }
+        if (kind === "configure-reasoning") await socketPeer.send(accountId, targetUid, "/new");
+        const command = kind === "configure-reasoning";
+        if (!command && kind !== "followup" && events(run).some((e) => e.type === "input" && e.marker === marker && e.kind !== "followup")) {
+          throw new Error("flow already has a primary injected request");
+        }
+        const raw = buildPrompt(kind, marker, delay, targetUid);
+        const owner = ownerKey(account.config.apiUrl, `Bearer ${account.config.botToken}`);
+        const ack = await socketPeer.send(accountId, targetUid, raw, ({ messageId }) => {
+          if (!command) appendEvent(run, { type: "input", requestId: params.requestId, marker, sessionKey, messageId,
+            kind, owner, channelId: targetUid, channelType: 1 });
+          return command ? raw : `${raw}\n${inputTag(run.runId, params.requestId, messageId)}`;
+        });
+        if (!command) appendEvent(run, { type: "ack", requestId: params.requestId, messageId: ack.messageId });
+        return { ok: true, accepted: true, kind, marker, sessionKey, runId: run.runId, requestId: params.requestId, transport: "websocket", ...ack };
+
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
@@ -543,6 +569,7 @@ export default {
           const resultPath = path.join(REQUEST_DIR, name.replace(/\.request\.json$/, ".result.json"));
           try {
             const params = JSON.parse(fs.readFileSync(processingPath, "utf8"));
+            if (params.requestId !== name.replace(/\.request\.json$/, "")) throw new Error("request file identity mismatch");
             const result = await runRequest(params);
             fs.writeFileSync(resultPath, JSON.stringify(result));
           } catch (error) {
@@ -557,7 +584,8 @@ export default {
       }
     };
 
-    const startWatcher = () => {
+    const startWatcher = async () => {
+      await globalThis[MODEL_SERVER].ready;
       fs.mkdirSync(REQUEST_DIR, { recursive: true });
       watcher?.close();
       watcher = fs.watch(REQUEST_DIR, processRequests);

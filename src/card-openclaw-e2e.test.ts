@@ -11,13 +11,14 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 const execFileAsync = promisify(execFile);
 const enabled = process.env.OCTO_OPENCLAW_E2E === "1";
 const suite = enabled ? describe : describe.skip;
 
 type Evidence = {
+  requestId: string; inputMessageId: string; leaseRunId: string; otherFlowCardIds: string[];
   transcriptFile?: string;
   toolCalls: Array<{ name?: string; arguments?: Record<string, unknown> }>;
   completionEvent: boolean;
@@ -28,6 +29,7 @@ type Evidence = {
   sessionSettings: { thinkingLevel?: string; reasoningLevel?: string };
   cards: Array<{
     messageId: string;
+    correlation: { leaseRunId: string; marker: string; sessionKey: string; requestId: string; inputMessageId: string; agentRunId: string };
     timestampMs: number;
     plain: string;
     plainSource?: "original-message" | "accepted-edit";
@@ -95,14 +97,25 @@ type BridgeResult = {
   kind?: string;
   transport?: string;
   messageId?: string;
+  runId?: string; requestId?: string; closed?: boolean;
   error?: string;
 };
 
 const container = process.env.OCTO_E2E_CONTAINER ?? "ocprobe";
 const targetUid = process.env.OCTO_E2E_TARGET_UID ?? "";
+const runId = process.env.OCTO_E2E_RUN_ID ?? "";
+const requestRoot = process.env.OCTO_E2E_REQUEST_ROOT ?? "";
+const profile = process.env.OCTO_E2E_PROFILE ?? "";
+const gatewayLog = process.env.OCTO_E2E_GATEWAY_LOG ?? "";
+const primaryRequests = new Map<string, BridgeResult>();
+const openFlows = new Map<string, string>();
+afterEach(async () => {
+  for (const [marker, sessionKey] of openFlows) await callBridge({ kind: "close-flow", marker, sessionKey, targetUid });
+  openFlows.clear();
+});
 
 async function dockerExec(args: string[], timeout = 120_000): Promise<string> {
-  const { stdout } = await execFileAsync("docker", ["exec", ...args], {
+  const { stdout } = await execFileAsync("docker", ["exec", "-e", `OCTO_E2E_RUN_ID=${runId}`, "-e", `OPENCLAW_STATE_DIR=${profile}`, ...args], {
     timeout,
     maxBuffer: 4 * 1024 * 1024,
   });
@@ -110,14 +123,14 @@ async function dockerExec(args: string[], timeout = 120_000): Promise<string> {
 }
 
 async function callBridge(params: Record<string, unknown>): Promise<BridgeResult> {
-  const requestId = `${String(params.kind)}-${String(params.marker)}`;
-  const requestPath = `/tmp/octo-host-e2e/${requestId}.request.json`;
-  const resultPath = `/tmp/octo-host-e2e/${requestId}.result.json`;
-  const encoded = Buffer.from(JSON.stringify(params)).toString("base64");
+  const requestId = randomUUID();
+  const requestPath = `${requestRoot}/${requestId}.request.json`;
+  const resultPath = `${requestRoot}/${requestId}.result.json`;
+  const encoded = Buffer.from(JSON.stringify({ ...params, runId, requestId })).toString("base64");
   await dockerExec([
     container,
     "node", "-e",
-    "const fs=require('fs');const p=process.argv[1];fs.mkdirSync('/tmp/octo-host-e2e',{recursive:true});fs.writeFileSync(p+'.tmp',Buffer.from(process.argv[2],'base64'));fs.renameSync(p+'.tmp',p)",
+    "const fs=require('fs');const p=process.argv[1];fs.mkdirSync(require('path').dirname(p),{recursive:true});fs.writeFileSync(p+'.tmp',Buffer.from(process.argv[2],'base64'));fs.renameSync(p+'.tmp',p)",
     requestPath,
     encoded,
   ]);
@@ -137,9 +150,14 @@ async function callBridge(params: Record<string, unknown>): Promise<BridgeResult
     }
     const result = JSON.parse(output) as BridgeResult;
     expect(result.ok, result.error).toBe(true);
+    expect(result.runId).toBe(runId);
+    expect(result.requestId).toBe(requestId);
+    if (params.kind === "close-flow") { expect(result.closed).toBe(true); return result; }
     expect(result.transport).toBe("websocket");
     expect(result.messageId).toMatch(/^\d+$/);
     if (params.sessionKey) expect(result.sessionKey).toBe(params.sessionKey);
+    if (params.kind === "configure-reasoning") openFlows.set(String(params.marker), result.sessionKey!);
+    if (["spawn", "file-tools", "tool-delivery", "display-card-delivery"].includes(String(params.kind))) primaryRequests.set(String(params.marker), result);
     return result;
   }
   throw new Error(`bridge request timed out: ${requestId}`);
@@ -148,12 +166,20 @@ async function callBridge(params: Record<string, unknown>): Promise<BridgeResult
 async function inspect(marker: string, sessionKey: string, startedAtMs: number): Promise<Evidence> {
   const output = await dockerExec([
     container,
-    "node", "/root/.openclaw-dev/extensions/octo-host-e2e/inspect.mjs",
-    marker, sessionKey, targetUid, String(startedAtMs),
+    "node", `${profile}/extensions/octo-host-e2e/inspect.mjs`,
+    marker, sessionKey, targetUid, String(startedAtMs), JSON.stringify({ profile, requestRoot, runId, gatewayLog,
+      requestId: primaryRequests.get(marker)?.requestId }),
   ], 30_000);
   const line = output.split("\n").find((value) => value.startsWith("OCTO_E2E_EVIDENCE="));
   if (!line) throw new Error(`missing inspector evidence: ${output}`);
-  return JSON.parse(line.slice("OCTO_E2E_EVIDENCE=".length)) as Evidence;
+  const evidence = JSON.parse(line.slice("OCTO_E2E_EVIDENCE=".length)) as Evidence;
+  const primary = primaryRequests.get(marker)!;
+  expect(evidence.requestId).toBe(primary.requestId);
+  expect(evidence.inputMessageId).toBe(primary.messageId);
+  expect(evidence.leaseRunId).toBe(runId);
+  expect(evidence.otherFlowCardIds, "unrelated follow-up must not create a second flow card").toEqual([]);
+  for (const card of evidence.cards) expect(card.correlation).toMatchObject({ leaseRunId: runId, marker, sessionKey, requestId: primary.requestId, inputMessageId: primary.messageId });
+  return evidence;
 }
 
 async function waitForEvidence(
@@ -319,7 +345,7 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
   it("reads an input file, writes a report, and verifies it with exec", async () => {
     expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
     const marker = randomUUID();
-    const workDir = `/tmp/octo-realistic-e2e/${marker}`;
+    const workDir = `${profile}/workspace/file-tools/${marker}`;
     const inputPath = `${workDir}/input.txt`;
     const reportPath = `${workDir}/report.txt`;
 

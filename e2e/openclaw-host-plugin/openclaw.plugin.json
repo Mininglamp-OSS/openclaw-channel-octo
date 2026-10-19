@@ -13,6 +13,31 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "properties": {}
+    "properties": {
+      "runId": {
+        "type": "string"
+      },
+      "requestRoot": {
+        "type": "string"
+      },
+      "stateRoot": {
+        "type": "string"
+      },
+      "gatewayLog": {
+        "type": "string"
+      },
+      "modelPort": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65535
+      }
+    },
+    "required": [
+      "runId",
+      "requestRoot",
+      "stateRoot",
+      "gatewayLog",
+      "modelPort"
+    ]
   }
 }

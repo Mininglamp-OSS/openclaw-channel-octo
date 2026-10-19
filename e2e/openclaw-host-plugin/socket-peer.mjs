@@ -15,11 +15,12 @@ function frame(type, body) {
   do { let b = n % 128; n = Math.floor(n / 128); if (n) b |= 128; length.push(b); } while (n);
   return Buffer.concat([Buffer.from([type, ...length]), body]);
 }
-export function createSocketPeer(server) {
+export function createSocketPeer(server, expectedPath) {
   const ws = new WebSocketServer({ server });
   const peers = new Map();
   let sequence = 0;
   ws.on("connection", (socket, request) => {
+    if (expectedPath && new URL(request.url, "http://localhost").pathname !== expectedPath) { socket.close(1008, "wrong run"); return; }
     let peer;
     socket.on("message", (data) => {
       const bytes = Buffer.from(data);
@@ -55,13 +56,14 @@ export function createSocketPeer(server) {
     });
   });
   return {
-    async send(accountId, fromUid, content) {
+    async send(accountId, fromUid, content, prepare) {
       const deadline = Date.now() + 10_000;
       while (!peers.has(accountId) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
       const peer = peers.get(accountId);
       if (!peer) throw new Error(`no connected test socket for account ${accountId}`);
       const seq = ++sequence;
       const id = String(Date.now() * 1000 + seq);
+      content = prepare ? prepare({ messageId: id, messageSeq: seq }) : content;
       const encrypted = CryptoJS.AES.encrypt(CryptoJS.enc.Utf8.parse(JSON.stringify({ type: 1, content })),
         CryptoJS.enc.Utf8.parse(peer.aesKey), { iv: CryptoJS.enc.Utf8.parse(peer.salt),
           mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }).toString();

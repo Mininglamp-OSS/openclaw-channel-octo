@@ -1,6 +1,10 @@
 // Synthetic remote Octo HTTP service for disposable card-harness acceptance.
 // Host tools, scheduling, templates and edit payloads are produced by real code.
 import { createServer } from "node:http";
+import fs from "node:fs";
+// Optional synthetic fault injection; never used by the production plugin.
+const faultFile = process.env.OCTO_CARD_E2E_FAULT_FILE;
+function faultMode() { try { return faultFile ? fs.readFileSync(faultFile, "utf8").trim() : ""; } catch { return ""; } }
 export const TARGET = "user_card_e2e_00000000000000000000";
 const messages = [];
 const sequences = new Map();
@@ -21,9 +25,22 @@ const server = createServer(async (req, res) => {
       { name: "result", states: ["completed", "stopped"], wire_profile: "octo/v1", submit_actions: [] },
     ] }] } });
   if (url.pathname === "/v1/bot/sendMessage") {
-    const id = String(messages.length + 100);
-    messages.push({ message_id: id, message_seq: messages.length + 1, timestamp: Math.floor(Date.now() / 1000),
-      channel_id: body.channel_id, payload: Buffer.from(JSON.stringify(body.payload)).toString("base64") });
+    const add = (payload) => {
+      const id = String(messages.length + 100);
+      messages.push({ message_id: id, message_seq: messages.length + 1, timestamp: Math.floor(Date.now() / 1000),
+        channel_id: body.channel_id, channel_type: body.channel_type, payload: Buffer.from(JSON.stringify(payload)).toString("base64") });
+      return id;
+    };
+    const mode = faultMode();
+    const reasoning = body.payload?.template_ref?.id === "ai.reasoning-process";
+    const missing = reasoning && mode === "foreign-completed-own-absent";
+    const id = missing ? undefined : add(body.payload);
+    if (reasoning && mode.startsWith("foreign-completed")) {
+      const foreignId = add({ ...body.payload, state: "completed", transient: false,
+        data: { ...body.payload.data, reasoningId: "foreign-session:foreign-run" }, plain: "Foreign completed card" });
+      console.log(JSON.stringify({ type: "fault", mode, ownId: id ?? null, foreignId, foreignState: "completed", target: body.channel_id }));
+    }
+    if (missing) return json({ error: "synthetic owned card create refused" }, 400);
     return json({ message_id: id, message_seq: messages.length, client_msg_no: body.client_msg_no });
   }
   if (url.pathname === "/v1/bot/message/edit") {
