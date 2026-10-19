@@ -58,6 +58,17 @@ for per-account overrides. Preserve this decision and the upgrade requirements
 in the PR and versioned release notes. See [RELEASE.md](RELEASE.md) for the full
 exception. Review approval, required checks and branch protection still apply.
 
+**Current unreleased behavior after PR #270:** the v1.5.2 paragraph above is
+historical. Ordinary IM `dispatchTimeoutMs` now releases only the inbound queue;
+it neither cancels the agent nor discards late replies. Without an explicit
+queue override, use the host's public execution timeout plus 60 seconds. If
+neither the host API nor config provides a timeout, retain the 11-minute queue
+fallback; explicitly unlimited execution uses a 30-minute queue wait. Neither
+fallback is an agent execution deadline. Host execution limits, account-stop
+cancellation and document-task cancellation policies still apply. Describe this
+restoration from the Unreleased changelog in the next release; preserve the
+published v1.5.2 history and document-upload upgrade requirements above.
+
 Examples:
 - `fix(inbound): set MediaPaths under Core-allowed root (#58)`
 - `feat(richtext): bot adapter supports RichText=14`

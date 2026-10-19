@@ -859,6 +859,133 @@ describe("server-driven Registry reasoning progress", () => {
     expect(wire.calls.filter(c => c.url.includes("/message/edit") && c.body?.message_id === "live-card").at(-1)?.body?.state).toBe("completed");
   }, 100_000);
 
+  it.each(["flush wait", "terminal edit"])("GC cleanup fences a superseded generation after %s", async boundary => {
+    const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
+    const handlers = makeApi(); const sk = "gc-generation-fence";
+    setCardContext(sk, context()); await triggerFirstFrame(handlers, sk, "old");
+    const finalizer = createCardFinalizer(sk); await finalizer.pending();
+    const state = (process as any)[Symbol.for("openclaw.octo.card-progress-state.v2")];
+    const entry = state.cards.get(sk);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    if (boundary === "flush wait") entry.flushPromise = gate;
+    else global.fetch = (async (...args: Parameters<typeof fetch>) => {
+      if (String(args[0]).includes("/message/edit")) { entered(); await gate; }
+      return wire.fetch(...args);
+    }) as typeof fetch;
+    // Explicit fault injection for the cleanup invariant, not a claim that a
+    // current host can re-adopt this detached entry. Real GC/hook reachability
+    // is exercised separately below, without changing generations by hand.
+    state.releasedRuns.delete("old");
+    state.releasedRuns.notifyCollected("old");
+    if (boundary === "terminal edit") await started;
+    entry.generation = {};
+    release();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(entry.skip).toBe(false);
+    // Stale cleanup must not emit an error if superseded before its edit.
+    if (boundary === "flush wait") {
+      expect(wire.calls.filter(c => c.body?.state === "error")).toHaveLength(0);
+    }
+    await finalizer.finish({ success: true });
+  });
+
+  async function runGcCase(pattern: string): Promise<void> {
+    vi.useRealTimers();
+    await promisify(execFile)(process.execPath, [
+      "node_modules/vitest/vitest.mjs", "run", "src/card-progress.test.ts",
+      "--execArgv=--expose-gc", "-t", pattern,
+    ], { cwd: process.cwd(), timeout: 90_000, maxBuffer: 2 * 1024 * 1024 });
+  }
+
+  const gcTick = () => new Promise<void>(resolve => setImmediate(resolve));
+  const gcShared = () => (process as any)[Symbol.for("openclaw.octo.card-progress-state.v2")];
+  const collectCardOwners = async () => {
+    for (let i = 0; i < 20; i++) { await gcTick(); globalThis.gc!(); await gcTick(); }
+  };
+
+  it.each([false,true])("GC ownership: detached entry cannot be re-adopted (replace=%s)", async replace => {
+    if (!globalThis.gc) {
+      await runGcCase(`GC ownership: detached.*replace=${replace}`);
+      return;
+    }
+    const wire=mockFetch(); global.fetch=wire.fetch as typeof fetch;
+    const handlers=makeApi(true); const sk="gc-flush";
+    const old={sessionKey:sk,runId:"old"};
+    setCardContext(sk,context()); await triggerFirstFrame(handlers,sk,"old");
+    await (async()=>{ const owner=createCardFinalizer(sk); await owner.pending(); })();
+    const entry=gcShared().cards.get(sk); const gen=entry.generation;
+    handlers.after_tool_call?.({toolName:"sessions_spawn",result:{status:"accepted",childSessionKey:"child"}},old);
+    let release!:()=>void; let abortSeen=false; let entered=false;
+    global.fetch=vi.fn(async (input,init)=>{
+      if (!String(input).includes("/message/edit")) return wire.fetch(input,init);
+      entered=true;
+      return new Promise<Response>((_,reject)=>{
+        const signal=init!.signal!;
+        signal.addEventListener("abort",()=>{ abortSeen=true; release=()=>reject(signal.reason); },{once:true});
+      });
+    }) as typeof fetch;
+    handlers.before_tool_call?.({toolName:"exec",toolCallId:"pending"},old);
+    await vi.advanceTimersByTimeAsync(850); expect(entered).toBe(true);
+    vi.useRealTimers();
+    await collectCardOwners();
+    expect(abortSeen).toBe(true);
+    expect(gcShared().releasedCards.size).toBe(0);
+    expect(gcShared().cards.has(sk)).toBe(false);
+    expect(entry.skip).toBe(false); // reclaim is suspended in the production flush
+    expect(entry.deliveryEvidenceDisabled).toBe(true);
+    // These are actual registered hook paths, with trusted producer provenance.
+    handlers.after_tool_call?.({toolName:"sessions_yield",result:{status:"yielded"}},old);
+    await handlers["octo-card-progress-lifecycle"]?.({...old,stream:"lifecycle",data:{phase:"end",yielded:true}},old);
+    const next={sessionKey:sk,runId:"continuation",inputProvenance:{kind:"inter_session",sourceTool:"subagent_announce",sourceSessionKey:"child"}};
+    if (replace) { setCardContext(sk,context()); bindCardRun(sk,next.runId); }
+    handlers.before_agent_run?.({},next);
+    expect(gcShared().pausedCards.get(sk)).not.toBe(entry);
+    expect(entry.generation).toBe(gen);
+    const replacement=gcShared().cards.get(sk);
+    global.fetch=wire.fetch as typeof fetch;
+    release(); await gcTick(); await gcTick();
+    await vi.waitFor(()=>expect(entry.skip).toBe(true));
+    if (replace) {
+      expect(gcShared().cards.get(sk)).toBe(replacement);
+      expect(replacement.skip).toBe(false);
+      expect(replacement.deliveryEvidenceDisabled).toBe(false);
+    }
+  }, 100_000);
+
+  it.each(["before GC","after GC"])("GC ownership: retained yield protects continuation %s", async order=>{
+    if (!globalThis.gc) {
+      await runGcCase(`GC ownership: retained yield.*${order}`);
+      return;
+    }
+    const wire=mockFetch(); global.fetch=wire.fetch as typeof fetch;
+    const handlers=makeApi(true); const sk="gc-yield";
+    const old={sessionKey:sk,runId:"old"};
+    setCardContext(sk,context()); await triggerFirstFrame(handlers,sk,"old");
+    let entry:any; let gen:any;
+    await (async()=>{
+      const owner=createCardFinalizer(sk); await owner.pending();
+      entry=gcShared().cards.get(sk); gen=entry.generation;
+      setCardContext(sk,context()); bindCardRun(sk,"independent");
+      handlers.after_tool_call?.({toolName:"sessions_spawn",result:{status:"accepted",childSessionKey:"child"}},old);
+      handlers.after_tool_call?.({toolName:"sessions_yield",result:{status:"yielded"}},old);
+      expect(gcShared().pausedCards.get(sk)).toBe(entry);
+    })();
+    await vi.advanceTimersByTimeAsync(10);
+    vi.useRealTimers();
+    const next={sessionKey:sk,runId:"continuation",inputProvenance:{kind:"inter_session",sourceTool:"subagent_announce",sourceSessionKey:"child"}};
+    if (order==="before GC") handlers.before_agent_run?.({},next);
+    await collectCardOwners();
+    expect(gcShared().releasedCards.size).toBe(0);
+    expect(entry.skip).toBe(false); expect(entry.deliveryEvidenceDisabled).toBe(false);
+    if (order==="after GC") handlers.before_agent_run?.({},next);
+    expect(entry.generation).not.toBe(gen);
+    await handlers["octo-card-progress-lifecycle"]?.({...next,stream:"lifecycle",data:{phase:"end"}},next);
+    expect(wire.calls.filter(c=>c.url.includes("/message/edit")&&c.body?.message_id===entry.messageId).at(-1)?.body?.state).toBe("completed");
+  }, 100_000);
+
   it.each(["before", "after"])("keeps a continuation's second spawn/yield when the unrelated inbound settles %s continuation start", async order => {
     const wire = mockFetch(); global.fetch = wire.fetch as typeof fetch;
     const handlers = makeApi(true); const sk = "overlapping-continuation";

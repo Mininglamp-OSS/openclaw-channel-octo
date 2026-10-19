@@ -225,7 +225,11 @@ function reclaimAbandonedReleasedCard(runId: string): void {
           errorText: "任务执行上下文已释放，无法继续跟踪结果。",
         }), signal: AbortSignal.timeout(EDIT_TIMEOUT_MS) });
     } catch (err) { warn(`abandoned card finalization failed: ${String(err)}`); }
-    finally { entry.skip = true; }
+    finally {
+      // Reclamation owns only the captured generation, including after an
+      // awaited terminal edit. Never disable a future owner's shared entry.
+      if (entry.generation === generation) entry.skip = true;
+    }
   })();
 }
 
