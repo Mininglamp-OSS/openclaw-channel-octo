@@ -595,13 +595,16 @@ neutral withheld reason and action-status display names render `[redacted]`.
 
 ## Development
 
-Run the real container E2E for yielded progress cards with a configured Octo
-DM user. The runner builds this checkout, installs a test-only inbound bridge in
-the `ocprobe` container, restarts the real OpenClaw gateway, exercises
+Run the real container E2E for yielded progress cards in a disposable test
+container/profile with a configured Octo DM user. The runner builds this checkout,
+installs a test-only encrypted WebSocket peer in the `ocprobe` container, temporarily
+overrides the first account’s `wsUrl`, restarts its OpenClaw gateway, exercises
 `sessions_spawn` + `sessions_yield` + protected completion, and removes the
-bridge/config again even when the test fails.
+peer/config again even when the test fails. It uses the host’s normal Octo
+routing and `/new` + `/reasoning stream` commands to isolate each scenario; use
+a dedicated test conversation because its active session is reset.
 
-The bridge includes a loopback OpenAI-compatible scripted provider so tool
+The peer includes a loopback OpenAI-compatible scripted provider so tool
 choices are deterministic. OpenClaw's tool execution, subagent scheduler,
 lifecycle stream, and Octo send/edit HTTP requests remain the real host paths.
 
@@ -610,7 +613,9 @@ OCTO_E2E_TARGET_UID=<octo-user-uid> npm run test:e2e:openclaw
 ```
 
 Override the default container with `OCTO_E2E_CONTAINER` when needed. The
-target user receives progress-card messages during the test.
+target user receives progress-card messages during the test. See the
+[runtime-scope acceptance notes](e2e/runtime-scope/README.md) for the currently
+observed 2026.10.5 yield-card compatibility failure; its assertions remain active.
 
 ## Disconnect
 

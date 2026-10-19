@@ -2,7 +2,7 @@
  * Real OpenClaw host E2E (container + real Octo server), explicitly gated.
  *
  * The companion plugin under e2e/openclaw-host-plugin injects a synthetic
- * Octo DM into handleInboundMessage. A loopback scripted model makes tool
+ * Octo DM through the production encrypted WebSocket. A scripted model makes tool
  * choices deterministic; OpenClaw tool/subagent execution, sessions_yield,
  * protected completion, lifecycle hooks, and Octo send/edit HTTP calls are real.
  *
@@ -93,6 +93,8 @@ type BridgeResult = {
   ok?: boolean;
   sessionKey?: string;
   kind?: string;
+  transport?: string;
+  messageId?: string;
   error?: string;
 };
 
@@ -135,7 +137,9 @@ async function callBridge(params: Record<string, unknown>): Promise<BridgeResult
     }
     const result = JSON.parse(output) as BridgeResult;
     expect(result.ok, result.error).toBe(true);
-    expect(result.sessionKey).toBe(params.sessionKey);
+    expect(result.transport).toBe("websocket");
+    expect(result.messageId).toMatch(/^\d+$/);
+    if (params.sessionKey) expect(result.sessionKey).toBe(params.sessionKey);
     return result;
   }
   throw new Error(`bridge request timed out: ${requestId}`);
@@ -147,7 +151,9 @@ async function inspect(marker: string, sessionKey: string, startedAtMs: number):
     "node", "/root/.openclaw-dev/extensions/octo-host-e2e/inspect.mjs",
     marker, sessionKey, targetUid, String(startedAtMs),
   ], 30_000);
-  return JSON.parse(output) as Evidence;
+  const line = output.split("\n").find((value) => value.startsWith("OCTO_E2E_EVIDENCE="));
+  if (!line) throw new Error(`missing inspector evidence: ${output}`);
+  return JSON.parse(line.slice("OCTO_E2E_EVIDENCE=".length)) as Evidence;
 }
 
 async function waitForEvidence(
@@ -178,13 +184,12 @@ async function runLifecycleFlow({
 }: LifecycleFlowOptions): Promise<void> {
   expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
   const marker = randomUUID();
-  const sessionKey = `agent:main:octo-host-e2e:${marker}`;
-  await callBridge({
+  const configured = await callBridge({
     kind: "configure-reasoning",
     marker,
     targetUid,
-    sessionKey,
   });
+  const sessionKey = configured.sessionKey!;
   const startedAtMs = Date.now();
 
   await callBridge({
@@ -314,7 +319,6 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
   it("reads an input file, writes a report, and verifies it with exec", async () => {
     expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
     const marker = randomUUID();
-    const sessionKey = `agent:main:octo-host-e2e:${marker}`;
     const workDir = `/tmp/octo-realistic-e2e/${marker}`;
     const inputPath = `${workDir}/input.txt`;
     const reportPath = `${workDir}/report.txt`;
@@ -328,7 +332,8 @@ suite("OpenClaw realistic filesystem tool workflow E2E", () => {
     ]);
 
     try {
-      await callBridge({ kind: "configure-reasoning", marker, targetUid, sessionKey });
+      const configured = await callBridge({ kind: "configure-reasoning", marker, targetUid });
+      const sessionKey = configured.sessionKey!;
       const startedAtMs = Date.now();
       const accepted = await callBridge({ kind: "file-tools", marker, targetUid, sessionKey });
       expect(accepted.kind).toBe("file-tools");
@@ -397,9 +402,9 @@ suite("OpenClaw messaging-tool delivery E2E", () => {
   it("does not mark the card failed when the answer was delivered by the message tool", async () => {
     expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
     const marker = randomUUID();
-    const sessionKey = `agent:main:octo-host-e2e:${marker}`;
 
-    await callBridge({ kind: "configure-reasoning", marker, targetUid, sessionKey });
+    const configured = await callBridge({ kind: "configure-reasoning", marker, targetUid });
+    const sessionKey = configured.sessionKey!;
     const startedAtMs = Date.now();
     const accepted = await callBridge({ kind: "tool-delivery", marker, targetUid, sessionKey });
     expect(accepted.kind).toBe("tool-delivery");
@@ -435,9 +440,9 @@ suite("OpenClaw display-card delivery E2E", () => {
   it("does not mark reasoning failed after the display card delivered the answer", async () => {
     expect(targetUid, "OCTO_E2E_TARGET_UID is required").not.toBe("");
     const marker = randomUUID();
-    const sessionKey = `agent:main:octo-host-e2e:${marker}`;
 
-    await callBridge({ kind: "configure-reasoning", marker, targetUid, sessionKey });
+    const configured = await callBridge({ kind: "configure-reasoning", marker, targetUid });
+    const sessionKey = configured.sessionKey!;
     const startedAtMs = Date.now();
     const accepted = await callBridge({
       kind: "display-card-delivery",

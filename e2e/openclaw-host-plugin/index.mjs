@@ -1,6 +1,6 @@
 /**
  * Test-only OpenClaw plugin. It injects a synthetic Octo DM into the real
- * adapter so the host, sessions_spawn/yield lifecycle, and Octo HTTP edits are
+ * adapter over encrypted WebSocket so sessions_spawn/yield and HTTP edits are
  * all exercised without requiring a second human/bot account to send inbound.
  * A loopback OpenAI-compatible provider scripts only the model outputs; host
  * tool execution, subagent scheduling, lifecycle, and channel I/O stay real.
@@ -12,15 +12,16 @@
  * for the duration of an explicit container E2E and removes it afterwards.
  */
 import { resolveOctoAccount } from "../octo/dist/src/accounts.js";
-import { handleInboundMessage } from "../octo/dist/src/inbound.js";
-import { getOctoRuntime } from "../octo/dist/src/runtime.js";
-import { ChannelType, MessageType } from "../octo/dist/src/types.js";
+import { createSocketPeer } from "./socket-peer.mjs";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const SESSION_PREFIX = "agent:main:octo-host-e2e:";
+const TEST_SESSIONS = Symbol.for("octo.host-e2e.sessions");
+const testSessions = globalThis[TEST_SESSIONS] ??= new Set();
+const TEST_CHILDREN = Symbol.for("octo.host-e2e.children");
+const testChildren = globalThis[TEST_CHILDREN] ??= new Set();
 const PROVIDER = "octo-e2e";
 const MODEL = "scripted";
 const MODEL_REF = `${PROVIDER}/${MODEL}`;
@@ -100,7 +101,7 @@ function scriptedReply(body) {
         arguments: {
           command: "sleep 2 && printf TOOL_DELIVERY_PREFLIGHT_OK",
           yieldMs: 5_000,
-          timeout: 15,
+          timeoutSeconds: 15,
           background: false,
         },
         reasoning: "Check the environment before answering.",
@@ -131,7 +132,7 @@ function scriptedReply(body) {
         arguments: {
           command: "sleep 2 && printf DISPLAY_DELIVERY_PREFLIGHT_OK",
           yieldMs: 5_000,
-          timeout: 15,
+          timeoutSeconds: 15,
           background: false,
         },
         reasoning: "Check the current time source before rendering the card.",
@@ -181,7 +182,7 @@ function scriptedReply(body) {
         arguments: {
           command: `wc -c ${reportPath}`,
           yieldMs: 1_000,
-          timeout: 10,
+          timeoutSeconds: 10,
           background: false,
         },
         reasoning: "The report is written; I’ll verify its size with a command.",
@@ -193,7 +194,8 @@ function scriptedReply(body) {
     };
   }
 
-  if (allText.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") &&
+  if ((allText.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") ||
+       allText.includes("[Subagent Context] Every subagent in this batch has now settled")) &&
       allText.includes(`CHILD_E2E_OK:${marker}`)) {
     return { text: `PARENT_E2E_OK:${marker}`, reasoning: "Visible reasoning checkpoint." };
   }
@@ -212,7 +214,7 @@ function scriptedReply(body) {
       arguments: {
         command: `sleep ${delay}`,
         yieldMs: (delay + 5) * 1_000,
-        timeout: delay + 15,
+        timeoutSeconds: delay + 15,
         background: false,
       },
       reasoning: "Visible reasoning checkpoint.",
@@ -224,7 +226,7 @@ function scriptedReply(body) {
   if (spawnFinished) {
     return {
       tool: "sessions_yield",
-      arguments: { message: "Waiting for protected child completion event." },
+      arguments: {},
       delayMs: 2_000,
       reasoning: "Visible reasoning checkpoint.",
     };
@@ -237,7 +239,7 @@ function scriptedReply(body) {
       arguments: {
         command: "printf OCTO_TOOL_E2E_OK",
         yieldMs: 1_000,
-        timeout: 10,
+        timeoutSeconds: 10,
         background: false,
       },
       reasoning: "Visible reasoning checkpoint. Verify the tool input and result before delegation.",
@@ -354,13 +356,14 @@ function ensureModelServer(api) {
       }
     });
   });
+  const socketPeer = createSocketPeer(server);
   server.on("error", (error) => {
     if (error?.code !== "EADDRINUSE") api.logger.error(`octo-host-e2e model server: ${error}`);
   });
   server.listen(MODEL_PORT, "127.0.0.1", () => {
     api.logger.info(`octo-host-e2e: scripted model ready on 127.0.0.1:${MODEL_PORT}`);
   });
-  globalThis[MODEL_SERVER] = server;
+  globalThis[MODEL_SERVER] = { server, socketPeer };
 }
 
 function requiredString(params, key) {
@@ -383,7 +386,7 @@ function buildPrompt(kind, marker, childDelaySeconds, targetUid) {
     return [
       `TOOL_DELIVERY_E2E:${marker}.`,
       `TOOL_DELIVERY_TARGET=user:${targetUid}`,
-      "First call exec exactly once with command=\"printf TOOL_DELIVERY_PREFLIGHT_OK\", yieldMs=1000, timeout=10, background=false.",
+      "First call exec exactly once with command=\"printf TOOL_DELIVERY_PREFLIGHT_OK\", yieldMs=1000, timeoutSeconds=10, background=false.",
       `After exec succeeds, call message exactly once with action="send", target="user:${targetUid}",`,
       `message="TOOL_DELIVERY_E2E_SENT:${marker}".`,
       "The message tool already delivered the answer, so end the turn with no final text at all.",
@@ -412,14 +415,14 @@ function buildPrompt(kind, marker, childDelaySeconds, targetUid) {
   }
   const childResult = `CHILD_E2E_OK:${marker}`;
   const childTask = [
-    `Call exec exactly once with arguments {\"command\":\"sleep ${childDelaySeconds}\",\"yieldMs\":${(childDelaySeconds + 5) * 1_000},\"timeout\":${childDelaySeconds + 15},\"background\":false}.`,
+    `Call exec exactly once with arguments {\"command\":\"sleep ${childDelaySeconds}\",\"yieldMs\":${(childDelaySeconds + 5) * 1_000},\"timeoutSeconds\":${childDelaySeconds + 15},\"background\":false}.`,
     "Do not use process or any other tool.",
     `Only after exec reports exit code 0, reply exactly ${childResult}.`,
     "If exec fails or is interrupted, reply CHILD_E2E_FAILED instead.",
   ].join(" ");
   return [
     `OpenClaw host E2E marker: ${marker}.`,
-    "First call exec exactly once with command=\"printf OCTO_TOOL_E2E_OK\", yieldMs=1000, timeout=10, background=false.",
+    "First call exec exactly once with command=\"printf OCTO_TOOL_E2E_OK\", yieldMs=1000, timeoutSeconds=10, background=false.",
     `After exec succeeds, call sessions_spawn exactly once with runtime=\"subagent\", mode=\"run\", context=\"isolated\", model=\"${MODEL_REF}\".`,
     "Do not call agents_list; omit agentId.",
     `Set the child task exactly to ${JSON.stringify(childTask)}.`,
@@ -436,16 +439,36 @@ export default {
   register(api) {
     ensureEditObserver(api);
     ensureModelServer(api);
-    // Octo initializes its own runtime during its own registration. Writing
-    // from this bridge would seed the bridge instance, not the Octo instance,
-    // on managed hosts, and would conceal that direct injection has wrong scope.
+    // Only the production account socket receives messages. This bridge never
+    // reads/writes the Octo runtime or calls its inbound handler.
     let watcher;
 
     // Keep the test deterministic and avoid mutating the operator's default
     // model. The child gets the same explicit model in sessions_spawn.
     api.on("before_model_resolve", (_event, ctx) => {
-      if (!ctx.sessionKey?.startsWith(SESSION_PREFIX)) return;
+      if (!testSessions.has(ctx.sessionKey)) return;
       return { providerOverride: PROVIDER, modelOverride: MODEL };
+    });
+
+    // A deleted/worker-owned child may no longer be in a session listing. Keep
+    // its actual host tool receipt, linked by the accepted spawn key. Never infer
+    // successful execution from a scripted model's CHILD_E2E_OK text.
+    api.on("after_tool_call", (event, ctx) => {
+      const result = event.result;
+      if (event.toolName === "sessions_spawn" && testSessions.has(ctx.sessionKey) && !event.error) {
+        let child = result?.details?.childSessionKey;
+        if (!child) {
+          try { child = JSON.parse(contentText(result?.content)).childSessionKey; } catch {}
+        }
+        if (typeof child === "string") testChildren.add(child);
+      }
+      if (event.toolName === "exec" && testChildren.has(ctx.sessionKey)) {
+        fs.mkdirSync(REQUEST_DIR, { recursive: true });
+        fs.appendFileSync(path.join(REQUEST_DIR, "child-tools.jsonl"), JSON.stringify({
+          timestampMs: Date.now(), sessionKey: ctx.sessionKey, toolName: "exec",
+          success: !event.error && result?.details?.exitCode === 0,
+        }) + "\n");
+      }
     });
 
     const runRequest = async (params) => {
@@ -457,25 +480,11 @@ export default {
           : "spawn";
         const marker = requiredString(params, "marker");
         const targetUid = requiredString(params, "targetUid");
-        const sessionKey = requiredString(params, "sessionKey");
-        if (!sessionKey.startsWith(SESSION_PREFIX)) {
-          throw new Error(`sessionKey must start with ${SESSION_PREFIX}`);
-        }
         const delay = Number(params.childDelaySeconds ?? 25);
         if (!Number.isInteger(delay) || delay < 10 || delay > 90) {
           throw new Error("childDelaySeconds must be an integer between 10 and 90");
         }
 
-        try {
-          getOctoRuntime();
-        } catch (error) {
-          throw new Error(
-            "octo-host-e2e: direct cross-plugin inbound has no Octo runtime in this callback. " +
-            "On managed hosts use e2e/runtime-scope/gateway.mjs to inject through Octo's WebSocket; " +
-            "do not initialize Octo from the bridge plugin.",
-            { cause: error },
-          );
-        }
         const config = api.runtime.config.current();
         const accountId = resolveAccountId(
           config,
@@ -485,32 +494,28 @@ export default {
         if (!account.configured || !account.config.botToken) {
           throw new Error(`Octo account ${accountId} is not configured`);
         }
-        const now = Date.now();
-        await handleInboundMessage({
-          account,
-          botUid: accountId,
-          message: {
-            message_id: `host-e2e-${kind}-${marker}`,
-            message_seq: now,
-            from_uid: targetUid,
-            channel_id: targetUid,
-            channel_type: ChannelType.DM,
-            timestamp: Math.floor(now / 1000),
-            payload: {
-              type: MessageType.Text,
-              content: buildPrompt(kind, marker, delay, targetUid),
-            },
-          },
-          groupHistories: new Map(),
-          lastBotReplySeqMap: new Map(),
-          memberMap: new Map([["E2E User", targetUid]]),
-          uidToNameMap: new Map([[targetUid, "E2E User"]]),
-          groupCacheTimestamps: new Map(),
-          memberRobotMap: new Map([[targetUid, false]]),
-          routeOverride: { sessionKey, agentId: "main" },
-          log: api.logger,
+        const { sessionKey } = api.runtime.channel.routing.resolveAgentRoute({
+          cfg: config, channel: "octo", accountId, peer: { kind: "direct", id: targetUid },
         });
-        return { ok: true, accepted: true, kind, marker, sessionKey };
+        if (params.sessionKey && params.sessionKey !== sessionKey) throw new Error("request differs from host Octo route");
+        testSessions.add(sessionKey);
+        const { socketPeer } = globalThis[MODEL_SERVER];
+        if (kind === "configure-reasoning") {
+          const response = await fetch(`${account.config.apiUrl.replace(/\/+$/, "")}/v1/bot/messages/sync`, {
+            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${account.config.botToken}` },
+            body: JSON.stringify({ channel_id: targetUid, channel_type: 1, limit: 100, start_message_seq: 0, end_message_seq: 0, pull_mode: 1 }),
+          });
+          if (!response.ok) throw new Error(`baseline message sync failed: ${response.status}`);
+          const baseline = await response.json();
+          fs.writeFileSync(path.join(REQUEST_DIR, `${marker}.baseline.json`), JSON.stringify(
+            (baseline.messages ?? []).map((m) => String(m.message_idstr ?? m.message_id ?? "")),
+          ));
+          fs.writeFileSync(path.join(REQUEST_DIR, "session-keys.json"), JSON.stringify([...testSessions]));
+          // Reset via the same supported command path, not by editing host state.
+          await socketPeer.send(accountId, targetUid, "/new");
+        }
+        const ack = await socketPeer.send(accountId, targetUid, buildPrompt(kind, marker, delay, targetUid));
+        return { ok: true, accepted: true, kind, marker, sessionKey, transport: "websocket", ...ack };
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
@@ -559,7 +564,7 @@ export default {
       processRequests();
       api.logger.info("octo-host-e2e: request bridge ready");
     };
-    startWatcher();
+    // Embedded/tool-discovery registrations must not consume Gateway requests.
     api.on("gateway_start", startWatcher);
     api.on("gateway_stop", () => {
       watcher?.close();

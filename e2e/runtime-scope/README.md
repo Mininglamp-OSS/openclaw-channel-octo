@@ -49,11 +49,25 @@ there is no real private-chat or reload acceptance claim. The child Gateway and
 state are cleaned up. Set `OCTO_RUNTIME_KEEP_EVIDENCE=1` to retain its synthetic
 state and Gateway log for diagnosis.
 
-The older `npm run test:e2e:openclaw` card-lifecycle harness requires an existing
-container plus real Octo receiver/service and restarts that container's Gateway.
-Its bridge directly imports inbound from a different plugin: that cannot claim
-Octo invocation scope on a managed host. The invalid bridge setter is removed,
-and direct injection now fails with an explicit scope diagnostic instead of
-seeding the bridge's slot. Use the WebSocket Gateway fixture above to verify the
-managed runtime path. It does not replace the older harness's separate card,
-subagent/yield or real-service acceptance coverage.
+The existing `npm run test:e2e:openclaw` card-lifecycle harness now uses a
+WuKongIM WebSocket peer through the account's supported `wsUrl` override. It
+never imports Octo's runtime/inbound or supplies an arbitrary route override.
+The host computes the normal DM route; `/new` and `/reasoning stream` start each
+scenario. Original card, subagent/yield, follow-up, filesystem, message-tool and
+display-card assertions remain enabled. Existing remote Octo HTTP sends/edits
+are retained when using a configured real test service/recipient. Run it only
+in a disposable test container/profile: it restarts that Gateway and resets the
+test conversation. Configuration is restored and the companion removed after
+success or failure. `card-service.mjs` supplies an optional synthetic remote
+HTTP service for isolated acceptance without a real recipient; it does not
+claim real Octo server or client rendering acceptance.
+
+Current 2026.10.5 acceptance: the migrated filesystem, message-tool and display-card
+cases pass against the actual Gateway with a synthetic remote service. The short
+yield case still exposes a production compatibility failure: the host's automatic
+`continuationStatus` waiting reply completes the progress card before its child
+settles. The newer provenance-stamped subagent completion format also differs
+from the protected text format the current card continuation code recognizes.
+Both yield assertions remain enabled and unchanged; this is not full lifecycle
+acceptance. Fixing those production boundaries requires a separate scoped change,
+not a global runtime fallback, fabricated completion or relaxed ownership check.

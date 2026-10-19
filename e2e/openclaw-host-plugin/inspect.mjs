@@ -106,6 +106,11 @@ function readGatewayLogs() {
   }
   return candidates.map((file) => {
     try { return fs.readFileSync(file, "utf8"); } catch { return ""; }
+  }).join("\n").split("\n").filter((line) => {
+    let timestamp;
+    try { const row = JSON.parse(line); timestamp = row.time ?? row._meta?.date; } catch {}
+    timestamp ??= line.match(/\d{4}-\d{2}-\d{2}T[0-9:.]+(?:Z|[+-]\d{2}:\d{2})/)?.[0];
+    return timestamp && Date.parse(timestamp) >= startedAtMs;
   }).join("\n");
 }
 
@@ -150,12 +155,15 @@ async function recentCards() {
   });
   if (!response.ok) return [];
   const body = await response.json();
+  let baseline = [];
+  try { baseline = JSON.parse(fs.readFileSync(`/tmp/octo-host-e2e/${marker}.baseline.json`, "utf8")); } catch {}
   return (body.messages ?? []).flatMap((message) => {
     try {
       const payload = JSON.parse(Buffer.from(message.payload, "base64").toString("utf8"));
       const timestampMs = Number(message.timestamp ?? 0) * 1000;
       if (payload.type !== 17 || timestampMs < startedAtMs - 5_000) return [];
       const messageId = String(message.message_idstr ?? message.message_id ?? "");
+      if (baseline.includes(messageId)) return [];
       const edits = acceptedEdits(messageId);
       const edit = edits.at(-1);
       return [{
@@ -184,10 +192,45 @@ async function recentCards() {
   });
 }
 
-const { file, rows } = findParentTranscript();
-const trajectoryFile = file?.replace(/\.jsonl$/, ".trajectory.jsonl");
-const trajectoryRows = trajectoryFile ? readJsonLines(trajectoryFile) : [];
-const childTrajectoryText = JSON.stringify(findChildTrajectory());
+// New hosts persist transcripts in SQLite. Use the public read-only SDK rather
+// than assuming JSONL exports exist or reading/changing private DB tables.
+const sdk = await import("openclaw/plugin-sdk/session-store-runtime");
+const env = { ...process.env, OPENCLAW_STATE_DIR: "/root/.openclaw-dev" };
+const sqlite = typeof sdk.loadTranscriptEventsSync === "function";
+const entries = sqlite ? sdk.listSessionEntries({ agentId: "main", env, readOnly: true }) : [];
+const current = entries.find((item) => item.sessionKey === sessionKey)?.entry;
+const { file, rows: allRows } = sqlite
+  ? { file: `sqlite:${current?.sessionId ?? "pending"}`, rows: current ? sdk.loadTranscriptEventsSync({
+    agentId: "main", env, sessionKey, sessionId: current.sessionId,
+  }) : [] }
+  : findParentTranscript();
+const rows = allRows.filter((row) => {
+  const timestamp = row.timestamp ?? row.message?.timestamp;
+  const ms = typeof timestamp === "number" ? timestamp : Date.parse(timestamp);
+  return ms >= startedAtMs;
+});
+const trajectoryFile = !sqlite ? file?.replace(/\.jsonl$/, ".trajectory.jsonl") : undefined;
+const trajectoryRows = sqlite ? rows : trajectoryFile ? readJsonLines(trajectoryFile) : [];
+const spawnedKeys = new Set(rows.filter((r) => r.message?.toolName === "sessions_spawn")
+  .map((r) => r.message?.details?.childSessionKey).filter(Boolean));
+let childRows = [];
+if (sqlite) {
+  const rememberedPath = `/tmp/octo-host-e2e/${marker}.children.json`;
+  let children = [];
+  try { children = JSON.parse(fs.readFileSync(rememberedPath, "utf8")); } catch {}
+  for (const item of entries) {
+    if (item.sessionKey.includes(":subagent:") &&
+        (spawnedKeys.has(item.sessionKey) ||
+        item.entry.spawnedBy === sessionKey || item.entry.spawnedByKey === sessionKey)) {
+      if (!children.some((c) => c.sessionId === item.entry.sessionId)) children.push({ sessionKey: item.sessionKey, sessionId: item.entry.sessionId });
+    }
+  }
+  fs.writeFileSync(rememberedPath, JSON.stringify(children));
+  for (const child of children) {
+    childRows.push(...sdk.loadTranscriptEventsSync({ agentId: "main", env, ...child }));
+  }
+} else childRows = findChildTrajectory();
+const childTrajectoryText = JSON.stringify(childRows);
 const toolCalls = rows.flatMap((row) => {
   if (row.message?.role !== "assistant" || !Array.isArray(row.message.content)) return [];
   return row.message.content
@@ -198,7 +241,7 @@ const texts = rows.map((row) => ({ role: row.message?.role, text: messageText(ro
 const trajectoryText = JSON.stringify(trajectoryRows);
 const gatewayLogs = readGatewayLogs();
 const cards = await recentCards();
-const sessionSettings = readSessionSettings();
+const sessionSettings = sqlite ? { thinkingLevel: current?.thinkingLevel, reasoningLevel: current?.reasoningLevel } : readSessionSettings();
 
 const phaseEvidence = {
   paused: gatewayLogs.includes(`finalized session=${sessionKey} phase=paused`) ||
@@ -207,12 +250,18 @@ const phaseEvidence = {
   done: gatewayLogs.includes(`transitioned session=${sessionKey} phase=done`),
 };
 
-console.log(JSON.stringify({
+process.stdout.write("OCTO_E2E_EVIDENCE=" + JSON.stringify({
   transcriptFile: file,
   toolCalls,
-  completionEvent: trajectoryText.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") &&
-    trajectoryText.includes(`CHILD_E2E_OK:${marker}`),
-  childExec: childTrajectoryText.includes('"toolName":"exec"') &&
+  completionEvent: (trajectoryText.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") &&
+    trajectoryText.includes(`CHILD_E2E_OK:${marker}`)) || rows.some((r) =>
+      r.message?.provenance?.kind === "inter_session" &&
+      r.message?.provenance?.sourceTool === "subagent_settle" &&
+      spawnedKeys.has(r.message?.provenance?.sourceSessionKey) &&
+      messageText(r.message).includes(`CHILD_E2E_OK:${marker}`)),
+  childExec: readJsonLines("/tmp/octo-host-e2e/child-tools.jsonl").some((row) =>
+    row.timestampMs >= startedAtMs && spawnedKeys.has(row.sessionKey) && row.toolName === "exec" && row.success === true) ||
+    (childTrajectoryText.includes('"toolName":"exec"') || childRows.some((r) => r.message?.role === "toolResult" && r.message?.toolName === "exec")) &&
     (childTrajectoryText.includes('"exitCode":0') ||
       childTrajectoryText.includes('"status":"completed"')),
   followupReply: texts.some(({ role, text }) => role === "assistant" && text.includes(`FOLLOWUP_E2E_OK:${marker}`)),
@@ -220,4 +269,4 @@ console.log(JSON.stringify({
   phases: ["paused", "resuming", "done"].filter((phase) => phaseEvidence[phase]),
   sessionSettings,
   cards,
-}));
+}) + "\n");

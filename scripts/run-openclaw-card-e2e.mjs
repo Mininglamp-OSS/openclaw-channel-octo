@@ -39,6 +39,12 @@ config.agents.defaults ??= {};
 config.agents.defaults.models ??= {};
 if (mode === "setup") {
   const state = {
+    accounts: Object.fromEntries(Object.entries(config.channels?.octo?.accounts ?? {}).slice(0, 1)
+      .map(([id, a]) => [id, { hadWsUrl: Object.prototype.hasOwnProperty.call(a, "wsUrl"), wsUrl: a.wsUrl }])),
+    hadTools: Object.prototype.hasOwnProperty.call(config, "tools"),
+    tools: config.tools,
+    hadSession: Object.prototype.hasOwnProperty.call(config, "session"),
+    session: config.session,
     hadEntry: Object.prototype.hasOwnProperty.call(config.plugins.entries, pluginId),
     entry: config.plugins.entries[pluginId],
     hadAllow: Object.prototype.hasOwnProperty.call(config.plugins, "allow"),
@@ -53,6 +59,13 @@ if (mode === "setup") {
     reasoningDefault: config.agents.defaults.reasoningDefault,
   };
   fs.writeFileSync(statePath, JSON.stringify(state));
+  // Keep the scripted model on the direct tool surface; tool authorization
+  // and execution stay unchanged (no tool-search discovery choreography here).
+  config.tools = { ...config.tools, toolSearch: false };
+  config.session = { ...config.session, dmScope: "per-account-channel-peer" };
+  for (const [id, account] of Object.entries(config.channels?.octo?.accounts ?? {}).slice(0, 1)) {
+    account.wsUrl = "ws://127.0.0.1:19123/ws?account=" + encodeURIComponent(id);
+  }
   config.plugins.entries[pluginId] = {
     enabled: true,
     hooks: { allowConversationAccess: true },
@@ -63,7 +76,7 @@ if (mode === "setup") {
     baseUrl: "http://127.0.0.1:19123/v1",
     apiKey: "octo-host-e2e",
     request: { allowPrivateNetwork: true },
-    models: [{ id: "scripted", name: "Octo Host E2E Scripted", api: "openai-completions", reasoning: true }],
+    models: [{ id: "scripted", name: "Octo Host E2E Scripted", api: "openai-completions", contextWindow: 131072, maxTokens: 4096, reasoning: true }],
   };
   config.agents.defaults.models[modelRef] = {};
   config.agents.defaults.thinkingDefault = "low";
@@ -71,6 +84,13 @@ if (mode === "setup") {
 } else {
   let state;
   try { state = JSON.parse(fs.readFileSync(statePath, "utf8")); } catch { state = {}; }
+  for (const [id, prior] of Object.entries(state.accounts ?? {})) {
+    const account = config.channels?.octo?.accounts?.[id];
+    if (!account) continue;
+    if (prior.hadWsUrl) account.wsUrl = prior.wsUrl; else delete account.wsUrl;
+  }
+  if (state.hadSession) config.session = state.session; else delete config.session;
+  if (state.hadTools) config.tools = state.tools; else delete config.tools;
   if (state.hadEntry) config.plugins.entries[pluginId] = state.entry;
   else delete config.plugins.entries[pluginId];
   if (state.hadAllow) config.plugins.allow = state.allow;
@@ -95,9 +115,11 @@ const fs = require("node:fs");
 const storePath = process.argv[1];
 const sessionsDir = process.argv[2];
 const prefix = "agent:main:octo-host-e2e:";
+let testKeys = [];
+try { testKeys = JSON.parse(fs.readFileSync("/tmp/octo-host-e2e/session-keys.json", "utf8")); } catch {}
 let store;
 try { store = JSON.parse(fs.readFileSync(storePath, "utf8")); } catch { process.exit(0); }
-const removedKeys = new Set(Object.keys(store).filter((key) => key.startsWith(prefix)));
+const removedKeys = new Set(Object.keys(store).filter((key) => key.startsWith(prefix) || testKeys.includes(key)));
 let changed = true;
 while (changed) {
   changed = false;
@@ -112,10 +134,13 @@ while (changed) {
   }
 }
 const sessionIds = [];
+let prior = {};
+try { prior = JSON.parse(fs.readFileSync("/tmp/octo-host-e2e/session-backup.json", "utf8")); } catch {}
 for (const key of removedKeys) {
   const id = store[key]?.sessionId;
   if (typeof id === "string" && id) sessionIds.push(id);
-  delete store[key];
+  if (Object.prototype.hasOwnProperty.call(prior, key)) store[key] = prior[key];
+  else delete store[key];
 }
 if (removedKeys.size > 0) {
   const tmp = storePath + ".octo-host-e2e-" + process.pid;
@@ -196,9 +221,17 @@ async function cleanupE2ESessions() {
 async function stopGateway() {
   await docker([
     "exec", container, "sh", "-lc",
-    "pkill -TERM -x openclaw 2>/dev/null || true",
+    "pkill -TERM -f '^openclaw-gateway' 2>/dev/null || pkill -TERM -x openclaw 2>/dev/null || true",
   ]);
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  // Linux comm truncates this title to openclaw-gatewa; match argv instead.
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const { stdout } = await docker(["exec", container, "sh", "-lc",
+      "pgrep -f '^openclaw-gateway' || true"]);
+    if (!stdout.trim()) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("test Gateway did not stop within 10s; refusing to replace its files/config");
 }
 
 async function startGateway(debug) {
@@ -240,6 +273,7 @@ async function installCurrentBuildAndCompanion() {
   await docker(["exec", container, "mkdir", "-p", `${octoRoot}/dist`, companionRoot, requestRoot]);
   await docker(["cp", `${repoRoot}/dist/.`, `${container}:${octoRoot}/dist/`]);
   await docker(["cp", `${repoRoot}/e2e/openclaw-host-plugin/.`, `${container}:${companionRoot}/`]);
+  await docker(["exec", container, "ln", "-s", `${octoRoot}/node_modules`, `${companionRoot}/node_modules`]);
   await docker(["exec", container, "chown", "-R", "root:root", `${octoRoot}/dist`, companionRoot, requestRoot]);
 }
 
@@ -272,6 +306,10 @@ async function main() {
     await mutateConfig("setup");
     configured = true;
     await installCurrentBuildAndCompanion();
+    await docker(["exec", container, "node", "-e",
+      "const fs=require('fs');let s='{}';try{s=fs.readFileSync(process.argv[1],'utf8')}catch{}fs.writeFileSync(process.argv[2],s)",
+      sessionsStore, `${requestRoot}/session-backup.json`,
+    ]);
     info("restarting real OpenClaw gateway with card lifecycle diagnostics");
     await startGateway(true);
     info("running Octo inbound -> spawn -> yield -> follow-up -> completion E2E");
