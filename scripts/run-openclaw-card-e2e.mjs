@@ -29,7 +29,7 @@ const info = (s) => console.log(`[openclaw-e2e] ${s}`);
 function check() { if (interrupted) throw new Error(`runner interrupted by ${interrupted}`); }
 async function docker(args) { return await exec("docker", args, { cwd: repoRoot, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 }); }
 async function control(arg) {
-  await docker(["exec", container, "mkdir", "-p", controlRoot]);
+  await docker(["exec", container, "mkdir", "-p", "-m", "700", controlRoot]);
   const { stdout } = await docker(["exec", container, "flock", "-n", `${controlRoot}/operations.lock`,
     "node", "--input-type=module", "-e", stateSource, "--", "--control", JSON.stringify(arg)]);
   return JSON.parse(stdout);

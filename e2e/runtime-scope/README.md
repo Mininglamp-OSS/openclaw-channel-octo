@@ -146,12 +146,29 @@ Failed/interrupted cleanup retains the lease and remaining directory for exact
 recovery. A durable `removing` phase allows retries after partial deletion or
 failure to release the lease, even if metadata/the directory is already gone.
 Repeated completed cleanup while idle is a no-op. Directory device/inode/birth
-identity and metadata/lease ownership are checked before deletion; a replaced
-or symlink directory is refused. Existing UUID directories are never claimed,
+identity and metadata/lease ownership are checked before deletion; a replacement
+already present at verification, or a symlink directory, is refused. Lease and
+metadata reads use `O_NOFOLLOW`, require a regular file and read the same opened
+descriptor. Ownership is compared by immutable record fields, not a permanent
+inode/hard-link relationship: `prepare` and `mark` atomically replace both files.
+Existing UUID directories are never claimed,
 and unrelated/unleased or legacy artifacts are never swept. Legacy leases
 without creation identity require manual inspection rather than automatic
 whole-directory deletion. Container restart preserves the ledger; deleting the
 container filesystem does not. The original source profile needs no restoration.
+
+The entire controller operation, including asynchronous process teardown and
+directory verification/removal, holds `operations.lock` through `flock`. All
+lifecycle writers of the lease and `runs/<UUID>` directory entries must use that
+lock. Gateway/test artifact writers operate inside that run and are stopped
+before removal. New control roots and run
+directories use mode `0700`; an existing control root is not automatically
+chmodded and must remain writable only by the dedicated container owner. This
+is a cooperating-runner safety contract in an idle disposable container. It is
+not a filesystem security boundary against root or another same-UID process
+that deliberately bypasses the lock: that writer can replace a verified path
+before path-based recursive removal. Do not share the container/control root
+with untrusted workloads. No inode check is claimed to close that race.
 
 `infra-recovery.mjs` exercises real concurrent-run refusal, live/wrong
 recovery refusal, SIGTERM cleanup, SIGKILL after a real Gateway starts, exact

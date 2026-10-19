@@ -33,8 +33,20 @@ function verifyDirectory(root, run, allowAbsent = false) {
   if (!isDeepStrictEqual(directoryIdentity(run.runDir), run.directoryIdentity)) throw new Error("E2E run directory identity changed; refusing deletion");
 }
 function verifyMetadata(run) {
-  const stat = fs.lstatSync(run.metadata);
-  if (!stat.isFile() || stat.isSymbolicLink() || !sameRun(read(run.metadata), run)) throw new Error("E2E metadata owner mismatch; refusing deletion");
+  const record = readRecord(run.metadata);
+  if (!sameRun(record, run)) throw new Error("E2E metadata owner mismatch; refusing mutation");
+  return record;
+}
+// Open once: reject links (including dangling links) and read/fstat the same
+// descriptor. NONBLOCK also prevents a substituted FIFO from hanging recovery.
+// mark/prepare replace records atomically, so lease/metadata need not share an
+// inode after acquisition. Ownership is their immutable semantic identity.
+function readRecord(file) {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error("E2E ownership record must be a regular file");
+    return JSON.parse(fs.readFileSync(fd, "utf8"));
+  } finally { fs.closeSync(fd); }
 }
 function writeJson(file, value) {
   const tmp = `${file}.${process.pid}.tmp`;
@@ -53,7 +65,7 @@ function paths(root, id) {
 }
 export function status(root = CONTROL_ROOT) {
   const lease = path.join(root, "lease.json");
-  return fs.existsSync(lease) ? read(lease) : null;
+  try { return readRecord(lease); } catch (error) { if (error.code === "ENOENT") return null; throw error; }
 }
 function owned(root, id) {
   checkId(id);
@@ -178,6 +190,7 @@ function checkSourcePolicy(source, main, sourceRoot) {
 }
 export async function prepare(runId, root = CONTROL_ROOT, { cliEntry } = {}) {
   const run = owned(root, runId);
+  verifyMetadata(run);
   if (run.phase !== "acquired") throw new Error("E2E setup is not repeatable; refusing to overwrite a snapshot");
   const source = read(run.snapshot);
   const contract = await loadHostConfigContract(path.join(run.sourceRoot, "extensions/octo/node_modules/openclaw"));
@@ -226,13 +239,13 @@ export async function prepare(runId, root = CONTROL_ROOT, { cliEntry } = {}) {
   };
   validateOrThrow(contract, config, "private config", run.profile);
   writeJson(path.join(run.profile, "openclaw.json"), config);
-  const next = { ...read(run.metadata), phase: "prepared", accountId, hostVersion: contract.version, hostSourceCommit: contract.sourceCommit };
+  const next = { ...verifyMetadata(run), phase: "prepared", accountId, hostVersion: contract.version, hostSourceCommit: contract.sourceCommit };
   writeJson(run.metadata, next); writeJson(path.join(root, "lease.json"), next);
   return { ...next, ...paths(root, runId) };
 }
 export function mark(runId, phase, root = CONTROL_ROOT) {
   const run = owned(root, runId);
-  const next = { ...read(run.metadata), phase };
+  const next = { ...verifyMetadata(run), phase };
   writeJson(run.metadata, next); writeJson(path.join(root, "lease.json"), next);
   return { ...next, ...paths(root, runId) };
 }
@@ -274,7 +287,9 @@ export async function dispose(runId, root = CONTROL_ROOT) {
   verifyDirectory(root, run, current.phase === "removing");
   if (current.phase !== "removing") { verifyMetadata(run); mark(runId, "removing", root); }
   // No retention after completed disposal, including ordinary failed tests.
-  // Only the exclusive-created, inode-verified UUID directory is removed.
+  // The runner holds operations.lock across verification and removal. All
+  // lifecycle writers of lease/run-directory entries must cooperate; this is no
+  // security boundary against a same-UID/root writer bypassing that lock.
   fs.rmSync(run.runDir, { recursive: true, force: true });
   syncDirectory(path.dirname(run.runDir));
   const final = owned(root, runId);

@@ -157,3 +157,64 @@ it("legacy leases without creation identity are retained for manual inspection",
   expect(fs.existsSync(run.gatewayLog)).toBe(true);expect(status(f.root).runId).toBe(run.runId);
   fs.writeFileSync(leasePath,lease);fs.writeFileSync(run.metadata,metadata);await dispose(run.runId,f.root);
 });
+
+for (const dangling of [false, true]) it(`refuses a ${dangling ? "dangling" : "live"} lease symlink before reading or mutating anything`, async () => {
+  const f=fixture();const run=await acquire(f.arg,f.root);seedArtifacts(run);
+  const lease=path.join(f.root,"lease.json"),saved=lease+".saved",target=path.join(f.sourceRoot,"foreign.json");
+  if(!dangling)fs.writeFileSync(target,"not ownership JSON");
+  fs.renameSync(lease,saved);fs.symlinkSync(target,lease);
+  const reader=vi.spyOn(fs,"readFileSync");
+  expect(()=>status(f.root)).toThrow(/ELOOP|symbolic link/i);expect(reader).not.toHaveBeenCalled();
+  await expect(dispose(run.runId,f.root)).rejects.toThrow(/ELOOP|symbolic link/i);
+  expect(reader).not.toHaveBeenCalled();reader.mockRestore();
+  expect(fs.lstatSync(lease).isSymbolicLink()).toBe(true);expect(fs.existsSync(run.gatewayLog)).toBe(true);
+  if(!dangling)expect(fs.readFileSync(target,"utf8")).toBe("not ownership JSON");
+  fs.unlinkSync(lease);fs.renameSync(saved,lease);await dispose(run.runId,f.root);
+});
+it("rejects a non-regular lease without reading it", async () => {
+  const f=fixture();const run=await acquire(f.arg,f.root);const lease=path.join(f.root,"lease.json"),saved=lease+".saved";
+  fs.renameSync(lease,saved);fs.mkdirSync(lease);
+  const reader=vi.spyOn(fs,"readFileSync");
+  expect(()=>status(f.root)).toThrow(/regular file/);expect(reader).not.toHaveBeenCalled();reader.mockRestore();
+  fs.rmdirSync(lease);fs.renameSync(saved,lease);await dispose(run.runId,f.root);
+});
+it("reads the opened lease descriptor if the pathname is replaced after open", async () => {
+  const f=fixture();const run=await acquire(f.arg,f.root);const lease=path.join(f.root,"lease.json"),saved=lease+".saved";
+  const target=path.join(f.sourceRoot,"foreign.json");fs.writeFileSync(target,"not ownership JSON");
+  const original=fs.openSync.bind(fs);let replaced=false;
+  const spy=vi.spyOn(fs,"openSync").mockImplementation((file,flags,mode)=>{
+    const fd=original(file,flags,mode);
+    if(String(file)===lease&&!replaced){replaced=true;fs.renameSync(lease,saved);fs.symlinkSync(target,lease);}
+    return fd;
+  });
+  expect(status(f.root).runId).toBe(run.runId);expect(replaced).toBe(true);spy.mockRestore();
+  expect(()=>status(f.root)).toThrow(/ELOOP|symbolic link/i);
+  fs.unlinkSync(lease);fs.renameSync(saved,lease);await dispose(run.runId,f.root);
+});
+for (const action of ["mark", "prepare", "dispose"]) it(`refuses symlink metadata before ${action}`, async () => {
+  const f=fixture();const run=await acquire(f.arg,f.root);const saved=run.metadata+".saved";
+  fs.renameSync(run.metadata,saved);fs.symlinkSync(saved,run.metadata);
+  if(action==="mark")expect(()=>mark(run.runId,"running",f.root)).toThrow(/ELOOP|symbolic link/i);
+  else if(action==="prepare")await expect(prepare(run.runId,f.root,{cliEntry:f.cliEntry})).rejects.toThrow(/ELOOP|symbolic link/i);
+  else await expect(dispose(run.runId,f.root)).rejects.toThrow(/ELOOP|symbolic link/i);
+  expect(status(f.root).phase).toBe("acquired");expect(fs.existsSync(run.profile)).toBe(false);
+  fs.unlinkSync(run.metadata);fs.renameSync(saved,run.metadata);await dispose(run.runId,f.root);
+});
+for (const action of ["mark", "prepare"]) it(`checks semantic metadata ownership before ${action}`, async () => {
+  const f=fixture();const run=await acquire(f.arg,f.root);mark(run.runId,"acquired",f.root);
+  const bytes=fs.readFileSync(run.metadata,"utf8");fs.writeFileSync(run.metadata,JSON.stringify({...JSON.parse(bytes),owner:{hostId:"foreign"}}));
+  if(action==="mark")expect(()=>mark(run.runId,"running",f.root)).toThrow(/metadata owner mismatch/);
+  else await expect(prepare(run.runId,f.root,{cliEntry:f.cliEntry})).rejects.toThrow(/metadata owner mismatch/);
+  expect(status(f.root).phase).toBe("acquired");expect(fs.existsSync(run.profile)).toBe(false);
+  fs.writeFileSync(run.metadata,bytes);await dispose(run.runId,f.root);
+});
+it("accepts the distinct lease/metadata inodes produced by prepare and mark", async () => {
+  const f=fixture();const run=await acquire(f.arg,f.root);const lease=path.join(f.root,"lease.json");
+  expect(fs.statSync(lease).ino).toBe(fs.statSync(run.metadata).ino);
+  await prepare(run.runId,f.root,{cliEntry:f.cliEntry});
+  const leaseInode=fs.statSync(lease).ino,metadataInode=fs.statSync(run.metadata).ino;
+  expect(leaseInode).not.toBe(metadataInode);
+  mark(run.runId,"running",f.root);
+  expect(fs.statSync(lease).ino).not.toBe(leaseInode);expect(fs.statSync(run.metadata).ino).not.toBe(metadataInode);
+  expect(status(f.root).phase).toBe("running");await dispose(run.runId,f.root);expect(status(f.root)).toBeNull();
+});
