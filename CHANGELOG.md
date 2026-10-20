@@ -11,6 +11,13 @@ All notable changes to this project will be documented in this file.
 
 以下 1.5.2/1.5.3 条目记录已发布版本的历史行为；其中 1.5.2 的普通 IM 超时取消策略由上述未发布修复替代。
 
+## [1.5.4](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.3...v1.5.4) (2026-10-20)
+
+
+### Fixed
+
+* **inbound:** preserve long tasks and yielded progress cards ([#270](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/270)) ([3cdb7e7](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/3cdb7e794ba40ae617fb0215177d1493dd26460a))
+
 ## [1.5.3](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.5.2...v1.5.3) (2026-10-15)
 
 ### Fixed
