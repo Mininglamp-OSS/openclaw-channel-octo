@@ -95,6 +95,7 @@ async function freePorts() {
 }
 export async function acquire({ runId, owner, sourceRoot, containerId }, root = CONTROL_ROOT) {
   checkId(runId);
+  if (typeof owner?.birth !== "string" || !owner.birth.trim()) throw new Error("E2E lease requires a nonempty owner birth before acquisition");
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const existing = status(root);
   if (existing) throw new Error(`E2E container is leased by ${existing.runId}; use --recover ${existing.runId} only after its runner exits`);

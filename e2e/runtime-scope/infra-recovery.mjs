@@ -44,7 +44,7 @@ try {
   assert(docker('exec', container, 'cat', sentinel) === 'owner-data', 'second runner leaves first request ledger intact');
   active.child.kill('SIGTERM');
   assert((await active.exit).code !== 0 && state() === null, 'SIGTERM cleans private profile and releases lease');
-  assert(sourceHash() === initial, 'SIGTERM leaves source config and workspace byte-identical');
+  assert(sourceHash() === initial, 'SIGTERM leaves source config and fixed fixture sentinel byte-identical');
   active = launch([], 'ready');
   lease = await waitFor(() => { if (active.child.result) throw new Error(active.child.result.text); const s = state(); return s?.phase === 'test-gate-ready' && s; });
   assert(lease.runId !== firstId, 'sequential runs use distinct profile/request/log namespaces');
@@ -55,15 +55,18 @@ try {
   const unrelated = await waitFor(() => { try { return docker('exec', container, 'cat', '/tmp/octo-unrelated.pid').trim(); } catch {} });
   active.child.kill('SIGKILL'); await active.exit;
   assert(state()?.runId === secondId && owned() > 0, 'SIGKILL leaves durable lease and owned Gateway for explicit recovery');
-  assert(sourceHash() === initial, 'SIGKILL leaves source config/workspace byte-identical before recovery');
+  assert(sourceHash() === initial, 'SIGKILL leaves source config and fixed fixture sentinel byte-identical before recovery');
   await refused([], `leased by ${secondId}`);
   await refused(['--recover', randomUUID()], 'does not match');
   const recovery = await launch(['--recover', secondId]).exit;
   assert(recovery.code === 0 && state() === null && owned() === 0, 'exact dead-owner recovery removes only owned Gateway/profile and releases lease');
   assert(docker('exec', container, 'node', '-e', "process.kill(Number(process.argv[1]),0);console.log('alive')", unrelated).trim() === 'alive', 'recovery preserves unrelated process');
   docker('exec', container, 'kill', unrelated);
-  assert(sourceHash() === initial, 'source configuration and workspace remain byte-identical after recovery');
-  console.log(JSON.stringify({ passed: true, checks: output, sourceSha256: initial, firstId, secondId }, null, 2));
+  assert(sourceHash() === initial, 'source config and fixed fixture sentinel remain byte-identical after recovery');
+  console.log(JSON.stringify({ passed: true, checks: output, sourceCheck: {
+    sha256: initial, stateRoot: env.OCTO_E2E_STATE_ROOT ?? '/root/.openclaw-dev',
+    relativeFiles: ['openclaw.json', 'original-workspace/sentinel'], scope: 'two-files-only',
+  }, firstId, secondId }, null, 2));
 } finally {
   if (active && active.child.exitCode === null && active.child.signalCode === null) { active.child.kill('SIGTERM'); await active.exit; }
 }

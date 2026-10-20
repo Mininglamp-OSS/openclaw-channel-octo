@@ -28,6 +28,10 @@ it("exclusive acquisition precedes mutation and cannot overwrite another owner's
   expect(fs.readFileSync(path.join(f.sourceRoot, "openclaw.json"), "utf8")).toBe(f.bytes);
   await dispose(run.runId, f.root);
 });
+it("refuses an empty initial birth before creating any control resources", async () => {
+  const f=fixture();await expect(acquire({...f.arg,owner:{...f.arg.owner,birth:""}},f.root)).rejects.toThrow(/nonempty owner birth/);
+  expect(fs.existsSync(f.root)).toBe(false);
+});
 it("simultaneous acquisitions cannot both win even before the outer flock", async () => {
   const f = fixture(); const results = await Promise.allSettled([acquire(f.arg, f.root), acquire({ ...f.arg, runId: randomUUID() }, f.root)]);
   expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);

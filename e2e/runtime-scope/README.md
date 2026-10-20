@@ -132,8 +132,15 @@ OCTO_E2E_CONTAINER=my-disposable-container \
 node scripts/run-openclaw-card-e2e.mjs --recover EXACT_RUN_UUID
 ```
 
-Recovery verifies the lease token, container identity and dead local owner PID
-with process birth time. It refuses a live owner or another machine's owner.
+Recovery verifies the lease token and container identity, requires a valid
+recorded local owner PID/birth and permits cleanup only when the OS confirms
+that PID is absent (`ESRCH`); that positive absence check does not require `ps`.
+An empty/invalid recorded birth refuses recovery. For a present PID, missing or
+broken `ps`, empty/malformed output or other inspection failure refuses recovery;
+permission errors checking PID existence also refuse it. A live owner refuses
+it; an existing PID with a different birth is reported separately and retained
+for manual inspection. Initial acquisition requires a valid nonempty birth.
+Another machine's owner cannot be recovered automatically.
 After process teardown, completed disposal removes the entire exclusive-created
 UUID directory: private profile, source snapshot, requests/results, Gateway log
 and metadata. This applies after both passing and ordinary failing tests; there
@@ -172,12 +179,16 @@ with untrusted workloads. No inode check is claimed to close that race.
 
 `infra-recovery.mjs` exercises real concurrent-run refusal, live/wrong
 recovery refusal, SIGTERM cleanup, SIGKILL after a real Gateway starts, exact
-recovery, source byte preservation and unrelated-process survival in a dedicated
+recovery, config/fixed-sentinel byte preservation and unrelated-process survival in a dedicated
 synthetic container using the same two environment variables above.
 Its source-preservation checks use `OCTO_E2E_STATE_ROOT` (or the same default
 `/root/.openclaw-dev` as the runner). Before launching any runner, it requires
 both `openclaw.json` and `original-workspace/sentinel` under that selected root;
 a missing file fails the probe rather than falling back to another profile.
+This digest covers exactly those two files, **not the configured source
+workspace or its tree**. Changes to other files, including files under a
+different `agents.defaults.workspace`, are outside this check and can leave the
+digest unchanged. Passing it must not be reported as whole-workspace integrity.
 
 The synthetic HTTP fixture also accepts `OCTO_CARD_E2E_FAULT_FILE`, a local
 mode-file path supplied only to that test service. Writing

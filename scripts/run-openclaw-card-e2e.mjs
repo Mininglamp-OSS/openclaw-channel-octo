@@ -6,6 +6,7 @@ import { hostname, userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { promisify } from "node:util";
+import { ownerBirth, verifyRecoveryOwner } from "./openclaw-e2e-owner.mjs";
 
 const exec = promisify(execFile);
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -34,16 +35,12 @@ async function control(arg) {
     "node", "--input-type=module", "-e", stateSource, "--", "--control", JSON.stringify(arg)]);
   return JSON.parse(stdout);
 }
-async function stamp(pid) {
-  try { return (await exec("ps", ["-o", "lstart=", "-p", String(pid)])).stdout.trim(); } catch { return ""; }
-}
 const hostId = `${hostname()}:${userInfo().uid}`;
 async function recover() {
   const lease = await control({ action: "status" });
   if (!lease || lease.runId !== recoverId) throw new Error("recovery token does not match the persistent lease");
   if (lease.owner.hostId !== hostId) throw new Error("cannot verify another host's runner; lease retained for manual inspection");
-  const birth = await stamp(lease.owner.pid);
-  if (birth && birth === lease.owner.birth) throw new Error("lease runner is still alive; refusing recovery");
+  await verifyRecoveryOwner(lease.owner);
   const id = JSON.parse((await docker(["inspect", container, "--format", "{{json .Id}}"])).stdout);
   if (id !== lease.containerId) throw new Error("container identity changed; refusing recovery");
   info(JSON.stringify(await control({ action: "dispose", runId: recoverId })));
@@ -112,13 +109,14 @@ async function main() {
   if (!container) throw new Error("OCTO_E2E_CONTAINER must explicitly name an idle disposable test container");
   if (recoverAt >= 0) { if (!recoverId) throw new Error("--recover requires the exact run UUID"); await recover(); return; }
   if (!targetUid) throw new Error("OCTO_E2E_TARGET_UID is required");
+  const birth = await ownerBirth(process.pid);
   const containerId = JSON.parse((await docker(["inspect", container, "--format", "{{json .Id}}"])).stdout);
   check();
   let run;
   let failure;
   try {
     run = await control({ action: "acquire", runId: randomUUID(), sourceRoot, containerId,
-      owner: { hostId, pid: process.pid, birth: await stamp(process.pid) } });
+      owner: { hostId, pid: process.pid, birth } });
     info(`run=${run.runId} temp=${run.runDir}`);
     check();
     const cliEntry = (await docker(["exec", container, "which", "openclaw"])).stdout.trim();

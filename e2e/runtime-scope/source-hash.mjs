@@ -1,5 +1,7 @@
 // Arguments, not interpolated source: custom roots may contain spaces/quotes.
 // Execute inside the dedicated container, where the runner reads these files.
+// Deliberately checks only config + a fixed fixture sentinel, not the configured
+// workspace tree or any other files. This is no whole-workspace fingerprint.
 export function sourceHashArgs(env = process.env) {
   return ["node", "-e", `
     const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");

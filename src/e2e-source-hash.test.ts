@@ -41,3 +41,12 @@ it("rejects a directory in place of the source sentinel", () => {
 it("does not reinterpret an empty override as the default root", () => {
   expect(sourceHashArgs({OCTO_E2E_STATE_ROOT:""}).at(-1)).toBe("");expect(()=>hash("")).toThrow(/absolute state root/);
 });
+it("makes no workspace-integrity claim: only config and the selected fixed sentinel affect the digest", () => {
+  const root=fixture(),workspace=path.join(root,"configured-workspace");fs.mkdirSync(workspace);
+  const other=path.join(workspace,"other.txt"),fixedOther=path.join(root,"original-workspace/other.txt");
+  fs.writeFileSync(path.join(root,"openclaw.json"),JSON.stringify({agents:{defaults:{workspace}}}));
+  fs.writeFileSync(other,"before");fs.writeFileSync(fixedOther,"before");const initial=hash(root);
+  fs.writeFileSync(other,"after");fs.writeFileSync(fixedOther,"after");expect(hash(root)).toBe(initial);
+  fs.unlinkSync(other);expect(hash(root)).toBe(initial);
+  fs.writeFileSync(path.join(root,"original-workspace/sentinel"),"changed checked file");expect(hash(root)).not.toBe(initial);
+});
