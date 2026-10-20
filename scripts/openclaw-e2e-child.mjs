@@ -1,6 +1,7 @@
 // Host-side supervisor for a runner-owned build/test process group. A runner
 // SIGKILL cannot run its own handler; this separate process observes reparenting.
 import { spawn } from 'node:child_process';
+import { constants } from 'node:os';
 const [owner, file, ...args] = process.argv.slice(2);
 const ownerPid = Number(owner);
 if (!ownerPid || process.ppid !== ownerPid || !file) throw new Error('live direct runner parent required');
@@ -18,9 +19,13 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => stop(signal
 const watch = setInterval(() => { if (process.ppid !== ownerPid) stop('runner parent exited'); }, 100);
 child.on('spawn', () => console.log(`[openclaw-e2e child] group=${child.pid}`));
 child.once('error', error => { console.error(error.message); clearInterval(watch); clearTimeout(force); process.exitCode = 1; });
-child.once('exit', code => {
+child.once('exit', (code, signal) => {
   clearInterval(watch);
-  // Do not cancel the group kill on leader exit: grandchildren may remain.
-  if (!stopping) clearTimeout(force);
-  process.exitCode = stopping ? 143 : code ?? 1;
+  // A worker can exit before its group. Clean remaining descendants without
+  // replacing its original exit status with the cleanup signal's status.
+  process.exitCode = code ?? (128 + (constants.signals[signal] ?? 1));
+  if (!stopping) {
+    try { process.kill(-child.pid, 0); stop('worker exited with remaining group'); }
+    catch (error) { if (error.code !== 'ESRCH') { console.error(error.message); stop('group status unknown'); } }
+  }
 });

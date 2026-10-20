@@ -5,6 +5,7 @@ import { WebSocketServer } from "ws";
 import { generateKeyPair, sharedKey } from "curve25519-js";
 import CryptoJS from "crypto-js";
 import { Md5 } from "md5-typescript";
+import { listenServer } from "../openclaw-host-plugin/server-lifecycle.mjs";
 
 export const BOT_UID = "bot_runtime_00000000000000000000000";
 export const HUMAN_UID = "user_runtime_000000000000000000000";
@@ -28,7 +29,7 @@ export async function createSyntheticOcto() {
   let agentVersion;
   let finish;
   const delivered = new Promise((resolve) => { finish = resolve; });
-  const server = createServer(async (req, res) => {
+  const handle = async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     const chunks = [];
     for await (const b of req) chunks.push(b);
@@ -69,10 +70,22 @@ export async function createSyntheticOcto() {
     if (["/v1/bot/mention-prefs", "/v1/bot/mention_prefs", "/v1/bot/read"].includes(url.pathname)) return json({}, 404);
     unknown.push(`${req.method} ${url.pathname}`);
     json({ error: "unsupported synthetic endpoint" }, 404);
+  };
+  const server = createServer((req, res) => {
+    req.on("error", (error) => lifecycle.fail(error));
+    res.on("error", (error) => lifecycle.fail(error));
+    void handle(req, res).catch((error) => {
+      lifecycle.fail(error);
+      if (!res.headersSent) res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid synthetic request" }));
+    });
   });
   const wsServer = new WebSocketServer({ server, path: "/ws" });
+  wsServer.on("error", (error) => lifecycle.fail(error));
   wsServer.on("connection", (socket) => {
+    socket.on("error", (error) => lifecycle.fail(error));
     socket.on("message", (data) => {
+      try {
       const bytes = Buffer.from(data);
       const type = bytes[0] >> 4;
       if (type === 7) { socket.send(Buffer.from([0x80])); return; }
@@ -93,18 +106,26 @@ export async function createSyntheticOcto() {
       // The server was created outside plugin scope. Only the client's actual
       // network async resource can propagate the managed startAccount scope.
       setTimeout(() => {
+        try {
         const encrypted = CryptoJS.AES.encrypt(CryptoJS.enc.Utf8.parse(JSON.stringify({
           type: 1, content: "Reply with the scope test marker", })), CryptoJS.enc.Utf8.parse(aesKey),
         { iv: CryptoJS.enc.Utf8.parse(salt), mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }).toString();
         socket.send(frame(0x50, Buffer.concat([Buffer.from([0]), str("test"), str(HUMAN_UID),
           str(HUMAN_UID), Buffer.from([1]), u32(0), str("scope-inbound"), u64(1), u32(1),
           u32(Math.floor(Date.now() / 1000)), Buffer.from(encrypted)])));
+        } catch (error) { lifecycle.fail(error); }
       }, 20);
+      } catch (error) { lifecycle.fail(error); socket.close(1002, "invalid synthetic frame"); }
     });
   });
-  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const lifecycle = listenServer(server, 0);
+  try { await lifecycle.ready; } catch (error) {
+    await new Promise((resolve) => wsServer.close(() => resolve()));
+    await new Promise((resolve) => server.close(() => resolve()));
+    throw error;
+  }
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
-  return { baseUrl, delivered, requests, sends, unknown,
+  return { baseUrl, delivered, failed: lifecycle.failed, requests, sends, unknown,
     get acked() { return acked; }, get agentVersion() { return agentVersion; },
     async close() {
       for (const client of wsServer.clients) client.terminate();

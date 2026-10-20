@@ -6,12 +6,14 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
+import { isolateHostProcess } from "./openclaw-e2e-host-env.mjs";
 
 const require = createRequire(import.meta.url);
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const sdkEntry = require.resolve("openclaw/plugin-sdk/runtime-store");
 const hostRoot = resolve(dirname(sdkEntry), "../..");
 const { version } = JSON.parse(readFileSync(join(hostRoot, "package.json"), "utf8"));
+isolateHostProcess("octo-runtime-store-");
 const source = readFileSync(join(repoRoot, "src/runtime.ts"), "utf8");
 const compiled = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },

@@ -37,6 +37,8 @@ function identity(value) {
 }
 export function toolCardId(result) { return identity(result?.details?.message_id ?? result?.details?.messageId); }
 export function selectCards(log, { leaseRunId, marker, sessionKey, requestId }, remoteMessages) {
+  const failure = log.find((event) => event.leaseRunId === leaseRunId && event.type === "server-error");
+  if (failure) throw new Error(`synthetic server failed: ${failure.message}`);
   const input = log.filter((e) => e.leaseRunId === leaseRunId && e.type === "input" && e.marker === marker &&
     e.sessionKey === sessionKey && e.requestId === requestId);
   if (input.length !== 1 || !log.some((e) => e.type === "ack" && e.leaseRunId === leaseRunId && e.requestId === requestId && e.messageId === input[0].messageId)) {

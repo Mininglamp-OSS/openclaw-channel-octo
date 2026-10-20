@@ -6,14 +6,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
-import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { acquire, prepare, dispose, loadHostConfigContract } from './openclaw-e2e-state.mjs';
+import { isolateHostProcess } from './openclaw-e2e-host-env.mjs';
 const require = createRequire(import.meta.url);
 const hostRoot = fs.realpathSync(process.env.OCTO_E2E_POLICY_HOST_ROOT ?? path.resolve(path.dirname(require.resolve('openclaw/plugin-sdk/runtime-store')), '../..'));
-const temp = fs.mkdtempSync(path.join(tmpdir(), 'octo-host-policy-'));
-const previousState = process.env.OPENCLAW_STATE_DIR;
-process.env.OPENCLAW_STATE_DIR = path.join(temp, 'host-state');
+const temp = isolateHostProcess('octo-host-policy-');
+after(() => {
+  fs.rmSync(temp, {recursive:true, force:true});
+});
 const contract = await loadHostConfigContract(hostRoot);
 console.log(`Actual host schema/policy: OpenClaw ${contract.version} source=${contract.sourceCommit ?? "unavailable"}; ${process.version}`);
 const files = fs.readdirSync(path.join(hostRoot, 'dist')).filter(f => /\.m?js$/.test(f));
@@ -50,10 +51,6 @@ fs.writeFileSync(elevatedProbe, replySource + '\nexport { resolveElevatedPermiss
 let elevated;
 try { elevated = (await import(pathToFileURL(elevatedProbe).href)).octoTestElevated; }
 finally { fs.rmSync(elevatedProbe, {force:true}); }
-after(() => {
-  fs.rmSync(temp, {recursive:true, force:true});
-  if (previousState === undefined) delete process.env.OPENCLAW_STATE_DIR; else process.env.OPENCLAW_STATE_DIR = previousState;
-});
 const names = ['read','write','edit','apply_patch','exec','process','message','sessions_spawn','sessions_yield','web_search','octo_send_display_card'];
 function parse(config) { const r = contract.validate(config); assert.equal(r.ok, true, JSON.stringify(r.issues)); return r.config; }
 function project(config, provider = 'octo-e2e', model = 'scripted') {

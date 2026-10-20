@@ -6,11 +6,14 @@ import { cpSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, syml
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { createSyntheticOcto, REPLY } from "./synthetic-octo.mjs";
+import { cleanupAll } from "./cleanup.mjs";
+import { isolateHostProcess } from "../../scripts/openclaw-e2e-host-env.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
 const hostRoot = process.env.OCTO_RUNTIME_HOST_ROOT ?? path.resolve(path.dirname(require.resolve("openclaw/plugin-sdk/runtime-store")), "../..");
 const { version } = JSON.parse(readFileSync(path.join(hostRoot, "package.json"), "utf8"));
+isolateHostProcess("octo-production-path-");
 const setupFile = readdirSync(path.join(hostRoot, "dist")).find((n) => /^plugin-setup-module-.*\.m?js$/.test(n));
 assert.ok(setupFile, `SDK ${version} must provide managed PluginInstance for this integration probe`);
 const host = await import(pathToFileURL(path.join(hostRoot, "dist", setupFile)).href);
@@ -23,6 +26,8 @@ let candidate;
 let controller;
 let running;
 let deadline;
+let failure;
+let failed = false;
 try {
   cpSync(path.join(repoRoot, "dist"), path.join(fixture, "dist"), { recursive: true });
   cpSync(path.join(repoRoot, "openclaw.plugin.json"), path.join(fixture, "openclaw.plugin.json"));
@@ -65,9 +70,9 @@ try {
   await candidate.dispose();
   candidate = undefined;
   controller = new AbortController();
-  running = plugin.gateway.startAccount({ account: { accountId: "scope", enabled: true, configured: true,
-    config: config.channels.octo.accounts.scope }, cfg: config, log, setStatus() {}, abortSignal: controller.signal });
-  await Promise.race([server.delivered, new Promise((_, reject) => {
+  running = Promise.resolve(plugin.gateway.startAccount({ account: { accountId: "scope", enabled: true, configured: true,
+    config: config.channels.octo.accounts.scope }, cfg: config, log, setStatus() {}, abortSignal: controller.signal }));
+  await Promise.race([server.delivered, server.failed, running.then(() => { throw new Error("account stopped before delivery"); }), new Promise((_, reject) => {
     deadline = setTimeout(() => reject(new Error(`delivery timeout\n${logs.join("\n")}\nrequests=${server.requests}`)), 8_000);
   })]);
   assert.equal(dispatched, true);
@@ -75,12 +80,12 @@ try {
   assert.equal(server.agentVersion, version);
   assert.deepEqual(server.unknown, []);
   console.log(`SDK ${version}: PASS real entry registration -> managed startAccount -> encrypted WS -> inbound -> HTTP final; candidate retired; Agent dispatcher stubbed`);
-} finally {
+} catch (error) { failed = true; failure = error; }
+finally {
   clearTimeout(deadline);
-  controller?.abort();
-  if (running) await running;
-  await server?.close();
-  await candidate?.dispose();
-  await live?.dispose();
-  rmSync(fixture, { recursive: true, force: true });
+  await cleanupAll([
+    () => controller?.abort(), () => running,
+    () => server?.close(), () => candidate?.dispose(), () => live?.dispose(),
+    () => rmSync(fixture, { recursive: true, force: true }),
+  ], ...(failed ? [failure] : []));
 }

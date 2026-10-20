@@ -6,6 +6,8 @@ import net from "node:net";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 
 export const CONTROL_ROOT = "/var/lib/octo-host-e2e";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -142,8 +144,39 @@ export async function loadHostConfigContract(hostRoot) {
   });
   if (candidates.length !== 1) throw new Error(`cannot verify installed OpenClaw ${pkg.version} config contract; refusing E2E setup`);
   const { name, alias } = candidates[0];
-  const validate = (await import(pathToFileURL(path.join(dir, name)).href))[alias];
-  if (typeof validate !== "function") throw new Error("installed host validator unavailable; refusing E2E setup");
+  // Host imports can open state/config before validate() sees its env option.
+  // A fresh process gets private paths before its first host import; never load
+  // these transitive host modules into the developer's process/state cache.
+  const validate = (config, options = {}) => {
+    const state = fs.mkdtempSync(path.join(tmpdir(), "octo-validator-"));
+    const configPath = path.join(state, "openclaw.json");
+    fs.writeFileSync(configPath, "{}", { mode: 0o600 });
+    const env = { ...process.env, HOME: state, OPENCLAW_STATE_DIR: state, OPENCLAW_CONFIG_PATH: configPath };
+    const code = `
+      import fs from "node:fs";
+      const [url, alias] = process.argv.slice(1);
+      try {
+        const input = JSON.parse(fs.readFileSync(0, "utf8"));
+        const validate = (await import(url))[alias];
+        if (typeof validate !== "function") throw new Error("installed host validator unavailable");
+        const result = await validate(input.config, { ...input.options, env: { ...input.options.env,
+          HOME: process.env.HOME, OPENCLAW_STATE_DIR: process.env.OPENCLAW_STATE_DIR,
+          OPENCLAW_CONFIG_PATH: process.env.OPENCLAW_CONFIG_PATH } });
+        fs.writeSync(1, "\\nOCTO_VALIDATION=" + JSON.stringify(result) + "\\n");
+        process.exit(0);
+      } catch (error) { console.error(error); process.exit(1); }
+    `;
+    try {
+      const output = execFileSync(process.execPath, ["--input-type=module", "-e", code,
+        pathToFileURL(path.join(dir, name)).href, alias], {
+        env, input: JSON.stringify({ config, options }), encoding: "utf8", timeout: 20_000, killSignal: "SIGKILL",
+        maxBuffer: 8 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"],
+      });
+      const line = output.split("\n").findLast((line) => line.startsWith("OCTO_VALIDATION="));
+      if (!line) throw new Error("isolated host validator returned no result");
+      return JSON.parse(line.slice("OCTO_VALIDATION=".length));
+    } finally { fs.rmSync(state, { recursive: true, force: true }); }
+  };
   const buildInfo = path.join(dir, "build-info.json");
   const sourceCommit = fs.existsSync(buildInfo) ? read(buildInfo).commit : undefined;
   return { version: pkg.version, sourceCommit, hostRoot, cliEntry: fs.realpathSync(path.join(hostRoot, typeof pkg.bin === "string" ? pkg.bin : pkg.bin.openclaw)), validate };

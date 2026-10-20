@@ -84,6 +84,11 @@ remote/sandbox tool policies cause refusal instead of a policy override.
 Policy preflight validates the source snapshot and generated profile with the
 **actual installed host validator**, and verifies that the CLI binary and plugin
 SDK resolve to the same installation. It runs before build/Gateway startup.
+Each schema call imports the actual validator in a fresh subprocess whose
+process-level home, state and config are private **before** any host import;
+passing a local validator `env` alone is insufficient. The subprocess state is
+removed after the call. Tests follow the installed schema's legacy-layout
+contract: an unsupported `agents.list` must be rejected, not silently migrated.
 The root `tools` and canonical main-agent `tools` objects retain their separate
 allow/deny/alsoAllow/profile, sender, exec, elevated and filesystem settings;
 they are never flattened into a guessed merge. Supported defaults including
@@ -124,7 +129,9 @@ Gateway and descendants, verified by run/profile environment stamps and process
 start identity. **SIGKILL cannot execute a signal handler.** Its durable lease
 survives; subsequent runs refuse automatic takeover. A separate host-side child
 supervisor observes runner reparenting and stops its build/Vitest process group,
-including grandchildren, so an orphan test cannot continue injecting requests. After confirming the runner
+including grandchildren, so an orphan test cannot continue injecting requests.
+Worker exit also triggers bounded TERM/KILL cleanup of surviving group members,
+while retaining the worker's original exit code. After confirming the runner
 has exited, recover explicitly from the same machine:
 
 ```sh
@@ -209,6 +216,11 @@ and timestamps cannot supply a successful card. Missing/ambiguous bindings fail
 closed. `src/e2e-evidence.test.ts` covers foreign completed cards masking own
 errors/absence, wrong owner/session/run, rejected ACK and mismatched tool/edit IDs.
 The nonce is test correlation evidence, never a production authorization signal.
+Synthetic server errors remain observable after readiness: the bridge records
+them in the owned ledger and subsequent evidence/requests fail. Repeated error
+events do not become uncaught exceptions. The production-path probe attempts
+all teardown steps even if account shutdown or another cleanup step rejects;
+the original failure is preserved.
 
 Current 2026.10.5 acceptance: the migrated filesystem, message-tool and display-card
 cases pass against the actual Gateway with a synthetic remote service. The short

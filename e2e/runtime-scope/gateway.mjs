@@ -33,7 +33,7 @@ writeFileSync(configPath, JSON.stringify(config));
 let output = "";
 let deadline;
 const child = spawn(process.execPath, [path.join(hostRoot, "openclaw.mjs"), "gateway", "run", "--allow-unconfigured"], {
-  env: { ...process.env, OPENCLAW_STATE_DIR: state, OPENCLAW_CONFIG_PATH: configPath,
+  env: { ...process.env, HOME: state, OPENCLAW_STATE_DIR: state, OPENCLAW_CONFIG_PATH: configPath,
     OPENCLAW_NO_RESPAWN: "1", OPENCLAW_SKIP_UPDATE_CHECK: "1" },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -44,7 +44,7 @@ const ended = new Promise((resolve, reject) => {
   child.once("exit", (code) => resolve(code));
 });
 try {
-  await Promise.race([server.delivered,
+  await Promise.race([server.delivered, server.failed,
     ended.then((code) => { throw new Error(`Gateway exited ${code}\n${output}`); }),
     new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error(`Gateway delivery timeout\n${output}\nrequests=${server.requests}`)), 60_000); }),
   ]);

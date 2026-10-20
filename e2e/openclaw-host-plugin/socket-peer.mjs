@@ -15,14 +15,19 @@ function frame(type, body) {
   do { let b = n % 128; n = Math.floor(n / 128); if (n) b |= 128; length.push(b); } while (n);
   return Buffer.concat([Buffer.from([type, ...length]), body]);
 }
-export function createSocketPeer(server, expectedPath) {
+export function createSocketPeer(server, expectedPath, onFailure = (error) => console.error(`synthetic socket: ${error.message}`)) {
   const ws = new WebSocketServer({ server });
+  let failure;
+  const fail = (error) => { failure ??= error; onFailure(error); };
+  ws.on("error", fail);
   const peers = new Map();
   let sequence = 0;
   ws.on("connection", (socket, request) => {
+    socket.on("error", fail);
     if (expectedPath && new URL(request.url, "http://localhost").pathname !== expectedPath) { socket.close(1008, "wrong run"); return; }
     let peer;
     socket.on("message", (data) => {
+      try {
       const bytes = Buffer.from(data);
       const type = bytes[0] >> 4;
       if (type === 7) { socket.send(Buffer.from([0x80])); return; }
@@ -53,10 +58,12 @@ export function createSocketPeer(server, expectedPath) {
         if (peers.get(account) === peer) peers.delete(account);
         for (const p of peer.pending.values()) { clearTimeout(p.timer); p.reject(new Error("test socket closed before ACK")); }
       });
+      } catch (error) { fail(error); socket.close(1002, "invalid synthetic frame"); }
     });
   });
   return {
     async send(accountId, fromUid, content, prepare) {
+      if (failure) throw failure;
       const deadline = Date.now() + 10_000;
       while (!peers.has(accountId) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
       const peer = peers.get(accountId);

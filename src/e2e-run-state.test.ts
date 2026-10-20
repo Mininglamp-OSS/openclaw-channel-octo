@@ -4,7 +4,7 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { acquire, prepare, dispose, status, mark } from "../scripts/openclaw-e2e-state.mjs";
+import { acquire, prepare, dispose, status, mark, loadHostConfigContract } from "../scripts/openclaw-e2e-state.mjs";
 const dirs: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
 function fixture() {
@@ -65,7 +65,18 @@ for (const layout of ["entries", "list"]) it(`preserves main-agent tool restrict
   const main = { tools: { deny: ["exec"] }, subagents: { allowAgents: ["main"] } };
   source.agents[layout] = layout === "entries" ? { main } : [{ id: "main", ...main }];
   fs.writeFileSync(path.join(f.sourceRoot, "openclaw.json"), JSON.stringify(source));
-  const run = await acquire(f.arg, f.root); const prepared = await prepare(run.runId, f.root, { cliEntry: f.cliEntry });
+  const run = await acquire(f.arg, f.root);
+  const contract = await loadHostConfigContract(path.dirname(f.cliEntry));
+  const accepted = contract.validate(source);
+  if (layout === "list" && !accepted.ok) {
+    expect(accepted.issues.some((issue: {path: string}) => issue.path === "agents.list")).toBe(true);
+    await expect(prepare(run.runId, f.root, { cliEntry: f.cliEntry })).rejects.toThrow(/source config rejected/);
+    expect(fs.existsSync(path.join(run.profile, "openclaw.json"))).toBe(false);
+    expect(fs.readFileSync(path.join(f.sourceRoot,"openclaw.json"),"utf8")).toBe(JSON.stringify(source));
+    await dispose(run.runId,f.root);return;
+  }
+  expect(accepted.ok).toBe(true);
+  const prepared = await prepare(run.runId, f.root, { cliEntry: f.cliEntry });
   const cfg = JSON.parse(fs.readFileSync(path.join(prepared.profile, "openclaw.json"), "utf8"));
   const actual = cfg.agents.entries.main;
   expect(actual.tools).toEqual(main.tools); expect(actual.subagents).toEqual(main.subagents);

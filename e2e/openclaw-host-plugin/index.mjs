@@ -12,6 +12,7 @@
  */
 import { resolveOctoAccount } from "../octo/dist/src/accounts.js";
 import { createSocketPeer } from "./socket-peer.mjs";
+import { listenServer } from "./server-lifecycle.mjs";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -336,6 +337,8 @@ function sendScriptedResponse(res, body, reply) {
 function ensureModelServer(api) {
   if (globalThis[MODEL_SERVER]) return;
   const server = http.createServer((req, res) => {
+    req.on("error", (error) => lifecycle.fail(error));
+    res.on("error", (error) => lifecycle.fail(error));
     if (req.method !== "POST" || req.url !== `/runs/${run.runId}/v1/chat/completions`) {
       res.writeHead(404).end();
       return;
@@ -351,20 +354,20 @@ function ensureModelServer(api) {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         const reply = scriptedReply(body);
-        setTimeout(() => sendScriptedResponse(res, body, reply), reply.delayMs ?? 0);
+        setTimeout(() => { try { sendScriptedResponse(res, body, reply); } catch (error) { lifecycle.fail(error); } }, reply.delayMs ?? 0);
       } catch (error) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: error instanceof Error ? error.message : String(error) } }));
       }
     });
   });
-  const socketPeer = createSocketPeer(server, `/runs/${run.runId}/ws`);
-  const ready = new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(MODEL_PORT, "127.0.0.1", () => { console.log(`octo-host-e2e: scripted model ready on 127.0.0.1:${MODEL_PORT}`); resolve(); });
+  const lifecycle = listenServer(server, MODEL_PORT, (error) => {
+    console.error(`octo-host-e2e model server: ${error.message}`);
+    appendEvent(run, { type: "server-error", message: error.message });
   });
-  ready.catch((error) => console.error(`octo-host-e2e model server: ${error.message}`));
-  globalThis[MODEL_SERVER] = { server, socketPeer, ready };
+  const socketPeer = createSocketPeer(server, `/runs/${run.runId}/ws`, lifecycle.fail);
+  lifecycle.ready.then(() => console.log(`octo-host-e2e: scripted model ready on 127.0.0.1:${MODEL_PORT}`)).catch(() => {});
+  globalThis[MODEL_SERVER] = { server, socketPeer, ...lifecycle };
 }
 
 function requiredString(params, key) {
@@ -485,6 +488,7 @@ export default {
     });
     const runRequest = async (params) => {
       try {
+        globalThis[MODEL_SERVER].check();
         if (params.runId !== run.runId || !/^[0-9a-f-]{36}$/i.test(params.requestId)) throw new Error("wrong E2E run/request owner");
         const kind = params.kind === "close-flow" || params.kind === "followup" || params.kind === "configure-reasoning" ||
           params.kind === "file-tools" || params.kind === "tool-delivery" ||

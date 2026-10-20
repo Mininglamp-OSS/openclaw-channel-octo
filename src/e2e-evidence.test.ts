@@ -20,6 +20,11 @@ function fixture(state = "error") {
     remote: [{ message_id: "own", channel_id: "target", channel_type: 1 }] };
 }
 describe("exact injected-request card evidence", () => {
+  it("an owned server failure prevents an otherwise completed card from supplying success",()=>{
+    const f=fixture("completed");
+    expect(()=>selectCards([...f.log,{type:"server-error",leaseRunId:f.runId,message:"late model server error"}],f.query,f.remote)).toThrow(/late model server error/);
+    expect(selectCards([...f.log,{type:"server-error",leaseRunId:randomUUID(),message:"foreign"}],f.query,f.remote).cards).toHaveLength(1);
+  });
   it("keeps own error when a newer completed card for the same target exists", () => {
     const f = fixture();
     f.log.push({ ...f.log[3], messageId: "foreign", payload: { type: 17, state: "completed", plain: "exec message completed",
