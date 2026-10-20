@@ -3,13 +3,15 @@
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { sourceHashArgs } from './source-hash.mjs';
 const container = process.env.OCTO_E2E_CONTAINER;
 if (!container || !process.env.OCTO_E2E_TARGET_UID) throw new Error('explicit dedicated container and synthetic target required');
 const runner = 'scripts/run-openclaw-card-e2e.mjs';
 const env = { ...process.env, OCTO_E2E_CONTAINER: container };
 const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8', timeout: 30000 });
 const state = () => JSON.parse(docker('exec', container, 'node', '-e', "const f=require('fs'),p='/var/lib/octo-host-e2e/lease.json';console.log(f.existsSync(p)?f.readFileSync(p,'utf8'):'null')"));
-const sourceHash = () => docker('exec', container, 'node', '-e', "const f=require('fs'),c=require('crypto');console.log(c.createHash('sha256').update(f.readFileSync('/root/.openclaw-dev/openclaw.json')).update(f.readFileSync('/root/.openclaw-dev/original-workspace/sentinel')).digest('hex'))").trim();
+const sourceHash = () => docker('exec', container, ...sourceHashArgs(env)).trim();
+// Fail before any runner launch if either selected source file is missing.
 const initial = sourceHash();
 const output = [];
 const assert = (ok, message) => { if (!ok) throw new Error(message); output.push(message); };

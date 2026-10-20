@@ -174,6 +174,10 @@ with untrusted workloads. No inode check is claimed to close that race.
 recovery refusal, SIGTERM cleanup, SIGKILL after a real Gateway starts, exact
 recovery, source byte preservation and unrelated-process survival in a dedicated
 synthetic container using the same two environment variables above.
+Its source-preservation checks use `OCTO_E2E_STATE_ROOT` (or the same default
+`/root/.openclaw-dev` as the runner). Before launching any runner, it requires
+both `openclaw.json` and `original-workspace/sentinel` under that selected root;
+a missing file fails the probe rather than falling back to another profile.
 
 The synthetic HTTP fixture also accepts `OCTO_CARD_E2E_FAULT_FILE`, a local
 mode-file path supplied only to that test service. Writing

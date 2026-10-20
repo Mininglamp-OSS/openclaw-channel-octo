@@ -45,7 +45,7 @@ export function createSocketPeer(server, expectedPath) {
       const keys = generateKeyPair(Uint8Array.from(randomBytes(32)));
       const aesKey = Md5.init(Buffer.from(sharedKey(keys.private, clientKey)).toString("base64")).slice(0, 16);
       const account = new URL(request.url, "http://localhost").searchParams.get("account") ?? uid;
-      peer = { socket, aesKey, salt: "card-e2e-iv-00001", pending: new Map() };
+      peer = { socket, aesKey, salt: "card-e2e-iv-0001", pending: new Map() };
       peers.set(account, peer);
       socket.send(frame(0x21, Buffer.concat([Buffer.from([4]), u64(0), Buffer.from([1]),
         str(Buffer.from(keys.public).toString("base64")), str(peer.salt), u64(1)])));

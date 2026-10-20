@@ -87,7 +87,7 @@ export async function createSyntheticOcto() {
       const clientKey = Uint8Array.from(Buffer.from(readString(), "base64"));
       const keys = generateKeyPair(Uint8Array.from(randomBytes(32)));
       const aesKey = Md5.init(Buffer.from(sharedKey(keys.private, clientKey)).toString("base64")).slice(0, 16);
-      const salt = "scope-test-iv-001";
+      const salt = "scope-test-iv-01";
       socket.send(frame(0x21, Buffer.concat([Buffer.from([4]), u64(0), Buffer.from([1]),
         str(Buffer.from(keys.public).toString("base64")), str(salt), u64(1)])));
       // The server was created outside plugin scope. Only the client's actual
