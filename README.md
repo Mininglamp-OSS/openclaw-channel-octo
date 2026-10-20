@@ -6,7 +6,7 @@ OpenClaw channel plugin for **Octo**. Connects via WebSocket for real-time messa
 
 ## Prerequisites
 
-- Node.js >= 22 (OpenClaw >= 2026.4.15 requires Node 22)
+- Node.js >= 22, also satisfying the chosen OpenClaw host's engine requirement (see Host compatibility below)
 - OpenClaw installed and configured (`npm i -g openclaw`)
 - A bot created via BotFather in Octo (send `/newbot` to BotFather)
 
@@ -20,7 +20,24 @@ openclaw plugins install clawhub:octo
 
 ## Host compatibility
 
-The supported minimum remains OpenClaw `2026.6.9`. Full regression and local Gateway checks cover `2026.8.1`, `2026.9.9` and `2026.10.2`. Startup binding registration shares ownership with the older lazy-manager path. Duplicate suppression depends on the host invoking the target-normalization and delivery-receipt hooks; older hosts that do not invoke those hooks may still deliver the same tool reply and automatic final twice. Plugin installation alone does not guarantee those host capabilities.
+The supported minimum remains OpenClaw `2026.6.9`. Full repository regression uses locked SDK `2026.8.1`; release-specific SDK contracts and synthetic host probes have separate coverage, detailed below. Startup binding registration shares ownership with the older lazy-manager path. Duplicate suppression depends on the host invoking the target-normalization and delivery-receipt hooks; older hosts that do not invoke those hooks may still deliver the same tool reply and automatic final twice. Plugin installation alone does not guarantee those host capabilities.
+
+Octo uses the official named runtime store. Verified SDK releases `2026.6.9`
+and `2026.8.1` share a process-wide named slot; `2026.9.9`, `2026.10.2` and
+`2026.10.5` resolve it from the current managed plugin instance. These are tested
+release points, not a claim that instance scoping first appeared in 10.5.
+Callbacks must originate from the host-admitted Octo account lifecycle. Actual
+WebSocket callbacks created during `startAccount` retain that scope; importing
+Octo's setter from another plugin cannot initialize Octo's instance. A missing
+runtime rejects inbound with `reason=runtime-unavailable`; it does not borrow
+another instance or silently dispatch with a process-global fallback.
+
+The runtime contract and runtime-only strict type check are CI-gated on
+`2026.6.9`, `2026.9.9`, `2026.10.2` and `2026.10.5`; the normal full repository
+job retains locked SDK `2026.8.1`. Use the host's own supported Node version:
+OpenClaw `2026.10.5` requires Node `>=24.16.0 <25 || >=26.1.0`, even though
+Octo's own Node minimum remains 22. See [synthetic runtime-scope tests](e2e/runtime-scope/README.md)
+for production-path and isolated Gateway probes and their validation boundaries.
 
 Progress-card ownership and per-run prompt context use the public `replyOptions.runId` contract. The official `2026.6.9` runtime already adopts this caller-supplied ID and forwards it to prompt and tool hooks; local Gateway regression also verifies this on `2026.10.2`. A custom host that replaces or omits this ID is not compatible with this ownership contract: hooks fail closed rather than borrowing another concurrent turn's card or context. If its dispatch-scoped `onAgentRunStart` callback reports a different or missing ID, the plugin logs one diagnostic per process without rebinding ownership. Arbitrary late hooks do not trigger this diagnostic.
 
@@ -582,22 +599,29 @@ neutral withheld reason and action-status display names render `[redacted]`.
 
 ## Development
 
-Run the real container E2E for yielded progress cards with a configured Octo
-DM user. The runner builds this checkout, installs a test-only inbound bridge in
-the `ocprobe` container, restarts the real OpenClaw gateway, exercises
-`sessions_spawn` + `sessions_yield` + protected completion, and removes the
-bridge/config again even when the test fails.
+Run the real host E2E only in an explicitly selected **idle, dedicated,
+disposable Linux container** with a synthetic Octo test account/recipient. The
+runner refuses an existing Gateway, builds this checkout, and creates a UUID-owned
+private profile, Gateway and encrypted WebSocket peer. Source configuration and
+sessions are never modified. Completed cleanup removes the private Gateway and entire run directory after
+success or ordinary failure; interrupted-run recovery is documented in the fixture guide.
 
-The bridge includes a loopback OpenAI-compatible scripted provider so tool
-choices are deterministic. OpenClaw's tool execution, subagent scheduler,
-lifecycle stream, and Octo send/edit HTTP requests remain the real host paths.
+The peer includes a loopback OpenAI-compatible scripted provider so tool choices
+are deterministic. OpenClaw's tool execution, subagent scheduler, lifecycle hooks
+and Octo send/edit paths stay real. All five original card cases remain enabled.
 
 ```bash
-OCTO_E2E_TARGET_UID=<octo-user-uid> npm run test:e2e:openclaw
+OCTO_E2E_CONTAINER=my-disposable-container \
+OCTO_E2E_TARGET_UID=user_card_e2e_00000000000000000000 \
+npm run test:e2e:openclaw
 ```
 
-Override the default container with `OCTO_E2E_CONTAINER` when needed. The
-target user receives progress-card messages during the test.
+`OCTO_E2E_CONTAINER` is required; there is no default container. Use the runner to
+supply the owned profile, run UUID, request directory and Gateway log. Directly
+enabling the gated Vitest suite without complete, consistent runner state fails
+before any Docker command. See the [runtime-scope fixture and acceptance notes](e2e/runtime-scope/README.md)
+for setup, policy checks, recovery, version-specific test coverage and the known
+2026.10.5 yield-card compatibility failure; its assertions remain active.
 
 ## Disconnect
 
