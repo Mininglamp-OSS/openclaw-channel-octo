@@ -113,6 +113,11 @@ function installFetchStub() {
       });
     }
     if (url === "https://example.test/result.png") return new Response("fixture unavailable", { status: 404 });
+    // Real GC under CI can outlast the card progress debounce; the capability
+    // probe is expected, while cards remain disabled in this timeout fixture.
+    if (path === "/v1/bot/card/profile" && (init?.method ?? "GET") === "GET") {
+      return json({ enabled: false });
+    }
     if (path === "/v1/bot/user/info") return json({ uid: HUMAN_UID, name: "Alice" });
     if (/^\/v1\/bot\/groups\/[^/]+\/mention_pref$/.test(path)) return json({ no_mention: false });
     if (/^\/v1\/bot\/groups\/[^/]+(?:\/threads\/[^/]+)?\/md$/.test(path)) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
@@ -154,6 +159,11 @@ function installHangingSendFetchStub(): {
       });
     }
     if (url === "https://example.test/result.png") return new Response("fixture unavailable", { status: 404 });
+    // Real GC under CI can outlast the card progress debounce; the capability
+    // probe is expected, while cards remain disabled in this timeout fixture.
+    if (path === "/v1/bot/card/profile" && (init?.method ?? "GET") === "GET") {
+      return json({ enabled: false });
+    }
     if (path === "/v1/bot/user/info") return json({ uid: HUMAN_UID, name: "Alice" });
     if (/^\/v1\/bot\/groups\/[^/]+\/mention_pref$/.test(path)) return json({ no_mention: false });
     if (/^\/v1\/bot\/groups\/[^/]+(?:\/threads\/[^/]+)?\/md$/.test(path)) return json({ content: "", version: 0, updated_at: null, updated_by: "" });

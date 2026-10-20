@@ -51,6 +51,95 @@ reconnects on changes.
 
 ## Configuration
 
+### Shared HTTP MCP for existing and new Bots
+
+The Octo channel still registers each Bot, maintains its WebSocket and delivers
+normal replies. Business MCP calls use a shared service with **per-request Bot
+credentials**, selected from the host's trusted Octo channel account. Updating
+this plugin does not create or replace Bot identities.
+
+Deploy `octo-cli mcp serve` separately, with the intended business API backend,
+request-supplied authentication and either the two-tool or three-tool facade.
+Use a host that exposes `registerMcpServerConnectionResolver`. Older supported
+hosts retain ordinary channel behavior; configuring MCP on a host without this
+API produces an explicit compatibility warning and does not inject credentials.
+Such hosts must be upgraded before MCP business operations can work.
+
+The release pipeline supplies `OCTO_MCP_URL` when building this plugin and the
+matching `create-openclaw-octo` tool. For example (deployment operator only):
+
+```bash
+OCTO_MCP_URL=https://mcp.example.com/ npm run build
+```
+
+Build configured releases in an isolated, disposable packaging checkout: `prebuild`
+writes `src/mcp-deployment.ts` and `openclaw.plugin.json` in that checkout. Do not
+commit deployment-generated changes back to the source repository. An unset
+variable preserves existing artifacts; an empty value explicitly clears them.
+
+The plugin package then contains the endpoint and a native `mcpServers` entry.
+The binding tool contains the same deployment default. **End users do not enter
+a URL or set an environment variable**: they update normally and bind new Bots
+with the existing command. Existing Bot accounts and bindings are reused.
+
+```bash
+npx -y create-openclaw-octo update
+```
+
+For an already updated plugin, `create-openclaw-octo mcp` applies/checks the
+binding configuration without registering Bots again. The matching tool release
+adds MCP tool permission to bound Agents while respecting explicit denials.
+Direct plugin updates expose the bundled server but cannot override restrictive
+host tool policy; the updater performs that policy migration. These features
+require the matching source versions to be released.
+
+Operators can still override the bundled endpoint using the binding tool's
+`--mcp-url`, runtime `OCTO_MCP_URL`, or saved deployment configuration. A remote
+server's environment does not propagate to user machines; shipping the built
+artifact carries the deployment address. The gateway need not inherit a user
+shell variable. Source builds without a deployment address retain existing
+channel behavior; the installer reports that MCP is not configured. A build
+variable set to an empty string clears the default; leaving it unset preserves
+an already configured artifact. The address is never guessed from the Octo API.
+
+The release default lives in the plugin manifest, so later releases can update
+it automatically. Explicit operator overrides use `mcp.servers.octo-mcp`:
+
+```json
+{"enabled": true, "transport": "streamable-http", "url": "https://mcp.example.com/"}
+```
+
+Do not put Bot tokens, `headers`, OAuth, client certificates/keys or other static
+authentication in this entry, and do not disable TLS verification. When the host resolves a connection, the resolver reads the current configured Bot token;
+unknown, ambiguous, disabled and non-Octo accounts fail closed. Legacy top-level
+credentials are supported only for the explicit `default` account. Named
+accounts need their own tokens. The service URL must use HTTPS, or loopback HTTP
+for local deployment, without URL credentials, query or fragment.
+
+Identity resolution is registered through `registerCapabilities`, including the
+host's `discovery` mode used by prepared Agent runtimes. Registering it only in
+`registerFull` leaves those runtimes without the account's Authorization header.
+The host may cache resolved connections; the resolver reading live configuration
+does not by itself guarantee immediate connection refresh after a configuration change.
+
+The migration preserves existing accounts, bindings, tool allow/deny rules and
+other MCP services. It adds `bundle-mcp` to an existing `tools.allow`, or otherwise to
+`tools.alsoAllow`, only on Agents
+explicitly bound to enabled Octo accounts. This enables the host's MCP tool
+bundle, which can include other configured MCP servers; review those servers
+and their filters when granting access. An explicit bundle denial is not
+overridden. Both keyed and legacy array Agent rosters are supported.
+
+Protocol checks initialize the service and discover its business tools, without
+calling `bot.register` or changing business state. They do not prove WebSocket
+health or the host's runtime credential routing. After gateway reload, verify a
+real task through each bound Bot and inspect its actual business identity.
+Two-tool and three-tool services are both supported; changing facade affects
+tool discovery and may require a fresh Agent session.
+
+Document-comment/PPT tasks, imports/exports and binary workflows retain their
+existing CLI paths during migration. Keep the CLI installed for these paths.
+
 Bot accounts are stored in `~/.openclaw/openclaw.json` under `channels.octo.accounts`:
 
 ```json
@@ -617,3 +706,41 @@ The planning classifier only gates the optional continuation and emits operator 
 Unsupported nonempty `doc_kind` values never select a fallback API or start an Agent. The poller records `unsupported_doc_kind` in the existing per-account `doc-tasks.deadletter.json` (bounded to 200 entries), logs the event ID/kind, and advances its durable cursor without ACK. This avoids repeatedly executing later events behind an unknown-protocol gap. The server retains the original unacknowledged event until its own expiry; recovery after a consumer upgrade is an explicit operator action, not automatic replay. The diagnostics store is best effort, with write failures logged under the existing disk-failure policy. Upgrade every consuming plugin and CLI before the Server and Docs PPT producer. The only accepted nonempty wire kinds are `html` and `ppt`; legacy doc/sheet/board omit the kind. The stored `html_ppt` document type is not a wire alias.
 
 PPT revision-read failures log only document/thread IDs and HTTP status (or `unknown`) and disable continuation. No recurring poller-status interface is added to account snapshots.
+
+Octo's updater and MCP configuration commands refresh running Gateway connections
+through the standard OpenClaw restart command after successful configuration.
+This deployment path does not require an OpenClaw source patch. Direct manual
+configuration edits still follow the host's normal cache lifecycle.
+
+External document-comment and Bot Task sessions cannot execute Bot-authority
+Octo MCP business tools. While MCP is enabled, they also cannot delegate via
+sessions_spawn, sessions_yield or sessions_send, because a delegated session may
+not retain the external-task classification across host integrations. Existing
+CLI task workflows remain available; ordinary IM delegation is unaffected.
+
+### MCP discovery and argument names
+
+The MCP protocol hint uses `before_prompt_build`, so the existing operator-controlled
+`plugins.entries.octo.hooks.allowConversationAccess: true` opt-in above also applies.
+Installation does not grant this consent on the operator's behalf. Protocol probing
+alone does not prove the model receives the hint or follows discovery correctly.
+
+Two-tool clients call `get_skill` itself (`intent: search` / `describe`), then
+`execute`; `get_skill` is not a business operation ID. When the host exposes a
+compact `tool_search` surface, discover the prefixed MCP tool first. Execution
+arguments follow the described wire keys, e.g. `If-Match`, not CLI flags. Business
+`channel_id` and `uid` are raw IDs, not delivery routes such as `octo:user:<uid>`.
+A successful `dry_run` is a preview, not a completed change. Preserve failed Agent
+tasks in acceptance evidence even if a direct MCP call or an assisted retry works.
+
+The external-task execution guard recognizes direct and `mcp__`-prefixed Octo
+business tool names. Native Tool Search routes each `tool_call` target through
+the normal execution hooks, so the actual Octo target is rejected while unrelated
+non-Octo catalog tools remain available. MCP-capable hosts must preserve this
+nested hook contract; exposing an unguarded dispatcher is not supported. Ordinary
+IM keeps Octo MCP access. While MCP is enabled, external tasks cannot delegate
+Bot authority; that delegation guard fails closed when live configuration is unreadable.
+
+After building, `node scripts/check-mcp-tool-search.mjs /path/to/openclaw`
+checks the native Tool Search execution-hook contract with synthetic tools and
+configuration. It does not start a Gateway or contact a business service.
