@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { DOC_TASK_PROGRESS_DESCRIPTION, DOCS_CLI_PATH_DESCRIPTION, BOT_TASKS_DESCRIPTION, DOC_TASKS_DESCRIPTION, DOCS_API_URL_DESCRIPTION, OctoConfigJsonSchema } from "./config-schema.js";
+import { DISPATCH_TIMEOUT_MS_DESCRIPTION, DOC_TASK_PROGRESS_DESCRIPTION, DOCS_CLI_PATH_DESCRIPTION, BOT_TASKS_DESCRIPTION, DOC_TASKS_DESCRIPTION, DOCS_API_URL_DESCRIPTION, OctoConfigJsonSchema } from "./config-schema.js";
 
 // Regression guard for OpenClaw v2026.5.x channel manifest requirement:
 // openclaw.plugin.json#channelConfigs.octo.schema must stay in sync
@@ -51,6 +51,7 @@ describe("openclaw.plugin.json channelConfigs", () => {
   // openclaw.plugin.json 里各存了一份 —— 通用的那条只断言 key 存在、不比描述文本,所以两份
   // 会悄悄漂移。这里按 key 把两侧描述钉到 config-schema 的单一来源上。
   it.each([
+    ["dispatchTimeoutMs", DISPATCH_TIMEOUT_MS_DESCRIPTION],
     ["docTasks", DOC_TASKS_DESCRIPTION],
     ["docTaskProgress", DOC_TASK_PROGRESS_DESCRIPTION],
     ["botTasks", BOT_TASKS_DESCRIPTION],

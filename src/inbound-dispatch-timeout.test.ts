@@ -3,6 +3,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ChannelType, MessageType } from "./types.js";
 import {
   handleInboundMessage,
+  pendingInboundContext,
+  takePendingInboundContext,
   resolveDispatchTimeoutMs,
   _setDispatchTimeoutForTests,
   _setDispatchApologyTimeoutForTests,
@@ -15,6 +17,11 @@ import type { ResolvedOctoAccount } from "./accounts.js";
 import { createBotTaskHandler } from "./bot-task-handler.js";
 import type { BotTaskStateStore } from "./bot-task-store.js";
 import { botTaskDedupeKey } from "./bot-task.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { getEventListeners } from "node:events";
+import { registerCardProgress, _resetCardProgressForTests } from "./card-progress.js";
+import { subscribeAccountAbort } from "./account-abort.js";
 
 /**
  * Regression tests for issue #75 — upstream
@@ -45,6 +52,7 @@ const BOT_UID = "bot_self_0000000000000000000000000000";
 const HUMAN_UID = "human_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const GROUP_ID = "g_room_1";
 
+const unexpectedRequests: string[] = [];
 const originalFetch = globalThis.fetch;
 const originalSetTimeout = globalThis.setTimeout;
 const originalClearTimeout = globalThis.clearTimeout;
@@ -92,10 +100,11 @@ function installFetchStub() {
   const sends: any[] = [];
   globalThis.fetch = vi.fn(async (input: any, init?: any) => {
     const url = typeof input === "string" ? input : input.toString();
+    const path = new URL(url).pathname;
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 
-    if (url.includes("/members")) {
+    if (/^\/v1\/bot\/groups\/[^/]+\/members$/.test(path)) {
       return json({
         members: [
           { uid: HUMAN_UID, name: "Alice", robot: false },
@@ -103,16 +112,19 @@ function installFetchStub() {
         ],
       });
     }
-    if (url.includes("/mention_pref")) return json({ no_mention: false });
-    if (url.includes("/md")) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
-    if (url.includes("/messages/sync")) return json({ messages: [] });
-    if (url.includes("/readReceipt")) return json({});
-    if (url.includes("/typing")) return json({});
-    if (url.includes("/sendMessage")) {
+    if (url === "https://example.test/result.png") return new Response("fixture unavailable", { status: 404 });
+    if (path === "/v1/bot/user/info") return json({ uid: HUMAN_UID, name: "Alice" });
+    if (/^\/v1\/bot\/groups\/[^/]+\/mention_pref$/.test(path)) return json({ no_mention: false });
+    if (/^\/v1\/bot\/groups\/[^/]+(?:\/threads\/[^/]+)?\/md$/.test(path)) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
+    if (path === "/v1/bot/messages/sync") return json({ messages: [] });
+    if (path === "/v1/bot/readReceipt") return json({});
+    if (path === "/v1/bot/typing") return json({});
+    if (path === "/v1/bot/sendMessage") {
       sends.push(init?.body ? JSON.parse(init.body) : {});
       return json({ message_id: "reply1", message_seq: 0 });
     }
-    return json({});
+    unexpectedRequests.push(url);
+    throw new Error(`Unexpected Octo endpoint: ${url}`);
   }) as unknown as typeof fetch;
   return { sends };
 }
@@ -129,10 +141,11 @@ function installHangingSendFetchStub(): {
   const sends: Array<{ content: string | null; abortedBeforeResolve: boolean }> = [];
   globalThis.fetch = vi.fn(async (input: any, init?: any) => {
     const url = typeof input === "string" ? input : input.toString();
+    const path = new URL(url).pathname;
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 
-    if (url.includes("/members")) {
+    if (/^\/v1\/bot\/groups\/[^/]+\/members$/.test(path)) {
       return json({
         members: [
           { uid: HUMAN_UID, name: "Alice", robot: false },
@@ -140,12 +153,14 @@ function installHangingSendFetchStub(): {
         ],
       });
     }
-    if (url.includes("/mention_pref")) return json({ no_mention: false });
-    if (url.includes("/md")) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
-    if (url.includes("/messages/sync")) return json({ messages: [] });
-    if (url.includes("/readReceipt")) return json({});
-    if (url.includes("/typing")) return json({});
-    if (url.includes("/sendMessage")) {
+    if (url === "https://example.test/result.png") return new Response("fixture unavailable", { status: 404 });
+    if (path === "/v1/bot/user/info") return json({ uid: HUMAN_UID, name: "Alice" });
+    if (/^\/v1\/bot\/groups\/[^/]+\/mention_pref$/.test(path)) return json({ no_mention: false });
+    if (/^\/v1\/bot\/groups\/[^/]+(?:\/threads\/[^/]+)?\/md$/.test(path)) return json({ content: "", version: 0, updated_at: null, updated_by: "" });
+    if (path === "/v1/bot/messages/sync") return json({ messages: [] });
+    if (path === "/v1/bot/readReceipt") return json({});
+    if (path === "/v1/bot/typing") return json({});
+    if (path === "/v1/bot/sendMessage") {
       const body = init?.body ? JSON.parse(init.body) : null;
       const content: string | null = body?.payload?.content ?? null;
       const signal: AbortSignal | undefined = init?.signal;
@@ -169,7 +184,8 @@ function installHangingSendFetchStub(): {
       });
       return json({}); // unreachable
     }
-    return json({});
+    unexpectedRequests.push(url);
+    throw new Error(`Unexpected Octo endpoint: ${url}`);
   }) as unknown as typeof fetch;
   return { sends };
 }
@@ -202,7 +218,7 @@ function installHangingRuntime(): { dispatch: ReturnType<typeof vi.fn> } {
 
 function installImmediateRuntime(
   deliverArgs?: { text?: string; kind?: string },
-  opts?: { config?: Record<string, unknown> },
+  opts?: { config?: Record<string, unknown>; resolveAgentTimeoutMs?: (opts: any) => number },
 ) {
   const dispatch = vi.fn(async (args: any) => {
     if (deliverArgs) {
@@ -211,6 +227,7 @@ function installImmediateRuntime(
   });
   setOctoRuntime({
     config: { current: () => opts?.config ?? {} },
+    agent: { resolveAgentTimeoutMs: opts?.resolveAgentTimeoutMs },
     channel: {
       reply: {
         dispatchReplyWithBufferedBlockDispatcher: dispatch,
@@ -233,7 +250,7 @@ function installImmediateRuntime(
 
 function pickTimeoutSends(sends: any[]) {
   return sends.filter(
-    (body) => typeof body?.payload?.content === "string" && body.payload.content.includes("处理超时"),
+    (body) => typeof body?.payload?.content === "string" && (body.payload.content.includes("处理超时") || body.payload.content.includes("已放行后续消息")),
   );
 }
 
@@ -260,6 +277,123 @@ function runInbound(opts: {
   });
 }
 
+it("GC lifecycle: reclaims abandoned released dispatches but preserves live late delivery and cancellation", async () => {
+  if (!globalThis.gc) {
+    // Exercise the real handler in a separate V8 process; no fake WeakRef/GC.
+    await promisify(execFile)(process.execPath, ["node_modules/vitest/vitest.mjs", "run",
+      "src/inbound-dispatch-timeout.test.ts", "--execArgv=--expose-gc", "-t", "GC lifecycle:"],
+    { cwd: process.cwd(), timeout: 90_000, maxBuffer: 2 * 1024 * 1024 });
+    return;
+  }
+  const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+  const collect = async () => {
+    for (let i = 0; i < 12; i++) { await tick(); globalThis.gc!(); await tick(); }
+  };
+  const { dispatch } = installImmediateRuntime();
+  const { sends } = installFetchStub();
+  const account = new AbortController();
+  const state = (process as any)[Symbol.for("openclaw.octo.card-progress-state.v2")];
+  pendingInboundContext.clear(); _resetCardProgressForTests();
+  _setDispatchTimeoutForTests(10);
+  _setDispatchApologyTimeoutForTests(25);
+  let liveArgs: any;
+  const discardMockReferences = () => { dispatch.mockClear(); vi.mocked(globalThis.fetch).mockClear(); };
+  try {
+    dispatch.mockImplementation(() => new Promise(() => {}));
+    for (let i = 0; i < 4; i++) {
+      await expect(runInbound({ signal: account.signal })).rejects.toThrow("dispatch timed out");
+      discardMockReferences();
+    }
+    await collect();
+    expect(pendingInboundContext.size).toBe(0);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(state.cards.size).toBe(0);
+    expect(getEventListeners(account.signal, "abort")).toHaveLength(0);
+
+    // Host still owns only its callbacks, with no Promise/resolver reference.
+    dispatch.mockImplementation(args => { liveArgs = args; return new Promise(() => {}); });
+    await expect(runInbound({ signal: account.signal })).rejects.toThrow("dispatch timed out");
+    discardMockReferences();
+    await collect();
+    expect(pendingInboundContext.get(liveArgs.replyOptions.runId)?.memberListPrefix).toContain("Alice");
+    expect(state.releasedRuns.size).toBe(1);
+    expect(getEventListeners(account.signal, "abort")).toHaveLength(1);
+    await liveArgs.dispatcherOptions.deliver({ text: "live result after GC" }, { kind: "final" });
+    expect(sends.some(s => s.payload?.content === "live result after GC")).toBe(true);
+    account.abort();
+    expect(liveArgs.replyOptions.abortSignal.aborted).toBe(true);
+    await liveArgs.dispatcherOptions.deliver({ text: "must not send after stop" }, { kind: "final" });
+    expect(sends.some(s => s.payload?.content === "must not send after stop")).toBe(false);
+    await tick(); await tick();
+    expect(pendingInboundContext.size).toBe(0);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(getEventListeners(account.signal, "abort")).toHaveLength(0);
+    liveArgs = undefined;
+
+    // A host may retain just its native operation's run signal, not JS callbacks.
+    const signalAccount = new AbortController();
+    let signalOnly: AbortSignal | undefined;
+    dispatch.mockImplementation(args => {
+      signalOnly = args.replyOptions.abortSignal;
+      return new Promise(() => {});
+    });
+    await expect(runInbound({ signal: signalAccount.signal })).rejects.toThrow("dispatch timed out");
+    discardMockReferences(); await collect();
+    expect(signalOnly?.aborted).toBe(false);
+    expect(pendingInboundContext.size).toBe(1);
+    expect(state.releasedRuns.size).toBe(1);
+    signalAccount.abort();
+    expect(signalOnly?.aborted).toBe(true);
+    await tick(); await tick();
+    expect(pendingInboundContext.size).toBe(0);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(getEventListeners(signalAccount.signal, "abort")).toHaveLength(0);
+    signalOnly = undefined;
+
+    // A still-owned pending Promise is live work, even when it emits no events.
+    const promiseAccount = new AbortController();
+    let hostPromise: Promise<unknown> | undefined;
+    dispatch.mockImplementation(() => { hostPromise = new Promise(() => {}); return hostPromise; });
+    await expect(runInbound({ signal: promiseAccount.signal })).rejects.toThrow("dispatch timed out");
+    discardMockReferences(); await collect();
+    expect(hostPromise).toBeInstanceOf(Promise);
+    expect(pendingInboundContext.size).toBe(1);
+    expect(state.releasedRuns.size).toBe(1);
+    hostPromise = undefined; await collect();
+    expect(pendingInboundContext.size).toBe(0);
+    expect(state.releasedRuns.size).toBe(0);
+    expect(state.cards.size).toBe(0);
+    expect(getEventListeners(promiseAccount.signal, "abort")).toHaveLength(0);
+
+    const { WeakValueMap } = await import("./weak-value-map.js");
+    const collectedKeys: string[] = [];
+    const index = new WeakValueMap<string, object>(key => collectedKeys.push(key));
+    (() => index.set("reused", {}))();
+    const replacement = {};
+    index.set("reused", replacement);
+    await collect();
+    expect(index.get("reused")).toBe(replacement);
+    expect(collectedKeys).toEqual([]);
+    (() => index.set("abandoned", {}))();
+    await collect();
+    expect(index.size).toBe(1);
+    expect(collectedKeys).toEqual(["abandoned"]);
+
+    const bulkAccount = new AbortController();
+    for (let i = 0; i < 2000; i++) {
+      const run = new AbortController();
+      subscribeAccountAbort(bulkAccount.signal, () => run.abort(), run.signal);
+    }
+    await collect();
+    expect(getEventListeners(bulkAccount.signal, "abort")).toHaveLength(0);
+  } finally {
+    account.abort(); liveArgs = undefined;
+    _resetCardProgressForTests(); pendingInboundContext.clear();
+    _setDispatchTimeoutForTests(null); _setDispatchApologyTimeoutForTests(null);
+    globalThis.fetch = originalFetch;
+  }
+}, 100_000);
+
 function createInboundBackedBotTaskDispatch(
   log: any,
 ): Parameters<typeof createBotTaskHandler>[0]["dispatch"] {
@@ -282,6 +416,7 @@ function createInboundBackedBotTaskDispatch(
 }
 
 beforeEach(() => {
+  unexpectedRequests.length = 0;
   _clearKnownBots();
   _setDispatchTimeoutForTests(TIMEOUT_MS_FOR_TESTS);
   _setDispatchApologyTimeoutForTests(APOLOGY_TIMEOUT_MS_FOR_TESTS);
@@ -296,10 +431,85 @@ afterEach(() => {
   globalThis.setTimeout = originalSetTimeout;
   globalThis.clearTimeout = originalClearTimeout;
   vi.restoreAllMocks();
+  expect(unexpectedRequests).toEqual([]);
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
-  it("timeout cancels a stalled media presign, settles dispatch and allows the next IM turn", async () => {
+  it("an unknown host budget releases the queue after 11 minutes without aborting the run", async () => {
+    _setDispatchTimeoutForTests(null); vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    let release!: () => void; let enter!: () => void; let signal!: AbortSignal;
+    const gate = new Promise<void>(r => { release = r; }); const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      signal = args.replyOptions.abortSignal; enter(); await gate;
+      await args.dispatcherOptions.deliver({ text: "eventual answer" }, { kind: "final" });
+    });
+    try {
+      const running = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(659_999);
+      expect(sends).toEqual([]); expect(signal.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(2); await running;
+      expect(signal.aborted).toBe(false);
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "eventual answer"]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+  it("uses the host resolver in the real handler: a healthy silent turn survives the former 11-minute cutoff", async () => {
+    _setDispatchTimeoutForTests(null);
+    vi.useFakeTimers();
+    const resolve = vi.fn(() => 172_800_000);
+    const { dispatch } = installImmediateRuntime(undefined, { resolveAgentTimeoutMs: resolve });
+    const { sends } = installFetchStub();
+    let release!: () => void;
+    let enter!: () => void;
+    const entered = new Promise<void>(r => { enter = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    let signal!: AbortSignal;
+    dispatch.mockImplementation(async args => {
+      signal = args.replyOptions.abortSignal;
+      enter(); await gate;
+      await args.dispatcherOptions.deliver({ text: "long task completed" }, { kind: "final" });
+    });
+    try {
+      const running = runInbound();
+      await entered;
+      await vi.advanceTimersByTimeAsync(720_000);
+      expect(resolve).toHaveBeenCalledOnce();
+      expect(signal.aborted).toBe(false);
+      expect(sends).toEqual([]);
+      release(); await running;
+      expect(sends.map(s => s.payload?.content)).toEqual(["long task completed"]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+  it("account shutdown still cancels a background IM run after queue-only timeout", async () => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    const controller = new AbortController();
+    let enter!: () => void;
+    const entered = new Promise<void>(r => { enter = r; });
+    let signal!: AbortSignal;
+    dispatch.mockImplementation(async args => {
+      signal = args.replyOptions.abortSignal;
+      enter();
+      await new Promise<void>(r => signal.addEventListener("abort", () => r(), { once: true }));
+      await args.dispatcherOptions.deliver({ text: "must not escape shutdown" }, { kind: "final" });
+    });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered;
+      await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      expect(signal.aborted).toBe(false);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(signal.aborted).toBe(true);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。"]);
+    } finally { controller.abort(); vi.useRealTimers(); }
+  });
+
+  it("queue timeout leaves a stalled media request running and allows the next IM turn", async () => {
     _setDispatchTimeoutForTests(500);
     _setDispatchAbortGraceForTests(500);
     const { dispatch } = installImmediateRuntime();
@@ -327,12 +537,12 @@ describe("dispatch timeout guard (issue #75)", () => {
     });
     try {
       await expect(runInbound({ log: { warn: () => {}, error: () => {} } })).rejects.toThrow("dispatch timed out");
-      expect(uploadSignal?.aborted).toBe(true);
-      expect(dispatchSettled).toBe(true);
+      expect(uploadSignal?.aborted).toBe(false);
+      expect(dispatchSettled).toBe(false);
       installImmediateRuntime({ text: "next turn works", kind: "final" });
       await runInbound();
-      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。", "next turn works"]);
-    } finally { cancelUpload?.(); }
+      expect(sends.map(send => send.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "next turn works"]);
+    } finally { cancelUpload?.(); await dispatch.mock.results[0].value; }
   });
 
   it("account stop aborts a buffered-final POST after dispatch has already settled", async () => {
@@ -378,7 +588,7 @@ describe("dispatch timeout guard (issue #75)", () => {
     expect(sends).toEqual([]);
   });
 
-  it.each(["channel", "account"])("explicit %s deadline cancels a long IM turn, fences its final and permits recovery", async scope => {
+  it.each(["channel", "account"])("explicit %s queue limit permits recovery and a late final", async scope => {
     // Exercise the real configuration branch, without the test timeout override.
     _setDispatchTimeoutForTests(null);
     vi.useFakeTimers();
@@ -407,19 +617,19 @@ describe("dispatch timeout guard (issue #75)", () => {
       await entered;
       await vi.advanceTimersByTimeAsync(1000 + ABORT_GRACE_MS_FOR_TESTS + 1);
       await rejected;
-      expect(signal.aborted).toBe(true);
+      expect(signal.aborted).toBe(false);
       release();
       await dispatch.mock.results[0].value;
-      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。"]);
+      expect(sends.map(send => send.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "late answer under explicit deadline"]);
       installImmediateRuntime({ text: "next explicit-config turn works", kind: "final" }, { config: cfg });
       await runInbound({ account });
       expect(sends.map(send => send.payload?.content)).toEqual([
-        "⚠️ 处理超时，请稍后重试。", "next explicit-config turn works",
+        "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "late answer under explicit deadline", "next explicit-config turn works",
       ]);
     } finally { release(); vi.useRealTimers(); }
   });
 
-  it("cancels an ordinary IM run and fences an abort-ignoring late final", async () => {
+  it.each(["final", "block"])("preserves a late %s after releasing the queue without a duplicate error notice", async (kind) => {
     vi.useFakeTimers();
     const { dispatch } = installImmediateRuntime();
     const { sends } = installFetchStub();
@@ -432,19 +642,250 @@ describe("dispatch timeout guard (issue #75)", () => {
       signal = args.replyOptions.abortSignal;
       enter();
       await gate;
-      await args.dispatcherOptions.deliver({ text: "stale final" }, { kind: "final" });
-      await args.dispatcherOptions.onError(new Error("late cancellation"), { kind: "final" });
+      await args.dispatcherOptions.deliver({ text: "late answer" }, { kind });
+      if (kind === "final") {
+        await args.dispatcherOptions.deliver({ text: "duplicate trailing block" }, { kind: "block" });
+        await args.dispatcherOptions.onError(new Error("late cancellation"), { kind: "final" });
+      }
     });
     try {
       const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
       await entered;
       await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + ABORT_GRACE_MS_FOR_TESTS + 1);
       await rejected;
-      expect(signal.aborted).toBe(true);
+      expect(signal.aborted).toBe(false);
       release();
       await vi.advanceTimersByTimeAsync(1);
-      expect(sends.map(send => send.payload?.content)).toEqual(["⚠️ 处理超时，请稍后重试。"]);
+      expect(sends.map(send => send.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "late answer"]);
     } finally { release(); vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("does not flush an incomplete late block after background delivery reports an error (reject: %s)", async (reject) => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    let release!: () => void;
+    let enter!: () => void;
+    const entered = new Promise<void>(r => { enter = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    dispatch.mockImplementation(async args => {
+      enter(); await gate;
+      await args.dispatcherOptions.deliver({ text: "incomplete output" }, { kind: "block" });
+      await args.dispatcherOptions.onError(new Error("background delivery failed"), { kind: "final" });
+      if (reject) throw new Error("terminal rejection");
+    });
+    try {
+      const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered;
+      await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。"]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+  it.each(["reject", "progress then reject", "duplicate errors", "recover final", "recover block", "media final", "warning", "tool delivery", "stop", "foreground error"])("settled background failure visibility: %s", async mode => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    const controller = new AbortController();
+    const handlers: Record<string, (event: any, ctx: any) => any> = {};
+    registerCardProgress({ on: (name: string, fn: any) => { handlers[name] = fn; } } as any);
+    let release!: () => void; let enter!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      const options = args.dispatcherOptions;
+      const ctx = { sessionKey: "sk1", runId: args.replyOptions.runId };
+      if (mode === "tool delivery") handlers.before_agent_run?.({}, ctx);
+      if (mode === "progress then reject") await options.deliver({ text: "working" }, { kind: "tool" });
+      if (mode === "foreground error") await options.onError(new Error("initial failure"), { kind: "final" });
+      enter(); await gate;
+      if (mode === "stop") controller.abort();
+      if (mode === "duplicate errors" || mode.startsWith("recover")) {
+        await options.onError(new Error("failure one"), { kind: "final" });
+        await options.onError(new Error("failure two"), { kind: "final" });
+      }
+      if (mode.startsWith("recover")) await options.deliver({ text: "recovered answer" }, { kind: mode.endsWith("final") ? "final" : "block" });
+      if (mode === "media final") await options.deliver({ mediaUrl: "https://example.test/result.png" }, { kind: "final" });
+      if (mode === "warning") await options.deliver({ text: "⚠️ 🛠️ Exec: command failed", isError: true }, { kind: "final" });
+      if (mode === "tool delivery") {
+        handlers.before_tool_call?.({ toolName: "message", toolCallId: "sent", params: { action: "send", target: "group:" + GROUP_ID, message: "tool answer" } }, ctx);
+        handlers.after_tool_call?.({ toolName: "message", toolCallId: "sent", result: { status: "ok" } }, ctx);
+      }
+      throw new Error("terminal rejection");
+    });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      const noticesBeforeSettlement = sends.filter(s => s.payload?.content?.startsWith("⚠️ 抱歉"));
+      expect(noticesBeforeSettlement).toHaveLength(mode === "foreground error" ? 1 : 0);
+      release(); await vi.advanceTimersByTimeAsync(1);
+      const errors = sends.filter(s => s.payload?.content?.startsWith("⚠️ 抱歉"));
+      const shouldNotify = ["reject", "progress then reject", "duplicate errors", "foreground error"].includes(mode);
+      expect(errors).toHaveLength(shouldNotify ? 1 : 0);
+      if (mode.startsWith("recover")) expect(sends.filter(s => s.payload?.content === "recovered answer")).toHaveLength(1);
+      if (mode === "warning") expect(sends.filter(s => s.payload?.content?.includes("⚠️"))).toHaveLength(1);
+    } finally { release(); controller.abort(); await vi.advanceTimersByTimeAsync(0); vi.useRealTimers(); }
+  });
+
+  it("orders a racing background failure after the queue notice and sends it once", async () => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    const fetchStub = globalThis.fetch;
+    let release!: () => void; let enter!: () => void; let releaseNotice!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    const noticeGate = new Promise<void>(r => { releaseNotice = r; });
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const response = await fetchStub(input, init);
+      if (String(input).includes("/sendMessage") && init?.body?.includes("任务仍在运行")) await noticeGate;
+      return response;
+    }) as typeof fetch;
+    dispatch.mockImplementation(async () => { enter(); await gate; throw new Error("failed while notice was in flight"); });
+    try {
+      const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1);
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends).toHaveLength(1);
+      releaseNotice(); await vi.advanceTimersByTimeAsync(1); await rejected;
+      expect(sends.map(s => s.payload?.content)).toEqual([
+        "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。",
+        "⚠️ 抱歉，处理您的消息时遇到了问题，请稍后重试。",
+      ]);
+    } finally { release(); releaseNotice(); vi.useRealTimers(); }
+  });
+
+  it.each(["timeout", "account stop"])("bounds an in-flight background failure notice: %s", async mode => {
+    const { dispatch } = installImmediateRuntime(); installFetchStub();
+    const fetchStub = globalThis.fetch; const controller = new AbortController();
+    let release!: () => void; let enter!: () => void; let noticeStarted!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    const noticeEntered = new Promise<void>(r => { noticeStarted = r; });
+    let attempts = 0; let aborted = false;
+    globalThis.fetch = (async (input: any, init?: any) => {
+      if (String(input).includes("/sendMessage") && init?.body?.includes("⚠️ 抱歉")) {
+        attempts++; noticeStarted();
+        await new Promise<void>((_, reject) => {
+          const onAbort = () => { aborted = true; reject(new Error("notice aborted")); };
+          if (init.signal.aborted) onAbort(); else init.signal.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      return fetchStub(input, init);
+    }) as typeof fetch;
+    dispatch.mockImplementation(async () => { enter(); await gate; throw new Error("background failed"); });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered; await rejected; release(); await noticeEntered;
+      if (mode === "account stop") controller.abort();
+      await vi.waitFor(() => expect(aborted).toBe(true));
+      await vi.waitFor(() => expect(getEventListeners(controller.signal, "abort")).toHaveLength(0));
+      expect(attempts).toBe(1);
+    } finally { release(); controller.abort(); }
+  });
+
+  it("retains the old prompt context after release and isolates the next dispatch by its supplied runId", async () => {
+    vi.useFakeTimers(); pendingInboundContext.clear();
+    const { dispatch } = installImmediateRuntime(); installFetchStub();
+    let releaseA!: () => void; let releaseB!: () => void;
+    let enterA!: () => void; let enterB!: () => void;
+    const gateA = new Promise<void>(r => { releaseA = r; });
+    const gateB = new Promise<void>(r => { releaseB = r; });
+    const enteredA = new Promise<void>(r => { enterA = r; });
+    const enteredB = new Promise<void>(r => { enterB = r; });
+    let runA = ""; let runB = "";
+    dispatch.mockImplementationOnce(async args => { runA = args.replyOptions.runId; enterA(); await gateA; })
+      .mockImplementationOnce(async args => { runB = args.replyOptions.runId; enterB(); await gateB; });
+    try {
+      const timedOut = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await enteredA; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await timedOut;
+      expect(pendingInboundContext.get(runA)?.memberListPrefix).toContain("Alice");
+      const second = runInbound(); await enteredB;
+      expect(runB).not.toBe(runA);
+      expect(takePendingInboundContext("sk1", runA)?.memberListPrefix).toContain("Alice");
+      releaseA(); await vi.advanceTimersByTimeAsync(1);
+      expect(pendingInboundContext.has(runB)).toBe(true);
+      expect(takePendingInboundContext("sk1", runB)?.memberListPrefix).toContain("Alice");
+      releaseB(); await second;
+      expect(pendingInboundContext.size).toBe(0);
+    } finally { releaseA(); releaseB(); pendingInboundContext.clear(); vi.useRealTimers(); }
+  });
+
+  it.each(["warning only", "buffered answer", "account stop"])("settles a deferred background tool warning without the optional host callback: %s", async mode => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    const controller = new AbortController();
+    let release!: () => void; let enter!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      await args.dispatcherOptions.deliver({ text: "⚠️ 🛠️ Exec: command failed", isError: true }, { kind: "final" });
+      enter(); await gate;
+      if (mode === "buffered answer") await args.dispatcherOptions.deliver({ text: "recovered answer" }, { kind: "block" });
+    });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      expect(sends).toHaveLength(1);
+      if (mode === "account stop") controller.abort();
+      release(); await vi.advanceTimersByTimeAsync(1);
+      const texts = sends.map(s => s.payload?.content);
+      expect(texts).toHaveLength(mode === "account stop" ? 1 : 2);
+      if (mode === "buffered answer") expect(texts[1]).toBe("recovered answer");
+      if (mode === "warning only") {
+        expect(texts[1]).toContain("⚠️");
+        expect(texts[1]).not.toContain("command failed");
+      }
+    } finally { release(); controller.abort(); vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("keeps pre-timeout buffered output until background settles (reject: %s)", async reject => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime(); const { sends } = installFetchStub();
+    let release!: () => void; let enter!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      await args.dispatcherOptions.deliver({ text: "buffer before timeout" }, { kind: "block" });
+      enter(); await gate;
+      await args.dispatcherOptions.deliver({ text: "stale progress" }, { kind: "tool" });
+      if (reject) throw new Error("terminal rejection");
+    });
+    try {
+      const rejected = expect(runInbound()).rejects.toThrow("dispatch timed out");
+      await entered; await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      expect(sends.map(s => s.payload?.content)).not.toContain("buffer before timeout");
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(s => s.payload?.content)).toEqual(["⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", "buffer before timeout"]);
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+  it.each(["block", "final then block", "account stop"])("recovers a late answer on background rejection: %s", async (mode) => {
+    vi.useFakeTimers();
+    const { dispatch } = installImmediateRuntime();
+    const { sends } = installFetchStub();
+    const controller = new AbortController();
+    let release!: () => void;
+    let enter!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const entered = new Promise<void>(r => { enter = r; });
+    dispatch.mockImplementation(async args => {
+      enter(); await gate;
+      if (mode === "final then block") {
+        await args.dispatcherOptions.deliver({ text: "late answer" }, { kind: "final" });
+      }
+      await args.dispatcherOptions.deliver({ text: "late answer" }, { kind: "block" });
+      if (mode === "account stop") controller.abort();
+      throw new Error("non_deliverable_terminal_turn");
+    });
+    try {
+      const rejected = expect(runInbound({ signal: controller.signal })).rejects.toThrow("dispatch timed out");
+      await entered;
+      await vi.advanceTimersByTimeAsync(TIMEOUT_MS_FOR_TESTS + 1); await rejected;
+      release(); await vi.advanceTimersByTimeAsync(1);
+      expect(sends.map(s => s.payload?.content)).toEqual([
+        "⏳ 任务仍在运行，已放行后续消息；完成后会补充回复。", ...(mode === "account stop" ? [] : ["late answer"]),
+      ]);
+    } finally { release(); controller.abort(); vi.useRealTimers(); }
   });
 
   it.each(["deadline", "account stop"])("PPT %s cancels the runtime before a late write or reply", async (reason) => {
@@ -666,6 +1107,41 @@ describe("dispatch timeout guard (issue #75)", () => {
       expect(store.retry).toHaveBeenCalledOnce();
     },
   );
+
+  it("diagnoses a host runId mismatch once without confusing late dispatches or weakening ownership", async () => {
+    const key = Symbol.for("openclaw.octo.host-run-id-mismatch-warning.v1");
+    const shared = process as unknown as Record<PropertyKey, unknown>;
+    const previous = shared[key]; delete shared[key];
+    const warn = vi.fn();
+    const { dispatch } = installImmediateRuntime(); installFetchStub();
+    const seen: any[] = [];
+    dispatch.mockImplementation(async (args: any) => {
+      seen.push(args.replyOptions);
+      args.replyOptions.onAgentRunStart(args.replyOptions.runId);
+      // An old callback may arrive after the new dispatch started: it still
+      // validates against its own expected ID, never against the latest session.
+      if (seen.length > 1) seen[0].onAgentRunStart(seen[0].runId);
+      expect(warn).not.toHaveBeenCalled();
+      if (seen.length === 2) {
+        args.replyOptions.onAgentRunStart("foreign-host-id");
+        args.replyOptions.onAgentRunStart(undefined);
+        seen[0].onAgentRunStart("another-foreign-id");
+        expect(takePendingInboundContext(args.ctx.SessionKey, "foreign-host-id")).toBeUndefined();
+        expect(takePendingInboundContext(args.ctx.SessionKey, args.replyOptions.runId)).toBeDefined();
+      }
+      await args.dispatcherOptions.deliver({ text: "ok" }, { kind: "final" });
+    });
+    try {
+      await runInbound({ log: { warn } });
+      await runInbound({ log: { warn } });
+      expect(seen[0].runId).not.toBe(seen[1].runId);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn.mock.calls[0][0]).toContain("host did not preserve replyOptions.runId");
+      expect(warn.mock.calls[0][0]).not.toContain(seen[1].runId);
+    } finally {
+      if (previous === undefined) delete shared[key]; else shared[key] = previous;
+    }
+  });
 
   it("可信 route override 保持原始 sessionKey", async () => {
     const { dispatch } = installImmediateRuntime();
@@ -950,7 +1426,7 @@ describe("dispatch timeout guard (issue #75)", () => {
     const elapsed = Date.now() - start;
     expect(elapsed, "must settle within bound, not hang forever").toBeLessThan(2000);
 
-    const apology = sends.find((s) => s.content?.includes("处理超时"));
+    const apology = sends.find((s) => s.content?.includes("已放行后续消息"));
     expect(apology, "apology sendMessage must reach fetch").toBeDefined();
     expect(apology!.abortedBeforeResolve, "apology must be aborted by its own AbortSignal.timeout").toBe(true);
   });

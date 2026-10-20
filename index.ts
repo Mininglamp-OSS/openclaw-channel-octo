@@ -20,7 +20,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { getGroupMdForPrompt } from "./src/group-md.js";
-import { pendingInboundContext, sessionAccountMap, buildSessionAccountKey, recordSessionResetWatermark } from "./src/inbound.js";
+import { takePendingInboundContext, sessionAccountMap, buildSessionAccountKey, recordSessionResetWatermark } from "./src/inbound.js";
 import { resolvePersonaHintForSession } from "./src/persona-prompt.js";
 import { setOctoRuntime } from "./src/runtime.js";
 import { octoPlugin } from "./src/channel.js";
@@ -343,10 +343,9 @@ export default defineBundledChannelEntry({
 
       // 2. Inbound context (member list + history) — outside [GROUP CONTEXT], keeps original format
       const sessionKey = ctx.sessionKey;
-      if (sessionKey) {
-        const pending = pendingInboundContext.get(sessionKey);
+      if (sessionKey && ctx.messageProvider === CHANNEL_ID) {
+        const pending = takePendingInboundContext(sessionKey, ctx.runId);
         if (pending) {
-          pendingInboundContext.delete(sessionKey);
           if (pending.memberListPrefix) contextSections.push(pending.memberListPrefix);
           if (pending.historyPrefix) contextSections.push(pending.historyPrefix);
         }
