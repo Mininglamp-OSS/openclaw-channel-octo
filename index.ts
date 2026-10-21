@@ -31,6 +31,7 @@ import { CHANNEL_ID, PLUGIN_ID, DISPLAY_CARD_TOOL_NAME, INTERACTIVE_CARD_TOOL_NA
 import { bindCardRun, registerCardProgress } from "./src/card-progress.js";
 import { bindDocTaskRun, registerDocTaskProgress } from "./src/doc-task-progress.js";
 import { registerDocTaskToolPolicy } from "./src/doc-task-tool-policy.js";
+import { registerOctoMcpConnection, registerOctoMcpToolPolicy, registerOctoMcpPromptHint } from "./src/mcp-connection.js";
 
 // ---------------------------------------------------------------------------
 // Tool-availability self-diagnostic (issue #137)
@@ -159,7 +160,7 @@ export function _buildHookGateWarning(
     if (_hostGatesPromptBuildHook(hostVersion)) {
       lines.push(
         "  - this host also gates before_prompt_build: group MD, the member list and " +
-          "persona identity never reach the prompt. The bot still connects and still " +
+          "persona identity and Octo MCP protocol guidance never reach the prompt. The bot still connects and still " +
           "replies, so nothing looks broken — persona clones simply answer out of character.",
       );
     } else {
@@ -225,6 +226,12 @@ export default defineBundledChannelEntry({
     exportName: "setOctoRuntime",
   },
   configSchema: loadConfigSchema(),
+  // Prepared Agent generations use discovery, which skips registerFull.
+  // Identity is a runtime capability and must exist in that registry too.
+  registerCapabilities(api: OpenClawPluginApi) {
+    if (registerOctoMcpConnection(api)) registerOctoMcpPromptHint(api);
+    registerOctoMcpToolPolicy(api);
+  },
   registerFull(api: OpenClawPluginApi) {
     // Register agent tool BEFORE the 'full' mode guard — tool-discovery
     // mode calls registerFull with registrationMode='tool-discovery' and
@@ -386,6 +393,7 @@ export default defineBundledChannelEntry({
       // per-conversation raw id here, not the provider name).
       const toolHint = _buildToolAvailabilityHint(ctx.messageProvider);
       if (toolHint) systemSections.push(toolHint);
+
 
       if (contextSections.length === 0 && systemSections.length === 0) return;
       return {

@@ -7,6 +7,7 @@ const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '-
 }));
 const paths = new Set(packed[0].files.map(file => file.path));
 const required = ['dist/index.js', 'dist/setup-entry.js', 'openclaw.plugin.json',
+  'dist/src/mcp-connection.js', 'dist/src/mcp-deployment.js',
   'docs/ppt-contract.md', 'docs/doc-task-content-policy.md'];
 const missing = required.filter(path => !paths.has(path));
 if (missing.length) throw new Error('Package missing required files: ' + missing.join(', '));
